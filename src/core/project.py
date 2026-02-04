@@ -146,6 +146,57 @@ class ProjectManager:
             'percent': round(((translated + reviewed) / total * 100) if total > 0 else 0, 1),
         }
 
+    def mark_reviewed(self, segment_id: str, text: str = '') -> None:
+        """Mark a segment as reviewed and optionally update the translation."""
+        if not self.data:
+            raise RuntimeError("No project loaded.")
+
+        for seg in self.data.segments:
+            if seg.segment_id == segment_id:
+                if text:
+                    seg.translated_text = text
+                seg.status = 'reviewed'
+                self.save()
+                return
+
+        raise ValueError(f"Segment not found: {segment_id}")
+
+    def update_translation(self, segment_id: str, text: str) -> None:
+        """Update the translated text of a segment without changing its status."""
+        if not self.data:
+            raise RuntimeError("No project loaded.")
+
+        for seg in self.data.segments:
+            if seg.segment_id == segment_id:
+                seg.translated_text = text
+                self.save()
+                return
+
+        raise ValueError(f"Segment not found: {segment_id}")
+
+    def get_segments_by_chapter(self, chapter_id: str) -> list[SegmentState]:
+        """Get all segments belonging to a specific chapter."""
+        if not self.data:
+            raise RuntimeError("No project loaded.")
+        return [s for s in self.data.segments if s.chapter_id == chapter_id]
+
+    def get_chapters(self) -> list[dict]:
+        """Get a list of unique chapter IDs with segment counts."""
+        if not self.data:
+            raise RuntimeError("No project loaded.")
+
+        chapters: dict[str, dict] = {}
+        for seg in self.data.segments:
+            cid = seg.chapter_id
+            if cid not in chapters:
+                chapters[cid] = {'chapter_id': cid, 'total': 0, 'translated': 0, 'reviewed': 0}
+            chapters[cid]['total'] += 1
+            if seg.status == 'translated':
+                chapters[cid]['translated'] += 1
+            elif seg.status == 'reviewed':
+                chapters[cid]['reviewed'] += 1
+        return list(chapters.values())
+
     def exists(self) -> bool:
         """Check if a project file exists in the project directory."""
         return os.path.isfile(self.project_file)
