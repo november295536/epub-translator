@@ -167,6 +167,27 @@ def status(project):
 
 @cli.command()
 @click.option('--project', '-p', default=None, help='Project directory path')
+@click.option('--port', default=5000, help='Port number for the review server')
+def review(project, port):
+    """Launch the web-based translation review interface."""
+    project_dir = _find_project(project)
+    if not project_dir:
+        click.echo("找不到專案。請先執行 init 指令，或用 --project 指定專案目錄。")
+        sys.exit(1)
+
+    from src.web.server import create_app
+    import webbrowser
+
+    app = create_app(project_dir)
+    url = f'http://localhost:{port}'
+    click.echo(f"啟動審閱伺服器：{url}")
+    click.echo("按 Ctrl+C 停止")
+    webbrowser.open(url)
+    app.run(host='127.0.0.1', port=port, debug=False)
+
+
+@cli.command()
+@click.option('--project', '-p', default=None, help='Project directory path')
 @click.option('--format', '-f', 'fmt',
               type=click.Choice(['chinese-only', 'bilingual-horizontal', 'bilingual-vertical']),
               default='bilingual-horizontal', help='Output format')
