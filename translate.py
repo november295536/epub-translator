@@ -11,6 +11,7 @@ from src.core.segmenter import Segmenter
 from src.core.project import ProjectManager
 from src.core.translator import TranslationEngine, TranslationError
 from src.glossary.glossary_manager import GlossaryManager
+from src.epub.builder import EPUBBuilder
 
 
 def _get_project_dir(epub_path: str) -> str:
@@ -162,6 +163,36 @@ def status(project):
     click.echo(f"已審閱：  {progress['reviewed']}")
     click.echo(f"待翻譯：  {progress['pending']}")
     click.echo(f"進度：    {progress['percent']}%")
+
+
+@cli.command()
+@click.option('--project', '-p', default=None, help='Project directory path')
+@click.option('--format', '-f', 'fmt',
+              type=click.Choice(['chinese-only', 'bilingual-horizontal', 'bilingual-vertical']),
+              default='bilingual-horizontal', help='Output format')
+def export(project, fmt):
+    """Export translated EPUB in the chosen format."""
+    project_dir = _find_project(project)
+    if not project_dir:
+        click.echo("找不到專案。請先執行 init 指令，或用 --project 指定專案目錄。")
+        sys.exit(1)
+
+    pm = ProjectManager(project_dir)
+    pm.load()
+
+    progress = pm.get_progress()
+    if progress['translated'] + progress['reviewed'] == 0:
+        click.echo("尚未翻譯任何段落。請先執行 start 指令。")
+        sys.exit(1)
+
+    output_dir = os.path.join(project_dir, 'output')
+    base_name = os.path.splitext(os.path.basename(pm.data.epub_path))[0]
+    output_path = os.path.join(output_dir, f'{base_name}-{fmt}.epub')
+
+    click.echo(f"正在建構 {fmt} 格式的 EPUB...")
+    builder = EPUBBuilder(project_dir)
+    result_path = builder.build(output_path, fmt=fmt)
+    click.echo(f"已輸出：{result_path}")
 
 
 # --- Glossary CLI commands ---
