@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block title %}專案列表 - EPUB 智能翻譯系統{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>專案列表</h1>
+    <a href="/new" class="btn btn-primary">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+        </svg>
+        新增專案
+    </a>
+</div>
+
+{% if projects %}
+<div class="project-grid">
+    {% for project in projects %}
+    <a href="/project/{{ project.name }}" class="project-card">
+        <div class="project-card-header">
+            <h3>{{ project.title }}</h3>
+            <span class="project-status status-{{ project.status }}">
+                {% if project.status == 'completed' %}已完成
+                {% elif project.status == 'in_progress' %}進行中
+                {% else %}待處理{% endif %}
+            </span>
+        </div>
+        <p class="project-author">{{ project.author }}</p>
+        <div class="project-progress">
+            <div class="progress-bar-small">
+                <div class="progress-fill" style="width: {{ project.percent }}%"></div>
+            </div>
+            <span class="progress-label">{{ project.translated + project.reviewed }}/{{ project.total }} ({{ project.percent }}%)</span>
+        </div>
+        <div class="project-stats">
+            <span class="stat">
+                <span class="stat-value">{{ project.translated }}</span>
+                <span class="stat-label">已翻譯</span>
+            </span>
+            <span class="stat">
+                <span class="stat-value">{{ project.reviewed }}</span>
+                <span class="stat-label">已審閱</span>
+            </span>
+            <span class="stat">
+                <span class="stat-value">{{ project.total - project.translated - project.reviewed }}</span>
+                <span class="stat-label">待處理</span>
+            </span>
+        </div>
+    </a>
+    {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#ccc" stroke-width="1.5">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+        <polyline points="14 2 14 8 20 8"></polyline>
+    </svg>
+    <h2>尚無專案</h2>
+    <p>上傳 EPUB 檔案來建立第一個翻譯專案</p>
+    <a href="/new" class="btn btn-primary">新增專案</a>
+</div>
+{% endif %}
+{% endblock %}
