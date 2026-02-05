@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import logging
 
 logger = logging.getLogger(__name__)
+
+_AUTH_ERROR_PATTERN = re.compile(
+    r'authentication_error|OAuth token has expired|please run /login',
+    re.IGNORECASE,
+)
+
+
+class ExtractionError(Exception):
+    """Raised when term extraction fails due to a non-recoverable error."""
+    pass
 
 EXTRACT_PROMPT = """你是一位專業的技術術語提取專家。請從以下英文文本中提取「需要統一翻譯」的核心專業術語。
 
@@ -55,7 +66,10 @@ class TermExtractor:
             )
 
             if result.returncode != 0:
-                logger.warning("Term extraction failed: %s", result.stderr.strip())
+                combined = (result.stdout or '') + (result.stderr or '')
+                if _AUTH_ERROR_PATTERN.search(combined):
+                    raise ExtractionError('Claude CLI 認證已過期，請在終端執行 claude /login 重新登入')
+                logger.warning("Term extraction failed: %s", combined.strip())
                 return []
 
             output = result.stdout.strip()
