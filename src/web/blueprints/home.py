@@ -66,3 +66,9 @@ def api_projects():
     """Get all projects as JSON."""
     projects = get_all_projects()
     return jsonify(projects)
+
+
+@home_bp.route('/new')
+def new_project():
+    """Show the new project upload page."""
+    return render_template('new_project.html')
