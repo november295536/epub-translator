@@ -1,0 +1,214 @@
+{% extends "base.html" %}
+
+{% block title %}新增專案 - EPUB 智能翻譯系統{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>新增專案</h1>
+    <a href="/" class="btn btn-secondary">返回列表</a>
+</div>
+
+<div class="upload-container" x-data="uploadManager()">
+    <!-- Upload area -->
+    <div class="upload-area"
+         :class="{ 'drag-over': isDragging, 'has-file': file }"
+         @dragover.prevent="isDragging = true"
+         @dragleave.prevent="isDragging = false"
+         @drop.prevent="handleDrop($event)">
+
+        <template x-if="!file && !uploading">
+            <div class="upload-prompt">
+                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#999" stroke-width="1.5">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="17 8 12 3 7 8"></polyline>
+                    <line x1="12" y1="3" x2="12" y2="15"></line>
+                </svg>
+                <p>拖放 EPUB 檔案到這裡</p>
+                <p class="upload-hint">或</p>
+                <label class="btn btn-primary">
+                    選擇檔案
+                    <input type="file" accept=".epub" @change="handleFileSelect($event)" hidden>
+                </label>
+            </div>
+        </template>
+
+        <template x-if="uploading">
+            <div class="upload-progress">
+                <div class="spinner-large"></div>
+                <p>正在上傳並解析...</p>
+            </div>
+        </template>
+
+        <template x-if="file && !uploading && !metadata">
+            <div class="upload-progress">
+                <div class="spinner-large"></div>
+                <p>正在分析 EPUB 檔案...</p>
+            </div>
+        </template>
+    </div>
+
+    <!-- Metadata preview -->
+    <template x-if="metadata">
+        <div class="metadata-preview card">
+            <div class="card-header">
+                <h3>書籍資訊</h3>
+            </div>
+            <div class="card-body">
+                <div class="metadata-grid">
+                    <div class="metadata-item">
+                        <span class="metadata-label">書名</span>
+                        <span class="metadata-value" x-text="metadata.title"></span>
+                    </div>
+                    <div class="metadata-item">
+                        <span class="metadata-label">作者</span>
+                        <span class="metadata-value" x-text="metadata.author"></span>
+                    </div>
+                    <div class="metadata-item">
+                        <span class="metadata-label">章節數</span>
+                        <span class="metadata-value" x-text="metadata.chapters + ' 章'"></span>
+                    </div>
+                    <div class="metadata-item">
+                        <span class="metadata-label">預估字數</span>
+                        <span class="metadata-value" x-text="metadata.word_count.toLocaleString() + ' 字'"></span>
+                    </div>
+                </div>
+
+                <div class="form-group" x-show="metadata.project_exists">
+                    <div class="alert alert-warning">
+                        <strong>注意：</strong>同名專案已存在，建立新專案將會覆蓋現有資料。
+                    </div>
+                </div>
+
+                <div class="form-actions">
+                    <button class="btn btn-secondary" @click="reset()">取消</button>
+                    <button class="btn btn-primary" @click="createProject()" :disabled="creating">
+                        <span x-show="!creating">建立專案</span>
+                        <span x-show="creating" class="spinner"></span>
+                        <span x-show="creating">建立中...</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </template>
+
+    <!-- Error display -->
+    <template x-if="error">
+        <div class="alert alert-error">
+            <strong>錯誤：</strong><span x-text="error"></span>
+            <button class="btn btn-secondary btn-small" @click="reset()">重試</button>
+        </div>
+    </template>
+</div>
+
+<script>
+function uploadManager() {
+    return {
+        isDragging: false,
+        file: null,
+        uploading: false,
+        metadata: null,
+        creating: false,
+        error: null,
+        uploadedPath: null,
+
+        handleDrop(e) {
+            this.isDragging = false;
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                this.processFile(files[0]);
+            }
+        },
+
+        handleFileSelect(e) {
+            const files = e.target.files;
+            if (files.length > 0) {
+                this.processFile(files[0]);
+            }
+        },
+
+        async processFile(file) {
+            if (!file.name.endsWith('.epub')) {
+                this.error = '請選擇 EPUB 檔案';
+                return;
+            }
+
+            this.file = file;
+            this.error = null;
+            this.uploading = true;
+
+            try {
+                // Upload file
+                const formData = new FormData();
+                formData.append('file', file);
+
+                const uploadResponse = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!uploadResponse.ok) {
+                    const data = await uploadResponse.json();
+                    throw new Error(data.error || '上傳失敗');
+                }
+
+                const uploadData = await uploadResponse.json();
+                this.uploadedPath = uploadData.path;
+
+                // Get metadata
+                const metadataResponse = await fetch('/api/epub/metadata', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: this.uploadedPath })
+                });
+
+                if (!metadataResponse.ok) {
+                    const data = await metadataResponse.json();
+                    throw new Error(data.error || '無法解析 EPUB');
+                }
+
+                this.metadata = await metadataResponse.json();
+            } catch (e) {
+                this.error = e.message;
+                this.file = null;
+            } finally {
+                this.uploading = false;
+            }
+        },
+
+        async createProject() {
+            this.creating = true;
+            this.error = null;
+
+            try {
+                const response = await fetch('/api/projects', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ epub_path: this.uploadedPath })
+                });
+
+                if (!response.ok) {
+                    const data = await response.json();
+                    throw new Error(data.error || '建立專案失敗');
+                }
+
+                const data = await response.json();
+                window.location.href = '/project/' + data.name;
+            } catch (e) {
+                this.error = e.message;
+            } finally {
+                this.creating = false;
+            }
+        },
+
+        reset() {
+            this.file = null;
+            this.uploading = false;
+            this.metadata = null;
+            this.creating = false;
+            this.error = null;
+            this.uploadedPath = null;
+        }
+    }
+}
+</script>
+{% endblock %}
