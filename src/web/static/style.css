@@ -421,6 +421,12 @@ button {
     margin-right: 0.5rem;
 }
 
+.project-card-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
 .project-author {
     color: #666;
     font-size: 0.9rem;
