@@ -241,6 +241,17 @@ class EPUBBuilder:
                         orig_elem.append(str(trans_elem))
             return
 
+        if trans_tags:
+            # Translation has HTML but count doesn't match — replace all with parsed HTML
+            for child in list(trans_frag.children):
+                first.insert_before(child.extract())
+            for elem in elements:
+                if isinstance(elem, NavigableString):
+                    elem.extract()
+                else:
+                    elem.decompose()
+            return
+
         # Fallback: plain text replacement (backward compatible with old translations)
         if isinstance(first, NavigableString):
             first.replace_with(NavigableString(translated))

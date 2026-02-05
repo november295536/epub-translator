@@ -344,6 +344,36 @@ class TestHTMLAwareTranslation:
         found_p = any(div.find('p') for div in translation_divs)
         assert found_p, "Translation div should contain <p> from HTML translation"
 
+    def test_chinese_only_html_mismatched_count(self):
+        """When translated HTML has different element count, it should still render as HTML."""
+        from src.core.project import SegmentState
+
+        builder = EPUBBuilder.__new__(EPUBBuilder)
+        html = '<html><body><p>Paragraph one.</p><p>Paragraph two.</p></body></html>'
+        soup = BeautifulSoup(html, 'html.parser')
+        body = soup.find('body')
+        elements = list(body.children)  # 2 <p> elements
+
+        seg = SegmentState(
+            segment_id='ch1_seg0001',
+            chapter_id='ch1',
+            html='<p>Paragraph one.</p><p>Paragraph two.</p>',
+            text='Paragraph one. Paragraph two.',
+            word_count=4,
+            segment_type='text',
+            status='translated',
+            translated_text='<p class="author">作者 <span>Name</span></p><p class="copyright">版權</p><p class="loc">地點</p>',
+        )
+
+        builder._apply_chinese_only(seg, elements, soup)
+        result = str(body)
+        # HTML tags should be rendered, not escaped
+        assert '&lt;' not in result, "HTML should not be escaped"
+        assert '<p class="author">' in result
+        assert '<span>Name</span>' in result
+        assert '<p class="copyright">' in result
+        assert '<p class="loc">' in result
+
 
 class TestHTMLPreservation:
     """Tests that the new builder preserves original HTML structure."""
