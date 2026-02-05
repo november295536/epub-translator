@@ -27,8 +27,10 @@ class TestSegmenter:
         html = '<h1>Chapter Title</h1><p>Some content here in the paragraph.</p>'
         segments = segmenter.segment_chapter('ch1', html)
 
-        heading_segs = [s for s in segments if s.segment_type == 'heading']
+        heading_segs = [s for s in segments if '<h1' in s.html]
         assert len(heading_segs) >= 1
+        assert heading_segs[0].segment_type == 'text'
+        assert heading_segs[0].standalone is True
         assert 'Chapter Title' in heading_segs[0].text
 
     def test_code_block_standalone_segment(self, segmenter):
@@ -81,7 +83,8 @@ class TestSegmenter:
         html = '<h1>Just a Title</h1>'
         segments = segmenter.segment_chapter('ch1', html)
         assert len(segments) == 1
-        assert segments[0].segment_type == 'heading'
+        assert segments[0].segment_type == 'text'
+        assert segments[0].standalone is True
 
     def test_segment_ids_are_unique(self, segmenter):
         paragraphs = [make_paragraph(100, i) for i in range(10)]
@@ -108,7 +111,7 @@ class TestSegmenter:
             '<p>Section 2 content.</p>'
         )
         segments = segmenter.segment_chapter('ch1', html)
-        headings = [s for s in segments if s.segment_type == 'heading']
+        headings = [s for s in segments if s.standalone and '<h' in s.html]
         assert len(headings) == 3
 
     def test_short_content_single_segment(self, segmenter):
@@ -163,18 +166,18 @@ class TestSmallSegmentMerging:
             assert seg.word_count <= MAX_WORDS * 1.2
 
     def test_heading_breaks_small_merge(self, segmenter):
-        """Headings should interrupt small segment merging."""
+        """Headings (standalone) should interrupt small segment merging."""
         html = (
             '<p>Short text one.</p>'
             '<h2>Section Break</h2>'
             '<p>Short text two.</p>'
         )
         segments = segmenter.segment_chapter('ch1', html)
-        text_segs = [s for s in segments if s.segment_type == 'text']
-        heading_segs = [s for s in segments if s.segment_type == 'heading']
+        non_standalone_text = [s for s in segments if s.segment_type == 'text' and not s.standalone]
+        heading_segs = [s for s in segments if s.standalone and '<h' in s.html]
 
         assert len(heading_segs) == 1
-        assert len(text_segs) == 2  # Not merged because heading is between them
+        assert len(non_standalone_text) == 2  # Not merged because heading is between them
 
 
 class TestLargeSegmentSplitting:
@@ -267,8 +270,10 @@ class TestTableHandling:
         )
         segments = segmenter.segment_chapter('ch1', html)
 
-        table_segs = [s for s in segments if s.segment_type == 'table']
+        table_segs = [s for s in segments if '<table' in s.html]
         assert len(table_segs) == 1
+        assert table_segs[0].segment_type == 'text'
+        assert table_segs[0].standalone is True
         assert 'Header' in table_segs[0].text
 
     def test_table_not_merged_with_text(self, segmenter):
@@ -280,8 +285,9 @@ class TestTableHandling:
         )
         segments = segmenter.segment_chapter('ch1', html)
 
-        table_segs = [s for s in segments if s.segment_type == 'table']
+        table_segs = [s for s in segments if '<table' in s.html]
         assert len(table_segs) == 1
+        assert table_segs[0].standalone is True
         assert 'Before table' not in table_segs[0].text
         assert 'After table' not in table_segs[0].text
 

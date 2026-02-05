@@ -93,6 +93,10 @@ class ProjectManager:
             raw = json.load(f)
 
         segments = [SegmentState(**s) for s in raw.pop('segments', [])]
+        # Normalize legacy segment types: heading/table → text
+        for seg in segments:
+            if seg.segment_type in ('heading', 'table'):
+                seg.segment_type = 'text'
         self.data = ProjectData(**raw, segments=segments)
         return self.data
 

@@ -13,7 +13,7 @@ EPUB 智能翻譯系統 - Translates English EPUB books to Traditional Chinese u
 pip install -r requirements.txt
 
 # Run web server (recommended)
-python3 -m flask --app src.web.server:create_app run --port 5000
+python3 -m flask --app src.web.server:create_app run --port 3000
 
 # Run tests
 python3 -m pytest tests/ -v
