@@ -97,6 +97,8 @@ class EPUBBuilder:
 
             self._transform_chapter(item, chapter_segments, fmt)
 
+        self._translate_toc(book, segments_by_chapter)
+
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
         epub.write_epub(output_path, book)
         return output_path
@@ -331,3 +333,70 @@ class EPUBBuilder:
         p = soup.new_tag('p')
         p.string = translated
         parent_div.append(p)
+
+    def _translate_toc(self, book, segments_by_chapter: dict[str, list]) -> None:
+        """Replace TOC entry titles with translated heading text."""
+        import re
+
+        # Build file_name → item_id mapping from spine
+        name_to_id: dict[str, str] = {}
+        for item_id, _ in book.spine:
+            item = book.get_item_with_id(item_id)
+            if item:
+                name_to_id[item.get_name()] = item_id
+
+        heading_re = re.compile(r'<h[1-6][\s>]', re.IGNORECASE)
+
+        def update_toc_entries(toc_list: list) -> None:
+            for entry in toc_list:
+                if isinstance(entry, (epub.Link, epub.Section)):
+                    self._update_link_title(entry, name_to_id, segments_by_chapter, heading_re)
+                elif isinstance(entry, tuple) and len(entry) == 2:
+                    section, children = entry
+                    if isinstance(section, (epub.Link, epub.Section)):
+                        self._update_link_title(section, name_to_id, segments_by_chapter, heading_re)
+                    if isinstance(children, (list, tuple)):
+                        update_toc_entries(list(children))
+
+        update_toc_entries(book.toc)
+
+    @staticmethod
+    def _update_link_title(link, name_to_id, segments_by_chapter, heading_re) -> None:
+        """Update a single TOC Link's title from translated heading segments."""
+        href_parts = link.href.split('#', 1) if link.href else ['']
+        file_name = href_parts[0]
+        has_fragment = len(href_parts) > 1
+
+        item_id = name_to_id.get(file_name)
+        if not item_id:
+            return
+
+        chapter_segments = segments_by_chapter.get(item_id, [])
+        headings = [s for s in chapter_segments if heading_re.search(s.html)]
+        if not headings:
+            return
+
+        target = None
+        if has_fragment and len(headings) > 1:
+            # Multiple headings in same file — match by original TOC title
+            toc_title = link.title.strip() if link.title else ''
+            for seg in headings:
+                if seg.text.strip() == toc_title:
+                    target = seg
+                    break
+            # Fallback: containment match
+            if not target:
+                for seg in headings:
+                    seg_text = seg.text.strip()
+                    if toc_title in seg_text or seg_text in toc_title:
+                        target = seg
+                        break
+
+        # Default: first heading with a translation
+        if not target:
+            target = headings[0]
+
+        if target and target.translated_text:
+            plain = BeautifulSoup(target.translated_text, 'html.parser').get_text()
+            if plain.strip():
+                link.title = plain.strip()

@@ -532,3 +532,295 @@ class TestHTMLPreservation:
         translation = wrapper.find('div', class_='translation')
         assert original is not None
         assert translation is not None
+
+
+class TestTOCTranslation:
+    """Tests for TOC title translation during EPUB export."""
+
+    def test_toc_titles_translated(self, tmp_path, sample_epub):
+        """TOC titles are replaced with translated heading text after build."""
+        from src.epub.extractor import EPUBExtractor
+        from src.core.segmenter import Segmenter
+
+        project_dir = str(tmp_path / 'toc_project')
+        os.makedirs(project_dir, exist_ok=True)
+
+        extractor = EPUBExtractor(sample_epub)
+        extractor.load()
+        metadata = extractor.get_metadata()
+        chapters = extractor.extract_chapters()
+
+        segmenter = Segmenter()
+        all_segments = []
+        for ch in chapters:
+            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            all_segments.extend(segs)
+
+        pm = ProjectManager(project_dir)
+        pm.create(
+            epub_path=sample_epub,
+            title=metadata['title'],
+            author=metadata['author'],
+            segments=all_segments,
+        )
+
+        # Translate heading segments with Chinese titles based on original text
+        heading_map = {
+            'Introduction': '<h1>導論</h1>',
+            'Chapter 1: Main Content': '<h2>第一章：主要內容</h2>',
+            'Advanced Topics': '<h2>進階主題</h2>',
+        }
+        for seg in pm.data.segments:
+            if '<h1' in seg.html or '<h2' in seg.html:
+                # Match by original text content
+                for orig_title, zh_title in heading_map.items():
+                    if orig_title in seg.text:
+                        pm.mark_translated(seg.segment_id, zh_title)
+                        break
+                else:
+                    pm.mark_translated(seg.segment_id, seg.html)
+            else:
+                pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
+
+        builder = EPUBBuilder(project_dir)
+        output = str(tmp_path / 'toc_output.epub')
+        builder.build(output, fmt='chinese-only')
+
+        book = epub.read_epub(output)
+        toc_titles = [link.title for link in book.toc if isinstance(link, epub.Link)]
+        assert '導論' in toc_titles
+        assert '第一章：主要內容' in toc_titles
+        assert '進階主題' in toc_titles
+
+    def test_toc_untranslated_stays_original(self, tmp_path, sample_epub):
+        """TOC titles stay as original when headings are not translated."""
+        from src.epub.extractor import EPUBExtractor
+        from src.core.segmenter import Segmenter
+
+        project_dir = str(tmp_path / 'toc_orig_project')
+        os.makedirs(project_dir, exist_ok=True)
+
+        extractor = EPUBExtractor(sample_epub)
+        extractor.load()
+        metadata = extractor.get_metadata()
+        chapters = extractor.extract_chapters()
+
+        segmenter = Segmenter()
+        all_segments = []
+        for ch in chapters:
+            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            all_segments.extend(segs)
+
+        pm = ProjectManager(project_dir)
+        pm.create(
+            epub_path=sample_epub,
+            title=metadata['title'],
+            author=metadata['author'],
+            segments=all_segments,
+        )
+
+        # Only translate non-heading segments; leave headings untranslated
+        for seg in pm.data.segments:
+            if '<h1' not in seg.html and '<h2' not in seg.html:
+                pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
+
+        builder = EPUBBuilder(project_dir)
+        output = str(tmp_path / 'toc_orig_output.epub')
+        builder.build(output, fmt='chinese-only')
+
+        book = epub.read_epub(output)
+        toc_titles = [link.title for link in book.toc if isinstance(link, epub.Link)]
+        assert 'Introduction' in toc_titles
+        assert 'Main Content' in toc_titles
+        assert 'Advanced Topics' in toc_titles
+
+    def test_toc_nested_structure(self, tmp_path):
+        """Nested TOC entries are recursively translated."""
+        # Create an EPUB with nested TOC
+        book = epub.EpubBook()
+        book.set_identifier('nested-toc-001')
+        book.set_title('Nested TOC Book')
+        book.set_language('en')
+        book.add_author('Test Author')
+
+        c1 = epub.EpubHtml(title='Part One', file_name='part01.xhtml', lang='en')
+        c1.content = b'<html><body><h1>Part One</h1><p>Content of part one.</p></body></html>'
+
+        c2 = epub.EpubHtml(title='Chapter A', file_name='chap_a.xhtml', lang='en')
+        c2.content = b'<html><body><h2>Chapter A</h2><p>Content of chapter A.</p></body></html>'
+
+        book.add_item(c1)
+        book.add_item(c2)
+
+        # Nested TOC: Part One contains Chapter A as child
+        part_link = epub.Link('part01.xhtml', 'Part One', 'part1')
+        child_link = epub.Link('chap_a.xhtml', 'Chapter A', 'chap_a')
+        book.toc = [(part_link, [child_link])]
+
+        book.add_item(epub.EpubNcx())
+        book.add_item(epub.EpubNav())
+        book.spine = ['nav', c1, c2]
+
+        epub_path = str(tmp_path / 'nested_toc.epub')
+        epub.write_epub(epub_path, book)
+
+        # Set up project
+        from src.epub.extractor import EPUBExtractor
+        from src.core.segmenter import Segmenter
+
+        project_dir = str(tmp_path / 'nested_project')
+        os.makedirs(project_dir, exist_ok=True)
+
+        extractor = EPUBExtractor(epub_path)
+        extractor.load()
+        metadata = extractor.get_metadata()
+        chapters = extractor.extract_chapters()
+
+        segmenter = Segmenter()
+        all_segments = []
+        for ch in chapters:
+            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            all_segments.extend(segs)
+
+        pm = ProjectManager(project_dir)
+        pm.create(
+            epub_path=epub_path,
+            title=metadata['title'],
+            author=metadata['author'],
+            segments=all_segments,
+        )
+
+        # Translate all segments with Chinese headings
+        for seg in pm.data.segments:
+            if '<h1' in seg.html:
+                pm.mark_translated(seg.segment_id, '<h1>第一部分</h1>')
+            elif '<h2' in seg.html:
+                pm.mark_translated(seg.segment_id, '<h2>章節 A</h2>')
+            else:
+                pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
+
+        builder = EPUBBuilder(project_dir)
+        output = str(tmp_path / 'nested_output.epub')
+        builder.build(output, fmt='chinese-only')
+
+        book = epub.read_epub(output)
+        # Nested TOC: first entry is a tuple (Link, [children])
+        assert len(book.toc) >= 1
+        entry = book.toc[0]
+        if isinstance(entry, tuple):
+            parent_link, children = entry
+            assert parent_link.title == '第一部分'
+            assert len(children) >= 1
+            child = children[0]
+            if isinstance(child, epub.Link):
+                assert child.title == '章節 A'
+        else:
+            # If ebooklib flattened the TOC, check flat titles
+            toc_titles = [l.title for l in book.toc if isinstance(l, epub.Link)]
+            assert '第一部分' in toc_titles
+            assert '章節 A' in toc_titles
+
+    def test_toc_multi_heading_same_file(self, tmp_path):
+        """Multiple TOC entries pointing to same file with fragments get correct titles."""
+        book = epub.EpubBook()
+        book.set_identifier('multi-heading-001')
+        book.set_title('Multi Heading Book')
+        book.set_language('en')
+        book.add_author('Test Author')
+
+        # Single file with multiple sections identified by div IDs
+        c1 = epub.EpubHtml(title='Preface', file_name='preface.xhtml', lang='en')
+        c1.content = (
+            '<html><body>'
+            '<div id="preface"><h1>Preface</h1>'
+            '<p>Welcome to this book about testing.</p></div>'
+            '<div id="who"><h1>Who This Book Is For</h1>'
+            '<p>This book is for developers.</p></div>'
+            '<div id="why"><h1>Why We Wrote This Book</h1>'
+            '<p>We wrote this book because testing matters.</p></div>'
+            '</body></html>'
+        ).encode('utf-8')
+
+        book.add_item(c1)
+
+        # TOC with fragment links to same file
+        parent = epub.Link('preface.xhtml#preface', 'Preface', 'preface')
+        child1 = epub.Link('preface.xhtml#who', 'Who This Book Is For', 'who')
+        child2 = epub.Link('preface.xhtml#why', 'Why We Wrote This Book', 'why')
+        book.toc = [(parent, [child1, child2])]
+
+        book.add_item(epub.EpubNcx())
+        book.add_item(epub.EpubNav())
+        book.spine = ['nav', c1]
+
+        epub_path = str(tmp_path / 'multi_heading.epub')
+        epub.write_epub(epub_path, book)
+
+        from src.epub.extractor import EPUBExtractor
+        from src.core.segmenter import Segmenter
+
+        project_dir = str(tmp_path / 'multi_heading_project')
+        os.makedirs(project_dir, exist_ok=True)
+
+        extractor = EPUBExtractor(epub_path)
+        extractor.load()
+        metadata = extractor.get_metadata()
+        chapters = extractor.extract_chapters()
+
+        segmenter = Segmenter()
+        all_segments = []
+        for ch in chapters:
+            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            all_segments.extend(segs)
+
+        pm = ProjectManager(project_dir)
+        pm.create(
+            epub_path=epub_path,
+            title=metadata['title'],
+            author=metadata['author'],
+            segments=all_segments,
+        )
+
+        # Translate headings with distinct Chinese titles
+        heading_map = {
+            'Preface': '<h1>前言</h1>',
+            'Who This Book Is For': '<h1>本書適合誰閱讀</h1>',
+            'Why We Wrote This Book': '<h1>我們為什麼寫這本書</h1>',
+        }
+        for seg in pm.data.segments:
+            matched = False
+            for orig, zh in heading_map.items():
+                if orig in seg.text and '<h1' in seg.html:
+                    pm.mark_translated(seg.segment_id, zh)
+                    matched = True
+                    break
+            if not matched:
+                pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
+
+        builder = EPUBBuilder(project_dir)
+        output = str(tmp_path / 'multi_heading_output.epub')
+        builder.build(output, fmt='chinese-only')
+
+        result_book = epub.read_epub(output)
+
+        # Collect all TOC titles (including nested)
+        def collect_titles(toc):
+            titles = []
+            for entry in toc:
+                if isinstance(entry, (epub.Link, epub.Section)):
+                    titles.append(entry.title)
+                elif isinstance(entry, tuple):
+                    section, children = entry
+                    if isinstance(section, (epub.Link, epub.Section)):
+                        titles.append(section.title)
+                    if isinstance(children, (list, tuple)):
+                        titles.extend(collect_titles(children))
+            return titles
+
+        titles = collect_titles(result_book.toc)
+        assert '前言' in titles
+        assert '本書適合誰閱讀' in titles
+        assert '我們為什麼寫這本書' in titles
+        # Ensure they are NOT all the same
+        unique_zh = [t for t in titles if t != '前言']
+        assert len(unique_zh) >= 2, f"Sub-entries should have distinct titles, got: {titles}"
