@@ -15,16 +15,31 @@
 </div>
 
 {% if projects %}
-<div class="project-grid">
+<div class="project-grid" x-data="{ deleteProject(name, title) {
+    if (!confirm('確定要刪除專案「' + title + '」嗎？此操作無法復原。')) return;
+    fetch('/api/projects/' + name, { method: 'DELETE' })
+        .then(r => r.json())
+        .then(() => location.reload())
+        .catch(e => alert('刪除失敗：' + e.message));
+} }">
     {% for project in projects %}
     <a href="/project/{{ project.name }}" class="project-card">
         <div class="project-card-header">
             <h3>{{ project.title }}</h3>
-            <span class="project-status status-{{ project.status }}">
-                {% if project.status == 'completed' %}已完成
-                {% elif project.status == 'in_progress' %}進行中
-                {% else %}待處理{% endif %}
-            </span>
+            <div class="project-card-actions">
+                <span class="project-status status-{{ project.status }}">
+                    {% if project.status == 'completed' %}已完成
+                    {% elif project.status == 'in_progress' %}進行中
+                    {% else %}待處理{% endif %}
+                </span>
+                <button class="btn-icon btn-icon-danger" title="刪除專案"
+                        @click.stop.prevent="deleteProject('{{ project.name }}', '{{ project.title }}')">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="3 6 5 6 21 6"></polyline>
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                    </svg>
+                </button>
+            </div>
         </div>
         <p class="project-author">{{ project.author }}</p>
         <div class="project-progress">
