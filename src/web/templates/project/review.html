@@ -51,8 +51,7 @@
                     <textarea class="translation-input"
                               x-show="tView === 'edit'"
                               x-ref="textarea"
-                              data-id="{{ seg.segment_id }}"
-                              rows="4">{{ seg.translated_text }}</textarea>
+                              data-id="{{ seg.segment_id }}">{{ seg.translated_text }}</textarea>
                     <div class="html-preview" x-show="tView === 'preview'" x-html="previewHtml"></div>
                     <div class="actions">
                         <button class="btn-save" onclick="saveSegment('{{ seg.segment_id }}')">儲存</button>
