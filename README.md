@@ -4,28 +4,14 @@
 
 ## 系統需求
 
-- **Python 3.9+**
-- **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** — 翻譯引擎，需先安裝並完成認證
-- **Node.js 18+** — Claude Code CLI 的執行環境
+- **[Python 3.9+](https://www.python.org/downloads/)**
+- **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview)** — 翻譯引擎（需要 [Anthropic](https://console.anthropic.com/) 帳號，Claude Pro/Max 訂閱或 API credits）
 
 ## 從零開始設置
 
 ### 1. 安裝 Claude Code CLI
 
-Claude Code CLI 是本專案的翻譯引擎，透過它呼叫 Claude 進行翻譯。
-
-```bash
-# 安裝 Claude Code CLI（需要 Node.js 18+）
-npm install -g @anthropic-ai/claude-code
-
-# 驗證安裝
-claude --version
-
-# 首次使用需登入 Anthropic 帳號（會開啟瀏覽器）
-claude
-```
-
-> 需要有效的 [Anthropic](https://console.anthropic.com/) 帳號，可使用 Claude Pro/Max 訂閱或 API credits。
+請參考官方文件安裝並完成登入認證：https://docs.anthropic.com/en/docs/claude-code/overview
 
 ### 2. 安裝 Python 依賴
 
