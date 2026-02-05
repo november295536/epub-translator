@@ -132,6 +132,12 @@ function uploadManager() {
                 return;
             }
 
+            const maxSize = 50 * 1024 * 1024; // 50MB
+            if (file.size > maxSize) {
+                this.error = '檔案過大，上限為 50MB';
+                return;
+            }
+
             this.file = file;
             this.error = null;
             this.uploading = true;
