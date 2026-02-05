@@ -172,8 +172,12 @@ class TestCLIStart:
 class TestGetProjectDir:
 
     def test_derives_from_filename(self):
-        assert _get_project_dir('my_book.epub') == os.path.join('projects', 'my_book')
+        assert _get_project_dir('my_book.epub') == os.path.join('projects', 'my-book')
 
     def test_handles_path(self):
         result = _get_project_dir('/path/to/my_book.epub')
-        assert result == os.path.join('projects', 'my_book')
+        assert result == os.path.join('projects', 'my-book')
+
+    def test_sanitizes_special_chars(self):
+        result = _get_project_dir('Book (2nd Ed.) [Library].epub')
+        assert result == os.path.join('projects', 'Book-2nd-Ed.-Library')
