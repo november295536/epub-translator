@@ -162,6 +162,35 @@ class TestResponseCleaning:
     def test_clean_text_passes_through(self):
         assert TranslationEngine._clean_response('這是完全正常的翻譯文本。') == '這是完全正常的翻譯文本。'
 
+    def test_removes_markdown_heading_prefix(self):
+        assert TranslationEngine._clean_response('# 可觀測性工程（Observability Engineering）') == '可觀測性工程（Observability Engineering）'
+        assert TranslationEngine._clean_response('## 第一章 簡介') == '第一章 簡介'
+        assert TranslationEngine._clean_response('### 小節標題') == '小節標題'
+
+    def test_removes_markdown_bold(self):
+        assert TranslationEngine._clean_response('可觀測性更是一個**社會技術**概念') == '可觀測性更是一個社會技術概念'
+        assert TranslationEngine._clean_response('這是__粗體__文字') == '這是粗體文字'
+
+    def test_removes_markdown_italic(self):
+        assert TranslationEngine._clean_response('這是一個*重要*概念') == '這是一個重要概念'
+        assert TranslationEngine._clean_response('這是一個_重要_概念') == '這是一個重要概念'
+
+    def test_preserves_normal_asterisks_and_underscores(self):
+        # Asterisk in multiplication should not be stripped
+        assert TranslationEngine._clean_response('計算 3*5 的結果') == '計算 3*5 的結果'
+        # Underscores in variable names should not be stripped
+        assert TranslationEngine._clean_response('使用 my_variable_name 變數') == '使用 my_variable_name 變數'
+
+    def test_removes_multiple_markdown_in_same_text(self):
+        text = '# 標題\n\n這是**粗體**和*斜體*混合的文字'
+        expected = '標題\n\n這是粗體和斜體混合的文字'
+        assert TranslationEngine._clean_response(text) == expected
+
+    def test_removes_markdown_heading_multiline(self):
+        text = '第一行\n## 第二行標題\n第三行'
+        expected = '第一行\n第二行標題\n第三行'
+        assert TranslationEngine._clean_response(text) == expected
+
 
 class TestSegmentTypePrompts:
 
@@ -176,7 +205,7 @@ class TestSegmentTypePrompts:
 
         prompt = mock_run.call_args[0][0][2]
         assert '標題' in prompt
-        assert '只輸出翻譯結果' in prompt
+        assert '只輸出純文字翻譯結果' in prompt
 
     def test_code_uses_code_prompt(self):
         engine = TranslationEngine()
