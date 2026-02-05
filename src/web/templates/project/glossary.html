@@ -1,7 +1,319 @@
 {% extends "project/layout.html" %}
 
 {% block tab_content %}
-<div class="empty-state">
-    <p>術語表管理功能即將推出</p>
+<div x-data="glossaryManager()" x-init="loadTerms()">
+    <!-- Header with actions -->
+    <div class="page-header">
+        <h2>術語表</h2>
+        <div class="header-actions">
+            <button class="btn btn-secondary" @click="showExtractModal = true">
+                自動提取術語
+            </button>
+            <button class="btn btn-primary" @click="showAddForm = true">
+                新增術語
+            </button>
+        </div>
+    </div>
+
+    <!-- Add term form -->
+    <template x-if="showAddForm">
+        <div class="card" style="margin-bottom: 1.5rem;">
+            <div class="card-header">
+                <h3>新增術語</h3>
+            </div>
+            <div class="card-body">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>英文術語</label>
+                        <input type="text" x-model="newTerm.term" placeholder="machine learning">
+                    </div>
+                    <div class="form-group">
+                        <label>中文翻譯</label>
+                        <input type="text" x-model="newTerm.translation" placeholder="機器學習">
+                    </div>
+                    <div class="form-group">
+                        <label>類別</label>
+                        <select x-model="newTerm.category">
+                            <option value="">-- 選擇類別 --</option>
+                            <option value="technology">technology</option>
+                            <option value="programming">programming</option>
+                            <option value="data">data</option>
+                            <option value="networking">networking</option>
+                            <option value="security">security</option>
+                            <option value="cloud">cloud</option>
+                            <option value="ai">ai</option>
+                            <option value="other">other</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-actions">
+                    <button class="btn btn-secondary" @click="showAddForm = false; resetNewTerm()">取消</button>
+                    <button class="btn btn-primary" @click="addTerm()" :disabled="!newTerm.term || !newTerm.translation">
+                        新增
+                    </button>
+                </div>
+            </div>
+        </div>
+    </template>
+
+    <!-- Extraction modal -->
+    <template x-if="showExtractModal">
+        <div class="card" style="margin-bottom: 1.5rem;">
+            <div class="card-header">
+                <h3>自動提取術語</h3>
+            </div>
+            <div class="card-body">
+                <template x-if="extractStatus === 'idle'">
+                    <div>
+                        <p>從書籍內容自動提取技術術語。此功能會使用 Claude 分析前 50 個段落，提取專業術語並建議翻譯。</p>
+                        <div class="form-actions" style="margin-top: 1rem;">
+                            <button class="btn btn-secondary" @click="showExtractModal = false">取消</button>
+                            <button class="btn btn-primary" @click="startExtraction()">開始提取</button>
+                        </div>
+                    </div>
+                </template>
+                <template x-if="extractStatus === 'running'">
+                    <div class="upload-progress">
+                        <div class="spinner-large"></div>
+                        <p>正在提取術語，請稍候...</p>
+                    </div>
+                </template>
+                <template x-if="extractStatus === 'completed'">
+                    <div>
+                        <p class="text-green">提取完成！新增了 <strong x-text="extractResult"></strong> 個術語。</p>
+                        <div class="form-actions" style="margin-top: 1rem;">
+                            <button class="btn btn-primary" @click="showExtractModal = false; extractStatus = 'idle'; loadTerms()">確定</button>
+                        </div>
+                    </div>
+                </template>
+                <template x-if="extractStatus === 'error'">
+                    <div>
+                        <p class="text-error">提取失敗：<span x-text="extractError"></span></p>
+                        <div class="form-actions" style="margin-top: 1rem;">
+                            <button class="btn btn-secondary" @click="showExtractModal = false; extractStatus = 'idle'">關閉</button>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </div>
+    </template>
+
+    <!-- Terms table -->
+    <div class="card">
+        <div class="card-header">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>術語列表 (<span x-text="terms.length"></span>)</h3>
+                <input type="text" class="search-input" placeholder="搜尋術語..."
+                       x-model="searchQuery" @input="filterTerms()">
+            </div>
+        </div>
+        <div class="card-body" style="padding: 0;">
+            <template x-if="filteredTerms.length === 0">
+                <div class="empty-state" style="padding: 2rem;">
+                    <p x-text="terms.length === 0 ? '尚無術語。點擊「新增術語」或「自動提取」來建立術語表。' : '找不到符合的術語。'"></p>
+                </div>
+            </template>
+            <template x-if="filteredTerms.length > 0">
+                <table class="glossary-table">
+                    <thead>
+                        <tr>
+                            <th>術語</th>
+                            <th>翻譯</th>
+                            <th>類別</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <template x-for="term in filteredTerms" :key="term.term">
+                            <tr>
+                                <td>
+                                    <template x-if="editingTerm !== term.term">
+                                        <span x-text="term.term"></span>
+                                    </template>
+                                    <template x-if="editingTerm === term.term">
+                                        <span x-text="term.term" class="text-muted"></span>
+                                    </template>
+                                </td>
+                                <td>
+                                    <template x-if="editingTerm !== term.term">
+                                        <span x-text="term.translation"></span>
+                                    </template>
+                                    <template x-if="editingTerm === term.term">
+                                        <input type="text" x-model="editData.translation" class="inline-input">
+                                    </template>
+                                </td>
+                                <td>
+                                    <template x-if="editingTerm !== term.term">
+                                        <span class="category-badge" x-text="term.category || '-'" :class="'cat-' + (term.category || 'other')"></span>
+                                    </template>
+                                    <template x-if="editingTerm === term.term">
+                                        <select x-model="editData.category" class="inline-input">
+                                            <option value="">--</option>
+                                            <option value="technology">technology</option>
+                                            <option value="programming">programming</option>
+                                            <option value="data">data</option>
+                                            <option value="networking">networking</option>
+                                            <option value="security">security</option>
+                                            <option value="cloud">cloud</option>
+                                            <option value="ai">ai</option>
+                                            <option value="other">other</option>
+                                        </select>
+                                    </template>
+                                </td>
+                                <td class="actions-cell">
+                                    <template x-if="editingTerm !== term.term">
+                                        <div class="table-actions">
+                                            <button class="btn-icon" @click="startEdit(term)" title="編輯">
+                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                                                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+                                                </svg>
+                                            </button>
+                                            <button class="btn-icon btn-icon-danger" @click="deleteTerm(term.term)" title="刪除">
+                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <polyline points="3 6 5 6 21 6"></polyline>
+                                                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                                                </svg>
+                                            </button>
+                                        </div>
+                                    </template>
+                                    <template x-if="editingTerm === term.term">
+                                        <div class="table-actions">
+                                            <button class="btn-icon" @click="saveEdit(term.term)" title="儲存">
+                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#27ae60" stroke-width="2">
+                                                    <polyline points="20 6 9 17 4 12"></polyline>
+                                                </svg>
+                                            </button>
+                                            <button class="btn-icon" @click="cancelEdit()" title="取消">
+                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <line x1="18" y1="6" x2="6" y2="18"></line>
+                                                    <line x1="6" y1="6" x2="18" y2="18"></line>
+                                                </svg>
+                                            </button>
+                                        </div>
+                                    </template>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </template>
+        </div>
+    </div>
 </div>
+
+<script>
+function glossaryManager() {
+    const projectName = '{{ project_name }}';
+    return {
+        terms: [],
+        filteredTerms: [],
+        searchQuery: '',
+        showAddForm: false,
+        showExtractModal: false,
+        newTerm: { term: '', translation: '', category: '' },
+        editingTerm: null,
+        editData: { translation: '', category: '' },
+        extractStatus: 'idle',
+        extractResult: 0,
+        extractError: '',
+
+        async loadTerms() {
+            const res = await fetch(`/api/projects/${projectName}/glossary`);
+            this.terms = await res.json();
+            this.filterTerms();
+        },
+
+        filterTerms() {
+            if (!this.searchQuery) {
+                this.filteredTerms = this.terms;
+            } else {
+                const q = this.searchQuery.toLowerCase();
+                this.filteredTerms = this.terms.filter(t =>
+                    t.term.toLowerCase().includes(q) ||
+                    t.translation.includes(q)
+                );
+            }
+        },
+
+        async addTerm() {
+            const res = await fetch(`/api/projects/${projectName}/glossary`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(this.newTerm)
+            });
+            if (res.ok) {
+                this.showAddForm = false;
+                this.resetNewTerm();
+                await this.loadTerms();
+            }
+        },
+
+        resetNewTerm() {
+            this.newTerm = { term: '', translation: '', category: '' };
+        },
+
+        startEdit(term) {
+            this.editingTerm = term.term;
+            this.editData = { translation: term.translation, category: term.category };
+        },
+
+        cancelEdit() {
+            this.editingTerm = null;
+            this.editData = { translation: '', category: '' };
+        },
+
+        async saveEdit(term) {
+            const res = await fetch(`/api/projects/${projectName}/glossary/${encodeURIComponent(term)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(this.editData)
+            });
+            if (res.ok) {
+                this.editingTerm = null;
+                await this.loadTerms();
+            }
+        },
+
+        async deleteTerm(term) {
+            if (!confirm(`確定要刪除術語「${term}」嗎？`)) return;
+            const res = await fetch(`/api/projects/${projectName}/glossary/${encodeURIComponent(term)}`, {
+                method: 'DELETE'
+            });
+            if (res.ok) {
+                await this.loadTerms();
+            }
+        },
+
+        async startExtraction() {
+            this.extractStatus = 'running';
+            const res = await fetch(`/api/projects/${projectName}/glossary/extract`, {
+                method: 'POST'
+            });
+            if (!res.ok) {
+                const data = await res.json();
+                this.extractStatus = 'error';
+                this.extractError = data.error;
+                return;
+            }
+            // Poll for completion
+            this.pollExtraction();
+        },
+
+        async pollExtraction() {
+            const res = await fetch(`/api/projects/${projectName}/glossary/extract/status`);
+            const data = await res.json();
+            if (data.status === 'running') {
+                setTimeout(() => this.pollExtraction(), 2000);
+            } else if (data.status === 'completed') {
+                this.extractStatus = 'completed';
+                this.extractResult = data.extracted_count;
+            } else if (data.status === 'error') {
+                this.extractStatus = 'error';
+                this.extractError = data.error;
+            }
+        }
+    };
+}
+</script>
 {% endblock %}
