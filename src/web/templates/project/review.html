@@ -23,7 +23,7 @@
         <div class="segment" id="seg-{{ seg.segment_id }}" data-id="{{ seg.segment_id }}">
             <div class="segment-header">
                 <span class="segment-id">{{ seg.segment_id }}</span>
-                <span class="segment-type">{{ seg.segment_type }}</span>
+                {% if seg.segment_type == 'code' %}<span class="segment-type">code</span>{% endif %}
                 <span class="segment-status status-{{ seg.status }}">{{ seg.status }}</span>
             </div>
             <div class="segment-body">
@@ -40,11 +40,20 @@
                     <div class="html-preview" x-show="view === 'preview'">{{ seg.html|safe }}</div>
                     <pre class="html-source" x-show="view === 'html'"><code>{{ seg.html }}</code></pre>
                 </div>
-                <div class="translation">
-                    <h4>譯文</h4>
+                <div class="translation" x-data="{ tView: 'edit', previewHtml: '' }">
+                    <div class="original-header">
+                        <h4>譯文</h4>
+                        <div class="view-toggle">
+                            <button class="toggle-btn" :class="{ active: tView === 'edit' }" @click="tView = 'edit'">編輯</button>
+                            <button class="toggle-btn" :class="{ active: tView === 'preview' }" @click="previewHtml = $refs.textarea.value; tView = 'preview'">預覽</button>
+                        </div>
+                    </div>
                     <textarea class="translation-input"
+                              x-show="tView === 'edit'"
+                              x-ref="textarea"
                               data-id="{{ seg.segment_id }}"
                               rows="4">{{ seg.translated_text }}</textarea>
+                    <div class="html-preview" x-show="tView === 'preview'" x-html="previewHtml"></div>
                     <div class="actions">
                         <button class="btn-save" onclick="saveSegment('{{ seg.segment_id }}')">儲存</button>
                         <button class="btn-approve" onclick="approveSegment('{{ seg.segment_id }}')">通過審閱</button>

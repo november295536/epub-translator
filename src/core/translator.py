@@ -29,18 +29,8 @@ TRANSLATION_PROMPT = """你是一位專業的英文翻譯，請將以下英文�
 原文：
 {text}"""
 
-HEADING_PROMPT = """將以下英文標題翻譯成繁體中文（台灣用語）。專業術語保留原文用括號標註。
-
-嚴格禁止：不要加 # 號、不要加 markdown 標記、不要加引號、不要加任何格式或說明。只輸出純文字翻譯結果。
-{glossary_section}
-{text}"""
-
 CODE_PROMPT = """以下是程式碼區塊，請只翻譯其中的註解（# 或 // 開頭的行），保持程式碼本身完全不變。直接輸出結果，不加任何說明。
 
-{text}"""
-
-TABLE_PROMPT = """將以下 HTML 表格中的英文文字內容翻譯成繁體中文（台灣用語）。保持 HTML 標籤結構完全不變，只翻譯文字部分。專業術語保留原文用括號標註。直接輸出結果。
-{glossary_section}
 {text}"""
 
 TEXT_HTML_PROMPT = """你是一位專業的英文翻譯，請將以下 HTML 內容中的英文文字翻譯成繁體中文。
@@ -107,11 +97,11 @@ class TranslationEngine:
 
         Args:
             text: The English text to translate.
-            segment_type: Type of segment ('text', 'heading', 'code', 'table').
+            segment_type: Type of segment ('text' or 'code').
             glossary_text: Formatted glossary entries for the prompt.
             context_before: Previous segment text for context.
             context_after: Next segment text for context.
-            html: Original HTML content. When provided for text/table types,
+            html: Original HTML content. When provided for non-code types,
                   the HTML-preserving prompt is used instead of the plain text prompt.
 
         Returns:
@@ -120,7 +110,7 @@ class TranslationEngine:
         Raises:
             TranslationError: If translation fails after all retries.
         """
-        use_html_mode = bool(html) and segment_type in ('text', 'table')
+        use_html_mode = bool(html) and segment_type != 'code'
         prompt = self._build_prompt(text, segment_type, glossary_text,
                                     context_before, context_after, html=html)
 
@@ -189,16 +179,9 @@ class TranslationEngine:
                 parts.append(f'後文參考（不需翻譯）：\n{context_after[:200]}')
             context_section = '\n'.join(parts) + '\n'
 
-        if segment_type == 'heading':
-            return HEADING_PROMPT.format(
-                text=text, glossary_section=glossary_section)
-        elif segment_type == 'code':
+        if segment_type == 'code':
             return CODE_PROMPT.format(text=text)
-        elif segment_type == 'table':
-            return TABLE_PROMPT.format(
-                text=html if html else text, glossary_section=glossary_section)
         elif html:
-            # Text type with HTML — use HTML-preserving prompt
             return TEXT_HTML_PROMPT.format(
                 html=html,
                 glossary_section=glossary_section,

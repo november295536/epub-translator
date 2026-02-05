@@ -14,7 +14,8 @@ class Segment:
     html: str
     text: str
     word_count: int
-    segment_type: str  # 'text', 'code', 'heading', 'table'
+    segment_type: str  # 'text' or 'code'
+    standalone: bool = False
 
 
 MIN_WORDS = 300
@@ -48,7 +49,7 @@ class Segmenter:
         return segments
 
     def _extract_blocks(self, element) -> list[dict]:
-        """Extract logical blocks from HTML, classifying each as heading, code, table, or text."""
+        """Extract logical blocks from HTML, classifying each as text or code."""
         blocks = []
         for child in element.children:
             if isinstance(child, NavigableString):
@@ -58,6 +59,7 @@ class Segmenter:
                         'html': str(child),
                         'text': text,
                         'type': 'text',
+                        'standalone': False,
                     })
                 continue
 
@@ -72,7 +74,8 @@ class Segmenter:
                     blocks.append({
                         'html': str(child),
                         'text': text,
-                        'type': 'heading',
+                        'type': 'text',
+                        'standalone': True,
                     })
             elif tag_name == 'table':
                 text = child.get_text(separator=' ', strip=True)
@@ -80,7 +83,8 @@ class Segmenter:
                     blocks.append({
                         'html': str(child),
                         'text': text,
-                        'type': 'table',
+                        'type': 'text',
+                        'standalone': True,
                     })
             elif tag_name == 'pre' or (tag_name == 'code' and child.parent and child.parent.name != 'pre'):
                 text = child.get_text()
@@ -89,6 +93,7 @@ class Segmenter:
                         'html': str(child),
                         'text': text,
                         'type': 'code',
+                        'standalone': True,
                     })
             elif tag_name in ('div', 'section', 'article'):
                 inner_blocks = self._extract_blocks(child)
@@ -100,6 +105,7 @@ class Segmenter:
                         'html': str(child),
                         'text': text,
                         'type': 'text',
+                        'standalone': False,
                     })
 
         return blocks
@@ -134,7 +140,7 @@ class Segmenter:
             pending_word_count = 0
 
         for block in blocks:
-            if block['type'] in ('heading', 'code', 'table'):
+            if block.get('standalone', False):
                 flush_pending()
                 seg_counter += 1
                 wc = len(block['text'].split())
@@ -144,6 +150,7 @@ class Segmenter:
                     text=block['text'],
                     word_count=wc,
                     segment_type=block['type'],
+                    standalone=True,
                 ))
                 continue
 
@@ -205,7 +212,7 @@ class Segmenter:
             pending_wc = 0
 
         for seg in segments:
-            if seg.segment_type != 'text':
+            if seg.segment_type != 'text' or seg.standalone:
                 flush()
                 result.append(seg)
                 continue
@@ -246,7 +253,7 @@ class Segmenter:
         result = []
 
         for seg in segments:
-            if seg.segment_type != 'text' or seg.word_count <= MAX_WORDS:
+            if seg.segment_type != 'text' or seg.standalone or seg.word_count <= MAX_WORDS:
                 result.append(seg)
                 continue
 

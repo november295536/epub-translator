@@ -185,7 +185,10 @@ class EPUBBuilder:
         For text segments: count top-level HTML tags in the segment's stored HTML.
         Falls back to 1 if no tags found (e.g. split segments with plain text).
         """
-        if seg.segment_type in ('heading', 'code', 'table'):
+        if seg.segment_type == 'code':
+            return 1
+        # Backward compatibility: legacy heading/table types are single-element
+        if seg.segment_type in ('heading', 'table'):
             return 1
 
         frag = BeautifulSoup(seg.html, 'html.parser')
@@ -199,16 +202,6 @@ class EPUBBuilder:
 
         first = elements[0]
         translated = seg.translated_text
-
-        if seg.segment_type == 'table' and '<table' in translated.lower():
-            new_content = BeautifulSoup(translated, 'html.parser')
-            first.replace_with(new_content)
-            for elem in elements[1:]:
-                if isinstance(elem, NavigableString):
-                    elem.extract()
-                else:
-                    elem.decompose()
-            return
 
         if seg.segment_type == 'code':
             code_elem = first.find('code') if isinstance(first, Tag) else None
@@ -228,7 +221,7 @@ class EPUBBuilder:
                     elem.decompose()
             return
 
-        # Try HTML-aware replacement for text/heading segments
+        # Try HTML-aware replacement for text segments
         trans_frag = BeautifulSoup(translated, 'html.parser')
         trans_tags = [c for c in trans_frag.children
                       if isinstance(c, Tag) or (isinstance(c, NavigableString) and c.strip())]
@@ -305,27 +298,12 @@ class EPUBBuilder:
         """Fill a div with the translated content using appropriate HTML tags."""
         translated = seg.translated_text
 
-        if seg.segment_type == 'table' and '<table' in translated.lower():
-            content = BeautifulSoup(translated, 'html.parser')
-            for child in list(content.children):
-                parent_div.append(child)
-            return
-
         if seg.segment_type == 'code':
             pre = soup.new_tag('pre')
             code = soup.new_tag('code')
             code.string = translated
             pre.append(code)
             parent_div.append(pre)
-            return
-
-        if seg.segment_type == 'heading':
-            tag_name = 'h2'
-            if original_elements and isinstance(original_elements[0], Tag):
-                tag_name = original_elements[0].name
-            h = soup.new_tag(tag_name)
-            h.string = translated
-            parent_div.append(h)
             return
 
         # Try to parse translated text as HTML

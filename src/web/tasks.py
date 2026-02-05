@@ -153,7 +153,7 @@ class TaskManager:
                 context_after = all_segments[seg_idx + 1].text if seg_idx < len(all_segments) - 1 else ''
 
                 try:
-                    html_arg = seg.html if seg.segment_type in ('text', 'table') else ''
+                    html_arg = seg.html if seg.segment_type != 'code' else ''
                     translated = engine.translate(
                         seg.text,
                         segment_type=seg.segment_type,

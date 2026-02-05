@@ -6,7 +6,7 @@ from unittest.mock import patch, MagicMock
 
 from src.core.translator import (
     TranslationEngine, TranslationError,
-    TRANSLATION_PROMPT, HEADING_PROMPT, CODE_PROMPT, TABLE_PROMPT,
+    TRANSLATION_PROMPT, CODE_PROMPT,
     TEXT_HTML_PROMPT,
 )
 
@@ -195,19 +195,6 @@ class TestResponseCleaning:
 
 class TestSegmentTypePrompts:
 
-    def test_heading_uses_heading_prompt(self):
-        engine = TranslationEngine()
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '標題'
-
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
-            engine.translate('Introduction', segment_type='heading')
-
-        prompt = mock_run.call_args[0][0][2]
-        assert '標題' in prompt
-        assert '只輸出純文字翻譯結果' in prompt
-
     def test_code_uses_code_prompt(self):
         engine = TranslationEngine()
         mock_result = MagicMock()
@@ -221,19 +208,20 @@ class TestSegmentTypePrompts:
         prompt = mock_run.call_args[0][0][2]
         assert '註解' in prompt
 
-    def test_table_uses_table_prompt(self):
+    def test_text_with_html_uses_html_prompt(self):
+        """Text segments with HTML should use TEXT_HTML_PROMPT."""
         engine = TranslationEngine()
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = '<table><tr><td>結果</td></tr></table>'
+        mock_result.stdout = '<h1>標題</h1>'
 
+        html = '<h1>Introduction</h1>'
         with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
-            engine.translate('<table><tr><td>Result</td></tr></table>',
-                           segment_type='table')
+            engine.translate('Introduction', segment_type='text', html=html)
 
         prompt = mock_run.call_args[0][0][2]
-        assert 'HTML' in prompt
-        assert '表格' in prompt
+        assert 'HTML 標籤結構' in prompt
+        assert '<h1>Introduction</h1>' in prompt
 
     def test_glossary_included_in_prompt(self):
         engine = TranslationEngine()
@@ -296,31 +284,6 @@ class TestHTMLMode:
 
         prompt = mock_run.call_args[0][0][2]
         assert '原文：' in prompt
-
-    def test_table_with_html_passes_html_to_prompt(self):
-        engine = TranslationEngine()
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '<table><tr><td>結果</td></tr></table>'
-
-        html = '<table><tr><td>Data</td></tr></table>'
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
-            engine.translate('Data', segment_type='table', html=html)
-
-        prompt = mock_run.call_args[0][0][2]
-        assert '<table>' in prompt
-
-    def test_heading_ignores_html_param(self):
-        engine = TranslationEngine()
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '標題'
-
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
-            engine.translate('Title', segment_type='heading', html='<h1>Title</h1>')
-
-        prompt = mock_run.call_args[0][0][2]
-        assert '只輸出純文字翻譯結果' in prompt
 
     def test_code_ignores_html_param(self):
         engine = TranslationEngine()

@@ -22,13 +22,13 @@ def project_with_translations(tmp_path):
 
     segments = [
         Segment(id='ch1_seg0001', html='<h1>Title</h1>', text='Title',
-                word_count=1, segment_type='heading'),
+                word_count=1, segment_type='text'),
         Segment(id='ch1_seg0002', html='<p>First paragraph.</p>',
                 text='First paragraph.', word_count=2, segment_type='text'),
         Segment(id='ch1_seg0003', html='<p>Second paragraph.</p>',
                 text='Second paragraph.', word_count=2, segment_type='text'),
         Segment(id='ch2_seg0001', html='<h2>Chapter 2</h2>',
-                text='Chapter 2', word_count=2, segment_type='heading'),
+                text='Chapter 2', word_count=2, segment_type='text'),
         Segment(id='ch2_seg0002', html='<p>Chapter 2 content.</p>',
                 text='Chapter 2 content.', word_count=3, segment_type='text'),
     ]
