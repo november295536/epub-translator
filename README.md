@@ -1,149 +1,105 @@
 # EPUB 智能翻譯系統
 
-使用 Claude Code 將英文 EPUB 電子書翻譯成繁體中文的智能工具，支援雙語對照輸出。
-
-## 特色功能
-
-- 🔄 **智能分段翻譯** - 自動將內容分成適當大小的段落，支援斷點續傳
-- 📚 **雙語對照** - 可選擇並排或上下對照的雙語輸出格式
-- 🎯 **術語一致性** - 自動管理專業術語，確保整本書翻譯一致
-- 🖥️ **雙介面支援** - 提供 GUI 圖形介面和 CLI 命令行介面
-- ✏️ **人工校對** - 完整的校對編輯功能，支援即時預覽
-- 🔧 **格式保真** - 完整保留原始 EPUB 的格式、樣式和排版
+使用 Claude CLI 將英文 EPUB 電子書翻譯成繁體中文，支援術語管理、雙語對照輸出、Web 審閱介面。
 
 ## 系統需求
 
-- Python 3.8 或更高版本
-- Claude Code CLI 工具
-- Git（用於版本控制）
-- 10GB+ 可用硬碟空間
+- Python 3.9+
+- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code)（翻譯引擎）
 
-## 快速開始
-
-### 安裝
+## 安裝
 
 ```bash
-# 複製專案
-git clone https://github.com/yourusername/epub-translator.git
 cd epub-translator
-
-# 建立虛擬環境
-python -m venv venv
-source venv/bin/activate  # macOS/Linux
-# 或
-venv\Scripts\activate  # Windows
-
-# 安裝依賴
 pip install -r requirements.txt
 ```
 
-### GUI 模式使用
+## 使用方式
+
+### Web 介面（推薦）
 
 ```bash
-# 啟動圖形介面
-python gui_launcher.py
+python3 -m flask --app src.web.server:create_app run --port 5002
 ```
 
-1. 點擊「開啟 EPUB」選擇要翻譯的檔案
-2. 調整分段大小等設定（可選）
-3. 點擊「開始翻譯」
-4. 在校對介面中檢視和編輯翻譯結果
-5. 選擇輸出格式並匯出
+開啟瀏覽器 http://localhost:5000，即可進行完整流程：
 
-### CLI 模式使用
+1. **首頁** — 查看所有專案，點「新增專案」上傳 EPUB
+2. **總覽** — 各章節進度統計
+3. **術語表** — 新增/刪除術語，或自動提取
+4. **翻譯** — 啟動背景翻譯，即時 SSE 進度推送，可暫停/繼續
+5. **審閱** — 原文譯文左右對照，即時編輯，一鍵通過
+6. **匯出** — 選擇格式，產生並下載 EPUB
+
+### CLI 模式
 
 ```bash
-# 初始化新專案
-python translate.py init mybook.epub
+# 初始化專案
+python3 translate.py init book.epub
 
-# 開始翻譯
-python translate.py start
+# 查看進度
+python3 translate.py status
 
-# 如果中斷，可以繼續翻譯
-python translate.py resume
+# 術語管理
+python3 translate.py glossary extract          # 自動提取術語
+python3 translate.py glossary show             # 查看術語表
+python3 translate.py glossary add "API" "應用程式介面" -c programming
 
-# 進入校對模式
-python translate.py review
+# 開始翻譯（可中斷，再次執行自動續傳）
+python3 translate.py start
 
-# 輸出最終檔案
-python translate.py export --format bilingual-horizontal
+# 開啟 Web 審閱介面
+python3 translate.py review
+
+# 匯出 EPUB
+python3 translate.py export --format bilingual-horizontal
 ```
 
-## 輸出格式選項
+## 輸出格式
 
-- **純中文** - 只包含翻譯後的中文內容
-- **雙語並排** - 左邊原文，右邊譯文
-- **雙語上下** - 上方原文，下方譯文
-- **切換模式** - 讀者可自行切換顯示模式
+| 格式                   | 說明             |
+| ---------------------- | ---------------- |
+| `chinese-only`         | 純繁體中文       |
+| `bilingual-horizontal` | 左右對照（預設） |
+| `bilingual-vertical`   | 上下對照         |
 
 ## 專案結構
 
 ```
 epub-translator/
-├── src/              # 核心程式碼
-├── gui/              # 圖形介面
-├── data/             # 資料檔案
-├── docs/             # 文件
-└── tests/            # 測試檔案
+├── translate.py              # CLI 入口
+├── requirements.txt
+├── projects/                 # 翻譯專案資料
+│   └── <book-name>/
+│       ├── project.json      # 專案狀態與所有段落
+│       ├── glossary.json     # 術語表
+│       └── output/           # 匯出的 EPUB
+├── src/
+│   ├── core/
+│   │   ├── project.py        # 專案管理（JSON 持久化）
+│   │   ├── segmenter.py      # 智能分段（300-500 字）
+│   │   └── translator.py     # Claude CLI 翻譯引擎
+│   ├── epub/
+│   │   ├── extractor.py      # EPUB 解析
+│   │   └── builder.py        # EPUB 重建輸出
+│   ├── glossary/
+│   │   ├── glossary_manager.py  # 術語表 CRUD
+│   │   └── term_extractor.py    # 自動術語提取
+│   └── web/
+│       ├── server.py         # Flask app factory
+│       ├── tasks.py          # 背景任務（翻譯、提取）
+│       ├── blueprints/       # API 路由
+│       ├── templates/        # HTML 頁面（Alpine.js）
+│       └── static/           # CSS
+└── tests/                    # pytest 測試（113 個）
 ```
 
-## 設定選項
-
-編輯 `config.json` 來自訂設定：
-
-```json
-{
-  "segment_size": 400,
-  "auto_save_interval": 300,
-  "claude_timeout": 30,
-  "output_formats": ["bilingual-horizontal", "chinese-only"],
-  "glossary_path": "./data/glossary/default.json"
-}
-```
-
-## 進階功能
-
-### 術語表管理
+## 測試
 
 ```bash
-# 匯出術語表
-python translate.py glossary export --output my_glossary.json
-
-# 匯入術語表
-python translate.py glossary import --input my_glossary.json
-
-# 檢查一致性
-python translate.py glossary check
+python3 -m pytest tests/ -v
 ```
-
-### 批次處理
-
-雖然主要設計為單書處理，但可以使用腳本批次處理：
-
-```bash
-# 使用提供的批次處理腳本
-./batch_translate.sh book1.epub book2.epub book3.epub
-```
-
-## 常見問題
-
-**Q: 翻譯速度很慢怎麼辦？**
-A: 這是正常的，因為我們優先考慮品質。每個段落都會經過 Claude Code 仔細翻譯。
-
-**Q: 可以自訂翻譯風格嗎？**
-A: 可以在設定中調整翻譯提示詞，或在術語表中預設特定翻譯。
-
-**Q: 支援其他語言嗎？**
-A: 目前專注於英翻中，但架構支援擴展到其他語言。
 
 ## 授權
 
 MIT License
-
-## 貢獻
-
-歡迎提交 Issue 和 Pull Request！
-
-## 聯絡方式
-
-如有問題或建議，請在 GitHub 上開 Issue。
