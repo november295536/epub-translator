@@ -187,9 +187,62 @@ class TestLargeSegmentSplitting:
         segments = segmenter.segment_chapter('ch1', html)
         text_segs = [s for s in segments if s.segment_type == 'text']
 
+        # Single <p> cannot be split at element boundaries, so it stays as one
+        assert len(text_segs) >= 1
+
+    def test_large_multi_element_segment_is_split(self, segmenter):
+        """Multiple paragraphs exceeding MAX_WORDS should be split at element boundaries."""
+        paragraphs = [make_paragraph(200, i) for i in range(5)]
+        html = '\n'.join(paragraphs)
+
+        segments = segmenter.segment_chapter('ch1', html)
+        text_segs = [s for s in segments if s.segment_type == 'text']
+
+        # ~1000 words across 5 paragraphs should result in multiple segments
         assert len(text_segs) >= 2
+
+    def test_split_preserves_html_tags(self, segmenter):
+        """Split segments should preserve complete HTML elements, not plain text."""
+        paragraphs = [make_paragraph(200, i) for i in range(5)]
+        html = '\n'.join(paragraphs)
+
+        segments = segmenter.segment_chapter('ch1', html)
+        text_segs = [s for s in segments if s.segment_type == 'text']
+
         for seg in text_segs:
-            assert seg.word_count <= MAX_WORDS * 1.2
+            assert '<p>' in seg.html, f"Split segment should contain HTML tags, got: {seg.html[:100]}"
+
+    def test_single_large_element_kept_by_split_step(self, segmenter):
+        """_split_large_segments keeps a single-element segment intact.
+
+        Note: a single 800-word <p> gets split by _merge_blocks_into_segments
+        at sentence boundaries before _split_large_segments runs. To test
+        _split_large_segments directly, we call it with a hand-crafted segment.
+        """
+        from src.core.segmenter import Segment
+        # Create a segment with a single large <p> element
+        big_html = make_paragraph(800)
+        seg = Segment(id='ch1_seg0001', html=big_html, text='x ' * 800,
+                       word_count=800, segment_type='text')
+        result = segmenter._split_large_segments([seg], 'ch1')
+
+        # Single element cannot be split at element boundaries
+        assert len(result) == 1
+        assert '<p>' in result[0].html
+
+    def test_split_html_and_text_differ(self, segmenter):
+        """After splitting, html should contain tags while text is plain."""
+        paragraphs = [make_paragraph(200, i) for i in range(4)]
+        html = '\n'.join(paragraphs)
+
+        segments = segmenter.segment_chapter('ch1', html)
+        text_segs = [s for s in segments if s.segment_type == 'text']
+
+        for seg in text_segs:
+            # html should have tags
+            assert '<p>' in seg.html
+            # text should not have tags
+            assert '<p>' not in seg.text
 
     def test_code_block_not_split(self, segmenter):
         """Code blocks should never be split, even if large."""

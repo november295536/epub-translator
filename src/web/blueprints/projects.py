@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import uuid
 from flask import Blueprint, render_template, redirect, request, jsonify, current_app
 
@@ -253,6 +254,19 @@ def api_project_detail(project_name: str):
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 404
+
+
+@projects_bp.route('/api/projects/<project_name>', methods=['DELETE'])
+def delete_project(project_name: str):
+    """Delete a project and all its files."""
+    projects_dir = current_app.config['PROJECTS_DIR']
+    project_dir = os.path.join(projects_dir, project_name)
+
+    if not os.path.isdir(project_dir):
+        return jsonify({'error': '專案不存在'}), 404
+
+    shutil.rmtree(project_dir)
+    return jsonify({'status': 'ok'})
 
 
 @projects_bp.route('/api/projects/<project_name>/chapters')

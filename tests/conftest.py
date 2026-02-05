@@ -78,6 +78,52 @@ and deep learning are important concepts in modern computer science.</p>
 
 
 @pytest.fixture
+def rich_sample_epub(tmp_path):
+    """Create an EPUB with rich HTML: CSS, classes, blockquotes, lists."""
+    book = epub.EpubBook()
+    book.set_identifier('rich-book-001')
+    book.set_title('Rich Test Book')
+    book.set_language('en')
+    book.add_author('Rich Author')
+
+    # Add a CSS file
+    css = epub.EpubItem(
+        uid='style',
+        file_name='style/main.css',
+        media_type='text/css',
+        content=b'.indent { text-indent: 2em; } .note { color: #666; font-style: italic; }'
+    )
+    book.add_item(css)
+
+    c1 = epub.EpubHtml(title='Chapter One', file_name='chap01.xhtml', lang='en')
+    c1.content = (
+        '<html><head>'
+        '<link href="style/main.css" rel="stylesheet" type="text/css"/>'
+        '</head><body>'
+        '<h1 id="ch1">Chapter One</h1>'
+        '<p class="indent">This is an indented paragraph with a CSS class that should be preserved.</p>'
+        '<blockquote>This is a blockquote element that should be preserved in the output.</blockquote>'
+        '<p>A regular paragraph following the blockquote for additional context.</p>'
+        '<ul>'
+        '<li>First list item about important concepts in the domain.</li>'
+        '<li>Second list item about other relevant things to discuss.</li>'
+        '</ul>'
+        '<p class="note">This is a note paragraph with special styling applied.</p>'
+        '</body></html>'
+    ).encode('utf-8')
+
+    book.add_item(c1)
+    book.toc = [epub.Link('chap01.xhtml', 'Chapter One', 'ch1')]
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = ['nav', c1]
+
+    epub_path = str(tmp_path / 'rich_book.epub')
+    epub.write_epub(epub_path, book)
+    return epub_path
+
+
+@pytest.fixture
 def project_dir(tmp_path):
     """Provide a temporary project directory."""
     d = tmp_path / 'test_project'

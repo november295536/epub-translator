@@ -1,4 +1,4 @@
-"""EPUB builder - reconstructs translated EPUB files with multiple output formats."""
+"""EPUB builder - reconstructs translated EPUB files preserving original HTML format."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import copy
 
 import ebooklib
 from ebooklib import epub
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag, NavigableString
 
 from src.core.project import ProjectManager, SegmentState
 
@@ -41,7 +41,7 @@ BILINGUAL_CSS = """
 
 
 class EPUBBuilder:
-    """Builds translated EPUB files from project data."""
+    """Builds translated EPUB files from project data, preserving original HTML formatting."""
 
     FORMATS = ('chinese-only', 'bilingual-horizontal', 'bilingual-vertical')
 
@@ -50,7 +50,7 @@ class EPUBBuilder:
         self.pm = ProjectManager(project_dir)
 
     def build(self, output_path: str, fmt: str = 'chinese-only') -> str:
-        """Build the translated EPUB.
+        """Build the translated EPUB by modifying a deep copy of the source book.
 
         Args:
             output_path: Path for the output EPUB file.
@@ -66,13 +66,10 @@ class EPUBBuilder:
         source_epub_path = self.pm.data.epub_path
 
         source_book = epub.read_epub(source_epub_path)
-        new_book = epub.EpubBook()
+        book = copy.deepcopy(source_book)
+        self._fix_toc_uids(book.toc)
 
-        # Copy metadata
-        self._copy_metadata(source_book, new_book)
-
-        # Copy non-document items (CSS, images, fonts)
-        self._copy_resources(source_book, new_book)
+        segments_by_chapter = self._group_segments_by_chapter()
 
         # Add bilingual CSS if needed
         if fmt != 'chinese-only':
@@ -82,78 +79,27 @@ class EPUBBuilder:
                 media_type='text/css',
                 content=BILINGUAL_CSS.encode('utf-8'),
             )
-            new_book.add_item(css_item)
+            book.add_item(css_item)
 
-        # Build translated chapters
-        spine_items = []
-        toc_items = []
-
-        segments_by_chapter = self._group_segments_by_chapter()
-        spine_ids = [item_id for item_id, _ in source_book.spine]
-
-        for item_id in spine_ids:
-            item = source_book.get_item_with_id(item_id)
+        # Transform each chapter in spine order
+        for item_id, _ in book.spine:
+            item = book.get_item_with_id(item_id)
             if item is None or item.get_type() != ebooklib.ITEM_DOCUMENT:
                 continue
 
             chapter_segments = segments_by_chapter.get(item_id, [])
+            if not chapter_segments:
+                continue
 
-            if chapter_segments:
-                new_html = self._build_chapter_html(
-                    item, chapter_segments, fmt)
-            else:
-                # No translations for this chapter - keep original
-                new_html = item.get_content().decode('utf-8')
+            has_translation = any(s.translated_text for s in chapter_segments)
+            if not has_translation:
+                continue
 
-            new_chapter = epub.EpubHtml(
-                title=item.get_name(),
-                file_name=item.get_name(),
-                lang='zh-TW',
-            )
-            new_chapter.set_content(new_html.encode('utf-8'))
-
-            if fmt != 'chinese-only':
-                new_chapter.add_link(
-                    href='style/bilingual.css', rel='stylesheet', type='text/css')
-
-            new_book.add_item(new_chapter)
-            spine_items.append(new_chapter)
-
-            # Extract title for TOC
-            soup = BeautifulSoup(new_html, 'lxml')
-            heading = soup.find(['h1', 'h2', 'h3'])
-            title = heading.get_text(strip=True) if heading else item.get_name()
-            toc_items.append(
-                epub.Link(item.get_name(), title, item_id))
-
-        new_book.toc = toc_items
-        new_book.add_item(epub.EpubNcx())
-        new_book.add_item(epub.EpubNav())
-        new_book.spine = ['nav'] + spine_items
+            self._transform_chapter(item, chapter_segments, fmt)
 
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-        epub.write_epub(output_path, new_book)
+        epub.write_epub(output_path, book)
         return output_path
-
-    def _copy_metadata(self, source: epub.EpubBook, target: epub.EpubBook) -> None:
-        """Copy metadata from source to target book."""
-        title_meta = source.get_metadata('DC', 'title')
-        title = title_meta[0][0] if title_meta else 'Translated Book'
-        target.set_title(title)
-
-        author_meta = source.get_metadata('DC', 'creator')
-        if author_meta:
-            target.add_author(author_meta[0][0])
-
-        target.set_language('zh-TW')
-        target.set_identifier(f'translated-{id(source)}')
-
-    def _copy_resources(self, source: epub.EpubBook, target: epub.EpubBook) -> None:
-        """Copy non-document items (images, CSS, fonts) from source."""
-        for item in source.get_items():
-            if item.get_type() in (ebooklib.ITEM_IMAGE, ebooklib.ITEM_STYLE,
-                                   ebooklib.ITEM_FONT):
-                target.add_item(item)
 
     def _group_segments_by_chapter(self) -> dict[str, list[SegmentState]]:
         """Group project segments by their chapter ID."""
@@ -165,47 +111,234 @@ class EPUBBuilder:
             result[chapter_id].append(seg)
         return result
 
-    def _build_chapter_html(self, item, segments: list[SegmentState],
-                            fmt: str) -> str:
-        """Build the HTML content for a chapter with translated segments."""
-        parts = []
-        parts.append('<html><head><meta charset="utf-8"/></head><body>')
-
-        for seg in segments:
-            translated = seg.translated_text or seg.text
-            original = seg.text
-
-            if fmt == 'chinese-only':
-                parts.append(self._wrap_content(translated, seg.segment_type))
-            elif fmt == 'bilingual-horizontal':
-                parts.append(
-                    '<div class="bilingual-container">'
-                    f'<div class="original">{self._wrap_content(original, seg.segment_type)}</div>'
-                    f'<div class="translation">{self._wrap_content(translated, seg.segment_type)}</div>'
-                    '</div>'
-                )
-            elif fmt == 'bilingual-vertical':
-                parts.append(
-                    '<div class="bilingual-vertical">'
-                    f'<div class="original">{self._wrap_content(original, seg.segment_type)}</div>'
-                    f'<div class="translation">{self._wrap_content(translated, seg.segment_type)}</div>'
-                    '</div>'
-                )
-
-        parts.append('</body></html>')
-        return '\n'.join(parts)
-
     @staticmethod
-    def _wrap_content(text: str, segment_type: str) -> str:
-        """Wrap text in appropriate HTML tags based on segment type."""
-        if segment_type == 'heading':
-            return f'<h2>{text}</h2>'
-        elif segment_type == 'code':
-            return f'<pre><code>{text}</code></pre>'
-        elif segment_type == 'table':
-            # Tables are already HTML
-            if '<table' in text.lower():
-                return text
-            return f'<p>{text}</p>'
+    def _fix_toc_uids(toc: list, prefix: str = 'toc') -> None:
+        """Fix None UIDs in TOC entries produced by read_epub + deepcopy."""
+        for i, item in enumerate(toc):
+            if isinstance(item, epub.Link):
+                if item.uid is None:
+                    item.uid = f'{prefix}_{i}'
+            elif isinstance(item, tuple) and len(item) == 2:
+                section, children = item
+                if isinstance(section, epub.Link) and section.uid is None:
+                    section.uid = f'{prefix}_{i}'
+                if isinstance(children, (list, tuple)):
+                    EPUBBuilder._fix_toc_uids(list(children), f'{prefix}_{i}')
+
+    def _transform_chapter(self, item, segments: list[SegmentState], fmt: str) -> None:
+        """Transform a chapter's HTML in place by matching segments to elements."""
+        html = item.get_content().decode('utf-8')
+        soup = BeautifulSoup(html, 'html.parser')
+        body = soup.find('body')
+        if not body:
+            return
+
+        elements = self._walk_content_elements(body)
+
+        elem_idx = 0
+        for seg in segments:
+            if elem_idx >= len(elements):
+                break
+
+            n = self._count_segment_blocks(seg)
+            end_idx = min(elem_idx + n, len(elements))
+            covered = elements[elem_idx:end_idx]
+
+            if not covered:
+                elem_idx = end_idx
+                continue
+
+            if seg.translated_text:
+                if fmt == 'chinese-only':
+                    self._apply_chinese_only(seg, covered, soup)
+                elif fmt == 'bilingual-vertical':
+                    self._apply_bilingual_vertical(seg, covered, soup)
+                elif fmt == 'bilingual-horizontal':
+                    self._apply_bilingual_horizontal(seg, covered, soup)
+
+            elem_idx = end_idx
+
+        item.set_content(str(soup).encode('utf-8'))
+
+    def _walk_content_elements(self, parent) -> list:
+        """Walk body elements in the same order as the segmenter, flattening div/section/article."""
+        elements = []
+        for child in parent.children:
+            if isinstance(child, NavigableString):
+                if child.strip():
+                    elements.append(child)
+                continue
+            if not isinstance(child, Tag):
+                continue
+            if child.name in ('div', 'section', 'article'):
+                elements.extend(self._walk_content_elements(child))
+            else:
+                text = child.get_text(separator=' ', strip=True)
+                if text:
+                    elements.append(child)
+        return elements
+
+    def _count_segment_blocks(self, seg: SegmentState) -> int:
+        """Count how many body-level elements this segment corresponds to.
+
+        For heading/code/table segments: always 1.
+        For text segments: count top-level HTML tags in the segment's stored HTML.
+        Falls back to 1 if no tags found (e.g. split segments with plain text).
+        """
+        if seg.segment_type in ('heading', 'code', 'table'):
+            return 1
+
+        frag = BeautifulSoup(seg.html, 'html.parser')
+        tag_count = sum(1 for c in frag.children if isinstance(c, Tag))
+        return tag_count if tag_count > 0 else 1
+
+    def _apply_chinese_only(self, seg: SegmentState, elements: list, soup) -> None:
+        """Replace element content with translated text, preserving tag and attributes."""
+        if not elements:
+            return
+
+        first = elements[0]
+        translated = seg.translated_text
+
+        if seg.segment_type == 'table' and '<table' in translated.lower():
+            new_content = BeautifulSoup(translated, 'html.parser')
+            first.replace_with(new_content)
+            for elem in elements[1:]:
+                if isinstance(elem, NavigableString):
+                    elem.extract()
+                else:
+                    elem.decompose()
+            return
+
+        if seg.segment_type == 'code':
+            code_elem = first.find('code') if isinstance(first, Tag) else None
+            if code_elem:
+                code_elem.clear()
+                code_elem.append(translated)
+            else:
+                if isinstance(first, NavigableString):
+                    first.replace_with(NavigableString(translated))
+                else:
+                    first.clear()
+                    first.append(translated)
+            for elem in elements[1:]:
+                if isinstance(elem, NavigableString):
+                    elem.extract()
+                else:
+                    elem.decompose()
+            return
+
+        # Try HTML-aware replacement for text/heading segments
+        trans_frag = BeautifulSoup(translated, 'html.parser')
+        trans_tags = [c for c in trans_frag.children
+                      if isinstance(c, Tag) or (isinstance(c, NavigableString) and c.strip())]
+
+        if trans_tags and len(trans_tags) == len(elements):
+            # HTML structure matches — replace content 1:1
+            for orig_elem, trans_elem in zip(elements, trans_tags):
+                if isinstance(orig_elem, NavigableString):
+                    text = trans_elem.get_text() if isinstance(trans_elem, Tag) else str(trans_elem)
+                    orig_elem.replace_with(NavigableString(text))
+                else:
+                    orig_elem.clear()
+                    if isinstance(trans_elem, Tag):
+                        for child in list(trans_elem.children):
+                            orig_elem.append(child.extract())
+                    else:
+                        orig_elem.append(str(trans_elem))
+            return
+
+        # Fallback: plain text replacement (backward compatible with old translations)
+        if isinstance(first, NavigableString):
+            first.replace_with(NavigableString(translated))
         else:
-            return f'<p>{text}</p>'
+            first.clear()
+            first.append(translated)
+
+        # Remove remaining elements (they were merged into this segment)
+        for elem in elements[1:]:
+            if isinstance(elem, NavigableString):
+                elem.extract()
+            else:
+                elem.decompose()
+
+    def _apply_bilingual_vertical(self, seg: SegmentState, elements: list, soup) -> None:
+        """Keep original elements, add translation block after them."""
+        if not elements:
+            return
+
+        first = elements[0]
+
+        wrapper = soup.new_tag('div', attrs={'class': 'bilingual-vertical'})
+        first.insert_before(wrapper)
+
+        original_div = soup.new_tag('div', attrs={'class': 'original'})
+        for elem in elements:
+            original_div.append(elem.extract())
+        wrapper.append(original_div)
+
+        trans_div = soup.new_tag('div', attrs={'class': 'translation'})
+        self._fill_translation(trans_div, seg, elements, soup)
+        wrapper.append(trans_div)
+
+    def _apply_bilingual_horizontal(self, seg: SegmentState, elements: list, soup) -> None:
+        """Wrap original + translation in a flex container."""
+        if not elements:
+            return
+
+        first = elements[0]
+
+        container = soup.new_tag('div', attrs={'class': 'bilingual-container'})
+        first.insert_before(container)
+
+        original_div = soup.new_tag('div', attrs={'class': 'original'})
+        for elem in elements:
+            original_div.append(elem.extract())
+        container.append(original_div)
+
+        trans_div = soup.new_tag('div', attrs={'class': 'translation'})
+        self._fill_translation(trans_div, seg, elements, soup)
+        container.append(trans_div)
+
+    def _fill_translation(self, parent_div, seg: SegmentState,
+                          original_elements: list, soup) -> None:
+        """Fill a div with the translated content using appropriate HTML tags."""
+        translated = seg.translated_text
+
+        if seg.segment_type == 'table' and '<table' in translated.lower():
+            content = BeautifulSoup(translated, 'html.parser')
+            for child in list(content.children):
+                parent_div.append(child)
+            return
+
+        if seg.segment_type == 'code':
+            pre = soup.new_tag('pre')
+            code = soup.new_tag('code')
+            code.string = translated
+            pre.append(code)
+            parent_div.append(pre)
+            return
+
+        if seg.segment_type == 'heading':
+            tag_name = 'h2'
+            if original_elements and isinstance(original_elements[0], Tag):
+                tag_name = original_elements[0].name
+            h = soup.new_tag(tag_name)
+            h.string = translated
+            parent_div.append(h)
+            return
+
+        # Try to parse translated text as HTML
+        trans_frag = BeautifulSoup(translated, 'html.parser')
+        trans_tags = [c for c in trans_frag.children if isinstance(c, Tag)]
+
+        if trans_tags:
+            # Translation contains HTML — use it directly
+            for child in list(trans_frag.children):
+                parent_div.append(child.extract())
+            return
+
+        # Fallback: wrap plain text in a <p> tag
+        p = soup.new_tag('p')
+        p.string = translated
+        parent_div.append(p)
