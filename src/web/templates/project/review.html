@@ -1,0 +1,104 @@
+{% extends "project/layout.html" %}
+
+{% block tab_content %}
+<div class="review-layout">
+    <nav class="review-sidebar">
+        <h3>章節</h3>
+        <ul>
+        {% for ch in chapters %}
+            <li>
+                <a href="/project/{{ project_name }}/review/chapter/{{ ch.chapter_id }}"
+                   class="{% if current_chapter == ch.chapter_id %}active{% endif %}">
+                    {{ ch.chapter_id }}
+                    <span class="badge">{{ ch.translated + ch.reviewed }}/{{ ch.total }}</span>
+                </a>
+            </li>
+        {% endfor %}
+        </ul>
+    </nav>
+
+    <div class="review-content">
+    {% if segments %}
+        {% for seg in segments %}
+        <div class="segment" id="seg-{{ seg.segment_id }}" data-id="{{ seg.segment_id }}">
+            <div class="segment-header">
+                <span class="segment-id">{{ seg.segment_id }}</span>
+                <span class="segment-type">{{ seg.segment_type }}</span>
+                <span class="segment-status status-{{ seg.status }}">{{ seg.status }}</span>
+            </div>
+            <div class="segment-body">
+                <div class="original">
+                    <h4>原文</h4>
+                    <div class="text-content">{{ seg.text }}</div>
+                </div>
+                <div class="translation">
+                    <h4>譯文</h4>
+                    <textarea class="translation-input"
+                              data-id="{{ seg.segment_id }}"
+                              rows="4">{{ seg.translated_text }}</textarea>
+                    <div class="actions">
+                        <button class="btn-save" onclick="saveSegment('{{ seg.segment_id }}')">儲存</button>
+                        <button class="btn-approve" onclick="approveSegment('{{ seg.segment_id }}')">通過審閱</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    {% else %}
+        <div class="empty-state">
+            <p>請從左側選擇一個章節開始審閱。</p>
+        </div>
+    {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const projectName = '{{ project_name }}';
+
+function saveSegment(segId) {
+    const textarea = document.querySelector(`textarea[data-id="${segId}"]`);
+    fetch(`/api/projects/${projectName}/segments/${segId}`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text: textarea.value})
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.status === 'ok') {
+            const el = document.getElementById(`seg-${segId}`);
+            el.querySelector('.segment-status').textContent = 'saved';
+            el.querySelector('.segment-status').className = 'segment-status status-translated';
+        }
+    });
+}
+
+function approveSegment(segId) {
+    const textarea = document.querySelector(`textarea[data-id="${segId}"]`);
+    fetch(`/api/projects/${projectName}/segments/${segId}/approve`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text: textarea.value})
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.status === 'ok') {
+            const el = document.getElementById(`seg-${segId}`);
+            el.querySelector('.segment-status').textContent = 'reviewed';
+            el.querySelector('.segment-status').className = 'segment-status status-reviewed';
+        }
+    });
+}
+
+// Auto-save on textarea change (debounced)
+let saveTimers = {};
+document.querySelectorAll('.translation-input').forEach(ta => {
+    ta.addEventListener('input', function() {
+        const id = this.dataset.id;
+        clearTimeout(saveTimers[id]);
+        saveTimers[id] = setTimeout(() => saveSegment(id), 2000);
+    });
+});
+</script>
+{% endblock %}

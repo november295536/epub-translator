@@ -1,0 +1,74 @@
+{% extends "project/layout.html" %}
+
+{% block tab_content %}
+<div class="overview-grid">
+    <!-- Statistics cards -->
+    <div class="stats-row">
+        <div class="stat-card">
+            <div class="stat-card-value">{{ progress.total }}</div>
+            <div class="stat-card-label">總段落數</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-card-value text-blue">{{ progress.translated }}</div>
+            <div class="stat-card-label">已翻譯</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-card-value text-green">{{ progress.reviewed }}</div>
+            <div class="stat-card-label">已審閱</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-card-value text-orange">{{ progress.pending }}</div>
+            <div class="stat-card-label">待處理</div>
+        </div>
+    </div>
+
+    <!-- Word count -->
+    <div class="stats-row">
+        <div class="stat-card stat-card-wide">
+            <div class="stat-card-label">總字數</div>
+            <div class="stat-card-value">{{ "{:,}".format(total_words) }}</div>
+            <div class="stat-card-sub">已翻譯 {{ "{:,}".format(translated_words) }} 字</div>
+        </div>
+    </div>
+
+    <!-- Chapter list -->
+    <div class="card">
+        <div class="card-header">
+            <h3>章節列表</h3>
+        </div>
+        <div class="card-body">
+            <table class="chapter-table">
+                <thead>
+                    <tr>
+                        <th>章節</th>
+                        <th>總段落</th>
+                        <th>已翻譯</th>
+                        <th>已審閱</th>
+                        <th>進度</th>
+                    </tr>
+                </thead>
+                <tbody>
+                {% for ch in chapters %}
+                    <tr>
+                        <td>
+                            <a href="/project/{{ project_name }}/review/chapter/{{ ch.chapter_id }}">
+                                {{ ch.chapter_id }}
+                            </a>
+                        </td>
+                        <td>{{ ch.total }}</td>
+                        <td>{{ ch.translated }}</td>
+                        <td>{{ ch.reviewed }}</td>
+                        <td>
+                            <div class="progress-bar-small">
+                                <div class="progress-fill" style="width: {{ ((ch.translated + ch.reviewed) / ch.total * 100) if ch.total > 0 else 0 }}%"></div>
+                            </div>
+                            <span class="progress-label">{{ ch.translated + ch.reviewed }}/{{ ch.total }}</span>
+                        </td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
