@@ -27,9 +27,18 @@
                 <span class="segment-status status-{{ seg.status }}">{{ seg.status }}</span>
             </div>
             <div class="segment-body">
-                <div class="original">
-                    <h4>原文</h4>
-                    <div class="text-content">{{ seg.text }}</div>
+                <div class="original" x-data="{ view: 'text' }">
+                    <div class="original-header">
+                        <h4>原文</h4>
+                        <div class="view-toggle">
+                            <button class="toggle-btn" :class="{ active: view === 'text' }" @click="view = 'text'">純文字</button>
+                            <button class="toggle-btn" :class="{ active: view === 'preview' }" @click="view = 'preview'">預覽</button>
+                            <button class="toggle-btn" :class="{ active: view === 'html' }" @click="view = 'html'">HTML</button>
+                        </div>
+                    </div>
+                    <div class="text-content" x-show="view === 'text'">{{ seg.text }}</div>
+                    <div class="html-preview" x-show="view === 'preview'">{{ seg.html|safe }}</div>
+                    <pre class="html-source" x-show="view === 'html'"><code>{{ seg.html }}</code></pre>
                 </div>
                 <div class="translation">
                     <h4>譯文</h4>

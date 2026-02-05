@@ -824,6 +824,77 @@ button {
     overflow-y: auto;
 }
 
+/* Review page: view toggle and HTML display */
+.original-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+}
+
+.original-header h4 {
+    margin-bottom: 0;
+}
+
+.view-toggle {
+    display: flex;
+    gap: 0;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.toggle-btn {
+    padding: 0.2rem 0.6rem;
+    font-size: 0.75rem;
+    background: white;
+    border: none;
+    border-left: 1px solid #ddd;
+    cursor: pointer;
+    color: #666;
+}
+
+.toggle-btn:first-child {
+    border-left: none;
+}
+
+.toggle-btn.active {
+    background: #3498db;
+    color: white;
+}
+
+.toggle-btn:hover:not(.active) {
+    background: #ecf0f1;
+}
+
+.html-preview {
+    font-size: 0.9rem;
+    line-height: 1.6;
+    color: #555;
+    padding: 0.5rem;
+    background: #fafafa;
+    border: 1px solid #eee;
+    border-radius: 4px;
+    overflow-x: auto;
+}
+
+.html-source {
+    font-size: 0.8rem;
+    line-height: 1.5;
+    background: #2c3e50;
+    color: #ecf0f1;
+    padding: 0.75rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin: 0;
+}
+
+.html-source code {
+    font-family: 'SF Mono', 'Menlo', 'Monaco', 'Courier New', monospace;
+}
+
 /* Glossary page */
 .header-actions {
     display: flex;
