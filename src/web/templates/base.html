@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}EPUB 智能翻譯系統{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    {% block head %}{% endblock %}
+</head>
+<body x-data="{ toast: { show: false, message: '', type: 'success' } }">
+    {% block header %}
+    <header>
+        <div class="header-content">
+            <a href="/" class="logo">EPUB 智能翻譯系統</a>
+            {% block nav %}{% endblock %}
+        </div>
+        {% block progress %}{% endblock %}
+    </header>
+    {% endblock %}
+
+    {% block body %}
+    <main class="main-content">
+        {% block content %}{% endblock %}
+    </main>
+    {% endblock %}
+
+    <!-- Toast notification -->
+    <div x-show="toast.show"
+         x-transition:enter="transition ease-out duration-300"
+         x-transition:enter-start="opacity-0 transform translate-y-2"
+         x-transition:enter-end="opacity-100 transform translate-y-0"
+         x-transition:leave="transition ease-in duration-200"
+         x-transition:leave-start="opacity-100"
+         x-transition:leave-end="opacity-0"
+         x-init="$watch('toast.show', val => val && setTimeout(() => toast.show = false, 3000))"
+         class="toast"
+         :class="{ 'toast-success': toast.type === 'success', 'toast-error': toast.type === 'error' }">
+        <span x-text="toast.message"></span>
+    </div>
+
+    <script>
+    // Global toast function
+    function showToast(message, type = 'success') {
+        const event = new CustomEvent('show-toast', { detail: { message, type } });
+        document.dispatchEvent(event);
+    }
+
+    document.addEventListener('alpine:init', () => {
+        document.addEventListener('show-toast', (e) => {
+            Alpine.store('toast', e.detail);
+        });
+    });
+    </script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
