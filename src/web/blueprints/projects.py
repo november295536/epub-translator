@@ -1,10 +1,10 @@
-"""Projects blueprint for project management APIs."""
+"""Projects blueprint for project management APIs and detail pages."""
 
 from __future__ import annotations
 
 import os
 import uuid
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, render_template, redirect, request, jsonify, current_app
 
 from src.core.project import ProjectManager
 from src.core.segmenter import Segmenter
@@ -12,6 +12,15 @@ from src.epub.extractor import EPUBExtractor
 
 
 projects_bp = Blueprint('projects', __name__)
+
+
+def get_pm(project_name: str) -> ProjectManager:
+    """Get ProjectManager instance for the specified project."""
+    projects_dir = current_app.config['PROJECTS_DIR']
+    project_dir = os.path.join(projects_dir, project_name)
+    pm = ProjectManager(project_dir)
+    pm.load()
+    return pm
 
 
 def get_uploads_dir() -> str:
@@ -156,3 +165,102 @@ def create_project():
         })
     except Exception as e:
         return jsonify({'error': f'建立專案失敗：{str(e)}'}), 500
+
+
+# --- Project detail pages ---
+
+@projects_bp.route('/project/<project_name>')
+def project_detail(project_name: str):
+    """Redirect to overview tab."""
+    return redirect(f'/project/{project_name}/overview')
+
+
+@projects_bp.route('/project/<project_name>/overview')
+def project_overview(project_name: str):
+    """Show project overview tab."""
+    pm = get_pm(project_name)
+    progress = pm.get_progress()
+    chapters = pm.get_chapters()
+
+    # Calculate word count statistics
+    total_words = sum(s.word_count for s in pm.data.segments)
+    translated_words = sum(s.word_count for s in pm.data.segments
+                          if s.status in ('translated', 'reviewed'))
+
+    return render_template('project/overview.html',
+                           project_name=project_name,
+                           title=pm.data.title,
+                           author=pm.data.author,
+                           progress=progress,
+                           chapters=chapters,
+                           total_words=total_words,
+                           translated_words=translated_words,
+                           active_tab='overview')
+
+
+@projects_bp.route('/project/<project_name>/glossary')
+def project_glossary(project_name: str):
+    """Show glossary management tab."""
+    pm = get_pm(project_name)
+    progress = pm.get_progress()
+    return render_template('project/glossary.html',
+                           project_name=project_name,
+                           title=pm.data.title,
+                           author=pm.data.author,
+                           progress=progress,
+                           active_tab='glossary')
+
+
+@projects_bp.route('/project/<project_name>/translation')
+def project_translation(project_name: str):
+    """Show translation control tab."""
+    pm = get_pm(project_name)
+    progress = pm.get_progress()
+    return render_template('project/translation.html',
+                           project_name=project_name,
+                           title=pm.data.title,
+                           author=pm.data.author,
+                           progress=progress,
+                           active_tab='translation')
+
+
+@projects_bp.route('/project/<project_name>/export')
+def project_export(project_name: str):
+    """Show export tab."""
+    pm = get_pm(project_name)
+    progress = pm.get_progress()
+    return render_template('project/export.html',
+                           project_name=project_name,
+                           title=pm.data.title,
+                           author=pm.data.author,
+                           progress=progress,
+                           active_tab='export')
+
+
+# --- Project detail APIs ---
+
+@projects_bp.route('/api/projects/<project_name>')
+def api_project_detail(project_name: str):
+    """Get project details as JSON."""
+    try:
+        pm = get_pm(project_name)
+        progress = pm.get_progress()
+        return jsonify({
+            'name': project_name,
+            'title': pm.data.title,
+            'author': pm.data.author,
+            'progress': progress
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 404
+
+
+@projects_bp.route('/api/projects/<project_name>/chapters')
+def api_project_chapters(project_name: str):
+    """Get chapter list for a project."""
+    try:
+        pm = get_pm(project_name)
+        chapters = pm.get_chapters()
+        return jsonify(chapters)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 404

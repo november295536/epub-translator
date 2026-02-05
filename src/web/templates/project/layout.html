@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }} - EPUB 智能翻譯系統{% endblock %}
+
+{% block header %}
+<header>
+    <div class="header-content">
+        <a href="/" class="logo">EPUB 智能翻譯系統</a>
+    </div>
+    <div class="project-header">
+        <div class="project-title-row">
+            <h1>{{ title }}</h1>
+            <span class="project-author-label">{{ author }}</span>
+        </div>
+        <div class="progress-bar">
+            <div class="progress-fill" style="width: {{ progress.percent }}%"></div>
+            <span class="progress-text">{{ progress.translated + progress.reviewed }}/{{ progress.total }} ({{ progress.percent }}%)</span>
+        </div>
+    </div>
+    <nav class="tabs">
+        <a href="/project/{{ project_name }}/overview"
+           class="tab {% if active_tab == 'overview' %}active{% endif %}">總覽</a>
+        <a href="/project/{{ project_name }}/glossary"
+           class="tab {% if active_tab == 'glossary' %}active{% endif %}">術語表</a>
+        <a href="/project/{{ project_name }}/translation"
+           class="tab {% if active_tab == 'translation' %}active{% endif %}">翻譯</a>
+        <a href="/project/{{ project_name }}/review"
+           class="tab {% if active_tab == 'review' %}active{% endif %}">審閱</a>
+        <a href="/project/{{ project_name }}/export"
+           class="tab {% if active_tab == 'export' %}active{% endif %}">匯出</a>
+    </nav>
+</header>
+{% endblock %}
+
+{% block body %}
+<main class="main-content">
+    {% block tab_content %}{% endblock %}
+</main>
+{% endblock %}

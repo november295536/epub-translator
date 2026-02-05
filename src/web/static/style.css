@@ -624,3 +624,196 @@ button {
     padding: 0.25rem 0.75rem;
     font-size: 0.8rem;
 }
+
+/* Project header */
+.project-header {
+    margin-top: 0.5rem;
+}
+
+.project-title-row {
+    display: flex;
+    align-items: baseline;
+    gap: 1rem;
+    margin-bottom: 0.5rem;
+}
+
+.project-title-row h1 {
+    font-size: 1.4rem;
+    margin-bottom: 0;
+}
+
+.project-author-label {
+    font-size: 0.9rem;
+    opacity: 0.8;
+}
+
+/* Tabs navigation */
+.tabs {
+    display: flex;
+    gap: 0;
+    margin-top: 1rem;
+    border-bottom: 1px solid rgba(255,255,255,0.2);
+}
+
+.tab {
+    padding: 0.6rem 1.25rem;
+    color: rgba(255,255,255,0.7);
+    text-decoration: none;
+    font-size: 0.9rem;
+    border-bottom: 2px solid transparent;
+    transition: all 0.2s;
+}
+
+.tab:hover {
+    color: white;
+    background: rgba(255,255,255,0.1);
+}
+
+.tab.active {
+    color: white;
+    border-bottom-color: #3498db;
+    font-weight: 500;
+}
+
+/* Overview page */
+.overview-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.stats-row {
+    display: flex;
+    gap: 1rem;
+}
+
+.stat-card {
+    flex: 1;
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 1.25rem;
+    text-align: center;
+}
+
+.stat-card-wide {
+    flex: none;
+    width: 100%;
+}
+
+.stat-card-value {
+    font-size: 2rem;
+    font-weight: 700;
+    color: #2c3e50;
+}
+
+.stat-card-label {
+    font-size: 0.8rem;
+    color: #888;
+    text-transform: uppercase;
+    margin-top: 0.25rem;
+}
+
+.stat-card-sub {
+    font-size: 0.85rem;
+    color: #666;
+    margin-top: 0.25rem;
+}
+
+.text-blue { color: #3498db; }
+.text-green { color: #27ae60; }
+.text-orange { color: #f39c12; }
+
+/* Chapter table */
+.chapter-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.chapter-table th,
+.chapter-table td {
+    padding: 0.6rem 1rem;
+    text-align: left;
+    border-bottom: 1px solid #eee;
+}
+
+.chapter-table th {
+    font-size: 0.8rem;
+    color: #888;
+    text-transform: uppercase;
+    font-weight: 500;
+}
+
+.chapter-table td a {
+    color: #3498db;
+    text-decoration: none;
+}
+
+.chapter-table td a:hover {
+    text-decoration: underline;
+}
+
+.chapter-table td:last-child {
+    width: 200px;
+}
+
+.chapter-table .progress-bar-small {
+    margin-bottom: 0.25rem;
+}
+
+/* Review layout (within project page) */
+.review-layout {
+    display: flex;
+    gap: 0;
+    margin: -2rem;
+    min-height: calc(100vh - 180px);
+}
+
+.review-sidebar {
+    width: 220px;
+    background: white;
+    border-right: 1px solid #ddd;
+    padding: 1rem;
+    overflow-y: auto;
+    flex-shrink: 0;
+}
+
+.review-sidebar h3 {
+    font-size: 1rem;
+    margin-bottom: 0.75rem;
+    color: #555;
+}
+
+.review-sidebar ul {
+    list-style: none;
+}
+
+.review-sidebar li {
+    margin-bottom: 0.25rem;
+}
+
+.review-sidebar a {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem 0.75rem;
+    color: #333;
+    text-decoration: none;
+    border-radius: 4px;
+    font-size: 0.85rem;
+}
+
+.review-sidebar a:hover {
+    background: #ecf0f1;
+}
+
+.review-sidebar a.active {
+    background: #3498db;
+    color: white;
+}
+
+.review-content {
+    flex: 1;
+    padding: 1.5rem;
+    overflow-y: auto;
+}

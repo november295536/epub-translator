@@ -26,12 +26,13 @@ def index(project_name: str):
     pm = get_pm(project_name)
     progress = pm.get_progress()
     chapters = pm.get_chapters()
-    return render_template('review.html',
+    return render_template('project/review.html',
                            project_name=project_name,
                            title=pm.data.title,
                            author=pm.data.author,
                            progress=progress,
-                           chapters=chapters)
+                           chapters=chapters,
+                           active_tab='review')
 
 
 @review_bp.route('/project/<project_name>/review/chapter/<chapter_id>')
@@ -41,14 +42,15 @@ def chapter_view(project_name: str, chapter_id: str):
     segments = pm.get_segments_by_chapter(chapter_id)
     progress = pm.get_progress()
     chapters = pm.get_chapters()
-    return render_template('review.html',
+    return render_template('project/review.html',
                            project_name=project_name,
                            title=pm.data.title,
                            author=pm.data.author,
                            progress=progress,
                            chapters=chapters,
                            current_chapter=chapter_id,
-                           segments=segments)
+                           segments=segments,
+                           active_tab='review')
 
 
 @review_bp.route('/api/projects/<project_name>/segments/<segment_id>', methods=['POST'])
