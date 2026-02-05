@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from flask import Flask
 
@@ -32,6 +33,13 @@ def create_app(projects_dir: str | None = None) -> Flask:
         )
 
     app.config['PROJECTS_DIR'] = projects_dir
+
+    # Configure logging for all src.* modules
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%H:%M:%S',
+    )
 
     # Register blueprints
     app.register_blueprint(export_bp)
