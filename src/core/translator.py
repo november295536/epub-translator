@@ -17,6 +17,7 @@ TRANSLATION_PROMPT = """你是一位專業的英文翻譯，請將以下英文�
 6. LaTeX 公式（$...$、$$...$$）保持不變，不要翻譯
 7. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來，例如："observability" → 「可觀測性」
 8. 英文中的斜體或粗體強調，翻譯時用「」標示，不要使用 markdown 的 * 或 ** 語法
+9. 人名保持英文原文，不要翻譯，例如：Nassim Taleb、Charity Majors
 {glossary_section}
 {context_section}
 嚴格禁止：
@@ -43,6 +44,7 @@ TEXT_HTML_PROMPT = """你是一位專業的英文翻譯，請將以下 HTML 內�
 5. 專業術語請保留原文並用括號標註，例如：機器學習（machine learning）
 6. LaTeX 公式（$...$、$$...$$）保持不變
 7. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來
+8. 人名保持英文原文，不要翻譯
 {glossary_section}
 {context_section}
 嚴格禁止：
