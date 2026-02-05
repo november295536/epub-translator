@@ -8,14 +8,30 @@ from flask import Flask
 from src.web.blueprints import review_bp
 
 
-def create_app(project_dir: str) -> Flask:
-    """Create and configure the Flask app for reviewing translations."""
+def create_app(projects_dir: str | None = None) -> Flask:
+    """Create and configure the Flask app.
+
+    Args:
+        projects_dir: Directory containing project folders.
+                      Defaults to 'projects/' in the repository root.
+
+    Returns:
+        Configured Flask application.
+    """
     app = Flask(
         __name__,
         template_folder=os.path.join(os.path.dirname(__file__), 'templates'),
         static_folder=os.path.join(os.path.dirname(__file__), 'static'),
     )
-    app.config['PROJECT_DIR'] = project_dir
+
+    # Default to 'projects/' directory
+    if projects_dir is None:
+        projects_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            'projects'
+        )
+
+    app.config['PROJECTS_DIR'] = projects_dir
 
     # Register blueprints
     app.register_blueprint(review_bp)

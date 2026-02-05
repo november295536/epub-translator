@@ -9,10 +9,15 @@ from src.core.project import ProjectManager
 from src.core.segmenter import Segment
 
 
+PROJECT_NAME = 'test_project'
+
+
 @pytest.fixture
 def project_with_translations(tmp_path):
     """Create a project with some translated segments for testing."""
-    project_dir = str(tmp_path / 'web_project')
+    # Create projects directory structure: tmp_path/test_project/
+    projects_dir = str(tmp_path)
+    project_dir = os.path.join(projects_dir, PROJECT_NAME)
     os.makedirs(project_dir, exist_ok=True)
 
     segments = [
@@ -35,12 +40,12 @@ def project_with_translations(tmp_path):
     pm.mark_translated('ch1_seg0001', '標題')
     pm.mark_translated('ch1_seg0002', '第一段。')
 
-    return project_dir
+    return projects_dir
 
 
 @pytest.fixture
 def client(project_with_translations):
-    app = create_app(project_with_translations)
+    app = create_app(projects_dir=project_with_translations)
     app.config['TESTING'] = True
     with app.test_client() as client:
         yield client
@@ -49,12 +54,12 @@ def client(project_with_translations):
 class TestWebServer:
 
     def test_index_page(self, client):
-        response = client.get('/')
+        response = client.get(f'/project/{PROJECT_NAME}/review')
         assert response.status_code == 200
         assert 'Test Book' in response.data.decode()
 
     def test_chapter_view(self, client):
-        response = client.get('/chapter/ch1')
+        response = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1')
         assert response.status_code == 200
         data = response.data.decode()
         assert 'ch1_seg0001' in data
@@ -62,7 +67,7 @@ class TestWebServer:
 
     def test_update_segment(self, client):
         response = client.post(
-            '/api/segment/ch1_seg0002',
+            f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002',
             data=json.dumps({'text': '更新的翻譯'}),
             content_type='application/json',
         )
@@ -72,7 +77,7 @@ class TestWebServer:
 
     def test_update_segment_missing_text(self, client):
         response = client.post(
-            '/api/segment/ch1_seg0002',
+            f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002',
             data=json.dumps({}),
             content_type='application/json',
         )
@@ -80,7 +85,7 @@ class TestWebServer:
 
     def test_update_segment_not_found(self, client):
         response = client.post(
-            '/api/segment/nonexistent',
+            f'/api/projects/{PROJECT_NAME}/segments/nonexistent',
             data=json.dumps({'text': 'test'}),
             content_type='application/json',
         )
@@ -88,7 +93,7 @@ class TestWebServer:
 
     def test_approve_segment(self, client):
         response = client.post(
-            '/api/segment/ch1_seg0002/approve',
+            f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/approve',
             data=json.dumps({'text': '審閱後的翻譯'}),
             content_type='application/json',
         )
@@ -98,14 +103,14 @@ class TestWebServer:
 
     def test_approve_segment_not_found(self, client):
         response = client.post(
-            '/api/segment/nonexistent/approve',
+            f'/api/projects/{PROJECT_NAME}/segments/nonexistent/approve',
             data=json.dumps({}),
             content_type='application/json',
         )
         assert response.status_code == 404
 
     def test_api_progress(self, client):
-        response = client.get('/api/progress')
+        response = client.get(f'/api/projects/{PROJECT_NAME}/progress')
         assert response.status_code == 200
         data = response.get_json()
         assert 'total' in data
@@ -114,25 +119,27 @@ class TestWebServer:
 
     def test_segment_persists_after_update(self, client, project_with_translations):
         client.post(
-            '/api/segment/ch1_seg0003',
+            f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003',
             data=json.dumps({'text': '永久翻譯'}),
             content_type='application/json',
         )
 
         # Verify by loading the project directly
-        pm = ProjectManager(project_with_translations)
+        project_dir = os.path.join(project_with_translations, PROJECT_NAME)
+        pm = ProjectManager(project_dir)
         pm.load()
         seg = [s for s in pm.data.segments if s.segment_id == 'ch1_seg0003'][0]
         assert seg.translated_text == '永久翻譯'
 
     def test_approve_persists_status(self, client, project_with_translations):
         client.post(
-            '/api/segment/ch1_seg0002/approve',
+            f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/approve',
             data=json.dumps({}),
             content_type='application/json',
         )
 
-        pm = ProjectManager(project_with_translations)
+        project_dir = os.path.join(project_with_translations, PROJECT_NAME)
+        pm = ProjectManager(project_dir)
         pm.load()
         seg = [s for s in pm.data.segments if s.segment_id == 'ch1_seg0002'][0]
         assert seg.status == 'reviewed'
