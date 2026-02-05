@@ -15,6 +15,8 @@ TRANSLATION_PROMPT = """你是一位專業的英文翻譯，請將以下英文�
 4. 程式碼區塊中只翻譯註解，不翻譯程式碼本身
 5. 翻譯要自然流暢，不要逐字翻譯
 6. LaTeX 公式（$...$、$$...$$）保持不變，不要翻譯
+7. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來，例如："observability" → 「可觀測性」
+8. 英文中的斜體或粗體強調，翻譯時用「」標示，不要使用 markdown 的 * 或 ** 語法
 {glossary_section}
 {context_section}
 嚴格禁止：
