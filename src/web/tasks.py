@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass, field
 
 from src.core.project import ProjectManager
-from src.core.translator import TranslationEngine, TranslationError
+from src.core.translator import TranslationEngine, TranslationError, RateLimitError
 from src.glossary.glossary_manager import GlossaryManager
 
 logger = logging.getLogger(__name__)
@@ -152,38 +152,59 @@ class TaskManager:
                 context_before = all_segments[seg_idx - 1].text if seg_idx > 0 else ''
                 context_after = all_segments[seg_idx + 1].text if seg_idx < len(all_segments) - 1 else ''
 
-                try:
-                    html_arg = seg.html if seg.segment_type != 'code' else ''
-                    translated = engine.translate(
-                        seg.text,
-                        segment_type=seg.segment_type,
-                        glossary_text=glossary_text,
-                        context_before=context_before,
-                        context_after=context_after,
-                        html=html_arg,
-                    )
-                    pm.mark_translated(seg.segment_id, translated)
-                    task.completed += 1
+                while True:
+                    try:
+                        html_arg = seg.html if seg.segment_type != 'code' else ''
+                        translated = engine.translate(
+                            seg.text,
+                            segment_type=seg.segment_type,
+                            glossary_text=glossary_text,
+                            context_before=context_before,
+                            context_after=context_after,
+                            html=html_arg,
+                        )
+                        pm.mark_translated(seg.segment_id, translated)
+                        task.completed += 1
 
-                    # Push progress event
-                    percent = round(task.completed / task.total * 100, 1) if task.total > 0 else 0
-                    task.progress_queue.put({'event': 'progress', 'data': {
-                        'completed': task.completed,
-                        'total': task.total,
-                        'percent': percent,
-                    }})
-                    task.progress_queue.put({'event': 'segment_complete', 'data': {
-                        'segment_id': seg.segment_id,
-                        'translated_text': translated[:200],
-                    }})
+                        # Push progress event
+                        percent = round(task.completed / task.total * 100, 1) if task.total > 0 else 0
+                        task.progress_queue.put({'event': 'progress', 'data': {
+                            'completed': task.completed,
+                            'total': task.total,
+                            'percent': percent,
+                        }})
+                        task.progress_queue.put({'event': 'segment_complete', 'data': {
+                            'segment_id': seg.segment_id,
+                            'translated_text': translated[:200],
+                        }})
+                        break  # Success, move to next segment
 
-                except TranslationError as e:
-                    logger.warning("Translation failed for %s: %s", seg.segment_id, e)
-                    task.progress_queue.put({'event': 'segment_error', 'data': {
-                        'segment_id': seg.segment_id,
-                        'error': str(e),
-                    }})
-                    # Continue to next segment instead of stopping
+                    except RateLimitError as e:
+                        logger.warning("API usage limit reached, pausing: %s", e)
+                        task.state = 'paused'
+                        task.pause_event.clear()
+                        task.progress_queue.put({'event': 'rate_limit', 'data': {
+                            'error': str(e),
+                            'completed': task.completed,
+                            'remaining': task.total - task.completed,
+                        }})
+                        # Wait until user resumes, then retry the same segment
+                        task.pause_event.wait()
+                        if task.state not in ('running',):
+                            break
+                        continue
+
+                    except TranslationError as e:
+                        logger.warning("Translation failed for %s: %s", seg.segment_id, e)
+                        task.progress_queue.put({'event': 'segment_error', 'data': {
+                            'segment_id': seg.segment_id,
+                            'error': str(e),
+                        }})
+                        break  # Skip to next segment
+
+                # Check if task was stopped during rate limit pause
+                if task.state not in ('running',):
+                    break
 
             if task.state == 'running':
                 task.state = 'completed'

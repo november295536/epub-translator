@@ -83,6 +83,14 @@ class TranslationError(Exception):
     pass
 
 
+class RateLimitError(TranslationError):
+    """Raised when API usage limit is reached."""
+    pass
+
+
+_RATE_LIMIT_PATTERN = re.compile(r"You've hit your limit", re.IGNORECASE)
+
+
 class TranslationEngine:
     """Translates text segments using Claude CLI."""
 
@@ -122,6 +130,12 @@ class TranslationEngine:
                     text=True,
                     timeout=120,
                 )
+
+                # Check for API usage limit in stdout or stderr
+                stdout = result.stdout if isinstance(result.stdout, str) else ''
+                stderr = result.stderr if isinstance(result.stderr, str) else ''
+                if _RATE_LIMIT_PATTERN.search(stdout) or _RATE_LIMIT_PATTERN.search(stderr):
+                    raise RateLimitError((stdout + stderr).strip())
 
                 if result.returncode != 0:
                     logger.warning(
