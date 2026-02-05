@@ -237,7 +237,12 @@ class Segmenter:
         return result
 
     def _split_large_segments(self, segments: list[Segment], chapter_id: str) -> list[Segment]:
-        """Split text segments larger than MAX_WORDS at sentence boundaries."""
+        """Split text segments larger than MAX_WORDS at HTML element boundaries.
+
+        Unlike sentence-level splitting, this preserves complete HTML elements.
+        If a segment contains only a single element, it is kept as-is even if
+        it exceeds MAX_WORDS (better a large segment than broken HTML).
+        """
         result = []
 
         for seg in segments:
@@ -245,30 +250,47 @@ class Segmenter:
                 result.append(seg)
                 continue
 
-            sentences = self._split_sentences(seg.text)
-            current_text = []
+            # Parse HTML to get individual elements
+            frag = BeautifulSoup(seg.html, 'html.parser')
+            elements = [c for c in frag.children
+                        if isinstance(c, Tag) or (isinstance(c, NavigableString) and c.strip())]
+
+            # Single element or no elements — cannot split, keep as-is
+            if len(elements) <= 1:
+                result.append(seg)
+                continue
+
+            # Group elements so each group stays <= MAX_WORDS
+            current_htmls = []
+            current_texts = []
             current_wc = 0
 
-            for sentence in sentences:
-                swc = len(sentence.split())
-                if current_wc + swc > MAX_WORDS and current_text:
+            for elem in elements:
+                elem_html = str(elem)
+                elem_text = elem.get_text(separator=' ', strip=True) if isinstance(elem, Tag) else str(elem).strip()
+                elem_wc = len(elem_text.split())
+
+                if current_wc + elem_wc > MAX_WORDS and current_htmls:
                     result.append(Segment(
                         id='',
-                        html='\n'.join(current_text),
-                        text='\n'.join(current_text),
+                        html='\n'.join(current_htmls),
+                        text='\n'.join(current_texts),
                         word_count=current_wc,
                         segment_type='text',
                     ))
-                    current_text = []
+                    current_htmls = []
+                    current_texts = []
                     current_wc = 0
-                current_text.append(sentence)
-                current_wc += swc
 
-            if current_text:
+                current_htmls.append(elem_html)
+                current_texts.append(elem_text)
+                current_wc += elem_wc
+
+            if current_htmls:
                 result.append(Segment(
                     id='',
-                    html='\n'.join(current_text),
-                    text='\n'.join(current_text),
+                    html='\n'.join(current_htmls),
+                    text='\n'.join(current_texts),
                     word_count=current_wc,
                     segment_type='text',
                 ))

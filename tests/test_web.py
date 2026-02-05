@@ -145,6 +145,23 @@ class TestWebServer:
         assert seg.status == 'reviewed'
 
 
+class TestDeleteProjectAPI:
+
+    def test_delete_project(self, client, project_with_translations):
+        response = client.delete(f'/api/projects/{PROJECT_NAME}')
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['status'] == 'ok'
+
+        # Verify project directory is removed
+        project_dir = os.path.join(project_with_translations, PROJECT_NAME)
+        assert not os.path.exists(project_dir)
+
+    def test_delete_nonexistent_project(self, client):
+        response = client.delete('/api/projects/nonexistent')
+        assert response.status_code == 404
+
+
 class TestGlossaryAPI:
 
     @pytest.fixture(autouse=True)

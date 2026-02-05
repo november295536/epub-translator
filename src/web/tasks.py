@@ -153,12 +153,14 @@ class TaskManager:
                 context_after = all_segments[seg_idx + 1].text if seg_idx < len(all_segments) - 1 else ''
 
                 try:
+                    html_arg = seg.html if seg.segment_type in ('text', 'table') else ''
                     translated = engine.translate(
                         seg.text,
                         segment_type=seg.segment_type,
                         glossary_text=glossary_text,
                         context_before=context_before,
                         context_after=context_after,
+                        html=html_arg,
                     )
                     pm.mark_translated(seg.segment_id, translated)
                     task.completed += 1

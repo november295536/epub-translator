@@ -43,6 +43,26 @@ TABLE_PROMPT = """將以下 HTML 表格中的英文文字內容翻譯成繁體�
 {glossary_section}
 {text}"""
 
+TEXT_HTML_PROMPT = """你是一位專業的英文翻譯，請將以下 HTML 內容中的英文文字翻譯成繁體中文。
+
+翻譯要求：
+1. 保持所有 HTML 標籤結構完全不變（<p>, <blockquote>, <ul>, <li>, <em>, <strong> 等）
+2. 保持所有 HTML 屬性不變（class, id, href 等）
+3. 只翻譯標籤內的文字內容
+4. 使用台灣慣用的繁體中文用語
+5. 專業術語請保留原文並用括號標註，例如：機器學習（machine learning）
+6. LaTeX 公式（$...$、$$...$$）保持不變
+7. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來
+{glossary_section}
+{context_section}
+嚴格禁止：
+- 不要加任何說明、前綴或後綴（例如「以下是翻譯」「翻譯如下」等）
+- 不要使用 markdown 語法
+- 不要改變 HTML 結構
+- 直接輸出翻譯後的 HTML，第一個字元就是 <
+
+{html}"""
+
 # Patterns to clean from Claude's response
 # Patterns applied at the start of the response only (no MULTILINE)
 _START_PATTERNS = [
@@ -81,7 +101,8 @@ class TranslationEngine:
 
     def translate(self, text: str, segment_type: str = 'text',
                   glossary_text: str = '',
-                  context_before: str = '', context_after: str = '') -> str:
+                  context_before: str = '', context_after: str = '',
+                  html: str = '') -> str:
         """Translate a text segment using Claude CLI.
 
         Args:
@@ -90,6 +111,8 @@ class TranslationEngine:
             glossary_text: Formatted glossary entries for the prompt.
             context_before: Previous segment text for context.
             context_after: Next segment text for context.
+            html: Original HTML content. When provided for text/table types,
+                  the HTML-preserving prompt is used instead of the plain text prompt.
 
         Returns:
             The translated Traditional Chinese text.
@@ -97,8 +120,9 @@ class TranslationEngine:
         Raises:
             TranslationError: If translation fails after all retries.
         """
+        use_html_mode = bool(html) and segment_type in ('text', 'table')
         prompt = self._build_prompt(text, segment_type, glossary_text,
-                                    context_before, context_after)
+                                    context_before, context_after, html=html)
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -133,7 +157,7 @@ class TranslationEngine:
                         )
                     continue
 
-                return self._clean_response(translated)
+                return self._clean_response(translated, html_mode=use_html_mode)
 
             except subprocess.TimeoutExpired:
                 logger.warning(
@@ -149,11 +173,21 @@ class TranslationEngine:
 
     def _build_prompt(self, text: str, segment_type: str,
                       glossary_text: str = '',
-                      context_before: str = '', context_after: str = '') -> str:
+                      context_before: str = '', context_after: str = '',
+                      html: str = '') -> str:
         """Build the appropriate prompt based on segment type."""
         glossary_section = ''
         if glossary_text:
             glossary_section = f'\n術語表（請遵循以下翻譯）：\n{glossary_text}\n'
+
+        context_section = ''
+        if context_before or context_after:
+            parts = []
+            if context_before:
+                parts.append(f'前文參考（不需翻譯）：\n{context_before[:200]}')
+            if context_after:
+                parts.append(f'後文參考（不需翻譯）：\n{context_after[:200]}')
+            context_section = '\n'.join(parts) + '\n'
 
         if segment_type == 'heading':
             return HEADING_PROMPT.format(
@@ -162,17 +196,15 @@ class TranslationEngine:
             return CODE_PROMPT.format(text=text)
         elif segment_type == 'table':
             return TABLE_PROMPT.format(
-                text=text, glossary_section=glossary_section)
+                text=html if html else text, glossary_section=glossary_section)
+        elif html:
+            # Text type with HTML — use HTML-preserving prompt
+            return TEXT_HTML_PROMPT.format(
+                html=html,
+                glossary_section=glossary_section,
+                context_section=context_section,
+            )
         else:
-            context_section = ''
-            if context_before or context_after:
-                parts = []
-                if context_before:
-                    parts.append(f'前文參考（不需翻譯）：\n{context_before[:200]}')
-                if context_after:
-                    parts.append(f'後文參考（不需翻譯）：\n{context_after[:200]}')
-                context_section = '\n'.join(parts) + '\n'
-
             return TRANSLATION_PROMPT.format(
                 text=text,
                 glossary_section=glossary_section,
@@ -180,21 +212,28 @@ class TranslationEngine:
             )
 
     @staticmethod
-    def _clean_response(text: str) -> str:
-        """Remove common Claude response prefixes, formatting artifacts, and markdown syntax."""
+    def _clean_response(text: str, html_mode: bool = False) -> str:
+        """Remove common Claude response prefixes, formatting artifacts, and markdown syntax.
+
+        Args:
+            text: The raw response from Claude.
+            html_mode: If True, only strip prefix/suffix commentary but preserve
+                       all HTML tags and structure (no markdown stripping).
+        """
         cleaned = text
         for pattern in _START_PATTERNS:
             cleaned = re.sub(pattern, '', cleaned)
         for pattern in _END_PATTERNS:
             cleaned = re.sub(pattern, '', cleaned)
 
-        # Strip markdown heading markers (# Title → Title)
-        cleaned = _MD_HEADING_PATTERN.sub('', cleaned)
+        if not html_mode:
+            # Strip markdown heading markers (# Title → Title)
+            cleaned = _MD_HEADING_PATTERN.sub('', cleaned)
 
-        # Strip markdown bold markers (**text** → text)
-        cleaned = _MD_BOLD_PATTERN.sub(lambda m: m.group(1) or m.group(2), cleaned)
+            # Strip markdown bold markers (**text** → text)
+            cleaned = _MD_BOLD_PATTERN.sub(lambda m: m.group(1) or m.group(2), cleaned)
 
-        # Strip markdown italic markers (*text* → text)
-        cleaned = _MD_ITALIC_PATTERN.sub(lambda m: m.group(1) or m.group(2), cleaned)
+            # Strip markdown italic markers (*text* → text)
+            cleaned = _MD_ITALIC_PATTERN.sub(lambda m: m.group(1) or m.group(2), cleaned)
 
         return cleaned.strip()

@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock
 from src.core.translator import (
     TranslationEngine, TranslationError,
     TRANSLATION_PROMPT, HEADING_PROMPT, CODE_PROMPT, TABLE_PROMPT,
+    TEXT_HTML_PROMPT,
 )
 
 
@@ -264,3 +265,105 @@ class TestSegmentTypePrompts:
         assert 'previous text' in prompt
         assert '後文參考' in prompt
         assert 'next text' in prompt
+
+
+class TestHTMLMode:
+
+    def test_text_with_html_uses_html_prompt(self):
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '<p>翻譯結果</p>'
+
+        html = '<p>Source text</p>'
+        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+            result = engine.translate('Source text', segment_type='text', html=html)
+
+        prompt = mock_run.call_args[0][0][2]
+        assert 'HTML 標籤結構' in prompt
+        assert '<p>Source text</p>' in prompt
+        # Should preserve HTML in response (no markdown stripping)
+        assert result == '<p>翻譯結果</p>'
+
+    def test_text_without_html_uses_plain_prompt(self):
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '翻譯結果'
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+            engine.translate('Source text', segment_type='text')
+
+        prompt = mock_run.call_args[0][0][2]
+        assert '原文：' in prompt
+
+    def test_table_with_html_passes_html_to_prompt(self):
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '<table><tr><td>結果</td></tr></table>'
+
+        html = '<table><tr><td>Data</td></tr></table>'
+        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+            engine.translate('Data', segment_type='table', html=html)
+
+        prompt = mock_run.call_args[0][0][2]
+        assert '<table>' in prompt
+
+    def test_heading_ignores_html_param(self):
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '標題'
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+            engine.translate('Title', segment_type='heading', html='<h1>Title</h1>')
+
+        prompt = mock_run.call_args[0][0][2]
+        assert '只輸出純文字翻譯結果' in prompt
+
+    def test_code_ignores_html_param(self):
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = 'code'
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+            engine.translate('code', segment_type='code', html='<pre><code>code</code></pre>')
+
+        prompt = mock_run.call_args[0][0][2]
+        assert '註解' in prompt
+
+    def test_html_mode_preserves_html_tags(self):
+        """HTML mode should not strip bold/italic HTML tags."""
+        result = TranslationEngine._clean_response(
+            '<p>這是<strong>粗體</strong>和<em>斜體</em>文字</p>',
+            html_mode=True,
+        )
+        assert '<strong>' in result
+        assert '<em>' in result
+
+    def test_html_mode_still_strips_prefixes(self):
+        """HTML mode should still remove Claude's commentary prefixes."""
+        result = TranslationEngine._clean_response(
+            '以下是翻譯結果：\n\n<p>翻譯內容</p>',
+            html_mode=True,
+        )
+        assert result == '<p>翻譯內容</p>'
+
+    def test_html_prompt_includes_glossary(self):
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '<p>翻譯</p>'
+
+        glossary = 'machine learning → 機器學習'
+        html = '<p>Machine learning is important.</p>'
+        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+            engine.translate('Machine learning is important.',
+                           segment_type='text', html=html, glossary_text=glossary)
+
+        prompt = mock_run.call_args[0][0][2]
+        assert '術語表' in prompt
+        assert 'machine learning' in prompt
+        assert 'HTML 標籤結構' in prompt
