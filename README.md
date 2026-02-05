@@ -1,17 +1,54 @@
 # EPUB 智能翻譯系統
 
-使用 Claude CLI 將英文 EPUB 電子書翻譯成繁體中文，支援術語管理、雙語對照輸出、Web 審閱介面。
+使用 Claude Code CLI 將英文 EPUB 電子書翻譯成繁體中文，支援術語管理、雙語對照輸出、Web 審閱介面。
 
 ## 系統需求
 
-- Python 3.9+
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code)（翻譯引擎）
+- **Python 3.9+**
+- **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** — 翻譯引擎，需先安裝並完成認證
+- **Node.js 18+** — Claude Code CLI 的執行環境
 
-## 安裝
+## 從零開始設置
+
+### 1. 安裝 Claude Code CLI
+
+Claude Code CLI 是本專案的翻譯引擎，透過它呼叫 Claude 進行翻譯。
 
 ```bash
+# 安裝 Claude Code CLI（需要 Node.js 18+）
+npm install -g @anthropic-ai/claude-code
+
+# 驗證安裝
+claude --version
+
+# 首次使用需登入 Anthropic 帳號（會開啟瀏覽器）
+claude
+```
+
+> 需要有效的 [Anthropic](https://console.anthropic.com/) 帳號，可使用 Claude Pro/Max 訂閱或 API credits。
+
+### 2. 安裝 Python 依賴
+
+```bash
+git clone <repo-url> epub-translator
 cd epub-translator
+
+# 建議使用虛擬環境
+python3 -m venv venv
+source venv/bin/activate    # macOS / Linux
+
+# 安裝依賴
 pip install -r requirements.txt
+```
+
+### 3. 驗證安裝
+
+```bash
+# 確認 Claude CLI 可用
+claude -p "Hello"
+
+# 執行測試
+python3 -m pytest tests/ -v
 ```
 
 ## 使用方式
@@ -19,10 +56,12 @@ pip install -r requirements.txt
 ### Web 介面（推薦）
 
 ```bash
-python3 -m flask --app src.web.server:create_app run --port 5002
+python3 -m flask --app src.web.server:create_app run --port 5001
 ```
 
-開啟瀏覽器 http://localhost:5000，即可進行完整流程：
+> macOS 的 port 5000 預設被 AirPlay 佔用，建議使用 5001 或其他 port。
+
+開啟瀏覽器 http://localhost:5001，即可進行完整流程：
 
 1. **首頁** — 查看所有專案，點「新增專案」上傳 EPUB
 2. **總覽** — 各章節進度統計
@@ -34,18 +73,18 @@ python3 -m flask --app src.web.server:create_app run --port 5002
 ### CLI 模式
 
 ```bash
-# 初始化專案
+# 初始化專案（從 EPUB 提取章節並分段）
 python3 translate.py init book.epub
 
-# 查看進度
+# 查看翻譯進度
 python3 translate.py status
 
 # 術語管理
-python3 translate.py glossary extract          # 自動提取術語
+python3 translate.py glossary extract          # 用 Claude 自動提取術語
 python3 translate.py glossary show             # 查看術語表
 python3 translate.py glossary add "API" "應用程式介面" -c programming
 
-# 開始翻譯（可中斷，再次執行自動續傳）
+# 開始翻譯（可中斷，再次執行自動從中斷處繼續）
 python3 translate.py start
 
 # 開啟 Web 審閱介面
@@ -69,7 +108,7 @@ python3 translate.py export --format bilingual-horizontal
 epub-translator/
 ├── translate.py              # CLI 入口
 ├── requirements.txt
-├── projects/                 # 翻譯專案資料
+├── projects/                 # 翻譯專案資料（自動產生，不進版控）
 │   └── <book-name>/
 │       ├── project.json      # 專案狀態與所有段落
 │       ├── glossary.json     # 術語表
@@ -91,7 +130,7 @@ epub-translator/
 │       ├── blueprints/       # API 路由
 │       ├── templates/        # HTML 頁面（Alpine.js）
 │       └── static/           # CSS
-└── tests/                    # pytest 測試（113 個）
+└── tests/                    # pytest 測試
 ```
 
 ## 測試
