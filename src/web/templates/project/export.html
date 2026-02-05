@@ -1,7 +1,203 @@
 {% extends "project/layout.html" %}
 
 {% block tab_content %}
-<div class="empty-state">
-    <p>匯出功能即將推出</p>
+<div x-data="exportController()" x-init="init()">
+    <!-- Format Selection -->
+    <div class="card" style="margin-bottom: 1.5rem;">
+        <div class="card-header">
+            <h3 style="margin: 0; font-size: 1rem;">產生 EPUB</h3>
+        </div>
+        <div class="card-body">
+            <div class="export-formats">
+                <label class="export-format-option" :class="{ active: selectedFormat === 'chinese-only' }">
+                    <input type="radio" name="format" value="chinese-only" x-model="selectedFormat">
+                    <div class="format-info">
+                        <div class="format-name">純中文</div>
+                        <div class="format-desc">只包含翻譯後的中文內容</div>
+                    </div>
+                </label>
+                <label class="export-format-option" :class="{ active: selectedFormat === 'bilingual-horizontal' }">
+                    <input type="radio" name="format" value="bilingual-horizontal" x-model="selectedFormat">
+                    <div class="format-info">
+                        <div class="format-name">左右對照</div>
+                        <div class="format-desc">原文與翻譯並排顯示</div>
+                    </div>
+                </label>
+                <label class="export-format-option" :class="{ active: selectedFormat === 'bilingual-vertical' }">
+                    <input type="radio" name="format" value="bilingual-vertical" x-model="selectedFormat">
+                    <div class="format-info">
+                        <div class="format-name">上下對照</div>
+                        <div class="format-desc">原文在上、翻譯在下</div>
+                    </div>
+                </label>
+            </div>
+
+            <div style="margin-top: 1.5rem; display: flex; align-items: center; gap: 1rem;">
+                <button class="btn btn-primary" @click="startExport()" :disabled="exporting">
+                    <template x-if="exporting">
+                        <span class="spinner"></span>
+                    </template>
+                    產生 EPUB
+                </button>
+                <span x-show="exportState === 'running'" class="text-muted">正在產生中...</span>
+                <span x-show="exportState === 'completed'" style="color: #27ae60; font-weight: 500;">產生完成</span>
+            </div>
+
+            <!-- Error -->
+            <div x-show="exportError" class="alert alert-error" style="margin-top: 1rem; margin-bottom: 0;">
+                <span x-text="exportError"></span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Existing Files -->
+    <div class="card">
+        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+            <h3 style="margin: 0; font-size: 1rem;">已產生的檔案</h3>
+            <button class="btn btn-small btn-secondary" @click="refreshFiles()" style="padding: 0.25rem 0.75rem; font-size: 0.8rem;">
+                重新整理
+            </button>
+        </div>
+        <div class="card-body" style="padding: 0;">
+            <div x-show="files.length === 0" class="empty-state" style="padding: 2rem;">
+                <p>尚未產生任何 EPUB 檔案</p>
+            </div>
+            <div x-show="files.length > 0">
+                <table class="export-file-table">
+                    <thead>
+                        <tr>
+                            <th>檔案名稱</th>
+                            <th>大小</th>
+                            <th>產生時間</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <template x-for="file in files" :key="file.filename">
+                            <tr>
+                                <td x-text="file.filename"></td>
+                                <td x-text="formatSize(file.size)"></td>
+                                <td x-text="formatDate(file.modified)"></td>
+                                <td>
+                                    <a :href="'/api/projects/{{ project_name }}/download/' + file.filename"
+                                       class="btn btn-small btn-primary"
+                                       style="padding: 0.25rem 0.75rem; font-size: 0.8rem; text-decoration: none;">
+                                        下載
+                                    </a>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
 </div>
+
+<script>
+function exportController() {
+    return {
+        selectedFormat: 'chinese-only',
+        exporting: false,
+        exportState: 'idle',
+        exportError: null,
+        files: [],
+        pollTimer: null,
+
+        init() {
+            this.refreshFiles();
+            this.checkStatus();
+        },
+
+        async checkStatus() {
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/export/status');
+                const data = await res.json();
+                this.exportState = data.state;
+                if (data.state === 'running') {
+                    this.exporting = true;
+                    this.startPolling();
+                }
+            } catch (e) {
+                console.error('Failed to check export status:', e);
+            }
+        },
+
+        async startExport() {
+            this.exporting = true;
+            this.exportError = null;
+            this.exportState = 'running';
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/export', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ format: this.selectedFormat }),
+                });
+                const data = await res.json();
+                if (data.error) {
+                    this.exportError = data.error;
+                    this.exporting = false;
+                    this.exportState = 'idle';
+                    return;
+                }
+                this.startPolling();
+            } catch (e) {
+                this.exportError = '匯出失敗: ' + e.message;
+                this.exporting = false;
+                this.exportState = 'idle';
+            }
+        },
+
+        startPolling() {
+            if (this.pollTimer) clearInterval(this.pollTimer);
+            this.pollTimer = setInterval(async () => {
+                try {
+                    const res = await fetch('/api/projects/{{ project_name }}/export/status');
+                    const data = await res.json();
+                    this.exportState = data.state;
+
+                    if (data.state === 'completed') {
+                        this.exporting = false;
+                        clearInterval(this.pollTimer);
+                        this.pollTimer = null;
+                        this.refreshFiles();
+                    } else if (data.state === 'failed') {
+                        this.exporting = false;
+                        this.exportError = data.error || '匯出失敗';
+                        clearInterval(this.pollTimer);
+                        this.pollTimer = null;
+                    }
+                } catch (e) {
+                    console.error('Poll error:', e);
+                }
+            }, 1000);
+        },
+
+        async refreshFiles() {
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/export/files');
+                const data = await res.json();
+                this.files = data.files || [];
+            } catch (e) {
+                console.error('Failed to list files:', e);
+            }
+        },
+
+        formatSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        },
+
+        formatDate(timestamp) {
+            const d = new Date(timestamp * 1000);
+            return d.toLocaleDateString('zh-TW') + ' ' + d.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
+        },
+
+        destroy() {
+            if (this.pollTimer) clearInterval(this.pollTimer);
+        }
+    };
+}
+</script>
 {% endblock %}
