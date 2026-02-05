@@ -239,6 +239,18 @@ function translationController() {
                 this.state = 'paused';
             });
 
+            this.eventSource.addEventListener('rate_limit', (e) => {
+                const data = JSON.parse(e.data);
+                this.state = 'paused';
+                this.error = data.error || 'API 使用量已達上限，請稍後再繼續';
+            });
+
+            this.eventSource.addEventListener('auth_error', (e) => {
+                const data = JSON.parse(e.data);
+                this.state = 'paused';
+                this.error = data.error || 'Claude CLI 認證已過期，請在終端執行 claude /login 重新登入';
+            });
+
             this.eventSource.addEventListener('complete', (e) => {
                 const data = JSON.parse(e.data);
                 this.state = 'completed';

@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass, field
 
 from src.core.project import ProjectManager
-from src.core.translator import TranslationEngine, TranslationError, RateLimitError
+from src.core.translator import TranslationEngine, TranslationError, RateLimitError, AuthError
 from src.glossary.glossary_manager import GlossaryManager
 
 logger = logging.getLogger(__name__)
@@ -178,6 +178,20 @@ class TaskManager:
                             'translated_text': translated[:200],
                         }})
                         break  # Success, move to next segment
+
+                    except AuthError as e:
+                        logger.warning("Auth expired, pausing: %s", e)
+                        task.state = 'paused'
+                        task.pause_event.clear()
+                        task.progress_queue.put({'event': 'auth_error', 'data': {
+                            'error': str(e),
+                            'completed': task.completed,
+                            'remaining': task.total - task.completed,
+                        }})
+                        task.pause_event.wait()
+                        if task.state not in ('running',):
+                            break
+                        continue
 
                     except RateLimitError as e:
                         logger.warning("API usage limit reached, pausing: %s", e)

@@ -88,7 +88,16 @@ class RateLimitError(TranslationError):
     pass
 
 
+class AuthError(TranslationError):
+    """Raised when Claude CLI authentication has expired."""
+    pass
+
+
 _RATE_LIMIT_PATTERN = re.compile(r"You've hit your limit", re.IGNORECASE)
+_AUTH_ERROR_PATTERN = re.compile(
+    r'authentication_error|OAuth token has expired|please run /login',
+    re.IGNORECASE,
+)
 
 
 class TranslationEngine:
@@ -134,8 +143,11 @@ class TranslationEngine:
                 # Check for API usage limit in stdout or stderr
                 stdout = result.stdout if isinstance(result.stdout, str) else ''
                 stderr = result.stderr if isinstance(result.stderr, str) else ''
-                if _RATE_LIMIT_PATTERN.search(stdout) or _RATE_LIMIT_PATTERN.search(stderr):
-                    raise RateLimitError((stdout + stderr).strip())
+                combined = stdout + stderr
+                if _RATE_LIMIT_PATTERN.search(combined):
+                    raise RateLimitError(combined.strip())
+                if _AUTH_ERROR_PATTERN.search(combined):
+                    raise AuthError('Claude CLI 認證已過期，請在終端執行 claude /login 重新登入')
 
                 if result.returncode != 0:
                     logger.warning(
