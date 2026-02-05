@@ -42,15 +42,18 @@
     <script>
     // Global toast function
     function showToast(message, type = 'success') {
-        const event = new CustomEvent('show-toast', { detail: { message, type } });
-        document.dispatchEvent(event);
+        const body = document.querySelector('body');
+        if (body && body.__x) {
+            body.__x.$data.toast = { show: true, message, type };
+        } else {
+            // Fallback: use Alpine.evaluate
+            const el = document.querySelector('[x-data]');
+            if (el && el._x_dataStack) {
+                const data = el._x_dataStack[0];
+                data.toast = { show: true, message, type };
+            }
+        }
     }
-
-    document.addEventListener('alpine:init', () => {
-        document.addEventListener('show-toast', (e) => {
-            Alpine.store('toast', e.detail);
-        });
-    });
     </script>
     {% block scripts %}{% endblock %}
 </body>

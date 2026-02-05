@@ -1116,3 +1116,97 @@ button {
 .export-file-table td:last-child {
     width: 80px;
 }
+
+/* Responsive design */
+@media (max-width: 768px) {
+    header {
+        padding: 0.75rem 1rem;
+    }
+
+    .main-content {
+        padding: 1rem;
+    }
+
+    /* Tabs: scrollable on mobile */
+    .tabs {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .tab {
+        padding: 0.5rem 0.75rem;
+        font-size: 0.8rem;
+        white-space: nowrap;
+    }
+
+    /* Project grid: single column */
+    .project-grid {
+        grid-template-columns: 1fr;
+    }
+
+    /* Stats row: wrap */
+    .stats-row {
+        flex-wrap: wrap;
+    }
+
+    .stat-card {
+        min-width: calc(50% - 0.5rem);
+    }
+
+    /* Chapter table: make responsive */
+    .chapter-table td:last-child {
+        width: auto;
+    }
+
+    /* Review layout: stack vertically */
+    .review-layout {
+        flex-direction: column;
+        margin: -1rem;
+    }
+
+    .review-sidebar {
+        width: 100%;
+        border-right: none;
+        border-bottom: 1px solid #ddd;
+        max-height: 200px;
+        overflow-y: auto;
+    }
+
+    /* Segment body: stack vertically */
+    .segment-body {
+        flex-direction: column;
+    }
+
+    /* Export format options: stack */
+    .export-formats {
+        flex-direction: column;
+    }
+
+    /* Upload area */
+    .upload-container {
+        max-width: 100%;
+    }
+
+    /* Metadata grid: single column */
+    .metadata-grid {
+        grid-template-columns: 1fr;
+    }
+
+    /* Form row: stack */
+    .form-row {
+        flex-direction: column;
+    }
+
+    /* Page header: stack */
+    .page-header {
+        flex-direction: column;
+        gap: 0.75rem;
+        align-items: flex-start;
+    }
+
+    /* Glossary table: horizontal scroll */
+    .glossary-table {
+        display: block;
+        overflow-x: auto;
+    }
+}
