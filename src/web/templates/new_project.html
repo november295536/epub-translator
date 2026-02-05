@@ -11,6 +11,7 @@
 <div class="upload-container" x-data="uploadManager()">
     <!-- Upload area -->
     <div class="upload-area"
+         x-show="!metadata"
          :class="{ 'drag-over': isDragging, 'has-file': file }"
          @dragover.prevent="isDragging = true"
          @dragleave.prevent="isDragging = false"
