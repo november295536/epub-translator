@@ -88,6 +88,22 @@ def delete_term(project_name: str, term: str):
     return jsonify({'error': f'找不到術語：{term}'}), 404
 
 
+@glossary_bp.route('/api/projects/<project_name>/glossary/batch', methods=['DELETE'])
+def batch_delete_terms(project_name: str):
+    """Delete multiple glossary terms at once."""
+    data = request.get_json()
+    if not data or 'terms' not in data or not isinstance(data['terms'], list):
+        return jsonify({'error': '請提供 terms 陣列'}), 400
+
+    gm = _get_glossary_manager(project_name)
+    deleted = 0
+    for term in data['terms']:
+        if gm.remove_term(term):
+            deleted += 1
+
+    return jsonify({'status': 'ok', 'deleted': deleted})
+
+
 @glossary_bp.route('/api/projects/<project_name>/glossary/extract', methods=['POST'])
 def extract_terms(project_name: str):
     """Start auto term extraction in background."""

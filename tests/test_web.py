@@ -143,3 +143,85 @@ class TestWebServer:
         pm.load()
         seg = [s for s in pm.data.segments if s.segment_id == 'ch1_seg0002'][0]
         assert seg.status == 'reviewed'
+
+
+class TestGlossaryAPI:
+
+    @pytest.fixture(autouse=True)
+    def setup_glossary(self, client, project_with_translations):
+        """Add some glossary terms for testing."""
+        self.client = client
+        self.projects_dir = project_with_translations
+        for term, translation in [
+            ('observability', '可觀測性'),
+            ('telemetry', '遙測'),
+            ('tracing', '追蹤'),
+        ]:
+            client.post(
+                f'/api/projects/{PROJECT_NAME}/glossary',
+                data=json.dumps({'term': term, 'translation': translation}),
+                content_type='application/json',
+            )
+
+    def test_list_glossary_terms(self):
+        response = self.client.get(f'/api/projects/{PROJECT_NAME}/glossary')
+        assert response.status_code == 200
+        terms = response.get_json()
+        assert len(terms) == 3
+
+    def test_batch_delete_terms(self):
+        response = self.client.delete(
+            f'/api/projects/{PROJECT_NAME}/glossary/batch',
+            data=json.dumps({'terms': ['observability', 'tracing']}),
+            content_type='application/json',
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['deleted'] == 2
+
+        # Verify only telemetry remains
+        response = self.client.get(f'/api/projects/{PROJECT_NAME}/glossary')
+        terms = response.get_json()
+        assert len(terms) == 1
+        assert terms[0]['term'] == 'telemetry'
+
+    def test_batch_delete_nonexistent_terms(self):
+        response = self.client.delete(
+            f'/api/projects/{PROJECT_NAME}/glossary/batch',
+            data=json.dumps({'terms': ['nonexistent1', 'nonexistent2']}),
+            content_type='application/json',
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['deleted'] == 0
+
+    def test_batch_delete_mixed(self):
+        response = self.client.delete(
+            f'/api/projects/{PROJECT_NAME}/glossary/batch',
+            data=json.dumps({'terms': ['observability', 'nonexistent']}),
+            content_type='application/json',
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['deleted'] == 1
+
+    def test_batch_delete_missing_body(self):
+        response = self.client.delete(
+            f'/api/projects/{PROJECT_NAME}/glossary/batch',
+            data=json.dumps({}),
+            content_type='application/json',
+        )
+        assert response.status_code == 400
+
+    def test_batch_delete_all(self):
+        response = self.client.delete(
+            f'/api/projects/{PROJECT_NAME}/glossary/batch',
+            data=json.dumps({'terms': ['observability', 'telemetry', 'tracing']}),
+            content_type='application/json',
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['deleted'] == 3
+
+        response = self.client.get(f'/api/projects/{PROJECT_NAME}/glossary')
+        assert len(response.get_json()) == 0
