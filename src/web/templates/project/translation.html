@@ -1,7 +1,284 @@
 {% extends "project/layout.html" %}
 
 {% block tab_content %}
-<div class="empty-state">
-    <p>翻譯控制功能即將推出</p>
+<div x-data="translationController()" x-init="init()">
+    <!-- Control Panel -->
+    <div class="card" style="margin-bottom: 1.5rem;">
+        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+            <h3 style="margin: 0; font-size: 1rem;">翻譯控制</h3>
+            <div class="header-actions">
+                <template x-if="state === 'idle' || state === 'completed' || state === 'failed'">
+                    <button class="btn btn-primary" @click="startTranslation()" :disabled="starting">
+                        <template x-if="starting">
+                            <span class="spinner"></span>
+                        </template>
+                        開始翻譯
+                    </button>
+                </template>
+                <template x-if="state === 'running'">
+                    <button class="btn btn-secondary" @click="pauseTranslation()">
+                        ⏸ 暫停
+                    </button>
+                </template>
+                <template x-if="state === 'paused'">
+                    <button class="btn btn-success" @click="pauseTranslation()">
+                        ▶ 繼續翻譯
+                    </button>
+                </template>
+            </div>
+        </div>
+        <div class="card-body">
+            <!-- Status indicator -->
+            <div class="translation-status-row">
+                <span class="translation-state-badge" :class="'state-' + state" x-text="stateLabel()"></span>
+                <span class="text-muted" x-show="total > 0" x-text="completed + ' / ' + total + ' 段落'"></span>
+            </div>
+
+            <!-- Progress bar -->
+            <div x-show="total > 0" style="margin-top: 1rem;">
+                <div class="progress-bar" style="height: 28px;">
+                    <div class="progress-fill" :style="'width: ' + percent + '%'"></div>
+                    <span class="progress-text" x-text="percent + '%'"></span>
+                </div>
+            </div>
+
+            <!-- Current segment -->
+            <div x-show="currentSegment" style="margin-top: 1rem;" class="current-segment-box">
+                <div class="current-segment-label">正在翻譯</div>
+                <div class="current-segment-id" x-text="currentSegment"></div>
+            </div>
+
+            <!-- Error message -->
+            <div x-show="error" class="alert alert-error" style="margin-top: 1rem; margin-bottom: 0;">
+                <span x-text="error"></span>
+            </div>
+
+            <!-- Completed message -->
+            <div x-show="state === 'completed'" class="alert" style="margin-top: 1rem; margin-bottom: 0; background: #d4edda; color: #155724; border: 1px solid #c3e6cb;">
+                翻譯完成！共翻譯 <span x-text="completed"></span> 個段落。
+            </div>
+        </div>
+    </div>
+
+    <!-- Translation Log -->
+    <div class="card">
+        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+            <h3 style="margin: 0; font-size: 1rem;">翻譯紀錄</h3>
+            <span class="text-muted" x-text="logs.length + ' 筆'"></span>
+        </div>
+        <div class="card-body" style="padding: 0;">
+            <div x-show="logs.length === 0" class="empty-state" style="padding: 2rem;">
+                <p>尚無翻譯紀錄</p>
+            </div>
+            <div class="translation-log" x-show="logs.length > 0">
+                <template x-for="log in logs.slice().reverse()" :key="log.id">
+                    <div class="log-entry" :class="log.type === 'error' ? 'log-error' : ''">
+                        <div class="log-entry-header">
+                            <span class="log-segment-id" x-text="log.segmentId"></span>
+                            <span class="log-type-badge" :class="'log-type-' + log.type"
+                                  x-text="log.type === 'error' ? '失敗' : '完成'"></span>
+                        </div>
+                        <div class="log-entry-text" x-text="log.text"></div>
+                    </div>
+                </template>
+            </div>
+        </div>
+    </div>
 </div>
+
+<script>
+function translationController() {
+    return {
+        state: 'idle',
+        total: 0,
+        completed: 0,
+        percent: 0,
+        currentSegment: null,
+        error: null,
+        starting: false,
+        logs: [],
+        eventSource: null,
+        logCounter: 0,
+
+        init() {
+            this.fetchStatus();
+        },
+
+        stateLabel() {
+            const labels = {
+                'idle': '閒置',
+                'pending': '準備中',
+                'running': '翻譯中',
+                'paused': '已暫停',
+                'completed': '已完成',
+                'failed': '失敗',
+            };
+            return labels[this.state] || this.state;
+        },
+
+        async fetchStatus() {
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/translate/status');
+                const data = await res.json();
+                this.state = data.state;
+                this.total = data.total;
+                this.completed = data.completed;
+                this.percent = data.percent || 0;
+                this.currentSegment = data.current_segment;
+                this.error = data.error;
+
+                if (this.state === 'running' || this.state === 'paused') {
+                    this.connectSSE();
+                }
+            } catch (e) {
+                console.error('Failed to fetch status:', e);
+            }
+        },
+
+        async startTranslation() {
+            this.starting = true;
+            this.error = null;
+            this.logs = [];
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/translate/start', {
+                    method: 'POST',
+                });
+                const data = await res.json();
+                if (data.error) {
+                    this.error = data.error;
+                    this.starting = false;
+                    return;
+                }
+                this.state = data.state;
+                this.total = data.total;
+                this.completed = 0;
+                this.percent = 0;
+
+                if (this.state === 'completed') {
+                    this.starting = false;
+                    return;
+                }
+
+                this.connectSSE();
+                this.starting = false;
+            } catch (e) {
+                this.error = '啟動翻譯失敗: ' + e.message;
+                this.starting = false;
+            }
+        },
+
+        async pauseTranslation() {
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/translate/pause', {
+                    method: 'POST',
+                });
+                const data = await res.json();
+                if (data.error) {
+                    this.error = data.error;
+                    return;
+                }
+                this.state = data.state;
+            } catch (e) {
+                this.error = '操作失敗: ' + e.message;
+            }
+        },
+
+        connectSSE() {
+            if (this.eventSource) {
+                this.eventSource.close();
+            }
+
+            this.eventSource = new EventSource('/api/projects/{{ project_name }}/translate/stream');
+
+            this.eventSource.addEventListener('status', (e) => {
+                const data = JSON.parse(e.data);
+                this.state = data.state;
+                this.completed = data.completed;
+                this.total = data.total;
+                if (this.total > 0) {
+                    this.percent = Math.round(this.completed / this.total * 1000) / 10;
+                }
+            });
+
+            this.eventSource.addEventListener('progress', (e) => {
+                const data = JSON.parse(e.data);
+                this.completed = data.completed;
+                this.total = data.total;
+                this.percent = data.percent;
+                this.state = 'running';
+            });
+
+            this.eventSource.addEventListener('segment_complete', (e) => {
+                const data = JSON.parse(e.data);
+                this.currentSegment = null;
+                this.logCounter++;
+                this.logs.push({
+                    id: this.logCounter,
+                    type: 'success',
+                    segmentId: data.segment_id,
+                    text: data.translated_text,
+                });
+                // Keep only last 50 entries
+                if (this.logs.length > 50) {
+                    this.logs = this.logs.slice(-50);
+                }
+            });
+
+            this.eventSource.addEventListener('segment_error', (e) => {
+                const data = JSON.parse(e.data);
+                this.logCounter++;
+                this.logs.push({
+                    id: this.logCounter,
+                    type: 'error',
+                    segmentId: data.segment_id,
+                    text: data.error,
+                });
+            });
+
+            this.eventSource.addEventListener('paused', (e) => {
+                this.state = 'paused';
+            });
+
+            this.eventSource.addEventListener('complete', (e) => {
+                const data = JSON.parse(e.data);
+                this.state = 'completed';
+                this.currentSegment = null;
+                this.completed = data.total_translated;
+                if (this.total > 0) {
+                    this.percent = Math.round(this.completed / this.total * 1000) / 10;
+                }
+                this.eventSource.close();
+                this.eventSource = null;
+            });
+
+            this.eventSource.addEventListener('error', (e) => {
+                if (e.data) {
+                    const data = JSON.parse(e.data);
+                    this.error = data.error;
+                    this.state = 'failed';
+                }
+                this.eventSource.close();
+                this.eventSource = null;
+            });
+
+            this.eventSource.onerror = () => {
+                // SSE connection error - try to reconnect after delay
+                this.eventSource.close();
+                this.eventSource = null;
+                setTimeout(() => {
+                    if (this.state === 'running' || this.state === 'paused') {
+                        this.fetchStatus();
+                    }
+                }, 3000);
+            };
+        },
+
+        destroy() {
+            if (this.eventSource) {
+                this.eventSource.close();
+            }
+        }
+    };
+}
+</script>
 {% endblock %}

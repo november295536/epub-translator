@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from flask import Flask
 
-from src.web.blueprints import glossary_bp, home_bp, projects_bp, review_bp
+from src.web.blueprints import glossary_bp, home_bp, projects_bp, review_bp, translation_bp
 
 
 def create_app(projects_dir: str | None = None) -> Flask:
@@ -38,5 +38,6 @@ def create_app(projects_dir: str | None = None) -> Flask:
     app.register_blueprint(home_bp)
     app.register_blueprint(projects_bp)
     app.register_blueprint(review_bp)
+    app.register_blueprint(translation_bp)
 
     return app

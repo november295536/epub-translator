@@ -941,3 +941,107 @@ button {
 
 .text-muted { color: #888; }
 .text-error { color: #e74c3c; }
+
+/* Translation page */
+.translation-status-row {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.translation-state-badge {
+    display: inline-block;
+    padding: 0.25rem 0.75rem;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    font-weight: 500;
+}
+
+.state-idle { background: #ecf0f1; color: #7f8c8d; }
+.state-pending { background: #fff3cd; color: #856404; }
+.state-running { background: #cce5ff; color: #004085; }
+.state-paused { background: #ffeaa7; color: #856404; }
+.state-completed { background: #d4edda; color: #155724; }
+.state-failed { background: #f8d7da; color: #721c24; }
+
+.current-segment-box {
+    background: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.current-segment-label {
+    font-size: 0.8rem;
+    color: #888;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.current-segment-id {
+    font-family: monospace;
+    font-size: 0.9rem;
+    color: #2c3e50;
+}
+
+/* Translation log */
+.translation-log {
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+.log-entry {
+    padding: 0.6rem 1rem;
+    border-bottom: 1px solid #f0f0f0;
+}
+
+.log-entry:last-child {
+    border-bottom: none;
+}
+
+.log-entry.log-error {
+    background: #fff5f5;
+}
+
+.log-entry-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.25rem;
+}
+
+.log-segment-id {
+    font-family: monospace;
+    font-size: 0.8rem;
+    color: #666;
+}
+
+.log-type-badge {
+    font-size: 0.7rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    font-weight: 500;
+}
+
+.log-type-success {
+    background: #d4edda;
+    color: #155724;
+}
+
+.log-type-error {
+    background: #f8d7da;
+    color: #721c24;
+}
+
+.log-entry-text {
+    font-size: 0.85rem;
+    color: #555;
+    line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+}
