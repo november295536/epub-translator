@@ -22,7 +22,7 @@
             <ul>
             {% for ch in chapters %}
                 <li>
-                    <a href="/chapter/{{ ch.chapter_id }}"
+                    <a href="/project/{{ project_name }}/review/chapter/{{ ch.chapter_id }}"
                        class="{% if current_chapter == ch.chapter_id %}active{% endif %}">
                         {{ ch.chapter_id }}
                         <span class="badge">{{ ch.translated + ch.reviewed }}/{{ ch.total }}</span>
@@ -68,9 +68,11 @@
     </div>
 
     <script>
+    const projectName = '{{ project_name }}';
+
     function saveSegment(segId) {
         const textarea = document.querySelector(`textarea[data-id="${segId}"]`);
-        fetch(`/api/segment/${segId}`, {
+        fetch(`/api/projects/${projectName}/segments/${segId}`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({text: textarea.value})
@@ -87,7 +89,7 @@
 
     function approveSegment(segId) {
         const textarea = document.querySelector(`textarea[data-id="${segId}"]`);
-        fetch(`/api/segment/${segId}/approve`, {
+        fetch(`/api/projects/${projectName}/segments/${segId}/approve`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({text: textarea.value})

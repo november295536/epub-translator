@@ -178,8 +178,12 @@ def review(project, port):
     from src.web.server import create_app
     import webbrowser
 
-    app = create_app(project_dir)
-    url = f'http://localhost:{port}'
+    # Extract project name and parent directory
+    projects_dir = os.path.dirname(project_dir)
+    project_name = os.path.basename(project_dir)
+
+    app = create_app(projects_dir=projects_dir)
+    url = f'http://localhost:{port}/project/{project_name}/review'
     click.echo(f"啟動審閱伺服器：{url}")
     click.echo("按 Ctrl+C 停止")
     webbrowser.open(url)
