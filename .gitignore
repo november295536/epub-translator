@@ -22,5 +22,5 @@ venv/
 # Environment
 .env
 
-# Generated EPUB output
-projects/*/output/
+# Translation project data (user-specific, generated at runtime)
+projects/
