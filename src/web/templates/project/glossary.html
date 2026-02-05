@@ -1,7 +1,7 @@
 {% extends "project/layout.html" %}
 
 {% block tab_content %}
-<div x-data="glossaryManager()" x-init="loadTerms()">
+<div x-data="glossaryManager()" x-init="init()">
     <!-- Header with actions -->
     <div class="page-header">
         <h2>術語表</h2>
@@ -98,6 +98,15 @@
         </div>
     </template>
 
+    <!-- Batch actions bar -->
+    <template x-if="selectedTerms.length > 0">
+        <div class="batch-actions">
+            <span>已選取 <strong x-text="selectedTerms.length"></strong> 項</span>
+            <button class="btn btn-danger btn-small" @click="deleteSelected()">刪除選取</button>
+            <button class="btn btn-secondary btn-small" @click="selectedTerms = []">取消選取</button>
+        </div>
+    </template>
+
     <!-- Terms table -->
     <div class="card">
         <div class="card-header">
@@ -117,6 +126,9 @@
                 <table class="glossary-table">
                     <thead>
                         <tr>
+                            <th class="checkbox-cell">
+                                <input type="checkbox" :checked="allSelected" @change="toggleAll()">
+                            </th>
                             <th>術語</th>
                             <th>翻譯</th>
                             <th>類別</th>
@@ -125,7 +137,10 @@
                     </thead>
                     <tbody>
                         <template x-for="term in filteredTerms" :key="term.term">
-                            <tr>
+                            <tr :class="{ 'row-selected': isSelected(term.term) }">
+                                <td class="checkbox-cell">
+                                    <input type="checkbox" :checked="isSelected(term.term)" @change="toggleTerm(term.term)">
+                                </td>
                                 <td>
                                     <template x-if="editingTerm !== term.term">
                                         <span x-text="term.term"></span>
@@ -214,9 +229,33 @@ function glossaryManager() {
         newTerm: { term: '', translation: '', category: '' },
         editingTerm: null,
         editData: { translation: '', category: '' },
+        selectedTerms: [],
         extractStatus: 'idle',
         extractResult: 0,
         extractError: '',
+
+        async init() {
+            await this.loadTerms();
+            await this.checkExtractionStatus();
+        },
+
+        async checkExtractionStatus() {
+            const res = await fetch(`/api/projects/${projectName}/glossary/extract/status`);
+            const data = await res.json();
+            if (data.status === 'running') {
+                this.extractStatus = 'running';
+                this.showExtractModal = true;
+                this.pollExtraction();
+            } else if (data.status === 'completed') {
+                this.extractStatus = 'completed';
+                this.extractResult = data.extracted_count;
+                this.showExtractModal = true;
+            } else if (data.status === 'error') {
+                this.extractStatus = 'error';
+                this.extractError = data.error;
+                this.showExtractModal = true;
+            }
+        },
 
         async loadTerms() {
             const res = await fetch(`/api/projects/${projectName}/glossary`);
@@ -275,12 +314,57 @@ function glossaryManager() {
             }
         },
 
+        get allSelected() {
+            return this.filteredTerms.length > 0 &&
+                this.filteredTerms.every(t => this.selectedTerms.includes(t.term));
+        },
+
+        isSelected(term) {
+            return this.selectedTerms.includes(term);
+        },
+
+        toggleAll() {
+            if (this.allSelected) {
+                const filtered = new Set(this.filteredTerms.map(t => t.term));
+                this.selectedTerms = this.selectedTerms.filter(t => !filtered.has(t));
+            } else {
+                const current = new Set(this.selectedTerms);
+                for (const t of this.filteredTerms) {
+                    current.add(t.term);
+                }
+                this.selectedTerms = [...current];
+            }
+        },
+
+        toggleTerm(term) {
+            const idx = this.selectedTerms.indexOf(term);
+            if (idx >= 0) {
+                this.selectedTerms.splice(idx, 1);
+            } else {
+                this.selectedTerms.push(term);
+            }
+        },
+
+        async deleteSelected() {
+            if (!confirm(`確定要刪除選取的 ${this.selectedTerms.length} 個術語嗎？`)) return;
+            const res = await fetch(`/api/projects/${projectName}/glossary/batch`, {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ terms: this.selectedTerms })
+            });
+            if (res.ok) {
+                this.selectedTerms = [];
+                await this.loadTerms();
+            }
+        },
+
         async deleteTerm(term) {
             if (!confirm(`確定要刪除術語「${term}」嗎？`)) return;
             const res = await fetch(`/api/projects/${projectName}/glossary/${encodeURIComponent(term)}`, {
                 method: 'DELETE'
             });
             if (res.ok) {
+                this.selectedTerms = this.selectedTerms.filter(t => t !== term);
                 await this.loadTerms();
             }
         },
