@@ -5,7 +5,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from src.core.translator import (
-    TranslationEngine, TranslationError,
+    TranslationEngine, TranslationError, RateLimitError,
     TRANSLATION_PROMPT, CODE_PROMPT,
     TEXT_HTML_PROMPT,
 )
@@ -142,6 +142,48 @@ class TestTranslationEngine:
         assert call_kwargs['timeout'] == 120
         assert call_kwargs['capture_output'] is True
         assert call_kwargs['text'] is True
+
+
+class TestRateLimitDetection:
+
+    def test_rate_limit_in_stdout(self):
+        engine = TranslationEngine(max_retries=3)
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "You've hit your limit · resets 8pm (Asia/Taipei)"
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            with pytest.raises(RateLimitError):
+                engine.translate('test')
+
+    def test_rate_limit_in_stderr(self):
+        engine = TranslationEngine(max_retries=3)
+
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ''
+        mock_result.stderr = "You've hit your limit · resets 8pm (Asia/Taipei)"
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            with pytest.raises(RateLimitError):
+                engine.translate('test')
+
+    def test_rate_limit_no_retry(self):
+        """Rate limit should raise immediately without retrying."""
+        engine = TranslationEngine(max_retries=3)
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "You've hit your limit · resets 8pm (Asia/Taipei)"
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+            with pytest.raises(RateLimitError):
+                engine.translate('test')
+
+        assert mock_run.call_count == 1
 
 
 class TestResponseCleaning:
