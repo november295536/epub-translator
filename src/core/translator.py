@@ -19,14 +19,17 @@ TRANSLATION_PROMPT = """你是一位專業的英文翻譯，請將以下英文�
 {context_section}
 嚴格禁止：
 - 不要加任何說明、前綴或後綴（例如「以下是翻譯」「翻譯如下」「看起來」等）
-- 不要加 markdown 格式標記（如 ```、---、** 等）
+- 不要使用任何 markdown 語法（禁止 #、##、**、*、__、```、---、> 等所有 markdown 標記）
+- 輸出純文字，不要加任何格式標記
 - 不要加分隔線
 - 直接輸出翻譯結果，第一個字就是翻譯內容
 
 原文：
 {text}"""
 
-HEADING_PROMPT = """將以下英文標題翻譯成繁體中文（台灣用語）。專業術語保留原文用括號標註。只輸出翻譯結果，不加任何格式或說明。
+HEADING_PROMPT = """將以下英文標題翻譯成繁體中文（台灣用語）。專業術語保留原文用括號標註。
+
+嚴格禁止：不要加 # 號、不要加 markdown 標記、不要加引號、不要加任何格式或說明。只輸出純文字翻譯結果。
 {glossary_section}
 {text}"""
 
@@ -52,6 +55,15 @@ _END_PATTERNS = [
     r'\n---+\s*$',
     r'\n```\s*$',
 ]
+
+# Markdown heading pattern: lines starting with one or more # followed by space
+_MD_HEADING_PATTERN = re.compile(r'^(#{1,6})\s+', re.MULTILINE)
+
+# Markdown bold: **text** or __text__
+_MD_BOLD_PATTERN = re.compile(r'\*\*(.+?)\*\*|__(.+?)__')
+
+# Markdown italic: *text* or _text_ (but not inside ASCII words like 3*5 or foo_bar)
+_MD_ITALIC_PATTERN = re.compile(r'(?<![0-9a-zA-Z])\*(.+?)\*(?![0-9a-zA-Z])|(?<![0-9a-zA-Z])_(.+?)_(?![0-9a-zA-Z])')
 
 
 class TranslationError(Exception):
@@ -167,10 +179,20 @@ class TranslationEngine:
 
     @staticmethod
     def _clean_response(text: str) -> str:
-        """Remove common Claude response prefixes and formatting artifacts."""
+        """Remove common Claude response prefixes, formatting artifacts, and markdown syntax."""
         cleaned = text
         for pattern in _START_PATTERNS:
             cleaned = re.sub(pattern, '', cleaned)
         for pattern in _END_PATTERNS:
             cleaned = re.sub(pattern, '', cleaned)
+
+        # Strip markdown heading markers (# Title → Title)
+        cleaned = _MD_HEADING_PATTERN.sub('', cleaned)
+
+        # Strip markdown bold markers (**text** → text)
+        cleaned = _MD_BOLD_PATTERN.sub(lambda m: m.group(1) or m.group(2), cleaned)
+
+        # Strip markdown italic markers (*text* → text)
+        cleaned = _MD_ITALIC_PATTERN.sub(lambda m: m.group(1) or m.group(2), cleaned)
+
         return cleaned.strip()
