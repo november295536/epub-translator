@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import uuid
 from flask import Blueprint, render_template, redirect, request, jsonify, current_app
@@ -10,6 +11,21 @@ from flask import Blueprint, render_template, redirect, request, jsonify, curren
 from src.core.project import ProjectManager
 from src.core.segmenter import Segmenter
 from src.epub.extractor import EPUBExtractor
+
+
+def sanitize_project_name(name: str) -> str:
+    """Sanitize a string into a safe project directory name.
+
+    - Replace spaces and underscores with hyphens
+    - Remove any character that isn't alphanumeric, hyphen, or dot
+    - Collapse consecutive hyphens
+    - Strip leading/trailing hyphens and dots
+    """
+    name = name.replace(' ', '-').replace('_', '-')
+    name = re.sub(r'[^a-zA-Z0-9\-.]', '', name)
+    name = re.sub(r'-{2,}', '-', name)
+    name = name.strip('-.')
+    return name or 'untitled'
 
 
 projects_bp = Blueprint('projects', __name__)
@@ -87,7 +103,7 @@ def get_epub_metadata():
         # Remove UUID prefix if present
         if '_' in original_name:
             original_name = '_'.join(original_name.split('_')[1:])
-        project_name = original_name.replace(' ', '-')
+        project_name = sanitize_project_name(original_name)
         project_dir = os.path.join(projects_dir, project_name)
         pm = ProjectManager(project_dir)
 
@@ -135,7 +151,7 @@ def create_project():
         original_name = os.path.splitext(os.path.basename(epub_path))[0]
         if '_' in original_name:
             original_name = '_'.join(original_name.split('_')[1:])
-        project_name = data.get('project_name') or original_name.replace(' ', '-')
+        project_name = sanitize_project_name(data.get('project_name') or original_name)
         project_dir = os.path.join(projects_dir, project_name)
 
         # Copy EPUB to project directory

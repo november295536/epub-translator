@@ -14,10 +14,20 @@ from src.glossary.glossary_manager import GlossaryManager
 from src.epub.builder import EPUBBuilder
 
 
+def _sanitize_name(name: str) -> str:
+    """Sanitize a string into a safe project directory name."""
+    import re
+    name = name.replace(' ', '-').replace('_', '-')
+    name = re.sub(r'[^a-zA-Z0-9\-.]', '', name)
+    name = re.sub(r'-{2,}', '-', name)
+    name = name.strip('-.')
+    return name or 'untitled'
+
+
 def _get_project_dir(epub_path: str) -> str:
     """Derive project directory from EPUB filename."""
     base = os.path.splitext(os.path.basename(epub_path))[0]
-    return os.path.join('projects', base)
+    return os.path.join('projects', _sanitize_name(base))
 
 
 def _get_glossary_path(project_dir: str) -> str:
