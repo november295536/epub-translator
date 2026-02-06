@@ -20,6 +20,9 @@ class SegmentStatus(str, Enum):
     TRANSLATED = 'translated'
     REVIEWED = 'reviewed'
 
+    def __str__(self):
+        return self.value
+
 
 @dataclass
 class SegmentState:

@@ -13,6 +13,9 @@ class SegmentType(str, Enum):
     TEXT = 'text'
     CODE = 'code'
 
+    def __str__(self):
+        return self.value
+
 
 @dataclass
 class Segment:
