@@ -24,3 +24,4 @@ venv/
 
 # Translation project data (user-specific, generated at runtime)
 projects/
+uploads/
