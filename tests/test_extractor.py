@@ -79,3 +79,20 @@ class TestEPUBExtractor:
         extractor = EPUBExtractor(sample_epub)
         with pytest.raises(RuntimeError, match="not loaded"):
             extractor.extract_chapters()
+
+    def test_extract_chapters_skips_duplicate_spine(self, epub_with_duplicate_spine):
+        """Verify that duplicate spine entries are skipped to avoid duplicate segments."""
+        extractor = EPUBExtractor(epub_with_duplicate_spine)
+        extractor.load()
+        chapters = extractor.extract_chapters()
+
+        # Spine has: nav, chapter_0, chapter_1, chapter_0 (duplicate)
+        # Should skip the duplicate, resulting in unique chapter IDs
+        chapter_ids = [c.id for c in chapters]
+        assert len(chapter_ids) == len(set(chapter_ids)), "Duplicate chapters should be skipped"
+
+        # Verify we got both content chapters (excluding nav)
+        content_chapters = [c for c in chapters if c.id != 'nav']
+        assert len(content_chapters) == 2
+        assert any('Chapter One' in c.title for c in content_chapters)
+        assert any('Chapter Two' in c.title for c in content_chapters)
