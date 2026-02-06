@@ -6,11 +6,19 @@ import json
 import os
 import time
 from dataclasses import dataclass, field, asdict
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.core.segmenter import Segment
+
+
+class SegmentStatus(str, Enum):
+    """Segment translation status."""
+    PENDING = 'pending'
+    TRANSLATED = 'translated'
+    REVIEWED = 'reviewed'
 
 
 @dataclass
@@ -22,7 +30,7 @@ class SegmentState:
     text: str
     word_count: int
     segment_type: str
-    status: str = 'pending'  # 'pending', 'translated', 'reviewed'
+    status: SegmentStatus = SegmentStatus.PENDING
     translated_text: str = ''
     translated_at: str = ''
 
@@ -92,11 +100,14 @@ class ProjectManager:
         with open(self.project_file, 'r', encoding='utf-8') as f:
             raw = json.load(f)
 
-        segments = [SegmentState(**s) for s in raw.pop('segments', [])]
-        # Normalize legacy segment types: heading/table → text
-        for seg in segments:
-            if seg.segment_type in ('heading', 'table'):
-                seg.segment_type = 'text'
+        raw_segments = raw.pop('segments', [])
+        for s in raw_segments:
+            # Normalize legacy segment types: heading/table → text
+            if s.get('segment_type') in ('heading', 'table'):
+                s['segment_type'] = 'text'
+            # Convert status string to enum
+            s['status'] = SegmentStatus(s.get('status', 'pending'))
+        segments = [SegmentState(**s) for s in raw_segments]
         self.data = ProjectData(**raw, segments=segments)
         return self.data
 
@@ -118,7 +129,7 @@ class ProjectManager:
 
         for seg in self.data.segments:
             if seg.segment_id == segment_id:
-                seg.status = 'translated'
+                seg.status = SegmentStatus.TRANSLATED
                 seg.translated_text = translated_text
                 seg.translated_at = time.strftime('%Y-%m-%d %H:%M:%S')
                 self.save()
@@ -130,7 +141,7 @@ class ProjectManager:
         """Get all segments that haven't been translated yet."""
         if not self.data:
             raise RuntimeError("No project loaded.")
-        return [s for s in self.data.segments if s.status == 'pending']
+        return [s for s in self.data.segments if s.status == SegmentStatus.PENDING]
 
     def get_progress(self) -> dict:
         """Get translation progress statistics."""
@@ -138,9 +149,9 @@ class ProjectManager:
             raise RuntimeError("No project loaded.")
 
         total = len(self.data.segments)
-        translated = sum(1 for s in self.data.segments if s.status == 'translated')
-        reviewed = sum(1 for s in self.data.segments if s.status == 'reviewed')
-        pending = sum(1 for s in self.data.segments if s.status == 'pending')
+        translated = sum(1 for s in self.data.segments if s.status == SegmentStatus.TRANSLATED)
+        reviewed = sum(1 for s in self.data.segments if s.status == SegmentStatus.REVIEWED)
+        pending = sum(1 for s in self.data.segments if s.status == SegmentStatus.PENDING)
 
         return {
             'total': total,
@@ -159,7 +170,7 @@ class ProjectManager:
             if seg.segment_id == segment_id:
                 if text:
                     seg.translated_text = text
-                seg.status = 'reviewed'
+                seg.status = SegmentStatus.REVIEWED
                 self.save()
                 return
 
@@ -195,9 +206,9 @@ class ProjectManager:
             if cid not in chapters:
                 chapters[cid] = {'chapter_id': cid, 'total': 0, 'translated': 0, 'reviewed': 0}
             chapters[cid]['total'] += 1
-            if seg.status == 'translated':
+            if seg.status == SegmentStatus.TRANSLATED:
                 chapters[cid]['translated'] += 1
-            elif seg.status == 'reviewed':
+            elif seg.status == SegmentStatus.REVIEWED:
                 chapters[cid]['reviewed'] += 1
         return list(chapters.values())
 

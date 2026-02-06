@@ -10,6 +10,7 @@ from ebooklib import epub
 from bs4 import BeautifulSoup, Tag, NavigableString
 
 from src.core.project import ProjectManager, SegmentState
+from src.core.segmenter import SegmentType
 
 BILINGUAL_CSS = """
 .bilingual-container {
@@ -187,10 +188,7 @@ class EPUBBuilder:
         For text segments: count top-level HTML tags in the segment's stored HTML.
         Falls back to 1 if no tags found (e.g. split segments with plain text).
         """
-        if seg.segment_type == 'code':
-            return 1
-        # Backward compatibility: legacy heading/table types are single-element
-        if seg.segment_type in ('heading', 'table'):
+        if seg.segment_type == SegmentType.CODE:
             return 1
 
         frag = BeautifulSoup(seg.html, 'html.parser')
@@ -205,7 +203,7 @@ class EPUBBuilder:
         first = elements[0]
         translated = seg.translated_text
 
-        if seg.segment_type == 'code':
+        if seg.segment_type == SegmentType.CODE:
             code_elem = first.find('code') if isinstance(first, Tag) else None
             if code_elem:
                 code_elem.clear()
@@ -311,7 +309,7 @@ class EPUBBuilder:
         """Fill a div with the translated content using appropriate HTML tags."""
         translated = seg.translated_text
 
-        if seg.segment_type == 'code':
+        if seg.segment_type == SegmentType.CODE:
             pre = soup.new_tag('pre')
             code = soup.new_tag('code')
             code.string = translated
