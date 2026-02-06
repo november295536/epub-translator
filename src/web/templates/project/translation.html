@@ -173,11 +173,13 @@ function translationController() {
                     method: 'POST',
                 });
                 const data = await res.json();
+                if (data.state) {
+                    this.state = data.state;
+                }
                 if (data.error) {
                     this.error = data.error;
                     return;
                 }
-                this.state = data.state;
             } catch (e) {
                 this.error = '操作失敗: ' + e.message;
             }
