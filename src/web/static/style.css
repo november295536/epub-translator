@@ -230,6 +230,20 @@ button {
     background: #229954;
 }
 
+.btn-retranslate {
+    background: #e67e22;
+    color: white;
+}
+
+.btn-retranslate:hover {
+    background: #d35400;
+}
+
+.btn-retranslate:disabled {
+    background: #bdc3c7;
+    cursor: not-allowed;
+}
+
 .empty-state {
     text-align: center;
     padding: 4rem 2rem;
