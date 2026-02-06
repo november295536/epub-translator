@@ -54,6 +54,7 @@
                               data-id="{{ seg.segment_id }}">{{ seg.translated_text }}</textarea>
                     <div class="html-preview" x-show="tView === 'preview'" x-html="previewHtml"></div>
                     <div class="actions">
+                        <button class="btn-retranslate" onclick="retranslateSegment('{{ seg.segment_id }}')" title="使用 Claude 重新翻譯此段落">重新翻譯</button>
                         <button class="btn-save" onclick="saveSegment('{{ seg.segment_id }}')">儲存</button>
                         <button class="btn-approve" onclick="approveSegment('{{ seg.segment_id }}')">通過審閱</button>
                     </div>
@@ -105,6 +106,41 @@ function approveSegment(segId) {
             el.querySelector('.segment-status').textContent = 'reviewed';
             el.querySelector('.segment-status').className = 'segment-status status-reviewed';
         }
+    });
+}
+
+function retranslateSegment(segId) {
+    const el = document.getElementById(`seg-${segId}`);
+    const btn = el.querySelector('.btn-retranslate');
+    const textarea = el.querySelector(`textarea[data-id="${segId}"]`);
+
+    // Disable button and show loading state
+    btn.disabled = true;
+    btn.textContent = '翻譯中...';
+
+    fetch(`/api/projects/${projectName}/segments/${segId}/retranslate`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'}
+    })
+    .then(r => r.json().then(data => ({ok: r.ok, data})))
+    .then(({ok, data}) => {
+        if (ok && data.status === 'ok') {
+            textarea.value = data.translated_text;
+            el.querySelector('.segment-status').textContent = 'translated';
+            el.querySelector('.segment-status').className = 'segment-status status-translated';
+        } else {
+            const errMsg = data.auth_error
+                ? '認證已過期，請執行 claude /login 重新登入'
+                : (data.error || '翻譯失敗');
+            alert(errMsg);
+        }
+    })
+    .catch(err => {
+        alert('翻譯請求失敗: ' + err.message);
+    })
+    .finally(() => {
+        btn.disabled = false;
+        btn.textContent = '重新翻譯';
     });
 }
 
