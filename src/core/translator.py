@@ -18,6 +18,7 @@ TRANSLATION_PROMPT = """你是一位專業的英文翻譯，請將以下英文�
 7. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來，例如："observability" → 「可觀測性」
 8. 英文中的斜體或粗體強調，翻譯時用「」標示，不要使用 markdown 的 * 或 ** 語法
 9. 人名保持英文原文，不要翻譯，例如：Nassim Taleb、Charity Majors
+10. 書名、地名、物種名稱等專有名詞：如有明確的中文翻譯就使用翻譯並加括號標註原文，例如：伊利亞德（Iliad）、紐約（New York）；如無確定翻譯則保留原文
 {glossary_section}
 {context_section}
 嚴格禁止：
@@ -45,6 +46,7 @@ TEXT_HTML_PROMPT = """你是一位專業的英文翻譯，請將以下 HTML 內�
 6. LaTeX 公式（$...$、$$...$$）保持不變
 7. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來
 8. 人名保持英文原文，不要翻譯
+9. 書名、地名、物種名稱等專有名詞：如有明確的中文翻譯就使用翻譯並加括號標註原文；如無確定翻譯則保留原文
 {glossary_section}
 {context_section}
 嚴格禁止：
