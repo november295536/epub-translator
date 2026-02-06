@@ -57,8 +57,14 @@ class EPUBExtractor:
 
         chapters = []
         spine_ids = [item_id for item_id, _ in self.book.spine]
+        seen_ids: set[str] = set()
 
         for order, item_id in enumerate(spine_ids):
+            # Skip duplicate spine entries (some EPUBs have malformed spines)
+            if item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+
             item = self.book.get_item_with_id(item_id)
             if item is None:
                 continue

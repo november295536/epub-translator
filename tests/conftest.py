@@ -129,3 +129,37 @@ def project_dir(tmp_path):
     d = tmp_path / 'test_project'
     d.mkdir()
     return str(d)
+
+
+@pytest.fixture
+def epub_with_duplicate_spine(tmp_path):
+    """Create an EPUB with duplicate spine entries (malformed EPUB)."""
+    book = epub.EpubBook()
+    book.set_identifier('dup-spine-001')
+    book.set_title('Duplicate Spine Book')
+    book.set_language('en')
+    book.add_author('Test Author')
+
+    c1 = epub.EpubHtml(title='Chapter One', file_name='chap01.xhtml', lang='en')
+    c1.content = b'<html><body><h1>Chapter One</h1><p>First chapter content.</p></body></html>'
+
+    c2 = epub.EpubHtml(title='Chapter Two', file_name='chap02.xhtml', lang='en')
+    c2.content = b'<html><body><h1>Chapter Two</h1><p>Second chapter content.</p></body></html>'
+
+    book.add_item(c1)
+    book.add_item(c2)
+
+    book.toc = [
+        epub.Link('chap01.xhtml', 'Chapter One', 'ch1'),
+        epub.Link('chap02.xhtml', 'Chapter Two', 'ch2'),
+    ]
+
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+
+    # Deliberately add c1 twice to simulate malformed spine
+    book.spine = ['nav', c1, c2, c1]
+
+    epub_path = str(tmp_path / 'duplicate_spine.epub')
+    epub.write_epub(epub_path, book)
+    return epub_path
