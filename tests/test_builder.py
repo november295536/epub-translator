@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 
 from src.epub.builder import EPUBBuilder, BILINGUAL_CSS
 from src.core.project import ProjectManager
-from src.core.segmenter import Segment
+from src.core.segmenter import Segment, SegmentType
 
 
 @pytest.fixture
@@ -237,7 +237,7 @@ class TestHTMLAwareTranslation:
 
         # Provide HTML-format translations for text segments
         for seg in pm.data.segments:
-            if seg.segment_type == 'text':
+            if seg.segment_type == SegmentType.TEXT:
                 # Simulate what the new HTML prompt would return
                 from bs4 import BeautifulSoup as BS, Tag as BTag
                 frag = BS(seg.html, 'html.parser')
@@ -329,7 +329,7 @@ class TestHTMLAwareTranslation:
 
         # Set HTML-format translations
         for seg in pm.data.segments:
-            if seg.segment_type == 'text':
+            if seg.segment_type == SegmentType.TEXT:
                 pm.mark_translated(seg.segment_id, '<p>翻譯段落</p>')
             else:
                 pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
@@ -360,7 +360,7 @@ class TestHTMLAwareTranslation:
             html='<p>Paragraph one.</p><p>Paragraph two.</p>',
             text='Paragraph one. Paragraph two.',
             word_count=4,
-            segment_type='text',
+            segment_type=SegmentType.TEXT,
             status='translated',
             translated_text='<p class="author">作者 <span>Name</span></p><p class="copyright">版權</p><p class="loc">地點</p>',
         )

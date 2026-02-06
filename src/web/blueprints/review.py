@@ -7,6 +7,7 @@ import os
 from flask import Blueprint, render_template, request, jsonify, current_app
 
 from src.core.project import ProjectManager
+from src.core.segmenter import SegmentType
 from src.core.translator import TranslationEngine, TranslationError, AuthError
 from src.glossary.glossary_manager import GlossaryManager
 
@@ -119,7 +120,7 @@ def retranslate_segment(project_name: str, segment_id: str):
 
     try:
         engine = TranslationEngine()
-        html_arg = seg.html if seg.segment_type != 'code' else ''
+        html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
         translated = engine.translate(
             seg.text,
             segment_type=seg.segment_type,

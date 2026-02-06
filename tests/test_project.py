@@ -4,8 +4,8 @@ import json
 import os
 import pytest
 
-from src.core.project import ProjectManager, ProjectData, SegmentState
-from src.core.segmenter import Segment
+from src.core.project import ProjectManager, ProjectData, SegmentState, SegmentStatus
+from src.core.segmenter import Segment, SegmentType
 
 
 @pytest.fixture
@@ -13,11 +13,11 @@ def sample_segments():
     """Create sample segments for testing."""
     return [
         Segment(id='ch1_seg0001', html='<h1>Title</h1>', text='Title',
-                word_count=1, segment_type='heading'),
+                word_count=1, segment_type=SegmentType.TEXT),
         Segment(id='ch1_seg0002', html='<p>First paragraph.</p>',
-                text='First paragraph.', word_count=2, segment_type='text'),
+                text='First paragraph.', word_count=2, segment_type=SegmentType.TEXT),
         Segment(id='ch1_seg0003', html='<p>Second paragraph.</p>',
-                text='Second paragraph.', word_count=2, segment_type='text'),
+                text='Second paragraph.', word_count=2, segment_type=SegmentType.TEXT),
     ]
 
 
@@ -35,7 +35,7 @@ class TestProjectManager:
         assert data.title == 'Test Book'
         assert data.author == 'Test Author'
         assert len(data.segments) == 3
-        assert data.segments[0].status == 'pending'
+        assert data.segments[0].status == SegmentStatus.PENDING
 
     def test_project_file_created(self, project_dir, sample_segments):
         pm = ProjectManager(project_dir)
@@ -62,7 +62,7 @@ class TestProjectManager:
         pm.mark_translated('ch1_seg0002', '第一段。')
 
         seg = [s for s in pm.data.segments if s.segment_id == 'ch1_seg0002'][0]
-        assert seg.status == 'translated'
+        assert seg.status == SegmentStatus.TRANSLATED
         assert seg.translated_text == '第一段。'
         assert seg.translated_at != ''
 
@@ -75,7 +75,7 @@ class TestProjectManager:
         pm2 = ProjectManager(project_dir)
         pm2.load()
         seg = [s for s in pm2.data.segments if s.segment_id == 'ch1_seg0002'][0]
-        assert seg.status == 'translated'
+        assert seg.status == SegmentStatus.TRANSLATED
         assert seg.translated_text == '第一段。'
 
     def test_mark_translated_invalid_id(self, project_dir, sample_segments):

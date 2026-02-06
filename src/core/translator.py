@@ -4,60 +4,56 @@ import re
 import subprocess
 import logging
 
+from src.core.segmenter import SegmentType
+
 logger = logging.getLogger(__name__)
 
-TRANSLATION_PROMPT = """你是一位專業的英文翻譯，請將以下英文內容翻譯成繁體中文。
+_SHARED_RULES = """1. 使用台灣慣用的繁體中文用語
+2. 專業術語請保留原文並用括號標註，例如：機器學習（machine learning）
+3. 翻譯要自然流暢，不要逐字翻譯
+4. LaTeX 公式（$...$、$$...$$）保持不變，不要翻譯
+5. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來
+6. 人名保持英文原文，不要翻譯，例如：Nassim Taleb、Charity Majors
+7. 書名、文章名、論文名、組織名等：使用翻譯並務必加括號標注原文
+8. 地名、物種名稱等專有名詞：如有明確翻譯就用翻譯並加括號標註原文；如無確定翻譯則保留原文"""
+
+_SHARED_PROHIBITIONS = """嚴格禁止：
+- 不要加任何說明、前綴或後綴（例如「以下是翻譯」「翻譯如下」等）
+- 不要使用 markdown 語法"""
+
+TRANSLATION_PROMPT = f"""你是一位專業的英文翻譯，請將以下英文內容翻譯成繁體中文。
 
 翻譯要求：
-1. 使用台灣慣用的繁體中文用語
-2. 專業術語請保留原文並用括號標註，例如：機器學習（machine learning）
-3. 保持原文的段落結構和格式
-4. 程式碼區塊中只翻譯註解，不翻譯程式碼本身
-5. 翻譯要自然流暢，不要逐字翻譯
-6. LaTeX 公式（$...$、$$...$$）保持不變，不要翻譯
-7. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來，例如："observability" → 「可觀測性」
-8. 英文中的斜體或粗體強調，翻譯時用「」標示，不要使用 markdown 的 * 或 ** 語法
-9. 人名保持英文原文，不要翻譯，例如：Nassim Taleb、Charity Majors
-10. 書名、文章名、論文名、組織名等：使用翻譯並務必加括號標注原文，例如：《金融經濟學基礎》（Foundations for Financial Economics）、《The Pragmatic Programmer》（《程式設計實踐》）
-11. 地名、物種名稱等專有名詞：如有明確的中文翻譯就使用翻譯並加括號標註原文，例如：伊利亞德（Iliad）、紐約（New York）；如無確定翻譯則保留原文
-{glossary_section}
-{context_section}
-嚴格禁止：
-- 不要加任何說明、前綴或後綴（例如「以下是翻譯」「翻譯如下」「看起來」等）
-- 不要使用任何 markdown 語法（禁止 #、##、**、*、__、```、---、> 等所有 markdown 標記）
+{_SHARED_RULES}
+9. 保持原文的段落結構和格式
+10. 英文中的斜體或粗體強調，翻譯時用「」標示，不要使用 markdown 的 * 或 ** 語法
+{{glossary_section}}
+{{context_section}}
+{_SHARED_PROHIBITIONS}
 - 輸出純文字，不要加任何格式標記
-- 不要加分隔線
 - 直接輸出翻譯結果，第一個字就是翻譯內容
 
 原文：
-{text}"""
+{{text}}"""
 
 CODE_PROMPT = """以下是程式碼區塊，請只翻譯其中的註解（# 或 // 開頭的行），保持程式碼本身完全不變。直接輸出結果，不加任何說明。
 
 {text}"""
 
-TEXT_HTML_PROMPT = """你是一位專業的英文翻譯，請將以下 HTML 內容中的英文文字翻譯成繁體中文。
+TEXT_HTML_PROMPT = f"""你是一位專業的英文翻譯，請將以下 HTML 內容中的英文文字翻譯成繁體中文。
 
 翻譯要求：
-1. 保持所有 HTML 標籤結構完全不變（<p>, <blockquote>, <ul>, <li>, <em>, <strong> 等）
-2. 保持所有 HTML 屬性不變（class, id, href 等）
+1. 保持所有 HTML 標籤結構完全不變
+2. 保持所有 HTML 屬性不變
 3. 只翻譯標籤內的文字內容
-4. 使用台灣慣用的繁體中文用語
-5. 專業術語請保留原文並用括號標註，例如：機器學習（machine learning）
-6. LaTeX 公式（$...$、$$...$$）保持不變
-7. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來
-8. 人名保持英文原文，不要翻譯
-9. 書名、文章名、論文名、組織名等：使用翻譯並務必加括號標注原文，例如：《金融經濟學基礎》（Foundations for Financial Economics）、《The Pragmatic Programmer》（《程式設計實踐》）
-10. 地名、物種名稱等專有名詞：如有明確的中文翻譯就使用翻譯並加括號標註原文，例如：伊利亞德（Iliad）、紐約（New York）；如無確定翻譯則保留原文
-{glossary_section}
-{context_section}
-嚴格禁止：
-- 不要加任何說明、前綴或後綴（例如「以下是翻譯」「翻譯如下」等）
-- 不要使用 markdown 語法
+{_SHARED_RULES}
+{{glossary_section}}
+{{context_section}}
+{_SHARED_PROHIBITIONS}
 - 不要改變 HTML 結構
 - 直接輸出翻譯後的 HTML，第一個字元就是 <
 
-{html}"""
+{{html}}"""
 
 # Patterns to clean from Claude's response
 # Patterns applied at the start of the response only (no MULTILINE)
@@ -112,7 +108,7 @@ class TranslationEngine:
     def __init__(self, max_retries: int = 3):
         self.max_retries = max_retries
 
-    def translate(self, text: str, segment_type: str = 'text',
+    def translate(self, text: str, segment_type: SegmentType = SegmentType.TEXT,
                   glossary_text: str = '',
                   context_before: str = '', context_after: str = '',
                   html: str = '') -> str:
@@ -120,7 +116,7 @@ class TranslationEngine:
 
         Args:
             text: The English text to translate.
-            segment_type: Type of segment ('text' or 'code').
+            segment_type: Type of segment (SegmentType.TEXT or SegmentType.CODE).
             glossary_text: Formatted glossary entries for the prompt.
             context_before: Previous segment text for context.
             context_after: Next segment text for context.
@@ -133,7 +129,7 @@ class TranslationEngine:
         Raises:
             TranslationError: If translation fails after all retries.
         """
-        use_html_mode = bool(html) and segment_type != 'code'
+        use_html_mode = bool(html) and segment_type != SegmentType.CODE
         prompt = self._build_prompt(text, segment_type, glossary_text,
                                     context_before, context_after, html=html)
 
@@ -193,7 +189,7 @@ class TranslationEngine:
 
         raise TranslationError("Translation failed unexpectedly")
 
-    def _build_prompt(self, text: str, segment_type: str,
+    def _build_prompt(self, text: str, segment_type: SegmentType,
                       glossary_text: str = '',
                       context_before: str = '', context_after: str = '',
                       html: str = '') -> str:
@@ -211,7 +207,7 @@ class TranslationEngine:
                 parts.append(f'後文參考（不需翻譯）：\n{context_after[:200]}')
             context_section = '\n'.join(parts) + '\n'
 
-        if segment_type == 'code':
+        if segment_type == SegmentType.CODE:
             return CODE_PROMPT.format(text=text)
         elif html:
             return TEXT_HTML_PROMPT.format(

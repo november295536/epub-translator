@@ -7,8 +7,8 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from src.web.server import create_app
-from src.core.project import ProjectManager
-from src.core.segmenter import Segment
+from src.core.project import ProjectManager, SegmentStatus
+from src.core.segmenter import Segment, SegmentType
 from src.core.translator import RateLimitError
 from src.web.tasks import TaskManager, TranslationTask
 
@@ -26,15 +26,15 @@ def project_with_translations(tmp_path):
 
     segments = [
         Segment(id='ch1_seg0001', html='<h1>Title</h1>', text='Title',
-                word_count=1, segment_type='text'),
+                word_count=1, segment_type=SegmentType.TEXT),
         Segment(id='ch1_seg0002', html='<p>First paragraph.</p>',
-                text='First paragraph.', word_count=2, segment_type='text'),
+                text='First paragraph.', word_count=2, segment_type=SegmentType.TEXT),
         Segment(id='ch1_seg0003', html='<p>Second paragraph.</p>',
-                text='Second paragraph.', word_count=2, segment_type='text'),
+                text='Second paragraph.', word_count=2, segment_type=SegmentType.TEXT),
         Segment(id='ch2_seg0001', html='<h2>Chapter 2</h2>',
-                text='Chapter 2', word_count=2, segment_type='text'),
+                text='Chapter 2', word_count=2, segment_type=SegmentType.TEXT),
         Segment(id='ch2_seg0002', html='<p>Chapter 2 content.</p>',
-                text='Chapter 2 content.', word_count=3, segment_type='text'),
+                text='Chapter 2 content.', word_count=3, segment_type=SegmentType.TEXT),
     ]
 
     pm = ProjectManager(project_dir)
@@ -146,7 +146,7 @@ class TestWebServer:
         pm = ProjectManager(project_dir)
         pm.load()
         seg = [s for s in pm.data.segments if s.segment_id == 'ch1_seg0002'][0]
-        assert seg.status == 'reviewed'
+        assert seg.status == SegmentStatus.REVIEWED
 
 
 class TestDeleteProjectAPI:

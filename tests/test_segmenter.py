@@ -1,7 +1,7 @@
 """Tests for smart segmentation module."""
 
 import pytest
-from src.core.segmenter import Segmenter, Segment, MIN_WORDS, MAX_WORDS, SMALL_SEGMENT_THRESHOLD
+from src.core.segmenter import Segmenter, Segment, SegmentType, MIN_WORDS, MAX_WORDS, SMALL_SEGMENT_THRESHOLD
 
 
 @pytest.fixture
@@ -29,7 +29,7 @@ class TestSegmenter:
 
         heading_segs = [s for s in segments if '<h1' in s.html]
         assert len(heading_segs) >= 1
-        assert heading_segs[0].segment_type == 'text'
+        assert heading_segs[0].segment_type == SegmentType.TEXT
         assert heading_segs[0].standalone is True
         assert 'Chapter Title' in heading_segs[0].text
 
@@ -41,7 +41,7 @@ class TestSegmenter:
         )
         segments = segmenter.segment_chapter('ch1', html)
 
-        code_segs = [s for s in segments if s.segment_type == 'code']
+        code_segs = [s for s in segments if s.segment_type == SegmentType.CODE]
         assert len(code_segs) == 1
         assert 'def hello()' in code_segs[0].text
 
@@ -51,7 +51,7 @@ class TestSegmenter:
         html = '\n'.join(paragraphs)
 
         segments = segmenter.segment_chapter('ch1', html)
-        text_segs = [s for s in segments if s.segment_type == 'text']
+        text_segs = [s for s in segments if s.segment_type == SegmentType.TEXT]
 
         for seg in text_segs[:-1]:
             assert seg.word_count >= MIN_WORDS * 0.8, (
@@ -67,7 +67,7 @@ class TestSegmenter:
         html = '\n'.join(paragraphs)
 
         segments = segmenter.segment_chapter('ch1', html)
-        text_segs = [s for s in segments if s.segment_type == 'text']
+        text_segs = [s for s in segments if s.segment_type == SegmentType.TEXT]
 
         for seg in text_segs:
             stripped = seg.text.rstrip()
@@ -83,7 +83,7 @@ class TestSegmenter:
         html = '<h1>Just a Title</h1>'
         segments = segmenter.segment_chapter('ch1', html)
         assert len(segments) == 1
-        assert segments[0].segment_type == 'text'
+        assert segments[0].segment_type == SegmentType.TEXT
         assert segments[0].standalone is True
 
     def test_segment_ids_are_unique(self, segmenter):
@@ -135,7 +135,7 @@ class TestSegmenter:
         )
         segments = segmenter.segment_chapter('ch1', html)
 
-        code_segs = [s for s in segments if s.segment_type == 'code']
+        code_segs = [s for s in segments if s.segment_type == SegmentType.CODE]
         assert len(code_segs) == 1
         assert 'Before code' not in code_segs[0].text
         assert 'After code' not in code_segs[0].text
@@ -149,7 +149,7 @@ class TestSmallSegmentMerging:
         html = '\n'.join(paragraphs)
 
         segments = segmenter.segment_chapter('ch1', html)
-        text_segs = [s for s in segments if s.segment_type == 'text']
+        text_segs = [s for s in segments if s.segment_type == SegmentType.TEXT]
 
         # 5 tiny paragraphs should be merged into 1 segment
         assert len(text_segs) == 1
@@ -160,7 +160,7 @@ class TestSmallSegmentMerging:
         html = '\n'.join(paragraphs)
 
         segments = segmenter.segment_chapter('ch1', html)
-        text_segs = [s for s in segments if s.segment_type == 'text']
+        text_segs = [s for s in segments if s.segment_type == SegmentType.TEXT]
 
         for seg in text_segs:
             assert seg.word_count <= MAX_WORDS * 1.2
@@ -173,7 +173,7 @@ class TestSmallSegmentMerging:
             '<p>Short text two.</p>'
         )
         segments = segmenter.segment_chapter('ch1', html)
-        non_standalone_text = [s for s in segments if s.segment_type == 'text' and not s.standalone]
+        non_standalone_text = [s for s in segments if s.segment_type == SegmentType.TEXT and not s.standalone]
         heading_segs = [s for s in segments if s.standalone and '<h' in s.html]
 
         assert len(heading_segs) == 1
@@ -188,7 +188,7 @@ class TestLargeSegmentSplitting:
         html = make_paragraph(800)
 
         segments = segmenter.segment_chapter('ch1', html)
-        text_segs = [s for s in segments if s.segment_type == 'text']
+        text_segs = [s for s in segments if s.segment_type == SegmentType.TEXT]
 
         # Single <p> cannot be split at element boundaries, so it stays as one
         assert len(text_segs) >= 1
@@ -199,7 +199,7 @@ class TestLargeSegmentSplitting:
         html = '\n'.join(paragraphs)
 
         segments = segmenter.segment_chapter('ch1', html)
-        text_segs = [s for s in segments if s.segment_type == 'text']
+        text_segs = [s for s in segments if s.segment_type == SegmentType.TEXT]
 
         # ~1000 words across 5 paragraphs should result in multiple segments
         assert len(text_segs) >= 2
@@ -210,7 +210,7 @@ class TestLargeSegmentSplitting:
         html = '\n'.join(paragraphs)
 
         segments = segmenter.segment_chapter('ch1', html)
-        text_segs = [s for s in segments if s.segment_type == 'text']
+        text_segs = [s for s in segments if s.segment_type == SegmentType.TEXT]
 
         for seg in text_segs:
             assert '<p>' in seg.html, f"Split segment should contain HTML tags, got: {seg.html[:100]}"
@@ -226,7 +226,7 @@ class TestLargeSegmentSplitting:
         # Create a segment with a single large <p> element
         big_html = make_paragraph(800)
         seg = Segment(id='ch1_seg0001', html=big_html, text='x ' * 800,
-                       word_count=800, segment_type='text')
+                       word_count=800, segment_type=SegmentType.TEXT)
         result = segmenter._split_large_segments([seg], 'ch1')
 
         # Single element cannot be split at element boundaries
@@ -239,7 +239,7 @@ class TestLargeSegmentSplitting:
         html = '\n'.join(paragraphs)
 
         segments = segmenter.segment_chapter('ch1', html)
-        text_segs = [s for s in segments if s.segment_type == 'text']
+        text_segs = [s for s in segments if s.segment_type == SegmentType.TEXT]
 
         for seg in text_segs:
             # html should have tags
@@ -254,7 +254,7 @@ class TestLargeSegmentSplitting:
         html = f'<pre><code>{code_content}</code></pre>'
 
         segments = segmenter.segment_chapter('ch1', html)
-        code_segs = [s for s in segments if s.segment_type == 'code']
+        code_segs = [s for s in segments if s.segment_type == SegmentType.CODE]
 
         assert len(code_segs) == 1
 
@@ -272,7 +272,7 @@ class TestTableHandling:
 
         table_segs = [s for s in segments if '<table' in s.html]
         assert len(table_segs) == 1
-        assert table_segs[0].segment_type == 'text'
+        assert table_segs[0].segment_type == SegmentType.TEXT
         assert table_segs[0].standalone is True
         assert 'Header' in table_segs[0].text
 

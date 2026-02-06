@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import Enum
 from bs4 import BeautifulSoup, Tag, NavigableString
+
+
+class SegmentType(str, Enum):
+    """Segment content type."""
+    TEXT = 'text'
+    CODE = 'code'
 
 
 @dataclass
@@ -14,7 +21,7 @@ class Segment:
     html: str
     text: str
     word_count: int
-    segment_type: str  # 'text' or 'code'
+    segment_type: SegmentType
     standalone: bool = False
 
 
@@ -58,7 +65,7 @@ class Segmenter:
                     blocks.append({
                         'html': str(child),
                         'text': text,
-                        'type': 'text',
+                        'type': SegmentType.TEXT,
                         'standalone': False,
                     })
                 continue
@@ -74,7 +81,7 @@ class Segmenter:
                     blocks.append({
                         'html': str(child),
                         'text': text,
-                        'type': 'text',
+                        'type': SegmentType.TEXT,
                         'standalone': True,
                     })
             elif tag_name == 'table':
@@ -83,7 +90,7 @@ class Segmenter:
                     blocks.append({
                         'html': str(child),
                         'text': text,
-                        'type': 'text',
+                        'type': SegmentType.TEXT,
                         'standalone': True,
                     })
             elif tag_name == 'pre' or (tag_name == 'code' and child.parent and child.parent.name != 'pre'):
@@ -92,7 +99,7 @@ class Segmenter:
                     blocks.append({
                         'html': str(child),
                         'text': text,
-                        'type': 'code',
+                        'type': SegmentType.CODE,
                         'standalone': True,
                     })
             elif tag_name in ('div', 'section', 'article'):
@@ -104,7 +111,7 @@ class Segmenter:
                     blocks.append({
                         'html': str(child),
                         'text': text,
-                        'type': 'text',
+                        'type': SegmentType.TEXT,
                         'standalone': False,
                     })
 
@@ -133,7 +140,7 @@ class Segmenter:
                 html='\n'.join(pending_html_parts),
                 text='\n'.join(pending_text_parts),
                 word_count=pending_word_count,
-                segment_type='text',
+                segment_type=SegmentType.TEXT,
             ))
             pending_html_parts = []
             pending_text_parts = []
@@ -205,14 +212,14 @@ class Segmenter:
                 html='\n'.join(pending_html),
                 text='\n'.join(pending_text),
                 word_count=pending_wc,
-                segment_type='text',
+                segment_type=SegmentType.TEXT,
             ))
             pending_html = []
             pending_text = []
             pending_wc = 0
 
         for seg in segments:
-            if seg.segment_type != 'text' or seg.standalone:
+            if seg.segment_type != SegmentType.TEXT or seg.standalone:
                 flush()
                 result.append(seg)
                 continue
@@ -253,7 +260,7 @@ class Segmenter:
         result = []
 
         for seg in segments:
-            if seg.segment_type != 'text' or seg.standalone or seg.word_count <= MAX_WORDS:
+            if seg.segment_type != SegmentType.TEXT or seg.standalone or seg.word_count <= MAX_WORDS:
                 result.append(seg)
                 continue
 
@@ -283,7 +290,7 @@ class Segmenter:
                         html='\n'.join(current_htmls),
                         text='\n'.join(current_texts),
                         word_count=current_wc,
-                        segment_type='text',
+                        segment_type=SegmentType.TEXT,
                     ))
                     current_htmls = []
                     current_texts = []
@@ -299,7 +306,7 @@ class Segmenter:
                     html='\n'.join(current_htmls),
                     text='\n'.join(current_texts),
                     word_count=current_wc,
-                    segment_type='text',
+                    segment_type=SegmentType.TEXT,
                 ))
 
         # Re-assign sequential IDs

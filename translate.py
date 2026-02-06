@@ -7,7 +7,7 @@ import sys
 import click
 
 from src.epub.extractor import EPUBExtractor
-from src.core.segmenter import Segmenter
+from src.core.segmenter import Segmenter, SegmentType
 from src.core.project import ProjectManager
 from src.core.translator import TranslationEngine, TranslationError
 from src.glossary.glossary_manager import GlossaryManager
@@ -133,7 +133,7 @@ def start(project):
         context_after = all_segments[seg_idx + 1].text if seg_idx < len(all_segments) - 1 else ''
 
         try:
-            html_arg = seg.html if seg.segment_type != 'code' else ''
+            html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
             translated = engine.translate(
                 seg.text,
                 segment_type=seg.segment_type,
@@ -299,7 +299,7 @@ def glossary_extract(project):
     from src.glossary.term_extractor import TermExtractor
     extractor = TermExtractor()
 
-    segments = [{'text': s.text} for s in pm.data.segments if s.segment_type == 'text']
+    segments = [{'text': s.text} for s in pm.data.segments if s.segment_type == SegmentType.TEXT]
     click.echo(f"正在從 {len(segments)} 個文字段落中提取術語...")
 
     terms = extractor.extract_from_segments(segments)

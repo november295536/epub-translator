@@ -4,6 +4,7 @@ import subprocess
 import pytest
 from unittest.mock import patch, MagicMock
 
+from src.core.segmenter import SegmentType
 from src.core.translator import (
     TranslationEngine, TranslationError, RateLimitError,
     TRANSLATION_PROMPT, CODE_PROMPT,
@@ -46,7 +47,7 @@ class TestTranslationEngine:
         prompt = mock_run.call_args[0][0][2]
         assert '台灣' in prompt
         assert '括號' in prompt
-        assert '程式碼' in prompt
+        assert 'LaTeX' in prompt
 
     def test_retry_on_nonzero_exit(self):
         engine = TranslationEngine(max_retries=3)
@@ -245,7 +246,7 @@ class TestSegmentTypePrompts:
 
         with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
             engine.translate('def hello():\n    # This is a comment\n    print("Hello")',
-                           segment_type='code')
+                           segment_type=SegmentType.CODE)
 
         prompt = mock_run.call_args[0][0][2]
         assert '註解' in prompt
@@ -259,7 +260,7 @@ class TestSegmentTypePrompts:
 
         html = '<h1>Introduction</h1>'
         with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
-            engine.translate('Introduction', segment_type='text', html=html)
+            engine.translate('Introduction', segment_type=SegmentType.TEXT, html=html)
 
         prompt = mock_run.call_args[0][0][2]
         assert 'HTML 標籤結構' in prompt
@@ -307,7 +308,7 @@ class TestHTMLMode:
 
         html = '<p>Source text</p>'
         with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
-            result = engine.translate('Source text', segment_type='text', html=html)
+            result = engine.translate('Source text', segment_type=SegmentType.TEXT, html=html)
 
         prompt = mock_run.call_args[0][0][2]
         assert 'HTML 標籤結構' in prompt
@@ -322,7 +323,7 @@ class TestHTMLMode:
         mock_result.stdout = '翻譯結果'
 
         with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
-            engine.translate('Source text', segment_type='text')
+            engine.translate('Source text', segment_type=SegmentType.TEXT)
 
         prompt = mock_run.call_args[0][0][2]
         assert '原文：' in prompt
@@ -334,7 +335,7 @@ class TestHTMLMode:
         mock_result.stdout = 'code'
 
         with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
-            engine.translate('code', segment_type='code', html='<pre><code>code</code></pre>')
+            engine.translate('code', segment_type=SegmentType.CODE, html='<pre><code>code</code></pre>')
 
         prompt = mock_run.call_args[0][0][2]
         assert '註解' in prompt
@@ -366,7 +367,7 @@ class TestHTMLMode:
         html = '<p>Machine learning is important.</p>'
         with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
             engine.translate('Machine learning is important.',
-                           segment_type='text', html=html, glossary_text=glossary)
+                           segment_type=SegmentType.TEXT, html=html, glossary_text=glossary)
 
         prompt = mock_run.call_args[0][0][2]
         assert '術語表' in prompt

@@ -10,6 +10,7 @@ import logging
 from dataclasses import dataclass, field
 
 from src.core.project import ProjectManager
+from src.core.segmenter import SegmentType
 from src.core.translator import TranslationEngine, TranslationError, RateLimitError, AuthError
 from src.glossary.glossary_manager import GlossaryManager
 
@@ -154,7 +155,7 @@ class TaskManager:
 
                 while True:
                     try:
-                        html_arg = seg.html if seg.segment_type != 'code' else ''
+                        html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
                         translated = engine.translate(
                             seg.text,
                             segment_type=seg.segment_type,
