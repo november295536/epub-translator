@@ -10,6 +10,7 @@ from src.core.project import ProjectManager
 from src.core.segmenter import SegmentType
 from src.core.translator import TranslationEngine, TranslationError, AuthError
 from src.glossary.glossary_manager import GlossaryManager
+from src.web.tasks import setup_project_logging, teardown_project_logging
 
 logger = logging.getLogger(__name__)
 
@@ -118,9 +119,11 @@ def retranslate_segment(project_name: str, segment_id: str):
     context_before = all_segments[seg_idx - 1].text if seg_idx > 0 else ''
     context_after = all_segments[seg_idx + 1].text if seg_idx < len(all_segments) - 1 else ''
 
+    handler = setup_project_logging(project_dir)
     try:
         engine = TranslationEngine()
         html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
+        logger.info("重新翻譯段落: %s", segment_id)
         translated = engine.translate(
             seg.text,
             segment_type=seg.segment_type,
@@ -130,7 +133,7 @@ def retranslate_segment(project_name: str, segment_id: str):
             html=html_arg,
         )
         pm.mark_translated(segment_id, translated)
-        logger.info("Retranslated segment %s", segment_id)
+        logger.info("重新翻譯完成: %s", segment_id)
         return jsonify({
             'status': 'ok',
             'segment_id': segment_id,
@@ -142,6 +145,8 @@ def retranslate_segment(project_name: str, segment_id: str):
     except TranslationError as e:
         logger.warning("Translation error for %s: %s", segment_id, e)
         return jsonify({'error': str(e)}), 500
+    finally:
+        teardown_project_logging(handler)
 
 
 @review_bp.route('/api/projects/<project_name>/progress')

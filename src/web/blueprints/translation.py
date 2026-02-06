@@ -49,12 +49,13 @@ def pause_translation(project_name: str):
         # Resume
         if tm.resume_translation(project_name):
             return jsonify({'status': 'ok', 'state': 'running'})
-        return jsonify({'error': '無法繼續翻譯'}), 500
+        # Resume failed (e.g. thread died) — return actual state so frontend can recover
+        return jsonify({'error': task.error or '無法繼續翻譯', 'state': task.state}), 500
     else:
         # Pause
         if tm.pause_translation(project_name):
             return jsonify({'status': 'ok', 'state': 'paused'})
-        return jsonify({'error': '無法暫停翻譯'}), 500
+        return jsonify({'error': '無法暫停翻譯', 'state': task.state}), 500
 
 
 @translation_bp.route('/api/projects/<project_name>/translate/status')
@@ -70,6 +71,12 @@ def translation_status(project_name: str):
             'completed': 0,
             'current_segment': None,
         })
+
+    # Detect dead thread and update state
+    thread_alive = task._thread is not None and task._thread.is_alive()
+    if task.state in ('running', 'paused') and not thread_alive:
+        task.state = 'failed'
+        task.error = task.error or '翻譯執行緒意外終止'
 
     return jsonify({
         'state': task.state,

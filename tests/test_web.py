@@ -273,10 +273,9 @@ class TestRateLimitPause:
                 thread = threading.Thread(target=tm._run_translation, args=(task,))
                 thread.start()
 
-                # Wait for task to pause (the thread will block on pause_event.wait)
+                # Wait for task to pause (the thread will block on _condition.wait)
                 thread.join(timeout=5)
                 assert task.state == 'paused'
-                assert not task.pause_event.is_set()
 
                 # Drain queue and check for rate_limit event
                 events = []
@@ -288,8 +287,9 @@ class TestRateLimitPause:
                 assert "You've hit your limit" in rate_limit_events[0]['data']['error']
 
                 # Stop the task so the thread exits
-                task.state = 'stopped'
-                task.pause_event.set()
+                with task._lock:
+                    task.state = 'stopped'
+                    task._condition.notify_all()
                 thread.join(timeout=5)
 
     def test_rate_limit_resume_retries_segment(self, project_with_translations):
@@ -325,9 +325,35 @@ class TestRateLimitPause:
                 assert task.state == 'paused'
 
                 # Resume — should retry the same segment and succeed
-                task.state = 'running'
-                task.pause_event.set()
+                with task._lock:
+                    task.state = 'running'
+                    task._condition.notify_all()
                 thread.join(timeout=5)
 
                 assert task.state == 'completed'
                 assert task.completed == 3  # All 3 pending segments translated
+
+    def test_resume_dead_thread(self, project_with_translations):
+        """Resuming a task whose thread has died should return False and set state to failed."""
+        tm = TaskManager()
+
+        task = TranslationTask(
+            task_id='test_dead',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='paused',
+            total=3,
+        )
+
+        # Create a thread that immediately exits
+        dead_thread = threading.Thread(target=lambda: None)
+        dead_thread.start()
+        dead_thread.join()  # Wait for it to finish
+        task._thread = dead_thread
+
+        tm.tasks[PROJECT_NAME] = task
+
+        result = tm.resume_translation(PROJECT_NAME)
+        assert result is False
+        assert task.state == 'failed'
+        assert '翻譯執行緒已終止' in task.error

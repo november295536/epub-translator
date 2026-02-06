@@ -17,6 +17,29 @@ from src.glossary.glossary_manager import GlossaryManager
 logger = logging.getLogger(__name__)
 
 
+def setup_project_logging(project_dir: str) -> logging.Handler:
+    """Add a FileHandler to root logger for project-specific logging."""
+    log_dir = os.path.join(project_dir, 'log')
+    os.makedirs(log_dir, exist_ok=True)
+
+    log_file = os.path.join(log_dir, f"translation_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    handler = logging.FileHandler(log_file, encoding='utf-8')
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    ))
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
+def teardown_project_logging(handler: logging.Handler | None):
+    """Remove project FileHandler from root logger."""
+    if handler:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+
+
 @dataclass
 class TranslationTask:
     """Represents a background translation job."""
@@ -28,13 +51,13 @@ class TranslationTask:
     completed: int = 0
     current_segment: str | None = None
     error: str | None = None
-    pause_event: threading.Event = field(default_factory=lambda: threading.Event())
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _condition: threading.Condition = field(default=None, repr=False)
     progress_queue: queue.Queue = field(default_factory=queue.Queue)
     _thread: threading.Thread | None = field(default=None, repr=False)
 
     def __post_init__(self):
-        # pause_event is SET when running, CLEARED when paused
-        self.pause_event.set()
+        self._condition = threading.Condition(self._lock)
 
 
 class TaskManager:
@@ -55,11 +78,24 @@ class TaskManager:
         """Get the current task for a project."""
         return self.tasks.get(project_name)
 
+    def stop_translation(self, project_name: str):
+        """Stop a running or paused translation task, terminating its thread."""
+        task = self.tasks.get(project_name)
+        if not task:
+            return
+        with task._lock:
+            if task.state in ('running', 'paused'):
+                task.state = 'stopped'
+                task._condition.notify_all()
+
     def start_translation(self, project_name: str, projects_dir: str) -> TranslationTask:
         """Start a new translation task for a project."""
         existing = self.tasks.get(project_name)
         if existing and existing.state == 'running':
             raise ValueError('翻譯任務已在執行中')
+        # Stop any lingering paused thread before creating a new task
+        if existing and existing.state == 'paused':
+            self.stop_translation(project_name)
 
         task = TranslationTask(
             task_id=f"{project_name}_{int(time.time())}",
@@ -95,10 +131,12 @@ class TaskManager:
     def pause_translation(self, project_name: str) -> bool:
         """Pause a running translation task."""
         task = self.tasks.get(project_name)
-        if not task or task.state != 'running':
+        if not task:
             return False
-        task.state = 'paused'
-        task.pause_event.clear()  # Block the translation loop
+        with task._lock:
+            if task.state != 'running':
+                return False
+            task.state = 'paused'
         task.progress_queue.put({'event': 'paused', 'data': {
             'completed': task.completed,
             'remaining': task.total - task.completed
@@ -108,16 +146,24 @@ class TaskManager:
     def resume_translation(self, project_name: str) -> bool:
         """Resume a paused translation task."""
         task = self.tasks.get(project_name)
-        if not task or task.state != 'paused':
+        if not task:
             return False
-        task.state = 'running'
-        task.pause_event.set()  # Unblock the translation loop
+        with task._lock:
+            if task.state != 'paused':
+                return False
+            if task._thread is None or not task._thread.is_alive():
+                task.state = 'failed'
+                task.error = '翻譯執行緒已終止，請重新開始翻譯'
+                return False
+            task.state = 'running'
+            task._condition.notify_all()
         return True
 
     def _run_translation(self, task: TranslationTask):
         """Execute translation in background thread."""
+        project_dir = os.path.join(task.projects_dir, task.project_name)
+        handler = setup_project_logging(project_dir)
         try:
-            project_dir = os.path.join(task.projects_dir, task.project_name)
             pm = ProjectManager(project_dir)
             pm.load()
 
@@ -130,13 +176,16 @@ class TaskManager:
             all_segments = pm.data.segments
             pending = pm.get_pending_segments()
 
-            for seg in pending:
-                # Check for pause
-                task.pause_event.wait()
+            logger.info("翻譯開始: %s (共 %d 段待翻譯)", task.project_name, task.total)
 
-                # Check if task was stopped while paused
-                if task.state not in ('running',):
-                    break
+            for seg in pending:
+                # Check for pause — blocks until resumed
+                with task._lock:
+                    while task.state == 'paused':
+                        logger.info("翻譯暫停: 已完成 %d/%d", task.completed, task.total)
+                        task._condition.wait()
+                    if task.state not in ('running',):
+                        break
 
                 task.current_segment = seg.segment_id
 
@@ -166,6 +215,7 @@ class TaskManager:
                         )
                         pm.mark_translated(seg.segment_id, translated)
                         task.completed += 1
+                        logger.info("段落完成 [%d/%d]: %s", task.completed, task.total, seg.segment_id)
 
                         # Push progress event
                         percent = round(task.completed / task.total * 100, 1) if task.total > 0 else 0
@@ -182,31 +232,36 @@ class TaskManager:
 
                     except AuthError as e:
                         logger.warning("Auth expired, pausing: %s", e)
-                        task.state = 'paused'
-                        task.pause_event.clear()
+                        with task._lock:
+                            task.state = 'paused'
                         task.progress_queue.put({'event': 'auth_error', 'data': {
                             'error': str(e),
                             'completed': task.completed,
                             'remaining': task.total - task.completed,
                         }})
-                        task.pause_event.wait()
-                        if task.state not in ('running',):
-                            break
+                        with task._lock:
+                            while task.state == 'paused':
+                                task._condition.wait()
+                            if task.state not in ('running',):
+                                break
                         continue
 
                     except RateLimitError as e:
                         logger.warning("API usage limit reached, pausing: %s", e)
-                        task.state = 'paused'
-                        task.pause_event.clear()
+                        with task._lock:
+                            task.state = 'paused'
                         task.progress_queue.put({'event': 'rate_limit', 'data': {
                             'error': str(e),
                             'completed': task.completed,
                             'remaining': task.total - task.completed,
                         }})
                         # Wait until user resumes, then retry the same segment
-                        task.pause_event.wait()
-                        if task.state not in ('running',):
-                            break
+                        with task._lock:
+                            while task.state == 'paused':
+                                task._condition.wait()
+                            if task.state not in ('running',):
+                                break
+                        logger.info("翻譯繼續")
                         continue
 
                     except TranslationError as e:
@@ -217,13 +272,10 @@ class TaskManager:
                         }})
                         break  # Skip to next segment
 
-                # Check if task was stopped during rate limit pause
-                if task.state not in ('running',):
-                    break
-
             if task.state == 'running':
                 task.state = 'completed'
                 task.current_segment = None
+                logger.info("翻譯完成: 共翻譯 %d 段", task.completed)
                 task.progress_queue.put({'event': 'complete', 'data': {
                     'total_translated': task.completed,
                 }})
@@ -235,3 +287,5 @@ class TaskManager:
             task.progress_queue.put({'event': 'error', 'data': {
                 'error': str(e),
             }})
+        finally:
+            teardown_project_logging(handler)
