@@ -113,9 +113,44 @@ src/
 - `POST /api/projects/<name>/export` — Generate EPUB
 - `GET /api/projects/<name>/download/<filename>` — Download generated EPUB
 
+## Troubleshooting
+
+### 查看與管理背景進程
+
+翻譯使用 `claude -p` subprocess，如果卡住需要手動處理：
+
+```bash
+# 查看翻譯 subprocess
+ps aux | grep 'claude -p' | grep -v grep
+
+# 砍掉特定進程（用 PID）
+kill <PID>          # 正常終止
+kill -9 <PID>       # 強制終止
+
+# 一次砍掉所有翻譯 subprocess
+pkill -f 'claude -p'
+```
+
+### 查看與管理 Web Server
+
+```bash
+# 查看佔用 port 3000 的進程
+lsof -ti:3000
+
+# 砍掉並重啟
+lsof -ti:3000 | xargs kill -9
+python3 -m flask --app src.web.server:create_app run --port 3000
+```
+
+### 翻譯卡住的常見原因
+
+- 多個 `claude` 互動式工作階段同時運行，導致 API 排隊（用 `ps aux | grep claude` 檢查）
+- subprocess 超時（預設 120 秒/次，共 3 次重試）
+- 翻譯日誌位於 `projects/<name>/log/translation_*.log`，可查看詳細錯誤
+
 ## Testing
 
-113 tests covering all modules:
+162 tests covering all modules:
 ```bash
 python3 -m pytest tests/ -v
 ```
