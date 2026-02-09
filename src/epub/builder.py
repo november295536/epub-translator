@@ -271,6 +271,27 @@ class EPUBBuilder:
         if not elements:
             return
 
+        # When translation has matching element count, pair them 1:1
+        paired = self._try_pair_translations(seg, elements)
+        if paired is not None:
+            for orig_elem, trans_elem in zip(elements, paired):
+                wrapper = soup.new_tag('div', attrs={'class': 'bilingual-vertical'})
+                orig_elem.insert_before(wrapper)
+
+                original_div = soup.new_tag('div', attrs={'class': 'original'})
+                original_div.append(orig_elem.extract())
+                wrapper.append(original_div)
+
+                trans_div = soup.new_tag('div', attrs={'class': 'translation'})
+                if isinstance(trans_elem, Tag):
+                    trans_div.append(trans_elem.extract())
+                else:
+                    p = soup.new_tag('p')
+                    p.string = str(trans_elem).strip()
+                    trans_div.append(p)
+                wrapper.append(trans_div)
+            return
+
         first = elements[0]
 
         wrapper = soup.new_tag('div', attrs={'class': 'bilingual-vertical'})
@@ -290,6 +311,27 @@ class EPUBBuilder:
         if not elements:
             return
 
+        # When translation has matching element count, pair them 1:1
+        paired = self._try_pair_translations(seg, elements)
+        if paired is not None:
+            for orig_elem, trans_elem in zip(elements, paired):
+                container = soup.new_tag('div', attrs={'class': 'bilingual-container'})
+                orig_elem.insert_before(container)
+
+                original_div = soup.new_tag('div', attrs={'class': 'original'})
+                original_div.append(orig_elem.extract())
+                container.append(original_div)
+
+                trans_div = soup.new_tag('div', attrs={'class': 'translation'})
+                if isinstance(trans_elem, Tag):
+                    trans_div.append(trans_elem.extract())
+                else:
+                    p = soup.new_tag('p')
+                    p.string = str(trans_elem).strip()
+                    trans_div.append(p)
+                container.append(trans_div)
+            return
+
         first = elements[0]
 
         container = soup.new_tag('div', attrs={'class': 'bilingual-container'})
@@ -303,6 +345,23 @@ class EPUBBuilder:
         trans_div = soup.new_tag('div', attrs={'class': 'translation'})
         self._fill_translation(trans_div, seg, elements, soup)
         container.append(trans_div)
+
+    def _try_pair_translations(self, seg: SegmentState, elements: list):
+        """Try to match translation elements 1:1 with original elements.
+
+        Returns a list of translation elements if the count matches,
+        or None to fall back to whole-segment wrapping.
+        """
+        if len(elements) <= 1 or seg.segment_type == SegmentType.CODE:
+            return None
+
+        trans_frag = BeautifulSoup(seg.translated_text, 'html.parser')
+        trans_children = [c for c in trans_frag.children
+                          if isinstance(c, Tag) or (isinstance(c, NavigableString) and c.strip())]
+
+        if len(trans_children) == len(elements):
+            return trans_children
+        return None
 
     def _fill_translation(self, parent_div, seg: SegmentState,
                           original_elements: list, soup) -> None:
