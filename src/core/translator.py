@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 _SHARED_RULES = """1. 使用台灣慣用的繁體中文用語
 2. 專業術語請保留原文並用括號標註，例如：機器學習（machine learning）
-3. 翻譯要自然流暢，不要逐字翻譯
+3. 翻譯要自然流暢，不要逐字翻譯，中英文的語句結構不太一樣
 4. LaTeX 公式（$...$、$$...$$）保持不變，不要翻譯
 5. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來
 6. 人名保持英文原文，嚴格禁止翻譯，例如：Nassim Taleb、Charity Majors
