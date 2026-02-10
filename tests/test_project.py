@@ -71,6 +71,7 @@ class TestProjectManager:
         pm = ProjectManager(project_dir)
         pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
         pm.mark_translated('ch1_seg0002', '第一段。')
+        pm.save()
 
         # Reload and verify
         pm2 = ProjectManager(project_dir)
@@ -78,6 +79,37 @@ class TestProjectManager:
         seg = [s for s in pm2.data.segments if s.segment_id == 'ch1_seg0002'][0]
         assert seg.status == SegmentStatus.TRANSLATED
         assert seg.translated_text == '第一段。'
+
+    def test_mark_translated_does_not_save(self, project_dir, sample_segments):
+        """mark_translated modifies memory but does not write to disk."""
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
+
+        # Read disk state before mutation
+        with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
+            before = json.load(f)
+
+        pm.mark_translated('ch1_seg0002', '第一段。')
+
+        # Disk should be unchanged
+        with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
+            after = json.load(f)
+        assert before['segments'] == after['segments']
+
+    def test_mutations_then_save_persists(self, project_dir, sample_segments):
+        """Batch mutations followed by a single save() should persist all changes."""
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
+
+        pm.mark_translated('ch1_seg0001', '標題')
+        pm.mark_translated('ch1_seg0002', '第一段。')
+        pm.mark_translated('ch1_seg0003', '第二段。')
+        pm.save()
+
+        pm2 = ProjectManager(project_dir)
+        pm2.load()
+        translated = [s for s in pm2.data.segments if s.status == SegmentStatus.TRANSLATED]
+        assert len(translated) == 3
 
     def test_mark_translated_invalid_id(self, project_dir, sample_segments):
         pm = ProjectManager(project_dir)
@@ -120,6 +152,7 @@ class TestProjectManager:
 
         # Translate first segment
         pm.mark_translated('ch1_seg0001', '標題')
+        pm.save()
 
         # Reload (simulating restart)
         pm2 = ProjectManager(project_dir)
@@ -169,6 +202,7 @@ class TestModelField:
         pm = ProjectManager(project_dir)
         pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
         pm.set_model('opus')
+        pm.save()
 
         pm2 = ProjectManager(project_dir)
         pm2.load()
@@ -181,7 +215,8 @@ class TestModelField:
         pm.set_model('haiku')
         assert pm.data.model == 'haiku'
 
-        # Verify persisted to disk
+        # Verify persisted to disk after save
+        pm.save()
         with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
             data = json.load(f)
         assert data['model'] == 'haiku'
@@ -216,6 +251,39 @@ class TestModelField:
         assert data['model'] == 'sonnet'
 
 
+class TestConcurrentSave:
+
+    def test_concurrent_save_no_data_loss(self, project_dir):
+        """N threads each mark_translated + save() concurrently; all must persist."""
+        n = 20
+        segments = [
+            Segment(id=f'ch1_seg{i:04d}', html=f'<p>Seg {i}</p>', text=f'Seg {i}',
+                    word_count=2, segment_type=SegmentType.TEXT)
+            for i in range(n)
+        ]
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test', 'Author', segments)
+
+        barrier = threading.Barrier(n)
+
+        def worker(idx):
+            barrier.wait()
+            pm.mark_translated(f'ch1_seg{idx:04d}', f'翻譯 {idx}')
+            pm.save()
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Reload from disk and verify all translations persisted
+        pm2 = ProjectManager(project_dir)
+        pm2.load()
+        translated = [s for s in pm2.data.segments if s.status == SegmentStatus.TRANSLATED]
+        assert len(translated) == n
+
+
 class TestAtomicSave:
 
     def test_atomic_save_writes_via_replace(self, project_dir, sample_segments):
@@ -229,88 +297,32 @@ class TestAtomicSave:
         assert pm2.data.title == 'Test'
 
     def test_original_intact_if_write_fails(self, project_dir, sample_segments):
-        """If writing the tmp file fails, original project.json stays intact."""
+        """If save() fails writing tmp file, original project.json stays intact."""
         pm = ProjectManager(project_dir)
         pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
         pm.mark_translated('ch1_seg0001', '標題')
+        pm.save()
 
-        # Simulate a write failure by making the tmp file path a directory
+        # Now mutate in memory but make save fail
+        pm.mark_translated('ch1_seg0002', '第一段')
+
         tmp_file = pm.project_file + '.tmp'
         os.makedirs(tmp_file, exist_ok=True)
 
         with pytest.raises(IsADirectoryError):
-            pm.mark_translated('ch1_seg0002', '第一段')
+            pm.save()
 
         # Clean up the directory we made
         os.rmdir(tmp_file)
 
-        # Original file should still be valid with the first translation
+        # Original file should still be valid with only the first translation
         pm2 = ProjectManager(project_dir)
         pm2.load()
         seg1 = [s for s in pm2.data.segments if s.segment_id == 'ch1_seg0001'][0]
         assert seg1.status == SegmentStatus.TRANSLATED
         assert seg1.translated_text == '標題'
-        # Second translation should NOT have been applied
+        # Second translation should NOT have been persisted
         seg2 = [s for s in pm2.data.segments if s.segment_id == 'ch1_seg0002'][0]
         assert seg2.status == SegmentStatus.PENDING
 
 
-class TestSaveLock:
-
-    def test_concurrent_mark_translated_no_data_loss(self, tmp_path):
-        """Multiple threads calling mark_translated with save_lock should not lose data."""
-        project_dir = str(tmp_path / 'concurrent_project')
-        os.makedirs(project_dir, exist_ok=True)
-
-        # Create 20 segments
-        segments = [
-            Segment(id=f'ch1_seg{i:04d}', html=f'<p>Seg {i}</p>',
-                    text=f'Segment {i}', word_count=2, segment_type=SegmentType.TEXT)
-            for i in range(20)
-        ]
-        pm_setup = ProjectManager(project_dir)
-        pm_setup.create('/path/to/book.epub', 'Test', 'Author', segments)
-
-        save_lock = threading.Lock()
-        pm = ProjectManager(project_dir, save_lock=save_lock)
-        pm.load()
-
-        errors = []
-
-        def translate_segment(seg_id, text):
-            try:
-                pm.mark_translated(seg_id, text)
-            except Exception as e:
-                errors.append(e)
-
-        threads = []
-        for i in range(20):
-            t = threading.Thread(
-                target=translate_segment,
-                args=(f'ch1_seg{i:04d}', f'翻譯 {i}')
-            )
-            threads.append(t)
-
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        assert len(errors) == 0
-
-        # Reload and verify all 20 segments are translated
-        pm2 = ProjectManager(project_dir)
-        pm2.load()
-        translated = [s for s in pm2.data.segments if s.status == SegmentStatus.TRANSLATED]
-        assert len(translated) == 20
-
-    def test_save_lock_backward_compatible(self, project_dir, sample_segments):
-        """ProjectManager without save_lock should work exactly as before."""
-        pm = ProjectManager(project_dir)
-        pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
-        pm.mark_translated('ch1_seg0001', '標題')
-
-        pm2 = ProjectManager(project_dir)
-        pm2.load()
-        seg = [s for s in pm2.data.segments if s.segment_id == 'ch1_seg0001'][0]
-        assert seg.status == SegmentStatus.TRANSLATED

@@ -105,6 +105,7 @@ def start(project, model, workers):
 
     if model:
         pm.set_model(model)
+        pm.save()
 
     pending = pm.get_pending_segments()
     if not pending:
@@ -163,6 +164,7 @@ def _start_sequential(pm, gm, pending, all_segments, progress):
                 html=html_arg,
             )
             pm.mark_translated(seg.segment_id, translated)
+            pm.save()
             click.echo(f"  ✓ 完成（{seg.word_count} 字）")
         except TranslationError as e:
             click.echo(f"  ✗ 翻譯失敗：{e}")
@@ -173,14 +175,13 @@ def _start_sequential(pm, gm, pending, all_segments, progress):
 def _start_parallel(pm, gm, pending, all_segments, progress, num_workers):
     """Multi-worker parallel translation."""
     import threading
-    from src.web.tasks import SegmentDispatcher
+    import queue as queue_mod
 
-    save_lock = threading.Lock()
-    pm._save_lock = save_lock
+    seg_queue = queue_mod.Queue()
+    for seg in pending:
+        seg_queue.put(seg)
 
-    dispatcher = SegmentDispatcher(pending)
-    completed = [0]  # mutable counter
-    counter_lock = threading.Lock()
+    result_queue = queue_mod.Queue()
     error_event = threading.Event()
     total = progress['total']
     base_translated = progress['translated']
@@ -190,8 +191,9 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers):
         engine = TranslationEngine(model=pm.data.model)
 
         while not error_event.is_set():
-            seg = dispatcher.next()
-            if seg is None:
+            try:
+                seg = seg_queue.get(timeout=1)
+            except queue_mod.Empty:
                 break
 
             glossary_text = ''
@@ -215,11 +217,7 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers):
                     context_after=context_after,
                     html=html_arg,
                 )
-                pm.mark_translated(seg.segment_id, translated)
-                with counter_lock:
-                    completed[0] += 1
-                    n = completed[0]
-                click.echo(f"  [{tag}] [{base_translated + n}/{total}] ✓ {seg.segment_id}（{seg.word_count} 字）")
+                result_queue.put((seg.segment_id, translated, seg.word_count, tag))
             except TranslationError as e:
                 click.echo(f"  [{tag}] ✗ {seg.segment_id} 翻譯失敗：{e}")
                 error_event.set()
@@ -231,6 +229,30 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers):
         t = threading.Thread(target=worker, args=(i,))
         threads.append(t)
         t.start()
+
+    # Process results in main thread
+    completed = 0
+    while any(t.is_alive() for t in threads) or not result_queue.empty():
+        try:
+            seg_id, translated, word_count, tag = result_queue.get(timeout=0.5)
+        except queue_mod.Empty:
+            continue
+        pm.mark_translated(seg_id, translated)
+        completed += 1
+        click.echo(f"  [{tag}] [{base_translated + completed}/{total}] ✓ {seg_id}（{word_count} 字）")
+
+        # Batch: drain any immediately available results
+        batch_count = 0
+        while True:
+            try:
+                seg_id, translated, word_count, tag = result_queue.get_nowait()
+                pm.mark_translated(seg_id, translated)
+                completed += 1
+                batch_count += 1
+                click.echo(f"  [{tag}] [{base_translated + completed}/{total}] ✓ {seg_id}（{word_count} 字）")
+            except queue_mod.Empty:
+                break
+        pm.save()
 
     for t in threads:
         t.join()

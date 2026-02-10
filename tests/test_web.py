@@ -16,6 +16,17 @@ from src.web.tasks import TaskManager, TranslationTask
 PROJECT_NAME = 'test_project'
 
 
+def _setup_task_pm(task, projects_dir):
+    """Load PM and fill segment queue on a task — mimics start_translation setup."""
+    project_dir = os.path.join(projects_dir, task.project_name)
+    pm = ProjectManager(project_dir)
+    pm.load()
+    task.pm = pm
+    pending = pm.get_pending_segments()
+    for seg in pending:
+        task.segment_queue.put(seg)
+
+
 @pytest.fixture
 def project_with_translations(tmp_path):
     """Create a project with some translated segments for testing."""
@@ -43,6 +54,7 @@ def project_with_translations(tmp_path):
     # Translate some segments
     pm.mark_translated('ch1_seg0001', '標題')
     pm.mark_translated('ch1_seg0002', '第一段。')
+    pm.save()
 
     return projects_dir
 
@@ -174,6 +186,10 @@ class TestSharedProjectManager:
         # get_project_manager should return the shared PM
         result = tm.get_project_manager(PROJECT_NAME)
         assert result is shared_pm
+
+        # get_or_load_pm should also return the shared PM
+        result2 = tm.get_or_load_pm(PROJECT_NAME, project_with_translations)
+        assert result2 is shared_pm
 
         TaskManager._instance = None
 
@@ -324,6 +340,7 @@ class TestRateLimitPause:
             state='running',
             total=3,
         )
+        _setup_task_pm(task, project_with_translations)
 
         def fake_translate(*args, **kwargs):
             raise RateLimitError("You've hit your limit · resets 8pm (Asia/Taipei)")
@@ -336,23 +353,20 @@ class TestRateLimitPause:
                 thread = threading.Thread(target=tm._run_translation, args=(task,))
                 thread.start()
 
-                # Wait for task to pause (the thread will block on _condition.wait)
+                # Wait for task to pause (workers block on pause_event.wait)
                 thread.join(timeout=5)
                 assert task.state == 'paused'
 
-                # Drain queue and check for rate_limit event
-                events = []
-                while not task.progress_queue.empty():
-                    events.append(task.progress_queue.get_nowait())
+                # Check for rate_limit event
+                events = task.progress.get_all()
 
                 rate_limit_events = [e for e in events if e['event'] == 'rate_limit']
                 assert len(rate_limit_events) == 1
                 assert "You've hit your limit" in rate_limit_events[0]['data']['error']
 
                 # Stop the task so the thread exits
-                with task._lock:
-                    task.state = 'stopped'
-                    task._condition.notify_all()
+                task.stop_event.set()
+                task.pause_event.set()
                 thread.join(timeout=5)
 
     def test_rate_limit_resume_retries_segment(self, project_with_translations):
@@ -366,6 +380,7 @@ class TestRateLimitPause:
             state='running',
             total=3,
         )
+        _setup_task_pm(task, project_with_translations)
 
         call_count = 0
 
@@ -390,7 +405,7 @@ class TestRateLimitPause:
                 # Resume — should retry the same segment and succeed
                 with task._lock:
                     task.state = 'running'
-                    task._condition.notify_all()
+                task.pause_event.set()
                 thread.join(timeout=5)
 
                 assert task.state == 'completed'
@@ -412,7 +427,7 @@ class TestRateLimitPause:
         dead_thread = threading.Thread(target=lambda: None)
         dead_thread.start()
         dead_thread.join()  # Wait for it to finish
-        task._thread = dead_thread
+        task._coordinator = dead_thread
 
         tm.tasks[PROJECT_NAME] = task
 
@@ -429,7 +444,7 @@ class TestStopThenStartJoin:
         TaskManager._instance = None
         tm = TaskManager()
 
-        # Create a fake stopped task with a thread
+        # Create a fake stopped task with a coordinator
         old_thread = MagicMock()
         old_thread.is_alive.return_value = False
 
@@ -440,7 +455,7 @@ class TestStopThenStartJoin:
             state='stopped',
             total=3,
         )
-        task._thread = old_thread
+        task._coordinator = old_thread
         tm.tasks[PROJECT_NAME] = task
 
         # Start a new translation — should join old thread
@@ -513,15 +528,14 @@ class TestModelAPI:
 class TestSetModelDuringTranslation:
 
     def test_set_model_updates_running_task_pm(self, project_with_translations):
-        """set_model API should update the running task's PM so mark_translated won't overwrite it."""
+        """set_model API should update the running task's PM so workers pick it up."""
         TaskManager._instance = None
         app = create_app(projects_dir=project_with_translations)
         app.config['TESTING'] = True
         tm = TaskManager()
 
         project_dir = os.path.join(project_with_translations, PROJECT_NAME)
-        save_lock = threading.Lock()
-        shared_pm = ProjectManager(project_dir, save_lock=save_lock)
+        shared_pm = ProjectManager(project_dir)
         shared_pm.load()
 
         task = TranslationTask(
@@ -546,10 +560,7 @@ class TestSetModelDuringTranslation:
             # The running task's PM should have the updated model
             assert shared_pm.data.model == 'opus'
 
-            # Simulate mark_translated (which saves pm.data to disk)
-            shared_pm.mark_translated('ch1_seg0003', '測試翻譯')
-
-            # Verify model is still opus on disk after save
+            # Verify model is persisted on disk
             reload_pm = ProjectManager(project_dir)
             reload_pm.load()
             assert reload_pm.data.model == 'opus'
@@ -600,6 +611,7 @@ class TestStoppedStateSSE:
             total=3,
             num_workers=1,
         )
+        _setup_task_pm(task, project_with_translations)
 
         call_count = 0
 
@@ -608,9 +620,7 @@ class TestStoppedStateSSE:
             call_count += 1
             if call_count == 1:
                 # Stop the task after first call
-                with task._lock:
-                    task.state = 'stopped'
-                    task._condition.notify_all()
+                task.stop_event.set()
             return '翻譯結果'
 
         with patch.object(TaskManager, '__new__', return_value=tm):
@@ -622,10 +632,8 @@ class TestStoppedStateSSE:
                 thread.start()
                 thread.join(timeout=10)
 
-                # Drain queue and check for stopped event
-                events = []
-                while not task.progress_queue.empty():
-                    events.append(task.progress_queue.get_nowait())
+                # Check for stopped event
+                events = task.progress.get_all()
 
                 stopped_events = [e for e in events if e['event'] == 'stopped']
                 assert len(stopped_events) == 1
@@ -650,7 +658,7 @@ class TestStoppedStateSSE:
         tm.tasks[PROJECT_NAME] = task
 
         # Push a stopped event
-        task.progress_queue.put({'event': 'stopped', 'data': {
+        task.progress.put({'event': 'stopped', 'data': {
             'completed': 1, 'remaining': 2
         }})
 
@@ -671,6 +679,7 @@ class TestRetranslateModel:
         pm = ProjectManager(project_dir)
         pm.load()
         pm.set_model('opus')
+        pm.save()
 
         TaskManager._instance = None
         app = create_app(projects_dir=project_with_translations)
@@ -703,41 +712,36 @@ class TestMidTranslationModelSwitch:
             total=3,
             num_workers=1,
         )
+        _setup_task_pm(task, project_with_translations)
 
         models_seen = []
 
-        # Patch mark_translated to inject a model change via PM after first save
-        original_mark = ProjectManager.mark_translated
-
-        def mark_with_model_switch(self, segment_id, translated_text):
-            original_mark(self, segment_id, translated_text)
-            # After first mark_translated, change model via PM (simulates set_model API)
-            if self.data.model == 'sonnet':
-                self.data.model = 'opus'
-
         def tracking_translate(self_engine, *args, **kwargs):
-            """Track which model the engine has when translate is called."""
+            """Track which model the engine has when translate is called,
+            and switch pm.data.model after first call."""
             models_seen.append(self_engine.model)
+            # After first translation, change model (simulates set_model API)
+            if len(models_seen) == 1:
+                task.pm.data.model = 'opus'
             return '翻譯結果'
 
         with patch.object(TaskManager, '__new__', return_value=tm):
-            with patch.object(ProjectManager, 'mark_translated', mark_with_model_switch):
-                with patch('src.web.tasks.TranslationEngine') as MockEngine:
-                    mock_engine = MagicMock()
-                    mock_engine.model = 'sonnet'
-                    mock_engine.translate = lambda *a, **kw: tracking_translate(mock_engine, *a, **kw)
-                    MockEngine.return_value = mock_engine
+            with patch('src.web.tasks.TranslationEngine') as MockEngine:
+                mock_engine = MagicMock()
+                mock_engine.model = 'sonnet'
+                mock_engine.translate = lambda *a, **kw: tracking_translate(mock_engine, *a, **kw)
+                MockEngine.return_value = mock_engine
 
-                    thread = threading.Thread(target=tm._run_translation, args=(task,))
-                    thread.start()
-                    thread.join(timeout=10)
+                thread = threading.Thread(target=tm._run_translation, args=(task,))
+                thread.start()
+                thread.join(timeout=10)
 
-                    assert task.state == 'completed'
-                    assert task.completed == 3
-                    assert len(models_seen) == 3
-                    # First segment uses sonnet, subsequent segments should use opus
-                    assert models_seen[0] == 'sonnet'
-                    assert all(m == 'opus' for m in models_seen[1:])
+                assert task.state == 'completed'
+                assert task.completed == 3
+                assert len(models_seen) == 3
+                # First segment uses sonnet, subsequent segments should use opus
+                assert models_seen[0] == 'sonnet'
+                assert all(m == 'opus' for m in models_seen[1:])
 
 
 class TestSegmentCompleteModel:
@@ -754,6 +758,7 @@ class TestSegmentCompleteModel:
             total=3,
             num_workers=1,
         )
+        _setup_task_pm(task, project_with_translations)
 
         with patch.object(TaskManager, '__new__', return_value=tm):
             with patch('src.web.tasks.TranslationEngine') as MockEngine:
@@ -767,9 +772,7 @@ class TestSegmentCompleteModel:
 
                 assert task.state == 'completed'
 
-                events = []
-                while not task.progress_queue.empty():
-                    events.append(task.progress_queue.get_nowait())
+                events = task.progress.get_all()
 
                 seg_events = [e for e in events if e['event'] == 'segment_complete']
                 assert len(seg_events) == 3
@@ -793,6 +796,7 @@ class TestDynamicWorkers:
             total=3,
             num_workers=1,
         )
+        _setup_task_pm(task, project_with_translations)
         tm.tasks[PROJECT_NAME] = task
 
         call_count = 0
@@ -813,7 +817,7 @@ class TestDynamicWorkers:
                 MockEngine.return_value.model = 'sonnet'
 
                 thread = threading.Thread(target=tm._run_translation, args=(task,))
-                task._thread = thread
+                task._coordinator = thread
                 thread.start()
 
                 # Wait for pause
@@ -843,6 +847,7 @@ class TestDynamicWorkers:
             total=3,
             num_workers=3,
         )
+        _setup_task_pm(task, project_with_translations)
         tm.tasks[PROJECT_NAME] = task
 
         call_count = 0
@@ -863,7 +868,7 @@ class TestDynamicWorkers:
                 MockEngine.return_value.model = 'sonnet'
 
                 thread = threading.Thread(target=tm._run_translation, args=(task,))
-                task._thread = thread
+                task._coordinator = thread
                 thread.start()
 
                 # Wait for pause
@@ -897,13 +902,13 @@ class TestDynamicWorkers:
             num_workers=1,
         )
 
-        # Create a thread that stays alive (blocked on condition)
+        # Create a thread that stays alive (blocked on event)
         alive_event = threading.Event()
         def keep_alive():
             alive_event.wait()
         alive_thread = threading.Thread(target=keep_alive, daemon=True)
         alive_thread.start()
-        task._thread = alive_thread
+        task._coordinator = alive_thread
         tm.tasks[PROJECT_NAME] = task
 
         with app.test_client() as client:
@@ -1004,6 +1009,7 @@ class TestMultiWorker:
             total=3,
             num_workers=2,
         )
+        _setup_task_pm(task, project_with_translations)
 
         with patch.object(TaskManager, '__new__', return_value=tm):
             with patch('src.web.tasks.TranslationEngine') as MockEngine:
@@ -1029,6 +1035,7 @@ class TestMultiWorker:
             total=3,
             num_workers=2,
         )
+        _setup_task_pm(task, project_with_translations)
 
         call_count = 0
         call_lock = threading.Lock()
@@ -1055,16 +1062,14 @@ class TestMultiWorker:
                 assert task.state == 'paused'
 
                 # Check rate_limit event emitted
-                events = []
-                while not task.progress_queue.empty():
-                    events.append(task.progress_queue.get_nowait())
+                events = task.progress.get_all()
                 rate_limit_events = [e for e in events if e['event'] == 'rate_limit']
                 assert len(rate_limit_events) >= 1
 
                 # Resume
                 with task._lock:
                     task.state = 'running'
-                    task._condition.notify_all()
+                task.pause_event.set()
                 thread.join(timeout=10)
 
                 assert task.state == 'completed'

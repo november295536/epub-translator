@@ -18,16 +18,10 @@ review_bp = Blueprint('review', __name__)
 
 
 def get_pm(project_name: str) -> ProjectManager:
-    """Get ProjectManager: reuse running task's PM if available, else create new."""
+    """Get ProjectManager: reuse running task's PM if available, else load from disk."""
     tm = TaskManager()
-    shared = tm.get_project_manager(project_name)
-    if shared is not None:
-        return shared
     projects_dir = current_app.config['PROJECTS_DIR']
-    project_dir = os.path.join(projects_dir, project_name)
-    pm = ProjectManager(project_dir)
-    pm.load()
-    return pm
+    return tm.get_or_load_pm(project_name, projects_dir)
 
 
 @review_bp.route('/project/<project_name>/review')
@@ -73,6 +67,7 @@ def update_segment(project_name: str, segment_id: str):
 
     try:
         pm.update_translation(segment_id, data['text'])
+        pm.save()
         return jsonify({'status': 'ok', 'segment_id': segment_id})
     except ValueError as e:
         return jsonify({'error': str(e)}), 404
@@ -87,6 +82,7 @@ def approve_segment(project_name: str, segment_id: str):
 
     try:
         pm.mark_reviewed(segment_id, text=text)
+        pm.save()
         return jsonify({'status': 'ok', 'segment_id': segment_id})
     except ValueError as e:
         return jsonify({'error': str(e)}), 404
@@ -125,7 +121,7 @@ def retranslate_segment(project_name: str, segment_id: str):
     try:
         engine = TranslationEngine(model=pm.data.model)
         html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
-        logger.info("重新翻譯段落: %s", segment_id)
+        logger.info("重新翻譯段落: %s (模型: %s)", segment_id, engine.model)
         translated = engine.translate(
             seg.text,
             segment_type=seg.segment_type,
@@ -135,7 +131,8 @@ def retranslate_segment(project_name: str, segment_id: str):
             html=html_arg,
         )
         pm.mark_translated(segment_id, translated)
-        logger.info("重新翻譯完成: %s", segment_id)
+        pm.save()
+        logger.info("重新翻譯完成: %s (%s)", segment_id, engine.model)
         return jsonify({
             'status': 'ok',
             'segment_id': segment_id,

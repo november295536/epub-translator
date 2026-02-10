@@ -88,11 +88,10 @@ def translation_status(project_name: str):
             'state': 'idle',
             'total': 0,
             'completed': 0,
-            'current_segment': None,
         })
 
     # Detect dead thread and update state
-    any_alive = (task._thread is not None and task._thread.is_alive()) or \
+    any_alive = (task._coordinator is not None and task._coordinator.is_alive()) or \
                 any(t.is_alive() for t in task._threads)
     if task.state in ('running', 'paused') and not any_alive:
         task.state = 'failed'
@@ -102,7 +101,6 @@ def translation_status(project_name: str):
         'state': task.state,
         'total': task.total,
         'completed': task.completed,
-        'current_segment': task.current_segment,
         'error': task.error,
         'percent': round(task.completed / task.total * 100, 1) if task.total > 0 else 0,
         'workers': task.num_workers,
@@ -124,22 +122,26 @@ def translation_stream(project_name: str):
         # Send initial status
         yield f"event: status\ndata: {json.dumps({'state': task.state, 'completed': task.completed, 'total': task.total})}\n\n"
 
+        cursor = 0
         while True:
-            try:
-                msg = task.progress_queue.get(timeout=30)
-                event = msg['event']
-                data = json.dumps(msg['data'], ensure_ascii=False)
-                yield f"event: {event}\ndata: {data}\n\n"
+            events, cursor = task.progress.iter_from(cursor, timeout=30)
 
-                if event in ('complete', 'error', 'stopped'):
-                    break
-            except Exception:
+            if not events:
                 # Send keepalive
                 yield f": keepalive\n\n"
 
                 # Check if task is done
                 if task.state in ('completed', 'failed', 'stopped'):
                     break
+                continue
+
+            for msg in events:
+                event = msg['event']
+                data = json.dumps(msg['data'], ensure_ascii=False)
+                yield f"event: {event}\ndata: {data}\n\n"
+
+                if event in ('complete', 'error', 'stopped'):
+                    return
 
     return Response(
         generate(),
@@ -155,23 +157,15 @@ def translation_stream(project_name: str):
 def get_model(project_name: str):
     """Get current model and available models."""
     projects_dir = current_app.config['PROJECTS_DIR']
-    project_dir = os.path.join(projects_dir, project_name)
-
-    # Prefer running task's PM for up-to-date model
     tm = _get_task_manager()
-    running_pm = tm.get_project_manager(project_name)
-    if running_pm is not None:
-        current_model = running_pm.data.model
-    else:
-        pm = ProjectManager(project_dir)
-        try:
-            pm.load()
-        except Exception as e:
-            return jsonify({'error': str(e)}), 404
-        current_model = pm.data.model
+
+    try:
+        pm = tm.get_or_load_pm(project_name, projects_dir)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 404
 
     return jsonify({
-        'current': current_model,
+        'current': pm.data.model,
         'available': AVAILABLE_MODELS,
     })
 
@@ -180,7 +174,6 @@ def get_model(project_name: str):
 def set_model(project_name: str):
     """Set the translation model for a project."""
     projects_dir = current_app.config['PROJECTS_DIR']
-    project_dir = os.path.join(projects_dir, project_name)
 
     data = request.get_json()
     if not data or 'model' not in data:
@@ -191,17 +184,13 @@ def set_model(project_name: str):
     if model not in valid_aliases:
         return jsonify({'error': f'無效的模型：{model}，可用模型：{", ".join(valid_aliases)}'}), 400
 
-    # Use the running task's PM if available, so mark_translated won't overwrite
     tm = _get_task_manager()
-    running_pm = tm.get_project_manager(project_name)
-    if running_pm is not None:
-        running_pm.set_model(model)
-    else:
-        pm = ProjectManager(project_dir)
-        try:
-            pm.load()
-        except Exception as e:
-            return jsonify({'error': str(e)}), 404
-        pm.set_model(model)
+    try:
+        pm = tm.get_or_load_pm(project_name, projects_dir)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 404
+
+    pm.set_model(model)
+    pm.save()
 
     return jsonify({'status': 'ok', 'model': model})
