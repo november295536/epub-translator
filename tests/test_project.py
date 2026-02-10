@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 import pytest
 
 from src.core.project import ProjectManager, ProjectData, SegmentState, SegmentStatus
@@ -213,3 +214,64 @@ class TestModelField:
         with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
             data = json.load(f)
         assert data['model'] == 'sonnet'
+
+
+class TestSaveLock:
+
+    def test_concurrent_mark_translated_no_data_loss(self, tmp_path):
+        """Multiple threads calling mark_translated with save_lock should not lose data."""
+        project_dir = str(tmp_path / 'concurrent_project')
+        os.makedirs(project_dir, exist_ok=True)
+
+        # Create 20 segments
+        segments = [
+            Segment(id=f'ch1_seg{i:04d}', html=f'<p>Seg {i}</p>',
+                    text=f'Segment {i}', word_count=2, segment_type=SegmentType.TEXT)
+            for i in range(20)
+        ]
+        pm_setup = ProjectManager(project_dir)
+        pm_setup.create('/path/to/book.epub', 'Test', 'Author', segments)
+
+        save_lock = threading.Lock()
+        pm = ProjectManager(project_dir, save_lock=save_lock)
+        pm.load()
+
+        errors = []
+
+        def translate_segment(seg_id, text):
+            try:
+                pm.mark_translated(seg_id, text)
+            except Exception as e:
+                errors.append(e)
+
+        threads = []
+        for i in range(20):
+            t = threading.Thread(
+                target=translate_segment,
+                args=(f'ch1_seg{i:04d}', f'翻譯 {i}')
+            )
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0
+
+        # Reload and verify all 20 segments are translated
+        pm2 = ProjectManager(project_dir)
+        pm2.load()
+        translated = [s for s in pm2.data.segments if s.status == SegmentStatus.TRANSLATED]
+        assert len(translated) == 20
+
+    def test_save_lock_backward_compatible(self, project_dir, sample_segments):
+        """ProjectManager without save_lock should work exactly as before."""
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
+        pm.mark_translated('ch1_seg0001', '標題')
+
+        pm2 = ProjectManager(project_dir)
+        pm2.load()
+        seg = [s for s in pm2.data.segments if s.segment_id == 'ch1_seg0001'][0]
+        assert seg.status == SegmentStatus.TRANSLATED

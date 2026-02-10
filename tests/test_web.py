@@ -428,45 +428,198 @@ class TestMidTranslationModelSwitch:
             projects_dir=project_with_translations,
             state='running',
             total=3,
+            num_workers=1,
         )
 
         project_dir = os.path.join(project_with_translations, PROJECT_NAME)
         models_seen = []
 
-        def tracking_translate(*args, **kwargs):
-            """Track which model the engine has when translate is called."""
-            models_seen.append(mock_engine_instance.model)
-            return '翻譯結果'
+        # Patch mark_translated to inject a model change on disk after first save
+        original_mark = ProjectManager.mark_translated
+        mark_count = [0]
 
-        # Patch ProjectManager.save to inject a model change on disk after first save
-        original_save = ProjectManager.save
-        save_count = [0]
-
-        def save_with_model_switch(self):
-            original_save(self)
-            save_count[0] += 1
-            # After first mark_translated save, change model on disk
-            if save_count[0] == 1:
+        def mark_with_model_switch(self, segment_id, translated_text):
+            original_mark(self, segment_id, translated_text)
+            mark_count[0] += 1
+            # After first mark_translated, change model on disk
+            if mark_count[0] == 1:
                 with open(self.project_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 data['model'] = 'opus'
                 with open(self.project_file, 'w', encoding='utf-8') as f:
                     json.dump(data, f, ensure_ascii=False)
 
-        with patch.object(TaskManager, '__new__', return_value=tm):
-            with patch('src.web.tasks.TranslationEngine') as MockEngine:
-                mock_engine_instance = MockEngine.return_value
-                mock_engine_instance.model = 'sonnet'
-                mock_engine_instance.translate.side_effect = tracking_translate
+        def tracking_translate(self_engine, *args, **kwargs):
+            """Track which model the engine has when translate is called."""
+            models_seen.append(self_engine.model)
+            return '翻譯結果'
 
-                with patch.object(ProjectManager, 'save', save_with_model_switch):
+        with patch.object(TaskManager, '__new__', return_value=tm):
+            with patch.object(ProjectManager, 'mark_translated', mark_with_model_switch):
+                with patch('src.web.tasks.TranslationEngine') as MockEngine:
+                    # Make each TranslationEngine() call return a real-ish mock
+                    # that tracks its own model attribute
+                    mock_engine = MagicMock()
+                    mock_engine.model = 'sonnet'
+                    mock_engine.translate = lambda *a, **kw: tracking_translate(mock_engine, *a, **kw)
+                    MockEngine.return_value = mock_engine
+
                     thread = threading.Thread(target=tm._run_translation, args=(task,))
                     thread.start()
                     thread.join(timeout=10)
 
+                    assert task.state == 'completed'
+                    assert task.completed == 3
+                    assert len(models_seen) == 3
+                    # First segment uses sonnet, subsequent segments should use opus
+                    assert models_seen[0] == 'sonnet'
+                    assert all(m == 'opus' for m in models_seen[1:])
+
+
+class TestMultiWorker:
+
+    def test_start_with_workers_param(self, project_with_translations):
+        """Start API should accept workers parameter and cap it."""
+        app = create_app(projects_dir=project_with_translations)
+        app.config['TESTING'] = True
+        # Reset singleton for isolation
+        TaskManager._instance = None
+
+        with app.test_client() as client:
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/translate/start',
+                data=json.dumps({'workers': 3}),
+                content_type='application/json',
+            )
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['workers'] == 3
+
+            # Stop the task
+            tm = TaskManager()
+            tm.stop_translation(PROJECT_NAME)
+
+        TaskManager._instance = None
+
+    def test_start_workers_capped_at_8(self, project_with_translations):
+        """Workers should be capped at MAX_WORKERS (8)."""
+        app = create_app(projects_dir=project_with_translations)
+        app.config['TESTING'] = True
+        TaskManager._instance = None
+
+        with app.test_client() as client:
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/translate/start',
+                data=json.dumps({'workers': 20}),
+                content_type='application/json',
+            )
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['workers'] == 8
+
+            tm = TaskManager()
+            tm.stop_translation(PROJECT_NAME)
+
+        TaskManager._instance = None
+
+    def test_status_returns_worker_info(self, project_with_translations):
+        """Status endpoint should include workers and active_workers."""
+        app = create_app(projects_dir=project_with_translations)
+        app.config['TESTING'] = True
+        TaskManager._instance = None
+
+        with app.test_client() as client:
+            # Start with 2 workers
+            client.post(
+                f'/api/projects/{PROJECT_NAME}/translate/start',
+                data=json.dumps({'workers': 2}),
+                content_type='application/json',
+            )
+
+            response = client.get(f'/api/projects/{PROJECT_NAME}/translate/status')
+            data = response.get_json()
+            assert 'workers' in data
+            assert 'active_workers' in data
+            assert data['workers'] == 2
+
+            tm = TaskManager()
+            tm.stop_translation(PROJECT_NAME)
+
+        TaskManager._instance = None
+
+    def test_multi_worker_completes_all_segments(self, project_with_translations):
+        """Multiple workers should translate all pending segments."""
+        tm = TaskManager()
+
+        task = TranslationTask(
+            task_id='test_mw',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='running',
+            total=3,
+            num_workers=2,
+        )
+
+        with patch.object(TaskManager, '__new__', return_value=tm):
+            with patch('src.web.tasks.TranslationEngine') as MockEngine:
+                MockEngine.return_value.translate.return_value = '翻譯結果'
+                MockEngine.return_value.model = 'sonnet'
+
+                thread = threading.Thread(target=tm._run_translation, args=(task,))
+                thread.start()
+                thread.join(timeout=10)
+
                 assert task.state == 'completed'
                 assert task.completed == 3
-                assert len(models_seen) == 3
-                # First segment uses sonnet, subsequent segments should use opus
-                assert models_seen[0] == 'sonnet'
-                assert all(m == 'opus' for m in models_seen[1:])
+
+    def test_rate_limit_pauses_all_workers(self, project_with_translations):
+        """When one worker hits rate limit, all workers should pause."""
+        tm = TaskManager()
+
+        task = TranslationTask(
+            task_id='test_mw_rl',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='running',
+            total=3,
+            num_workers=2,
+        )
+
+        call_count = 0
+        call_lock = threading.Lock()
+
+        def fake_translate(*args, **kwargs):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+                current = call_count
+            if current == 1:
+                raise RateLimitError("You've hit your limit")
+            return '翻譯結果'
+
+        with patch.object(TaskManager, '__new__', return_value=tm):
+            with patch('src.web.tasks.TranslationEngine') as MockEngine:
+                MockEngine.return_value.translate.side_effect = fake_translate
+                MockEngine.return_value.model = 'sonnet'
+
+                thread = threading.Thread(target=tm._run_translation, args=(task,))
+                thread.start()
+
+                # Wait for pause
+                thread.join(timeout=5)
+                assert task.state == 'paused'
+
+                # Check rate_limit event emitted
+                events = []
+                while not task.progress_queue.empty():
+                    events.append(task.progress_queue.get_nowait())
+                rate_limit_events = [e for e in events if e['event'] == 'rate_limit']
+                assert len(rate_limit_events) >= 1
+
+                # Resume
+                with task._lock:
+                    task.state = 'running'
+                    task._condition.notify_all()
+                thread.join(timeout=10)
+
+                assert task.state == 'completed'

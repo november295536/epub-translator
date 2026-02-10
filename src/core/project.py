@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -56,10 +57,11 @@ class ProjectManager:
 
     PROJECT_FILE = 'project.json'
 
-    def __init__(self, project_dir: str):
+    def __init__(self, project_dir: str, save_lock: threading.Lock | None = None):
         self.project_dir = project_dir
         self.project_file = os.path.join(project_dir, self.PROJECT_FILE)
         self.data: ProjectData | None = None
+        self._save_lock = save_lock
 
     def create(self, epub_path: str, title: str, author: str,
                segments: list[Segment], chapter_ids: dict[str, str] | None = None) -> ProjectData:
@@ -130,23 +132,36 @@ class ProjectManager:
         """Set the translation model and save immediately."""
         if not self.data:
             raise RuntimeError("No project loaded.")
-        self.data.model = model
-        self.save()
+        if self._save_lock:
+            with self._save_lock:
+                self.data.model = model
+                self.save()
+        else:
+            self.data.model = model
+            self.save()
 
     def mark_translated(self, segment_id: str, translated_text: str) -> None:
         """Mark a segment as translated and save immediately."""
         if not self.data:
             raise RuntimeError("No project loaded.")
 
-        for seg in self.data.segments:
-            if seg.segment_id == segment_id:
-                seg.status = SegmentStatus.TRANSLATED
-                seg.translated_text = translated_text
-                seg.translated_at = time.strftime('%Y-%m-%d %H:%M:%S')
-                self.save()
-                return
+        def _do_mark():
+            for seg in self.data.segments:
+                if seg.segment_id == segment_id:
+                    seg.status = SegmentStatus.TRANSLATED
+                    seg.translated_text = translated_text
+                    seg.translated_at = time.strftime('%Y-%m-%d %H:%M:%S')
+                    self.save()
+                    return True
+            return False
 
-        raise ValueError(f"Segment not found: {segment_id}")
+        if self._save_lock:
+            with self._save_lock:
+                if not _do_mark():
+                    raise ValueError(f"Segment not found: {segment_id}")
+        else:
+            if not _do_mark():
+                raise ValueError(f"Segment not found: {segment_id}")
 
     def get_pending_segments(self) -> list[SegmentState]:
         """Get all segments that haven't been translated yet."""
@@ -177,28 +192,44 @@ class ProjectManager:
         if not self.data:
             raise RuntimeError("No project loaded.")
 
-        for seg in self.data.segments:
-            if seg.segment_id == segment_id:
-                if text:
-                    seg.translated_text = text
-                seg.status = SegmentStatus.REVIEWED
-                self.save()
-                return
+        def _do_review():
+            for seg in self.data.segments:
+                if seg.segment_id == segment_id:
+                    if text:
+                        seg.translated_text = text
+                    seg.status = SegmentStatus.REVIEWED
+                    self.save()
+                    return True
+            return False
 
-        raise ValueError(f"Segment not found: {segment_id}")
+        if self._save_lock:
+            with self._save_lock:
+                if not _do_review():
+                    raise ValueError(f"Segment not found: {segment_id}")
+        else:
+            if not _do_review():
+                raise ValueError(f"Segment not found: {segment_id}")
 
     def update_translation(self, segment_id: str, text: str) -> None:
         """Update the translated text of a segment without changing its status."""
         if not self.data:
             raise RuntimeError("No project loaded.")
 
-        for seg in self.data.segments:
-            if seg.segment_id == segment_id:
-                seg.translated_text = text
-                self.save()
-                return
+        def _do_update():
+            for seg in self.data.segments:
+                if seg.segment_id == segment_id:
+                    seg.translated_text = text
+                    self.save()
+                    return True
+            return False
 
-        raise ValueError(f"Segment not found: {segment_id}")
+        if self._save_lock:
+            with self._save_lock:
+                if not _do_update():
+                    raise ValueError(f"Segment not found: {segment_id}")
+        else:
+            if not _do_update():
+                raise ValueError(f"Segment not found: {segment_id}")
 
     def get_segments_by_chapter(self, chapter_id: str) -> list[SegmentState]:
         """Get all segments belonging to a specific chapter."""

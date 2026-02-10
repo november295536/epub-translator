@@ -26,12 +26,21 @@ def start_translation(project_name: str):
     projects_dir = current_app.config['PROJECTS_DIR']
 
     try:
-        task = tm.start_translation(project_name, projects_dir)
+        data = request.get_json(silent=True) or {}
+        num_workers = data.get('workers', 1)
+        try:
+            num_workers = int(num_workers)
+        except (TypeError, ValueError):
+            num_workers = 1
+        num_workers = max(1, min(num_workers, 8))
+
+        task = tm.start_translation(project_name, projects_dir, num_workers=num_workers)
         return jsonify({
             'status': 'ok',
             'task_id': task.task_id,
             'state': task.state,
             'total': task.total,
+            'workers': task.num_workers,
         })
     except ValueError as e:
         return jsonify({'error': str(e)}), 409
@@ -76,8 +85,9 @@ def translation_status(project_name: str):
         })
 
     # Detect dead thread and update state
-    thread_alive = task._thread is not None and task._thread.is_alive()
-    if task.state in ('running', 'paused') and not thread_alive:
+    any_alive = (task._thread is not None and task._thread.is_alive()) or \
+                any(t.is_alive() for t in task._threads)
+    if task.state in ('running', 'paused') and not any_alive:
         task.state = 'failed'
         task.error = task.error or '翻譯執行緒意外終止'
 
@@ -88,6 +98,8 @@ def translation_status(project_name: str):
         'current_segment': task.current_segment,
         'error': task.error,
         'percent': round(task.completed / task.total * 100, 1) if task.total > 0 else 0,
+        'workers': task.num_workers,
+        'active_workers': task.active_workers,
     })
 
 
