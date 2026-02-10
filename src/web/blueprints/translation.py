@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
-from flask import Blueprint, Response, jsonify, current_app
+import os
+from flask import Blueprint, Response, jsonify, request, current_app
 
+from src.core.project import ProjectManager
+from src.core.translator import AVAILABLE_MODELS, DEFAULT_MODEL
 from src.web.tasks import TaskManager
 
 
@@ -127,3 +130,44 @@ def translation_stream(project_name: str):
             'X-Accel-Buffering': 'no',
         }
     )
+
+
+@translation_bp.route('/api/projects/<project_name>/model')
+def get_model(project_name: str):
+    """Get current model and available models."""
+    projects_dir = current_app.config['PROJECTS_DIR']
+    project_dir = os.path.join(projects_dir, project_name)
+    pm = ProjectManager(project_dir)
+    try:
+        pm.load()
+    except Exception as e:
+        return jsonify({'error': str(e)}), 404
+
+    return jsonify({
+        'current': pm.data.model,
+        'available': AVAILABLE_MODELS,
+    })
+
+
+@translation_bp.route('/api/projects/<project_name>/model', methods=['PUT'])
+def set_model(project_name: str):
+    """Set the translation model for a project."""
+    projects_dir = current_app.config['PROJECTS_DIR']
+    project_dir = os.path.join(projects_dir, project_name)
+    pm = ProjectManager(project_dir)
+    try:
+        pm.load()
+    except Exception as e:
+        return jsonify({'error': str(e)}), 404
+
+    data = request.get_json()
+    if not data or 'model' not in data:
+        return jsonify({'error': '未提供模型名稱'}), 400
+
+    model = data['model']
+    valid_aliases = [m['alias'] for m in AVAILABLE_MODELS]
+    if model not in valid_aliases:
+        return jsonify({'error': f'無效的模型：{model}，可用模型：{", ".join(valid_aliases)}'}), 400
+
+    pm.set_model(model)
+    return jsonify({'status': 'ok', 'model': model})

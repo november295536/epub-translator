@@ -89,7 +89,9 @@ def init(epub_file):
 
 @cli.command()
 @click.option('--project', '-p', default=None, help='Project directory path')
-def start(project):
+@click.option('--model', '-m', type=click.Choice(['sonnet', 'opus', 'haiku']),
+              default=None, help='Translation model (sonnet/opus/haiku)')
+def start(project, model):
     """Start or resume translation of pending segments."""
     project_dir = _find_project(project)
     if not project_dir:
@@ -99,12 +101,16 @@ def start(project):
     pm = ProjectManager(project_dir)
     pm.load()
 
+    if model:
+        pm.set_model(model)
+
     pending = pm.get_pending_segments()
     if not pending:
         click.echo("所有段落已翻譯完成！")
         return
 
     progress = pm.get_progress()
+    click.echo(f"使用模型：{pm.data.model}")
     click.echo(f"繼續翻譯：{progress['translated']}/{progress['total']} 已完成 ({progress['percent']}%)")
     click.echo(f"剩餘 {len(pending)} 個段落待翻譯")
     click.echo()
@@ -113,7 +119,7 @@ def start(project):
     gm = GlossaryManager(_get_glossary_path(project_dir))
     gm.load()
 
-    engine = TranslationEngine()
+    engine = TranslationEngine(model=pm.data.model)
     all_segments = pm.data.segments
 
     for i, seg in enumerate(pending, 1):

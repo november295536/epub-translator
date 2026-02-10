@@ -47,6 +47,7 @@ class ProjectData:
     author: str = ''
     created_at: str = ''
     updated_at: str = ''
+    model: str = 'sonnet'
     segments: list[SegmentState] = field(default_factory=list)
 
 
@@ -124,6 +125,13 @@ class ProjectManager:
         raw = asdict(self.data)
         with open(self.project_file, 'w', encoding='utf-8') as f:
             json.dump(raw, f, ensure_ascii=False, indent=2)
+
+    def set_model(self, model: str) -> None:
+        """Set the translation model and save immediately."""
+        if not self.data:
+            raise RuntimeError("No project loaded.")
+        self.data.model = model
+        self.save()
 
     def mark_translated(self, segment_id: str, translated_text: str) -> None:
         """Mark a segment as translated and save immediately."""

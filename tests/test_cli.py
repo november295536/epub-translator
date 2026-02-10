@@ -181,3 +181,66 @@ class TestGetProjectDir:
     def test_sanitizes_special_chars(self):
         result = _get_project_dir('Book (2nd Ed.) [Library].epub')
         assert result == os.path.join('projects', 'Book-2nd-Ed.-Library')
+
+
+class TestCLIModelOption:
+
+    def test_start_with_model_option(self, runner, sample_epub, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        runner.invoke(cli, ['init', sample_epub])
+        project_dir = _get_project_dir(sample_epub)
+        full_path = os.path.join(str(tmp_path), project_dir)
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '翻譯結果'
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+            result = runner.invoke(cli, ['start', '--project', full_path, '--model', 'opus'])
+
+        assert result.exit_code == 0
+        assert '使用模型：opus' in result.output
+
+        # Verify model persisted
+        pm = ProjectManager(full_path)
+        pm.load()
+        assert pm.data.model == 'opus'
+
+        # Verify --model passed to subprocess
+        cmd = mock_run.call_args[0][0]
+        assert '--model' in cmd
+        assert 'opus' in cmd
+
+    def test_start_invalid_model_rejected(self, runner, sample_epub, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        runner.invoke(cli, ['init', sample_epub])
+        project_dir = _get_project_dir(sample_epub)
+        full_path = os.path.join(str(tmp_path), project_dir)
+
+        result = runner.invoke(cli, ['start', '--project', full_path, '--model', 'invalid'])
+
+        assert result.exit_code != 0
+
+    def test_start_without_model_uses_default(self, runner, sample_epub, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        runner.invoke(cli, ['init', sample_epub])
+        project_dir = _get_project_dir(sample_epub)
+        full_path = os.path.join(str(tmp_path), project_dir)
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '翻譯結果'
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+            result = runner.invoke(cli, ['start', '--project', full_path])
+
+        assert result.exit_code == 0
+        assert '使用模型：sonnet' in result.output
+
+        # Verify --model sonnet passed to subprocess
+        cmd = mock_run.call_args[0][0]
+        assert '--model' in cmd
+        assert 'sonnet' in cmd

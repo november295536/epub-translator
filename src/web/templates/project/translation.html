@@ -28,6 +28,21 @@
             </div>
         </div>
         <div class="card-body">
+            <!-- Model selector -->
+            <div style="margin-bottom: 1rem;">
+                <label for="model-select" style="font-weight: 600; margin-right: 0.5rem;">翻譯模型</label>
+                <select id="model-select"
+                        :disabled="modelLoading"
+                        @change="setModel($event.target.value)"
+                        style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
+                    <template x-for="m in availableModels" :key="m.alias">
+                        <option :value="m.alias" :selected="m.alias === model"
+                                x-text="m.label + ' — ' + m.description"></option>
+                    </template>
+                </select>
+                <span x-show="modelLoading" class="spinner" style="margin-left: 0.5rem;"></span>
+            </div>
+
             <!-- Status indicator -->
             <div class="translation-status-row">
                 <span class="translation-state-badge" :class="'state-' + state" x-text="stateLabel()"></span>
@@ -99,8 +114,12 @@ function translationController() {
         logs: [],
         eventSource: null,
         logCounter: 0,
+        model: 'sonnet',
+        availableModels: [],
+        modelLoading: false,
 
         init() {
+            this.fetchModel();
             this.fetchStatus();
         },
 
@@ -114,6 +133,35 @@ function translationController() {
                 'failed': '失敗',
             };
             return labels[this.state] || this.state;
+        },
+
+        async fetchModel() {
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/model');
+                const data = await res.json();
+                this.model = data.current;
+                this.availableModels = data.available;
+            } catch (e) {
+                console.error('Failed to fetch model:', e);
+            }
+        },
+
+        async setModel(alias) {
+            this.modelLoading = true;
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/model', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: alias }),
+                });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    this.model = data.model;
+                }
+            } catch (e) {
+                console.error('Failed to set model:', e);
+            }
+            this.modelLoading = false;
         },
 
         async fetchStatus() {

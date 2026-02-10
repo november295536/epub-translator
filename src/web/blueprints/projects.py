@@ -266,6 +266,7 @@ def api_project_detail(project_name: str):
             'name': project_name,
             'title': pm.data.title,
             'author': pm.data.author,
+            'model': pm.data.model,
             'progress': progress
         })
     except Exception as e:

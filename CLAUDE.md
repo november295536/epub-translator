@@ -150,7 +150,7 @@ python3 -m flask --app src.web.server:create_app run --port 3000
 
 ## Testing
 
-162 tests covering all modules:
+183 tests covering all modules:
 ```bash
 python3 -m pytest tests/ -v
 ```
