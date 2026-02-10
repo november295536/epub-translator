@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 AVAILABLE_MODELS = [
     {'alias': 'sonnet', 'label': 'Sonnet', 'description': '快速且高品質，適合大多數翻譯'},
-    {'alias': 'opus', 'label': 'Opus', 'description': '最高品質，速度較慢'},
+    {'alias': 'opus', 'label': 'Opus', 'description': '最高品質，費用較高'},
     {'alias': 'haiku', 'label': 'Haiku', 'description': '最快速度，適合簡單內容'},
 ]
 

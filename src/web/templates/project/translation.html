@@ -33,12 +33,11 @@
                 <div>
                     <label for="model-select" style="font-weight: 600; margin-right: 0.5rem;">翻譯模型</label>
                     <select id="model-select"
-                            x-model="model"
                             :disabled="modelLoading"
-                            @change="setModel($event.target.value)"
+                            @change="model = $event.target.value; setModel($event.target.value)"
                             style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
                         <template x-for="m in availableModels" :key="m.alias">
-                            <option :value="m.alias"
+                            <option :value="m.alias" :selected="m.alias === model"
                                     x-text="m.label + ' — ' + m.description"></option>
                         </template>
                     </select>
@@ -163,8 +162,8 @@ function translationController() {
             try {
                 const res = await fetch('/api/projects/{{ project_name }}/model');
                 const data = await res.json();
-                this.model = data.current;
                 this.availableModels = data.available;
+                this.model = data.current;
             } catch (e) {
                 console.error('Failed to fetch model:', e);
             }
