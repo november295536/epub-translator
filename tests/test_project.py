@@ -155,3 +155,61 @@ class TestProjectManager:
             pm.get_progress()
         with pytest.raises(RuntimeError, match="No project"):
             pm.mark_translated('x', 'y')
+
+
+class TestModelField:
+
+    def test_default_model_is_sonnet(self, project_dir, sample_segments):
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
+        assert pm.data.model == 'sonnet'
+
+    def test_model_persists_through_save_load(self, project_dir, sample_segments):
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
+        pm.set_model('opus')
+
+        pm2 = ProjectManager(project_dir)
+        pm2.load()
+        assert pm2.data.model == 'opus'
+
+    def test_set_model(self, project_dir, sample_segments):
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
+
+        pm.set_model('haiku')
+        assert pm.data.model == 'haiku'
+
+        # Verify persisted to disk
+        with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        assert data['model'] == 'haiku'
+
+    def test_legacy_project_without_model(self, project_dir, sample_segments):
+        """Old project.json files without model field should default to sonnet."""
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
+
+        # Manually remove model from JSON to simulate legacy project
+        with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        del data['model']
+        with open(os.path.join(project_dir, 'project.json'), 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+
+        pm2 = ProjectManager(project_dir)
+        pm2.load()
+        assert pm2.data.model == 'sonnet'
+
+    def test_set_model_without_load(self, project_dir):
+        pm = ProjectManager(project_dir)
+        with pytest.raises(RuntimeError, match="No project"):
+            pm.set_model('opus')
+
+    def test_model_in_json(self, project_dir, sample_segments):
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
+
+        with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        assert data['model'] == 'sonnet'

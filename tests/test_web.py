@@ -357,3 +357,116 @@ class TestRateLimitPause:
         assert result is False
         assert task.state == 'failed'
         assert '翻譯執行緒已終止' in task.error
+
+
+class TestModelAPI:
+
+    def test_get_model(self, client):
+        response = client.get(f'/api/projects/{PROJECT_NAME}/model')
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['current'] == 'sonnet'
+        assert len(data['available']) == 3
+
+    def test_set_model(self, client, project_with_translations):
+        response = client.put(
+            f'/api/projects/{PROJECT_NAME}/model',
+            data=json.dumps({'model': 'opus'}),
+            content_type='application/json',
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['status'] == 'ok'
+        assert data['model'] == 'opus'
+
+        # Verify persisted
+        project_dir = os.path.join(project_with_translations, PROJECT_NAME)
+        pm = ProjectManager(project_dir)
+        pm.load()
+        assert pm.data.model == 'opus'
+
+    def test_set_invalid_model(self, client):
+        response = client.put(
+            f'/api/projects/{PROJECT_NAME}/model',
+            data=json.dumps({'model': 'invalid'}),
+            content_type='application/json',
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert '無效的模型' in data['error']
+
+    def test_set_model_missing_body(self, client):
+        response = client.put(
+            f'/api/projects/{PROJECT_NAME}/model',
+            data=json.dumps({}),
+            content_type='application/json',
+        )
+        assert response.status_code == 400
+
+    def test_get_model_nonexistent_project(self, client):
+        response = client.get('/api/projects/nonexistent/model')
+        assert response.status_code == 404
+
+    def test_project_detail_includes_model(self, client):
+        response = client.get(f'/api/projects/{PROJECT_NAME}')
+        assert response.status_code == 200
+        data = response.get_json()
+        assert 'model' in data
+        assert data['model'] == 'sonnet'
+
+
+class TestMidTranslationModelSwitch:
+
+    def test_model_switch_during_translation(self, project_with_translations):
+        """When project.json model changes on disk during translation, engine should pick it up."""
+        # The fixture has 5 segments, 2 translated → 3 pending
+        tm = TaskManager()
+
+        task = TranslationTask(
+            task_id='test_model_switch',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='running',
+            total=3,
+        )
+
+        project_dir = os.path.join(project_with_translations, PROJECT_NAME)
+        models_seen = []
+
+        def tracking_translate(*args, **kwargs):
+            """Track which model the engine has when translate is called."""
+            models_seen.append(mock_engine_instance.model)
+            return '翻譯結果'
+
+        # Patch ProjectManager.save to inject a model change on disk after first save
+        original_save = ProjectManager.save
+        save_count = [0]
+
+        def save_with_model_switch(self):
+            original_save(self)
+            save_count[0] += 1
+            # After first mark_translated save, change model on disk
+            if save_count[0] == 1:
+                with open(self.project_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                data['model'] = 'opus'
+                with open(self.project_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False)
+
+        with patch.object(TaskManager, '__new__', return_value=tm):
+            with patch('src.web.tasks.TranslationEngine') as MockEngine:
+                mock_engine_instance = MockEngine.return_value
+                mock_engine_instance.model = 'sonnet'
+                mock_engine_instance.translate.side_effect = tracking_translate
+
+                with patch.object(ProjectManager, 'save', save_with_model_switch):
+                    thread = threading.Thread(target=tm._run_translation, args=(task,))
+                    thread.start()
+                    thread.join(timeout=10)
+
+                assert task.state == 'completed'
+                assert task.completed == 3
+                assert len(models_seen) == 3
+                # First segment uses sonnet, subsequent segments should use opus
+                assert models_seen[0] == 'sonnet'
+                assert all(m == 'opus' for m in models_seen[1:])

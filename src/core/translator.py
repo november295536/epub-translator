@@ -8,6 +8,14 @@ from src.core.segmenter import SegmentType
 
 logger = logging.getLogger(__name__)
 
+AVAILABLE_MODELS = [
+    {'alias': 'sonnet', 'label': 'Sonnet', 'description': '快速且高品質，適合大多數翻譯'},
+    {'alias': 'opus', 'label': 'Opus', 'description': '最高品質，速度較慢'},
+    {'alias': 'haiku', 'label': 'Haiku', 'description': '最快速度，適合簡單內容'},
+]
+
+DEFAULT_MODEL = 'sonnet'
+
 _SHARED_RULES = """1. 使用台灣慣用的繁體中文用語
 2. 專業術語請保留原文並用括號標註，例如：機器學習（machine learning）
 3. 翻譯要自然流暢，不要逐字翻譯，中英文的語句結構不太一樣
@@ -106,8 +114,9 @@ _AUTH_ERROR_PATTERN = re.compile(
 class TranslationEngine:
     """Translates text segments using Claude CLI."""
 
-    def __init__(self, max_retries: int = 3):
+    def __init__(self, max_retries: int = 3, model: str = DEFAULT_MODEL):
         self.max_retries = max_retries
+        self.model = model
 
     def translate(self, text: str, segment_type: SegmentType = SegmentType.TEXT,
                   glossary_text: str = '',
@@ -137,7 +146,7 @@ class TranslationEngine:
         for attempt in range(1, self.max_retries + 1):
             try:
                 result = subprocess.run(
-                    ['claude', '-p', prompt],
+                    ['claude', '-p', prompt, '--model', self.model],
                     capture_output=True,
                     text=True,
                     timeout=120,

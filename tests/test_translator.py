@@ -9,6 +9,7 @@ from src.core.translator import (
     TranslationEngine, TranslationError, RateLimitError,
     TRANSLATION_PROMPT, CODE_PROMPT,
     TEXT_HTML_PROMPT,
+    AVAILABLE_MODELS, DEFAULT_MODEL,
 )
 
 
@@ -373,3 +374,56 @@ class TestHTMLMode:
         assert '術語表' in prompt
         assert 'machine learning' in prompt
         assert 'HTML 標籤結構' in prompt
+
+
+class TestModelSelection:
+
+    def test_default_model_is_sonnet(self):
+        assert DEFAULT_MODEL == 'sonnet'
+        engine = TranslationEngine()
+        assert engine.model == 'sonnet'
+
+    def test_available_models_list(self):
+        aliases = [m['alias'] for m in AVAILABLE_MODELS]
+        assert 'sonnet' in aliases
+        assert 'opus' in aliases
+        assert 'haiku' in aliases
+
+    def test_custom_model_passed_to_subprocess(self):
+        engine = TranslationEngine(model='opus')
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '翻譯'
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+            engine.translate('test')
+
+        cmd = mock_run.call_args[0][0]
+        assert '--model' in cmd
+        assert 'opus' in cmd
+
+    def test_default_model_passed_to_subprocess(self):
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '翻譯'
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+            engine.translate('test')
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ['claude', '-p', mock_run.call_args[0][0][2], '--model', 'sonnet']
+
+    def test_model_changeable_between_calls(self):
+        engine = TranslationEngine(model='sonnet')
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '翻譯'
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+            engine.translate('test')
+            assert mock_run.call_args[0][0][4] == 'sonnet'
+
+            engine.model = 'haiku'
+            engine.translate('test')
+            assert mock_run.call_args[0][0][4] == 'haiku'

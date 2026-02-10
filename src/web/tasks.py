@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
@@ -172,13 +173,23 @@ class TaskManager:
             gm = GlossaryManager(glossary_path)
             gm.load()
 
-            engine = TranslationEngine()
+            engine = TranslationEngine(model=pm.data.model)
             all_segments = pm.data.segments
             pending = pm.get_pending_segments()
 
-            logger.info("翻譯開始: %s (共 %d 段待翻譯)", task.project_name, task.total)
+            logger.info("翻譯開始: %s (共 %d 段待翻譯, 模型: %s)", task.project_name, task.total, engine.model)
 
             for seg in pending:
+                # Re-read model from disk to support mid-translation model switch
+                try:
+                    with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
+                        disk_model = json.load(f).get('model', 'sonnet')
+                    if disk_model != engine.model:
+                        logger.info("模型切換: %s → %s", engine.model, disk_model)
+                        engine.model = disk_model
+                        pm.data.model = disk_model
+                except Exception:
+                    pass  # Keep current model on read error
                 # Check for pause — blocks until resumed
                 with task._lock:
                     while task.state == 'paused':
