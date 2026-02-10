@@ -146,6 +146,24 @@ class TestTranslationEngine:
         assert call_kwargs['text'] is True
 
 
+class TestSubprocessIsolation:
+
+    def test_subprocess_runs_in_temp_dir(self):
+        """subprocess.run should use cwd=tempfile.gettempdir() to isolate from git context."""
+        import tempfile
+
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '翻譯'
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+            engine.translate('test')
+
+        call_kwargs = mock_run.call_args[1]
+        assert call_kwargs['cwd'] == tempfile.gettempdir()
+
+
 class TestRateLimitDetection:
 
     def test_rate_limit_in_stdout(self):

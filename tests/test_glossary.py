@@ -6,7 +6,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from src.glossary.glossary_manager import GlossaryManager, GlossaryEntry
-from src.glossary.term_extractor import TermExtractor
+from src.glossary.term_extractor import TermExtractor, ExtractionError
 
 
 class TestGlossaryManager:
@@ -188,3 +188,15 @@ class TestTermExtractor:
 
         # Same term from both batches should be deduplicated
         assert len(terms) == 1
+
+    def test_extraction_error_propagates(self):
+        """ExtractionError (e.g. auth error) should not be swallowed by broad except."""
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ''
+        mock_result.stderr = 'authentication_error: OAuth token has expired'
+
+        extractor = TermExtractor()
+        with patch('src.glossary.term_extractor.subprocess.run', return_value=mock_result):
+            with pytest.raises(ExtractionError, match='認證已過期'):
+                extractor.extract_from_text('Some text')

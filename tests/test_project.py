@@ -216,6 +216,45 @@ class TestModelField:
         assert data['model'] == 'sonnet'
 
 
+class TestAtomicSave:
+
+    def test_atomic_save_writes_via_replace(self, project_dir, sample_segments):
+        """save() should write to a tmp file then os.replace, not truncate directly."""
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
+
+        # Verify file is valid after save
+        pm2 = ProjectManager(project_dir)
+        pm2.load()
+        assert pm2.data.title == 'Test'
+
+    def test_original_intact_if_write_fails(self, project_dir, sample_segments):
+        """If writing the tmp file fails, original project.json stays intact."""
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
+        pm.mark_translated('ch1_seg0001', '標題')
+
+        # Simulate a write failure by making the tmp file path a directory
+        tmp_file = pm.project_file + '.tmp'
+        os.makedirs(tmp_file, exist_ok=True)
+
+        with pytest.raises(IsADirectoryError):
+            pm.mark_translated('ch1_seg0002', '第一段')
+
+        # Clean up the directory we made
+        os.rmdir(tmp_file)
+
+        # Original file should still be valid with the first translation
+        pm2 = ProjectManager(project_dir)
+        pm2.load()
+        seg1 = [s for s in pm2.data.segments if s.segment_id == 'ch1_seg0001'][0]
+        assert seg1.status == SegmentStatus.TRANSLATED
+        assert seg1.translated_text == '標題'
+        # Second translation should NOT have been applied
+        seg2 = [s for s in pm2.data.segments if s.segment_id == 'ch1_seg0002'][0]
+        assert seg2.status == SegmentStatus.PENDING
+
+
 class TestSaveLock:
 
     def test_concurrent_mark_translated_no_data_loss(self, tmp_path):

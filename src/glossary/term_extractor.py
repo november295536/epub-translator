@@ -78,6 +78,8 @@ class TermExtractor:
         except subprocess.TimeoutExpired:
             logger.warning("Term extraction timed out")
             return []
+        except ExtractionError:
+            raise
         except Exception as e:
             logger.warning("Term extraction error: %s", e)
             return []

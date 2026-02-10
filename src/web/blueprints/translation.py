@@ -124,14 +124,14 @@ def translation_stream(project_name: str):
                 data = json.dumps(msg['data'], ensure_ascii=False)
                 yield f"event: {event}\ndata: {data}\n\n"
 
-                if event in ('complete', 'error'):
+                if event in ('complete', 'error', 'stopped'):
                     break
             except Exception:
                 # Send keepalive
                 yield f": keepalive\n\n"
 
                 # Check if task is done
-                if task.state in ('completed', 'failed'):
+                if task.state in ('completed', 'failed', 'stopped'):
                     break
 
     return Response(

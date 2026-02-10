@@ -10,7 +10,7 @@ from src.core.project import ProjectManager
 from src.core.segmenter import SegmentType
 from src.core.translator import TranslationEngine, TranslationError, AuthError
 from src.glossary.glossary_manager import GlossaryManager
-from src.web.tasks import setup_project_logging, teardown_project_logging
+from src.web.tasks import TaskManager, setup_project_logging, teardown_project_logging
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,11 @@ review_bp = Blueprint('review', __name__)
 
 
 def get_pm(project_name: str) -> ProjectManager:
-    """Get ProjectManager instance for the specified project."""
+    """Get ProjectManager: reuse running task's PM if available, else create new."""
+    tm = TaskManager()
+    shared = tm.get_project_manager(project_name)
+    if shared is not None:
+        return shared
     projects_dir = current_app.config['PROJECTS_DIR']
     project_dir = os.path.join(projects_dir, project_name)
     pm = ProjectManager(project_dir)
@@ -91,10 +95,8 @@ def approve_segment(project_name: str, segment_id: str):
 @review_bp.route('/api/projects/<project_name>/segments/<segment_id>/retranslate', methods=['POST'])
 def retranslate_segment(project_name: str, segment_id: str):
     """Re-translate a single segment using Claude CLI."""
-    projects_dir = current_app.config['PROJECTS_DIR']
-    project_dir = os.path.join(projects_dir, project_name)
-    pm = ProjectManager(project_dir)
-    pm.load()
+    pm = get_pm(project_name)
+    project_dir = pm.project_dir
 
     # Find the segment
     seg = next((s for s in pm.data.segments if s.segment_id == segment_id), None)
@@ -121,7 +123,7 @@ def retranslate_segment(project_name: str, segment_id: str):
 
     handler = setup_project_logging(project_dir)
     try:
-        engine = TranslationEngine()
+        engine = TranslationEngine(model=pm.data.model)
         html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
         logger.info("重新翻譯段落: %s", segment_id)
         translated = engine.translate(

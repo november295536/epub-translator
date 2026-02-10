@@ -3,6 +3,7 @@
 import re
 import subprocess
 import logging
+import tempfile
 
 from src.core.segmenter import SegmentType
 
@@ -20,7 +21,7 @@ _SHARED_RULES = """1. 使用台灣慣用的繁體中文用語
 2. 專業術語請保留原文並用括號標註，例如：機器學習（machine learning）
 3. 翻譯要自然流暢，不要逐字翻譯，中英文的語句結構不太一樣
 4. LaTeX 公式（$...$、$$...$$）保持不變，不要翻譯
-5. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來
+5. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來，並注意其他中英標點符號的使用方法，像是逗點的轉換
 6. 人名保持英文原文，嚴格禁止翻譯，例如：Nassim Taleb、Charity Majors
 7. 書名、文章名、論文名、組織名、電影名等：如果使用翻譯，請使用廣泛使用的翻譯版本，並務必加括號標注原文
 8. 地名、物種名稱等專有名詞：如有明確翻譯就用翻譯並加括號標註原文；如無確定翻譯則保留原文
@@ -150,6 +151,7 @@ class TranslationEngine:
                     capture_output=True,
                     text=True,
                     timeout=120,
+                    cwd=tempfile.gettempdir(),
                 )
 
                 # Check for API usage limit in stdout or stderr

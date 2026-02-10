@@ -118,15 +118,17 @@ class ProjectManager:
         return self.data
 
     def save(self) -> None:
-        """Save project to disk."""
+        """Save project to disk atomically via temp file + os.replace()."""
         if not self.data:
             raise RuntimeError("No project data to save.")
 
         self.data.updated_at = time.strftime('%Y-%m-%d %H:%M:%S')
 
         raw = asdict(self.data)
-        with open(self.project_file, 'w', encoding='utf-8') as f:
+        tmp_file = self.project_file + '.tmp'
+        with open(tmp_file, 'w', encoding='utf-8') as f:
             json.dump(raw, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, self.project_file)
 
     def set_model(self, model: str) -> None:
         """Set the translation model and save immediately."""

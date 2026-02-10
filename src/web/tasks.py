@@ -79,6 +79,7 @@ class TranslationTask:
     progress_queue: queue.Queue = field(default_factory=queue.Queue)
     _thread: threading.Thread | None = field(default=None, repr=False)
     _threads: list = field(default_factory=list, repr=False)
+    pm: ProjectManager | None = field(default=None, repr=False)
 
     def __post_init__(self):
         self._condition = threading.Condition(self._lock)
@@ -102,6 +103,13 @@ class TaskManager:
         """Get the current task for a project."""
         return self.tasks.get(project_name)
 
+    def get_project_manager(self, project_name: str) -> ProjectManager | None:
+        """Return the running task's ProjectManager, or None if no active task."""
+        task = self.tasks.get(project_name)
+        if task and task.state in ('running', 'paused') and task.pm is not None:
+            return task.pm
+        return None
+
     def stop_translation(self, project_name: str):
         """Stop a running or paused translation task, terminating its thread."""
         task = self.tasks.get(project_name)
@@ -121,6 +129,9 @@ class TaskManager:
         # Stop any lingering paused thread before creating a new task
         if existing and existing.state == 'paused':
             self.stop_translation(project_name)
+        # Wait for old coordinator thread to finish before starting a new one
+        if existing and existing._thread is not None:
+            existing._thread.join(timeout=5)
 
         num_workers = max(1, min(num_workers, MAX_WORKERS))
 
@@ -198,6 +209,7 @@ class TaskManager:
             save_lock = threading.Lock()
             pm = ProjectManager(project_dir, save_lock=save_lock)
             pm.load()
+            task.pm = pm
 
             # Load glossary
             glossary_path = os.path.join(project_dir, 'glossary.json')
@@ -233,6 +245,12 @@ class TaskManager:
                 logger.info("翻譯完成: 共翻譯 %d 段", task.completed)
                 task.progress_queue.put({'event': 'complete', 'data': {
                     'total_translated': task.completed,
+                }})
+            elif task.state == 'stopped':
+                logger.info("翻譯已停止: 已完成 %d 段", task.completed)
+                task.progress_queue.put({'event': 'stopped', 'data': {
+                    'completed': task.completed,
+                    'remaining': task.total - task.completed,
                 }})
 
         except Exception as e:
