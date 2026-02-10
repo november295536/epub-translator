@@ -33,11 +33,12 @@
                 <div>
                     <label for="model-select" style="font-weight: 600; margin-right: 0.5rem;">翻譯模型</label>
                     <select id="model-select"
+                            x-model="model"
                             :disabled="modelLoading"
                             @change="setModel($event.target.value)"
                             style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
                         <template x-for="m in availableModels" :key="m.alias">
-                            <option :value="m.alias" :selected="m.alias === model"
+                            <option :value="m.alias"
                                     x-text="m.label + ' — ' + m.description"></option>
                         </template>
                     </select>
@@ -46,7 +47,7 @@
                 <div>
                     <label for="workers-select" style="font-weight: 600; margin-right: 0.5rem;">並行 Workers</label>
                     <select id="workers-select" x-model="workers"
-                            :disabled="state === 'running' || state === 'paused'"
+                            :disabled="state === 'running'"
                             style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
                         <option value="1">1</option>
                         <option value="2">2</option>
@@ -108,6 +109,9 @@
                     <div class="log-entry" :class="log.type === 'error' ? 'log-error' : ''">
                         <div class="log-entry-header">
                             <span class="log-segment-id" x-text="log.segmentId"></span>
+                            <template x-if="log.model">
+                                <span class="log-model-badge" x-text="log.model" style="font-size: 0.75rem; padding: 0.1rem 0.4rem; background: #e8e8e8; border-radius: 3px; color: #555;"></span>
+                            </template>
                             <span class="log-type-badge" :class="'log-type-' + log.type"
                                   x-text="log.type === 'error' ? '失敗' : '完成'"></span>
                         </div>
@@ -241,9 +245,12 @@ function translationController() {
 
         async pauseTranslation() {
             try {
-                const res = await fetch('/api/projects/{{ project_name }}/translate/pause', {
-                    method: 'POST',
-                });
+                const opts = { method: 'POST' };
+                if (this.state === 'paused') {
+                    opts.headers = { 'Content-Type': 'application/json' };
+                    opts.body = JSON.stringify({ workers: parseInt(this.workers) });
+                }
+                const res = await fetch('/api/projects/{{ project_name }}/translate/pause', opts);
                 const data = await res.json();
                 if (data.state) {
                     this.state = data.state;
@@ -291,6 +298,7 @@ function translationController() {
                     type: 'success',
                     segmentId: data.segment_id,
                     text: data.translated_text,
+                    model: data.model || null,
                 });
                 // Keep only last 50 entries
                 if (this.logs.length > 50) {
