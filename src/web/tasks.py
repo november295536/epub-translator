@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import queue
 import threading
@@ -333,16 +332,10 @@ class TaskManager:
                 if seg is None:
                     break  # No more segments
 
-                # Re-read model from disk to support mid-translation model switch
-                try:
-                    with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
-                        disk_model = json.load(f).get('model', 'sonnet')
-                    if disk_model != engine.model:
-                        logger.info("[%s] 模型切換: %s → %s", tag, engine.model, disk_model)
-                        engine.model = disk_model
-                        pm.data.model = disk_model
-                except Exception:
-                    pass  # Keep current model on read error
+                # Detect model switch (set_model API updates pm.data.model with save_lock)
+                if pm.data.model != engine.model:
+                    logger.info("[%s] 模型切換: %s → %s", tag, engine.model, pm.data.model)
+                    engine.model = pm.data.model
 
                 # Check for pause — blocks until resumed
                 with task._lock:

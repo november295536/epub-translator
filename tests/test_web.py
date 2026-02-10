@@ -691,7 +691,7 @@ class TestRetranslateModel:
 class TestMidTranslationModelSwitch:
 
     def test_model_switch_during_translation(self, project_with_translations):
-        """When project.json model changes on disk during translation, engine should pick it up."""
+        """When pm.data.model is changed via set_model, workers should pick it up."""
         # The fixture has 5 segments, 2 translated → 3 pending
         tm = TaskManager()
 
@@ -704,23 +704,16 @@ class TestMidTranslationModelSwitch:
             num_workers=1,
         )
 
-        project_dir = os.path.join(project_with_translations, PROJECT_NAME)
         models_seen = []
 
-        # Patch mark_translated to inject a model change on disk after first save
+        # Patch mark_translated to inject a model change via PM after first save
         original_mark = ProjectManager.mark_translated
-        mark_count = [0]
 
         def mark_with_model_switch(self, segment_id, translated_text):
             original_mark(self, segment_id, translated_text)
-            mark_count[0] += 1
-            # After first mark_translated, change model on disk
-            if mark_count[0] == 1:
-                with open(self.project_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                data['model'] = 'opus'
-                with open(self.project_file, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False)
+            # After first mark_translated, change model via PM (simulates set_model API)
+            if self.data.model == 'sonnet':
+                self.data.model = 'opus'
 
         def tracking_translate(self_engine, *args, **kwargs):
             """Track which model the engine has when translate is called."""
@@ -730,8 +723,6 @@ class TestMidTranslationModelSwitch:
         with patch.object(TaskManager, '__new__', return_value=tm):
             with patch.object(ProjectManager, 'mark_translated', mark_with_model_switch):
                 with patch('src.web.tasks.TranslationEngine') as MockEngine:
-                    # Make each TranslationEngine() call return a real-ish mock
-                    # that tracks its own model attribute
                     mock_engine = MagicMock()
                     mock_engine.model = 'sonnet'
                     mock_engine.translate = lambda *a, **kw: tracking_translate(mock_engine, *a, **kw)
