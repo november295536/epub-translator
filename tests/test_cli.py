@@ -244,3 +244,55 @@ class TestCLIModelOption:
         cmd = mock_run.call_args[0][0]
         assert '--model' in cmd
         assert 'sonnet' in cmd
+
+
+class TestCLIWorkersOption:
+
+    def test_start_with_workers(self, runner, sample_epub, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        runner.invoke(cli, ['init', sample_epub])
+        project_dir = _get_project_dir(sample_epub)
+        full_path = os.path.join(str(tmp_path), project_dir)
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '翻譯結果'
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            result = runner.invoke(cli, ['start', '--project', full_path, '--workers', '3'])
+
+        assert result.exit_code == 0
+        assert '並行 Workers：3' in result.output
+        assert '完成' in result.output
+
+    def test_start_default_workers_is_1(self, runner, sample_epub, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        runner.invoke(cli, ['init', sample_epub])
+        project_dir = _get_project_dir(sample_epub)
+        full_path = os.path.join(str(tmp_path), project_dir)
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '翻譯結果'
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            result = runner.invoke(cli, ['start', '--project', full_path])
+
+        assert result.exit_code == 0
+        # Should not show workers line when workers=1
+        assert '並行 Workers' not in result.output
+
+    def test_start_workers_invalid_rejected(self, runner, sample_epub, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        runner.invoke(cli, ['init', sample_epub])
+        project_dir = _get_project_dir(sample_epub)
+        full_path = os.path.join(str(tmp_path), project_dir)
+
+        result = runner.invoke(cli, ['start', '--project', full_path, '--workers', '0'])
+        assert result.exit_code != 0
+
+        result = runner.invoke(cli, ['start', '--project', full_path, '--workers', '10'])
+        assert result.exit_code != 0

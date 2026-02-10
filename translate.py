@@ -91,7 +91,9 @@ def init(epub_file):
 @click.option('--project', '-p', default=None, help='Project directory path')
 @click.option('--model', '-m', type=click.Choice(['sonnet', 'opus', 'haiku']),
               default=None, help='Translation model (sonnet/opus/haiku)')
-def start(project, model):
+@click.option('--workers', '-w', type=click.IntRange(1, 8), default=1,
+              help='Number of parallel workers (1-8)')
+def start(project, model, workers):
     """Start or resume translation of pending segments."""
     project_dir = _find_project(project)
     if not project_dir:
@@ -113,26 +115,38 @@ def start(project, model):
     click.echo(f"使用模型：{pm.data.model}")
     click.echo(f"繼續翻譯：{progress['translated']}/{progress['total']} 已完成 ({progress['percent']}%)")
     click.echo(f"剩餘 {len(pending)} 個段落待翻譯")
+    if workers > 1:
+        click.echo(f"並行 Workers：{workers}")
     click.echo()
 
     # Load glossary if available
     gm = GlossaryManager(_get_glossary_path(project_dir))
     gm.load()
 
-    engine = TranslationEngine(model=pm.data.model)
     all_segments = pm.data.segments
+
+    if workers > 1:
+        _start_parallel(pm, gm, pending, all_segments, progress, workers)
+    else:
+        _start_sequential(pm, gm, pending, all_segments, progress)
+
+    click.echo()
+    click.echo("全部翻譯完成！")
+
+
+def _start_sequential(pm, gm, pending, all_segments, progress):
+    """Single-worker sequential translation (original path)."""
+    engine = TranslationEngine(model=pm.data.model)
 
     for i, seg in enumerate(pending, 1):
         click.echo(f"[{progress['translated'] + i}/{progress['total']}] 翻譯段落 {seg.segment_id}...")
 
-        # Find glossary terms relevant to this segment
         glossary_text = ''
         if gm.entries:
             found = gm.find_terms_in_text(seg.text)
             if found:
                 glossary_text = gm.format_for_prompt(found)
 
-        # Get context from adjacent segments
         seg_idx = next((j for j, s in enumerate(all_segments)
                         if s.segment_id == seg.segment_id), -1)
         context_before = all_segments[seg_idx - 1].text if seg_idx > 0 else ''
@@ -155,8 +169,75 @@ def start(project, model):
             click.echo("翻譯中斷。已完成的進度已儲存，可用 start 繼續。")
             sys.exit(1)
 
-    click.echo()
-    click.echo("全部翻譯完成！")
+
+def _start_parallel(pm, gm, pending, all_segments, progress, num_workers):
+    """Multi-worker parallel translation."""
+    import threading
+    from src.web.tasks import SegmentDispatcher
+
+    save_lock = threading.Lock()
+    pm._save_lock = save_lock
+
+    dispatcher = SegmentDispatcher(pending)
+    completed = [0]  # mutable counter
+    counter_lock = threading.Lock()
+    error_event = threading.Event()
+    total = progress['total']
+    base_translated = progress['translated']
+
+    def worker(worker_id):
+        tag = f"W{worker_id}"
+        engine = TranslationEngine(model=pm.data.model)
+
+        while not error_event.is_set():
+            seg = dispatcher.next()
+            if seg is None:
+                break
+
+            glossary_text = ''
+            if gm.entries:
+                found = gm.find_terms_in_text(seg.text)
+                if found:
+                    glossary_text = gm.format_for_prompt(found)
+
+            seg_idx = next((j for j, s in enumerate(all_segments)
+                            if s.segment_id == seg.segment_id), -1)
+            context_before = all_segments[seg_idx - 1].text if seg_idx > 0 else ''
+            context_after = all_segments[seg_idx + 1].text if seg_idx < len(all_segments) - 1 else ''
+
+            try:
+                html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
+                translated = engine.translate(
+                    seg.text,
+                    segment_type=seg.segment_type,
+                    glossary_text=glossary_text,
+                    context_before=context_before,
+                    context_after=context_after,
+                    html=html_arg,
+                )
+                pm.mark_translated(seg.segment_id, translated)
+                with counter_lock:
+                    completed[0] += 1
+                    n = completed[0]
+                click.echo(f"  [{tag}] [{base_translated + n}/{total}] ✓ {seg.segment_id}（{seg.word_count} 字）")
+            except TranslationError as e:
+                click.echo(f"  [{tag}] ✗ {seg.segment_id} 翻譯失敗：{e}")
+                error_event.set()
+                break
+
+    actual_workers = min(num_workers, len(pending))
+    threads = []
+    for i in range(actual_workers):
+        t = threading.Thread(target=worker, args=(i,))
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+    if error_event.is_set():
+        click.echo("翻譯中斷。已完成的進度已儲存，可用 start 繼續。")
+        sys.exit(1)
 
 
 @cli.command()

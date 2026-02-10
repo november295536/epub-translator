@@ -29,18 +29,36 @@
         </div>
         <div class="card-body">
             <!-- Model selector -->
-            <div style="margin-bottom: 1rem;">
-                <label for="model-select" style="font-weight: 600; margin-right: 0.5rem;">翻譯模型</label>
-                <select id="model-select"
-                        :disabled="modelLoading"
-                        @change="setModel($event.target.value)"
-                        style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
-                    <template x-for="m in availableModels" :key="m.alias">
-                        <option :value="m.alias" :selected="m.alias === model"
-                                x-text="m.label + ' — ' + m.description"></option>
-                    </template>
-                </select>
-                <span x-show="modelLoading" class="spinner" style="margin-left: 0.5rem;"></span>
+            <div style="margin-bottom: 1rem; display: flex; gap: 1.5rem; flex-wrap: wrap; align-items: center;">
+                <div>
+                    <label for="model-select" style="font-weight: 600; margin-right: 0.5rem;">翻譯模型</label>
+                    <select id="model-select"
+                            :disabled="modelLoading"
+                            @change="setModel($event.target.value)"
+                            style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
+                        <template x-for="m in availableModels" :key="m.alias">
+                            <option :value="m.alias" :selected="m.alias === model"
+                                    x-text="m.label + ' — ' + m.description"></option>
+                        </template>
+                    </select>
+                    <span x-show="modelLoading" class="spinner" style="margin-left: 0.5rem;"></span>
+                </div>
+                <div>
+                    <label for="workers-select" style="font-weight: 600; margin-right: 0.5rem;">並行 Workers</label>
+                    <select id="workers-select" x-model="workers"
+                            :disabled="state === 'running' || state === 'paused'"
+                            style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="3">3</option>
+                        <option value="4">4</option>
+                        <option value="6">6</option>
+                        <option value="8">8</option>
+                    </select>
+                    <span x-show="state === 'running' && activeWorkers > 0" class="text-muted"
+                          style="margin-left: 0.5rem;"
+                          x-text="activeWorkers + ' 個活躍中'"></span>
+                </div>
             </div>
 
             <!-- Status indicator -->
@@ -117,6 +135,8 @@ function translationController() {
         model: 'sonnet',
         availableModels: [],
         modelLoading: false,
+        workers: 1,
+        activeWorkers: 0,
 
         init() {
             this.fetchModel();
@@ -174,6 +194,8 @@ function translationController() {
                 this.percent = data.percent || 0;
                 this.currentSegment = data.current_segment;
                 this.error = data.error;
+                if (data.workers) this.workers = data.workers;
+                if (data.active_workers !== undefined) this.activeWorkers = data.active_workers;
 
                 if (this.state === 'running' || this.state === 'paused') {
                     this.connectSSE();
@@ -190,6 +212,8 @@ function translationController() {
             try {
                 const res = await fetch('/api/projects/{{ project_name }}/translate/start', {
                     method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ workers: parseInt(this.workers) }),
                 });
                 const data = await res.json();
                 if (data.error) {
