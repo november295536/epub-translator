@@ -60,6 +60,12 @@ class SegmentDispatcher:
             self._index += 1
             return seg
 
+    def put_back(self, segment):
+        """Return a segment to the front of the remaining queue."""
+        with self._lock:
+            self._index -= 1
+            self._segments[self._index] = segment
+
 
 @dataclass
 class TranslationTask:
@@ -79,7 +85,12 @@ class TranslationTask:
     progress_queue: queue.Queue = field(default_factory=queue.Queue)
     _thread: threading.Thread | None = field(default=None, repr=False)
     _threads: list = field(default_factory=list, repr=False)
+    _next_worker_id: int = field(default=0, repr=False)
+    _workers_to_stop: int = field(default=0, repr=False)
     pm: ProjectManager | None = field(default=None, repr=False)
+    _gm: GlossaryManager | None = field(default=None, repr=False)
+    _dispatcher: SegmentDispatcher | None = field(default=None, repr=False)
+    _save_lock: threading.Lock | None = field(default=None, repr=False)
 
     def __post_init__(self):
         self._condition = threading.Condition(self._lock)
@@ -182,8 +193,8 @@ class TaskManager:
         }})
         return True
 
-    def resume_translation(self, project_name: str) -> bool:
-        """Resume a paused translation task."""
+    def resume_translation(self, project_name: str, num_workers: int | None = None) -> bool:
+        """Resume a paused translation task, optionally adjusting worker count."""
         task = self.tasks.get(project_name)
         if not task:
             return False
@@ -197,6 +208,36 @@ class TaskManager:
                 task.state = 'failed'
                 task.error = '翻譯執行緒已終止，請重新開始翻譯'
                 return False
+
+            # Dynamic worker adjustment
+            if num_workers is not None:
+                num_workers = max(1, min(num_workers, MAX_WORKERS))
+                current_alive = sum(1 for t in task._threads if t.is_alive())
+                task.num_workers = num_workers
+
+                if num_workers > current_alive:
+                    # Spawn additional workers
+                    additional = num_workers - current_alive
+                    if task.pm and task._gm and task._dispatcher:
+                        project_dir = os.path.join(task.projects_dir, task.project_name)
+                        for _ in range(additional):
+                            wid = task._next_worker_id
+                            task._next_worker_id += 1
+                            t = threading.Thread(
+                                target=self._worker_loop,
+                                args=(task, task.pm, task._gm, task._dispatcher,
+                                      project_dir, wid),
+                                daemon=True,
+                            )
+                            task._threads.append(t)
+                            task.active_workers += 1
+                            t.start()
+                        logger.info("動態增加 %d workers (共 %d)", additional, num_workers)
+                elif num_workers < current_alive:
+                    # Signal excess workers to exit
+                    task._workers_to_stop = current_alive - num_workers
+                    logger.info("動態減少 workers: %d → %d", current_alive, num_workers)
+
             task.state = 'running'
             task._condition.notify_all()
         return True
@@ -219,6 +260,11 @@ class TaskManager:
             pending = pm.get_pending_segments()
             dispatcher = SegmentDispatcher(pending)
 
+            # Store references for dynamic worker spawning
+            task._gm = gm
+            task._dispatcher = dispatcher
+            task._save_lock = save_lock
+
             num_workers = min(task.num_workers, task.total)
             logger.info("翻譯開始: %s (共 %d 段待翻譯, %d workers, 模型: %s)",
                         task.project_name, task.total, num_workers, pm.data.model)
@@ -232,12 +278,19 @@ class TaskManager:
                 )
                 workers.append(t)
             task._threads = workers
+            task._next_worker_id = num_workers
 
             for t in workers:
                 t.start()
 
-            for t in workers:
-                t.join()
+            # Dynamic join: wait for all threads including ones added later
+            while True:
+                with task._lock:
+                    alive = [t for t in task._threads if t.is_alive()]
+                if not alive:
+                    break
+                for t in alive:
+                    t.join(timeout=0.5)
 
             if task.state == 'running':
                 task.state = 'completed'
@@ -296,6 +349,12 @@ class TaskManager:
                     while task.state == 'paused':
                         logger.info("[%s] 翻譯暫停: 已完成 %d/%d", tag, task.completed, task.total)
                         task._condition.wait()
+                    # Check if this worker should exit (dynamic reduction)
+                    if task._workers_to_stop > 0:
+                        task._workers_to_stop -= 1
+                        logger.info("[%s] Worker 退出 (動態減少)", tag)
+                        dispatcher.put_back(seg)
+                        break
                     if task.state not in ('running',):
                         break
 
@@ -340,6 +399,7 @@ class TaskManager:
                         task.progress_queue.put({'event': 'segment_complete', 'data': {
                             'segment_id': seg.segment_id,
                             'translated_text': translated[:200],
+                            'model': engine.model,
                         }})
                         break  # Success, move to next segment
 
@@ -359,6 +419,12 @@ class TaskManager:
                         with task._lock:
                             while task.state == 'paused':
                                 task._condition.wait()
+                            if task._workers_to_stop > 0:
+                                task._workers_to_stop -= 1
+                                logger.info("[%s] Worker 退出 (動態減少)", tag)
+                                dispatcher.put_back(seg)
+                                should_stop = True
+                                break
                             if task.state not in ('running',):
                                 should_stop = True
                                 break

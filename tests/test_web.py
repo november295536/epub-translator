@@ -673,6 +673,187 @@ class TestMidTranslationModelSwitch:
                     assert all(m == 'opus' for m in models_seen[1:])
 
 
+class TestSegmentCompleteModel:
+
+    def test_segment_complete_includes_model(self, project_with_translations):
+        """segment_complete event should include the model field."""
+        tm = TaskManager()
+
+        task = TranslationTask(
+            task_id='test_model_event',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='running',
+            total=3,
+            num_workers=1,
+        )
+
+        with patch.object(TaskManager, '__new__', return_value=tm):
+            with patch('src.web.tasks.TranslationEngine') as MockEngine:
+                MockEngine.return_value.translate.return_value = '翻譯結果'
+                # model is 'sonnet' on disk; engine reads from disk each iteration
+                MockEngine.return_value.model = 'sonnet'
+
+                thread = threading.Thread(target=tm._run_translation, args=(task,))
+                thread.start()
+                thread.join(timeout=10)
+
+                assert task.state == 'completed'
+
+                events = []
+                while not task.progress_queue.empty():
+                    events.append(task.progress_queue.get_nowait())
+
+                seg_events = [e for e in events if e['event'] == 'segment_complete']
+                assert len(seg_events) == 3
+                for e in seg_events:
+                    assert 'model' in e['data']
+                    assert e['data']['model'] == 'sonnet'
+
+
+class TestDynamicWorkers:
+
+    def test_resume_increases_workers(self, project_with_translations):
+        """Resuming with more workers should spawn additional threads."""
+        TaskManager._instance = None
+        tm = TaskManager()
+
+        task = TranslationTask(
+            task_id='test_inc_workers',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='running',
+            total=3,
+            num_workers=1,
+        )
+        tm.tasks[PROJECT_NAME] = task
+
+        call_count = 0
+        call_lock = threading.Lock()
+
+        def fake_translate(*args, **kwargs):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+                current = call_count
+            if current == 1:
+                raise RateLimitError("Rate limited")
+            return '翻譯結果'
+
+        with patch.object(TaskManager, '__new__', return_value=tm):
+            with patch('src.web.tasks.TranslationEngine') as MockEngine:
+                MockEngine.return_value.translate.side_effect = fake_translate
+                MockEngine.return_value.model = 'sonnet'
+
+                thread = threading.Thread(target=tm._run_translation, args=(task,))
+                task._thread = thread
+                thread.start()
+
+                # Wait for pause
+                thread.join(timeout=5)
+                assert task.state == 'paused'
+
+                # Resume with 2 workers (was 1)
+                tm.resume_translation(PROJECT_NAME, num_workers=2)
+                thread.join(timeout=10)
+
+                assert task.state == 'completed'
+                assert task.completed == 3
+                assert task.num_workers == 2
+
+        TaskManager._instance = None
+
+    def test_resume_decreases_workers(self, project_with_translations):
+        """Resuming with fewer workers should signal excess workers to exit."""
+        TaskManager._instance = None
+        tm = TaskManager()
+
+        task = TranslationTask(
+            task_id='test_dec_workers',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='running',
+            total=3,
+            num_workers=3,
+        )
+        tm.tasks[PROJECT_NAME] = task
+
+        call_count = 0
+        call_lock = threading.Lock()
+
+        def fake_translate(*args, **kwargs):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+                current = call_count
+            if current == 1:
+                raise RateLimitError("Rate limited")
+            return '翻譯結果'
+
+        with patch.object(TaskManager, '__new__', return_value=tm):
+            with patch('src.web.tasks.TranslationEngine') as MockEngine:
+                MockEngine.return_value.translate.side_effect = fake_translate
+                MockEngine.return_value.model = 'sonnet'
+
+                thread = threading.Thread(target=tm._run_translation, args=(task,))
+                task._thread = thread
+                thread.start()
+
+                # Wait for pause
+                thread.join(timeout=5)
+                assert task.state == 'paused'
+
+                # Resume with 1 worker (was 3)
+                tm.resume_translation(PROJECT_NAME, num_workers=1)
+                thread.join(timeout=10)
+
+                assert task.state == 'completed'
+                assert task.completed == 3
+                assert task.num_workers == 1
+
+        TaskManager._instance = None
+
+    def test_resume_api_passes_workers(self, project_with_translations):
+        """Pause/resume API should pass workers parameter to resume_translation."""
+        TaskManager._instance = None
+        app = create_app(projects_dir=project_with_translations)
+        app.config['TESTING'] = True
+        tm = TaskManager()
+
+        # Create a fake paused task with alive thread
+        task = TranslationTask(
+            task_id='test_api_workers',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='paused',
+            total=3,
+            num_workers=1,
+        )
+
+        # Create a thread that stays alive (blocked on condition)
+        alive_event = threading.Event()
+        def keep_alive():
+            alive_event.wait()
+        alive_thread = threading.Thread(target=keep_alive, daemon=True)
+        alive_thread.start()
+        task._thread = alive_thread
+        tm.tasks[PROJECT_NAME] = task
+
+        with app.test_client() as client:
+            with patch.object(tm, 'resume_translation', return_value=True) as mock_resume:
+                response = client.post(
+                    f'/api/projects/{PROJECT_NAME}/translate/pause',
+                    data=json.dumps({'workers': 4}),
+                    content_type='application/json',
+                )
+                assert response.status_code == 200
+                mock_resume.assert_called_once_with(PROJECT_NAME, num_workers=4)
+
+        alive_event.set()
+        alive_thread.join(timeout=1)
+        TaskManager._instance = None
+
+
 class TestMultiWorker:
 
     def test_start_with_workers_param(self, project_with_translations):

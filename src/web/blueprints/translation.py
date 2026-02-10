@@ -58,8 +58,15 @@ def pause_translation(project_name: str):
         return jsonify({'error': '沒有執行中的翻譯任務'}), 404
 
     if task.state == 'paused':
-        # Resume
-        if tm.resume_translation(project_name):
+        # Resume — optionally adjust workers
+        data = request.get_json(silent=True) or {}
+        num_workers = None
+        if 'workers' in data:
+            try:
+                num_workers = int(data['workers'])
+            except (TypeError, ValueError):
+                pass
+        if tm.resume_translation(project_name, num_workers=num_workers):
             return jsonify({'status': 'ok', 'state': 'running'})
         # Resume failed (e.g. thread died) — return actual state so frontend can recover
         return jsonify({'error': task.error or '無法繼續翻譯', 'state': task.state}), 500
