@@ -145,6 +145,7 @@ class TestCLIStart:
         pm.load()
         for seg in pm.data.segments:
             pm.mark_translated(seg.segment_id, '已翻譯')
+        pm.save()
 
         result = runner.invoke(cli, ['start', '--project', full_path])
 

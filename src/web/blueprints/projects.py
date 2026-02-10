@@ -11,6 +11,7 @@ from flask import Blueprint, render_template, redirect, request, jsonify, curren
 from src.core.project import ProjectManager
 from src.core.segmenter import Segmenter
 from src.epub.extractor import EPUBExtractor
+from src.web.tasks import TaskManager
 
 
 def sanitize_project_name(name: str) -> str:
@@ -32,12 +33,10 @@ projects_bp = Blueprint('projects', __name__)
 
 
 def get_pm(project_name: str) -> ProjectManager:
-    """Get ProjectManager instance for the specified project."""
+    """Get ProjectManager: reuse running task's PM if available, else load from disk."""
+    tm = TaskManager()
     projects_dir = current_app.config['PROJECTS_DIR']
-    project_dir = os.path.join(projects_dir, project_name)
-    pm = ProjectManager(project_dir)
-    pm.load()
-    return pm
+    return tm.get_or_load_pm(project_name, projects_dir)
 
 
 def get_uploads_dir() -> str:

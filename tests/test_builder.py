@@ -42,6 +42,7 @@ def translated_project(tmp_path, sample_epub):
     # Translate all segments
     for seg in pm.data.segments:
         pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
+    pm.save()
 
     return project_dir
 
@@ -76,6 +77,7 @@ def rich_translated_project(tmp_path, rich_sample_epub):
 
     for seg in pm.data.segments:
         pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
+    pm.save()
 
     return project_dir
 
@@ -250,6 +252,7 @@ class TestHTMLAwareTranslation:
                 pm.mark_translated(seg.segment_id, '\n'.join(html_parts) if html_parts else f'翻譯_{seg.segment_id}')
             else:
                 pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
+        pm.save()
 
         builder = EPUBBuilder(project_dir)
         output = str(tmp_path / 'html_output.epub')
@@ -290,6 +293,7 @@ class TestHTMLAwareTranslation:
         # Plain text translations (old style)
         for seg in pm.data.segments:
             pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
+        pm.save()
 
         builder = EPUBBuilder(project_dir)
         output = str(tmp_path / 'plain_output.epub')
@@ -333,6 +337,7 @@ class TestHTMLAwareTranslation:
                 pm.mark_translated(seg.segment_id, '<p>翻譯段落</p>')
             else:
                 pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
+        pm.save()
 
         builder = EPUBBuilder(project_dir)
         output = str(tmp_path / 'bi_html_output.epub')
@@ -532,6 +537,7 @@ class TestHTMLPreservation:
         # Only translate the first segment
         if pm.data.segments:
             pm.mark_translated(pm.data.segments[0].segment_id, '僅翻譯第一段')
+            pm.save()
 
         builder = EPUBBuilder(project_dir)
         output = str(tmp_path / 'partial.epub')
@@ -633,6 +639,7 @@ class TestTOCTranslation:
                     pm.mark_translated(seg.segment_id, seg.html)
             else:
                 pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
+        pm.save()
 
         builder = EPUBBuilder(project_dir)
         output = str(tmp_path / 'toc_output.epub')
@@ -675,6 +682,7 @@ class TestTOCTranslation:
         for seg in pm.data.segments:
             if '<h1' not in seg.html and '<h2' not in seg.html:
                 pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
+        pm.save()
 
         builder = EPUBBuilder(project_dir)
         output = str(tmp_path / 'toc_orig_output.epub')
@@ -750,6 +758,7 @@ class TestTOCTranslation:
                 pm.mark_translated(seg.segment_id, '<h2>章節 A</h2>')
             else:
                 pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
+        pm.save()
 
         builder = EPUBBuilder(project_dir)
         output = str(tmp_path / 'nested_output.epub')
@@ -848,6 +857,7 @@ class TestTOCTranslation:
                     break
             if not matched:
                 pm.mark_translated(seg.segment_id, f'翻譯_{seg.segment_id}')
+        pm.save()
 
         builder = EPUBBuilder(project_dir)
         output = str(tmp_path / 'multi_heading_output.epub')

@@ -140,6 +140,7 @@ function translationController() {
         modelLoading: false,
         workers: 1,
         activeWorkers: 0,
+        _pauseInFlight: false,
 
         init() {
             this.fetchModel();
@@ -243,6 +244,8 @@ function translationController() {
         },
 
         async pauseTranslation() {
+            if (this._pauseInFlight) return;
+            this._pauseInFlight = true;
             try {
                 const opts = { method: 'POST' };
                 if (this.state === 'paused') {
@@ -256,10 +259,11 @@ function translationController() {
                 }
                 if (data.error) {
                     this.error = data.error;
-                    return;
                 }
             } catch (e) {
                 this.error = '操作失敗: ' + e.message;
+            } finally {
+                this._pauseInFlight = false;
             }
         },
 
@@ -272,7 +276,8 @@ function translationController() {
 
             this.eventSource.addEventListener('status', (e) => {
                 const data = JSON.parse(e.data);
-                this.state = data.state;
+                // Only update progress data — state is managed by API responses
+                // and server-initiated SSE events (rate_limit, auth_error, complete, error)
                 this.completed = data.completed;
                 this.total = data.total;
                 if (this.total > 0) {
@@ -285,7 +290,6 @@ function translationController() {
                 this.completed = data.completed;
                 this.total = data.total;
                 this.percent = data.percent;
-                this.state = 'running';
             });
 
             this.eventSource.addEventListener('segment_complete', (e) => {
@@ -317,7 +321,9 @@ function translationController() {
             });
 
             this.eventSource.addEventListener('paused', (e) => {
-                this.state = 'paused';
+                // User-initiated pause state is set by the API response.
+                // This handler is kept for potential multi-tab scenarios but
+                // does NOT overwrite state to avoid oscillation with resume.
             });
 
             this.eventSource.addEventListener('rate_limit', (e) => {
