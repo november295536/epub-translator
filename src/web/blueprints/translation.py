@@ -156,14 +156,22 @@ def get_model(project_name: str):
     """Get current model and available models."""
     projects_dir = current_app.config['PROJECTS_DIR']
     project_dir = os.path.join(projects_dir, project_name)
-    pm = ProjectManager(project_dir)
-    try:
-        pm.load()
-    except Exception as e:
-        return jsonify({'error': str(e)}), 404
+
+    # Prefer running task's PM for up-to-date model
+    tm = _get_task_manager()
+    running_pm = tm.get_project_manager(project_name)
+    if running_pm is not None:
+        current_model = running_pm.data.model
+    else:
+        pm = ProjectManager(project_dir)
+        try:
+            pm.load()
+        except Exception as e:
+            return jsonify({'error': str(e)}), 404
+        current_model = pm.data.model
 
     return jsonify({
-        'current': pm.data.model,
+        'current': current_model,
         'available': AVAILABLE_MODELS,
     })
 
@@ -173,11 +181,6 @@ def set_model(project_name: str):
     """Set the translation model for a project."""
     projects_dir = current_app.config['PROJECTS_DIR']
     project_dir = os.path.join(projects_dir, project_name)
-    pm = ProjectManager(project_dir)
-    try:
-        pm.load()
-    except Exception as e:
-        return jsonify({'error': str(e)}), 404
 
     data = request.get_json()
     if not data or 'model' not in data:
@@ -188,5 +191,17 @@ def set_model(project_name: str):
     if model not in valid_aliases:
         return jsonify({'error': f'無效的模型：{model}，可用模型：{", ".join(valid_aliases)}'}), 400
 
-    pm.set_model(model)
+    # Use the running task's PM if available, so mark_translated won't overwrite
+    tm = _get_task_manager()
+    running_pm = tm.get_project_manager(project_name)
+    if running_pm is not None:
+        running_pm.set_model(model)
+    else:
+        pm = ProjectManager(project_dir)
+        try:
+            pm.load()
+        except Exception as e:
+            return jsonify({'error': str(e)}), 404
+        pm.set_model(model)
+
     return jsonify({'status': 'ok', 'model': model})

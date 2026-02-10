@@ -510,6 +510,82 @@ class TestModelAPI:
         assert data['model'] == 'sonnet'
 
 
+class TestSetModelDuringTranslation:
+
+    def test_set_model_updates_running_task_pm(self, project_with_translations):
+        """set_model API should update the running task's PM so mark_translated won't overwrite it."""
+        TaskManager._instance = None
+        app = create_app(projects_dir=project_with_translations)
+        app.config['TESTING'] = True
+        tm = TaskManager()
+
+        project_dir = os.path.join(project_with_translations, PROJECT_NAME)
+        save_lock = threading.Lock()
+        shared_pm = ProjectManager(project_dir, save_lock=save_lock)
+        shared_pm.load()
+
+        task = TranslationTask(
+            task_id='test_set_model_running',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='running',
+            total=3,
+        )
+        task.pm = shared_pm
+        tm.tasks[PROJECT_NAME] = task
+
+        with app.test_client() as client:
+            # Change model via API while task is running
+            response = client.put(
+                f'/api/projects/{PROJECT_NAME}/model',
+                data=json.dumps({'model': 'opus'}),
+                content_type='application/json',
+            )
+            assert response.status_code == 200
+
+            # The running task's PM should have the updated model
+            assert shared_pm.data.model == 'opus'
+
+            # Simulate mark_translated (which saves pm.data to disk)
+            shared_pm.mark_translated('ch1_seg0003', '測試翻譯')
+
+            # Verify model is still opus on disk after save
+            reload_pm = ProjectManager(project_dir)
+            reload_pm.load()
+            assert reload_pm.data.model == 'opus'
+
+        TaskManager._instance = None
+
+    def test_get_model_reads_running_task_pm(self, project_with_translations):
+        """get_model API should read from the running task's PM for accurate model."""
+        TaskManager._instance = None
+        app = create_app(projects_dir=project_with_translations)
+        app.config['TESTING'] = True
+        tm = TaskManager()
+
+        project_dir = os.path.join(project_with_translations, PROJECT_NAME)
+        shared_pm = ProjectManager(project_dir)
+        shared_pm.load()
+        shared_pm.data.model = 'opus'  # In-memory only, not saved to disk
+
+        task = TranslationTask(
+            task_id='test_get_model_running',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='running',
+            total=3,
+        )
+        task.pm = shared_pm
+        tm.tasks[PROJECT_NAME] = task
+
+        with app.test_client() as client:
+            response = client.get(f'/api/projects/{PROJECT_NAME}/model')
+            data = response.get_json()
+            assert data['current'] == 'opus'
+
+        TaskManager._instance = None
+
+
 class TestStoppedStateSSE:
 
     def test_stopped_pushes_event(self, project_with_translations):
