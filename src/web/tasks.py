@@ -387,7 +387,7 @@ class TaskManager:
                         with task._lock:
                             task.completed += 1
                             completed = task.completed
-                        logger.info("[%s] 段落完成 [%d/%d]: %s", tag, completed, task.total, seg.segment_id)
+                        logger.info("[%s] 段落完成 [%d/%d]: %s (%s)", tag, completed, task.total, seg.segment_id, engine.model)
 
                         # Push progress event
                         percent = round(completed / task.total * 100, 1) if task.total > 0 else 0
