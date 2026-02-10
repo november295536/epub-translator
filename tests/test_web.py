@@ -149,6 +149,69 @@ class TestWebServer:
         assert seg.status == SegmentStatus.REVIEWED
 
 
+class TestSharedProjectManager:
+
+    def test_review_uses_running_task_pm(self, project_with_translations):
+        """When a translation task is running, review endpoints should use its PM."""
+        TaskManager._instance = None
+        tm = TaskManager()
+
+        # Create a fake running task with a PM
+        project_dir = os.path.join(project_with_translations, PROJECT_NAME)
+        shared_pm = ProjectManager(project_dir)
+        shared_pm.load()
+
+        task = TranslationTask(
+            task_id='test_shared',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='running',
+            total=3,
+        )
+        task.pm = shared_pm
+        tm.tasks[PROJECT_NAME] = task
+
+        # get_project_manager should return the shared PM
+        result = tm.get_project_manager(PROJECT_NAME)
+        assert result is shared_pm
+
+        TaskManager._instance = None
+
+    def test_review_creates_own_pm_when_idle(self, project_with_translations):
+        """When no task is running, review endpoints should create their own PM."""
+        TaskManager._instance = None
+        tm = TaskManager()
+
+        result = tm.get_project_manager(PROJECT_NAME)
+        assert result is None
+
+        TaskManager._instance = None
+
+    def test_review_creates_own_pm_when_completed(self, project_with_translations):
+        """When task is completed, review should create its own PM."""
+        TaskManager._instance = None
+        tm = TaskManager()
+
+        project_dir = os.path.join(project_with_translations, PROJECT_NAME)
+        shared_pm = ProjectManager(project_dir)
+        shared_pm.load()
+
+        task = TranslationTask(
+            task_id='test_done',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='completed',
+            total=3,
+        )
+        task.pm = shared_pm
+        tm.tasks[PROJECT_NAME] = task
+
+        result = tm.get_project_manager(PROJECT_NAME)
+        assert result is None
+
+        TaskManager._instance = None
+
+
 class TestDeleteProjectAPI:
 
     def test_delete_project(self, client, project_with_translations):
@@ -359,6 +422,38 @@ class TestRateLimitPause:
         assert '翻譯執行緒已終止' in task.error
 
 
+class TestStopThenStartJoin:
+
+    def test_start_joins_old_thread(self, project_with_translations):
+        """Starting a new translation should join the old coordinator thread."""
+        TaskManager._instance = None
+        tm = TaskManager()
+
+        # Create a fake stopped task with a thread
+        old_thread = MagicMock()
+        old_thread.is_alive.return_value = False
+
+        task = TranslationTask(
+            task_id='test_old',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='stopped',
+            total=3,
+        )
+        task._thread = old_thread
+        tm.tasks[PROJECT_NAME] = task
+
+        # Start a new translation — should join old thread
+        with patch.object(tm, '_run_translation'):
+            tm.start_translation(PROJECT_NAME, project_with_translations)
+
+        old_thread.join.assert_called_once_with(timeout=5)
+
+        # Clean up
+        tm.stop_translation(PROJECT_NAME)
+        TaskManager._instance = None
+
+
 class TestModelAPI:
 
     def test_get_model(self, client):
@@ -413,6 +508,108 @@ class TestModelAPI:
         data = response.get_json()
         assert 'model' in data
         assert data['model'] == 'sonnet'
+
+
+class TestStoppedStateSSE:
+
+    def test_stopped_pushes_event(self, project_with_translations):
+        """When task is stopped, a 'stopped' event should be pushed to the queue."""
+        tm = TaskManager()
+
+        task = TranslationTask(
+            task_id='test_stopped',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='running',
+            total=3,
+            num_workers=1,
+        )
+
+        call_count = 0
+
+        def fake_translate(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Stop the task after first call
+                with task._lock:
+                    task.state = 'stopped'
+                    task._condition.notify_all()
+            return '翻譯結果'
+
+        with patch.object(TaskManager, '__new__', return_value=tm):
+            with patch('src.web.tasks.TranslationEngine') as MockEngine:
+                MockEngine.return_value.translate.side_effect = fake_translate
+                MockEngine.return_value.model = 'sonnet'
+
+                thread = threading.Thread(target=tm._run_translation, args=(task,))
+                thread.start()
+                thread.join(timeout=10)
+
+                # Drain queue and check for stopped event
+                events = []
+                while not task.progress_queue.empty():
+                    events.append(task.progress_queue.get_nowait())
+
+                stopped_events = [e for e in events if e['event'] == 'stopped']
+                assert len(stopped_events) == 1
+                assert 'completed' in stopped_events[0]['data']
+                assert 'remaining' in stopped_events[0]['data']
+
+    def test_sse_terminates_on_stopped(self, project_with_translations):
+        """SSE stream should terminate when it receives a 'stopped' event."""
+        TaskManager._instance = None
+        app = create_app(projects_dir=project_with_translations)
+        app.config['TESTING'] = True
+
+        tm = TaskManager()
+
+        task = TranslationTask(
+            task_id='test_sse_stopped',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='stopped',
+            total=3,
+        )
+        tm.tasks[PROJECT_NAME] = task
+
+        # Push a stopped event
+        task.progress_queue.put({'event': 'stopped', 'data': {
+            'completed': 1, 'remaining': 2
+        }})
+
+        with app.test_client() as client:
+            response = client.get(f'/api/projects/{PROJECT_NAME}/translate/stream')
+            data = response.data.decode()
+            assert 'event: stopped' in data
+
+        TaskManager._instance = None
+
+
+class TestRetranslateModel:
+
+    def test_retranslate_uses_project_model(self, project_with_translations):
+        """Retranslate endpoint should use the project's configured model, not the default."""
+        # Set project model to opus
+        project_dir = os.path.join(project_with_translations, PROJECT_NAME)
+        pm = ProjectManager(project_dir)
+        pm.load()
+        pm.set_model('opus')
+
+        TaskManager._instance = None
+        app = create_app(projects_dir=project_with_translations)
+        app.config['TESTING'] = True
+
+        with app.test_client() as client:
+            with patch('src.web.blueprints.review.TranslationEngine') as MockEngine:
+                MockEngine.return_value.translate.return_value = '重新翻譯結果'
+                response = client.post(
+                    f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0001/retranslate',
+                )
+                assert response.status_code == 200
+                MockEngine.assert_called_once_with(model='opus')
+
+        TaskManager._instance = None
 
 
 class TestMidTranslationModelSwitch:

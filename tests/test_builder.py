@@ -375,6 +375,58 @@ class TestHTMLAwareTranslation:
         assert '<p class="loc">' in result
 
 
+class TestNavigableStringCounting:
+    """Tests for _count_segment_blocks with mixed NavigableString and Tag content."""
+
+    def test_count_mixed_tag_and_text(self):
+        """Segment HTML with mixed NavigableString + Tag should count both."""
+        from src.core.project import SegmentState
+
+        builder = EPUBBuilder.__new__(EPUBBuilder)
+        seg = SegmentState(
+            segment_id='ch1_seg0001',
+            chapter_id='ch1',
+            html='Some bare text\n<p>A paragraph</p>',
+            text='Some bare text A paragraph',
+            word_count=5,
+            segment_type=SegmentType.TEXT,
+        )
+        count = builder._count_segment_blocks(seg)
+        assert count == 2, f"Expected 2 (one text node + one <p> tag), got {count}"
+
+    def test_count_only_tags(self):
+        """Segment with only Tag children should count Tags."""
+        from src.core.project import SegmentState
+
+        builder = EPUBBuilder.__new__(EPUBBuilder)
+        seg = SegmentState(
+            segment_id='ch1_seg0002',
+            chapter_id='ch1',
+            html='<p>First</p><p>Second</p>',
+            text='First Second',
+            word_count=2,
+            segment_type=SegmentType.TEXT,
+        )
+        count = builder._count_segment_blocks(seg)
+        assert count == 2
+
+    def test_count_whitespace_only_text_ignored(self):
+        """Whitespace-only NavigableString nodes should not be counted."""
+        from src.core.project import SegmentState
+
+        builder = EPUBBuilder.__new__(EPUBBuilder)
+        seg = SegmentState(
+            segment_id='ch1_seg0003',
+            chapter_id='ch1',
+            html='\n<p>Paragraph</p>\n',
+            text='Paragraph',
+            word_count=1,
+            segment_type=SegmentType.TEXT,
+        )
+        count = builder._count_segment_blocks(seg)
+        assert count == 1, "Whitespace-only text nodes should not be counted"
+
+
 class TestHTMLPreservation:
     """Tests that the new builder preserves original HTML structure."""
 

@@ -192,8 +192,11 @@ class EPUBBuilder:
             return 1
 
         frag = BeautifulSoup(seg.html, 'html.parser')
-        tag_count = sum(1 for c in frag.children if isinstance(c, Tag))
-        return tag_count if tag_count > 0 else 1
+        block_count = sum(
+            1 for c in frag.children
+            if isinstance(c, Tag) or (isinstance(c, NavigableString) and c.strip())
+        )
+        return block_count if block_count > 0 else 1
 
     def _apply_chinese_only(self, seg: SegmentState, elements: list, soup) -> None:
         """Replace element content with translated text, preserving tag and attributes."""
