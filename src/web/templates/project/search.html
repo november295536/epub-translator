@@ -1,0 +1,280 @@
+{% extends "project/layout.html" %}
+
+{% block tab_content %}
+<div x-data="searchRetranslate()">
+    <!-- Search Panel -->
+    <div class="card" style="margin-bottom: 1.5rem;">
+        <div class="card-header">
+            <h3 style="margin: 0; font-size: 1rem;">搜尋段落</h3>
+        </div>
+        <div class="card-body">
+            <form @submit.prevent="search()" style="display: flex; gap: 0.5rem; align-items: center;">
+                <input type="text" x-model="query" placeholder="輸入關鍵字搜尋原文及譯文"
+                       style="flex: 1; padding: 0.5rem 0.75rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
+                <button type="submit" class="btn btn-primary" :disabled="searching || !query.trim()">
+                    <template x-if="searching"><span class="spinner"></span></template>
+                    搜尋
+                </button>
+            </form>
+            <p class="text-muted" style="margin-top: 0.5rem; margin-bottom: 0; font-size: 0.85rem;">
+                搜尋已翻譯和已審閱段落的原文及譯文（不區分大小寫）
+            </p>
+        </div>
+    </div>
+
+    <!-- Results -->
+    <div class="card" x-show="searched">
+        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+            <h3 style="margin: 0; font-size: 1rem;">
+                <span x-show="results.length > 0">
+                    找到 <span x-text="results.length"></span> 個段落
+                    <template x-if="truncated">
+                        <span class="text-muted">（結果已截取，請縮小搜尋範圍）</span>
+                    </template>
+                </span>
+                <span x-show="results.length === 0">沒有找到匹配的段落</span>
+            </h3>
+            <div x-show="results.length > 0" style="display: flex; gap: 0.5rem;">
+                <button class="btn btn-sm" @click="selectAll()">全選</button>
+                <button class="btn btn-sm" @click="selectNone()">取消全選</button>
+            </div>
+        </div>
+        <div class="card-body" style="padding: 0;">
+            <div x-show="results.length > 0">
+                <template x-for="seg in results" :key="seg.segment_id">
+                    <div class="search-result-item" :class="{ 'selected': selected.has(seg.segment_id) }">
+                        <div class="search-result-checkbox">
+                            <input type="checkbox"
+                                   :checked="selected.has(seg.segment_id)"
+                                   @change="toggleSelect(seg.segment_id)">
+                        </div>
+                        <div class="search-result-content">
+                            <div class="search-result-header">
+                                <span class="segment-id" x-text="seg.segment_id"></span>
+                                <span class="segment-status" :class="'status-' + seg.status" x-text="seg.status"></span>
+                                <span class="text-muted" style="font-size: 0.8rem;"
+                                      x-text="'匹配: ' + matchLabel(seg.match_in)"></span>
+                                <button class="btn-expand" @click.prevent="seg._expanded = !seg._expanded"
+                                        x-text="seg._expanded ? '收合 ▲' : '展開 ▼'"></button>
+                            </div>
+                            <!-- Preview (collapsed) -->
+                            <div class="search-result-text" x-show="!seg._expanded">
+                                <div><strong>原文:</strong> <span x-text="seg.text_preview"></span></div>
+                                <div><strong>譯文:</strong> <span x-text="seg.translation_preview"></span></div>
+                            </div>
+                            <!-- Full text (expanded) -->
+                            <div class="search-result-full" x-show="seg._expanded" x-cloak>
+                                <div class="full-text-block">
+                                    <div class="full-text-label">原文</div>
+                                    <div class="full-text-content" x-text="seg.text"></div>
+                                </div>
+                                <div class="full-text-block">
+                                    <div class="full-text-label">譯文</div>
+                                    <div class="full-text-content" x-text="seg.translated_text"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <!-- Action bar -->
+        <div x-show="results.length > 0" class="card-footer"
+             style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 1rem; border-top: 1px solid #eee;">
+            <span x-text="'已選取 ' + selected.size + ' 段'"></span>
+            <button class="btn btn-primary" @click="retranslate()" :disabled="selected.size === 0 || retranslating">
+                <template x-if="retranslating"><span class="spinner"></span></template>
+                重新翻譯選取段落
+            </button>
+        </div>
+    </div>
+
+    <!-- Error -->
+    <div x-show="error" class="alert alert-error" style="margin-top: 1rem;">
+        <span x-text="error"></span>
+    </div>
+</div>
+
+<script>
+function searchRetranslate() {
+    return {
+        query: '',
+        searching: false,
+        searched: false,
+        results: [],
+        truncated: false,
+        selected: new Set(),
+        retranslating: false,
+        error: null,
+
+        async search() {
+            if (!this.query.trim()) return;
+            this.searching = true;
+            this.error = null;
+            this.selected = new Set();
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/search-segments', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: this.query.trim() }),
+                });
+                const data = await res.json();
+                if (data.error) {
+                    this.error = data.error;
+                    this.results = [];
+                } else {
+                    this.results = data.segments.map(s => ({ ...s, _expanded: false }));
+                    this.truncated = data.truncated;
+                }
+                this.searched = true;
+            } catch (e) {
+                this.error = '搜尋失敗: ' + e.message;
+            }
+            this.searching = false;
+        },
+
+        toggleSelect(id) {
+            if (this.selected.has(id)) {
+                this.selected.delete(id);
+            } else {
+                this.selected.add(id);
+            }
+            // Trigger Alpine reactivity
+            this.selected = new Set(this.selected);
+        },
+
+        selectAll() {
+            this.selected = new Set(this.results.map(s => s.segment_id));
+        },
+
+        selectNone() {
+            this.selected = new Set();
+        },
+
+        matchLabel(matchIn) {
+            const labels = { 'text': '原文', 'translation': '譯文', 'both': '原文+譯文' };
+            return labels[matchIn] || matchIn;
+        },
+
+        async retranslate() {
+            if (this.selected.size === 0) return;
+            this.retranslating = true;
+            this.error = null;
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/translate/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        segment_ids: Array.from(this.selected),
+                        workers: 1,
+                    }),
+                });
+                const data = await res.json();
+                if (data.error) {
+                    this.error = data.error;
+                    this.retranslating = false;
+                    return;
+                }
+                // Redirect to translation tab to see progress
+                window.location.href = '/project/{{ project_name }}/translation';
+            } catch (e) {
+                this.error = '啟動重新翻譯失敗: ' + e.message;
+                this.retranslating = false;
+            }
+        },
+    };
+}
+</script>
+
+<style>
+.search-result-item {
+    display: flex;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid #f0f0f0;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.search-result-item:hover {
+    background: #f8f9fa;
+}
+.search-result-item.selected {
+    background: #e8f4fd;
+}
+.search-result-checkbox {
+    padding-top: 0.2rem;
+}
+.search-result-checkbox input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+}
+.search-result-content {
+    flex: 1;
+    min-width: 0;
+}
+.search-result-header {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin-bottom: 0.25rem;
+}
+.search-result-text {
+    font-size: 0.85rem;
+    color: #555;
+    line-height: 1.5;
+}
+.search-result-text div {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.btn-expand {
+    margin-left: auto;
+    padding: 0.1rem 0.4rem;
+    font-size: 0.75rem;
+    color: #666;
+    background: #f0f0f0;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.btn-expand:hover {
+    background: #e0e0e0;
+}
+.search-result-full {
+    margin-top: 0.5rem;
+}
+.full-text-block {
+    margin-bottom: 0.5rem;
+    border: 1px solid #e8e8e8;
+    border-radius: 4px;
+    overflow: hidden;
+}
+.full-text-label {
+    padding: 0.25rem 0.5rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #666;
+    background: #f5f5f5;
+    border-bottom: 1px solid #e8e8e8;
+}
+.full-text-content {
+    padding: 0.5rem;
+    font-size: 0.85rem;
+    line-height: 1.6;
+    color: #333;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.btn-sm {
+    padding: 0.25rem 0.5rem;
+    font-size: 0.8rem;
+}
+.card-footer {
+    background: #fafafa;
+}
+</style>
+{% endblock %}

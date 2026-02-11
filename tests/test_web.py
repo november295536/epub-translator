@@ -1073,3 +1073,192 @@ class TestMultiWorker:
                 thread.join(timeout=10)
 
                 assert task.state == 'completed'
+
+
+class TestSearchSegments:
+
+    def test_search_text_match(self, client):
+        """Search should find segments matching original text."""
+        response = client.post(
+            f'/api/projects/{PROJECT_NAME}/search-segments',
+            data=json.dumps({'query': 'First'}),
+            content_type='application/json',
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['total'] >= 1
+        ids = [s['segment_id'] for s in data['segments']]
+        assert 'ch1_seg0002' in ids
+
+    def test_search_translation_match(self, client):
+        """Search should find segments matching translated text."""
+        response = client.post(
+            f'/api/projects/{PROJECT_NAME}/search-segments',
+            data=json.dumps({'query': '第一段'}),
+            content_type='application/json',
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['total'] >= 1
+        ids = [s['segment_id'] for s in data['segments']]
+        assert 'ch1_seg0002' in ids
+
+    def test_search_case_insensitive(self, client):
+        """Search should be case-insensitive."""
+        response = client.post(
+            f'/api/projects/{PROJECT_NAME}/search-segments',
+            data=json.dumps({'query': 'TITLE'}),
+            content_type='application/json',
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        ids = [s['segment_id'] for s in data['segments']]
+        assert 'ch1_seg0001' in ids
+
+    def test_search_empty_query(self, client):
+        """Empty query should return 400."""
+        response = client.post(
+            f'/api/projects/{PROJECT_NAME}/search-segments',
+            data=json.dumps({'query': ''}),
+            content_type='application/json',
+        )
+        assert response.status_code == 400
+
+    def test_search_no_results(self, client):
+        """Query with no matches should return empty list."""
+        response = client.post(
+            f'/api/projects/{PROJECT_NAME}/search-segments',
+            data=json.dumps({'query': 'xyznonexistent'}),
+            content_type='application/json',
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['total'] == 0
+        assert data['segments'] == []
+
+    def test_search_excludes_pending(self, client):
+        """Search should not return PENDING segments."""
+        response = client.post(
+            f'/api/projects/{PROJECT_NAME}/search-segments',
+            data=json.dumps({'query': 'Second paragraph'}),
+            content_type='application/json',
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        # ch1_seg0003 is pending, should not appear
+        ids = [s['segment_id'] for s in data['segments']]
+        assert 'ch1_seg0003' not in ids
+
+    def test_search_includes_match_in(self, client):
+        """Results should include match_in field."""
+        response = client.post(
+            f'/api/projects/{PROJECT_NAME}/search-segments',
+            data=json.dumps({'query': 'Title'}),
+            content_type='application/json',
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['total'] >= 1
+        seg = data['segments'][0]
+        assert seg['match_in'] in ('text', 'translation', 'both')
+
+    def test_search_page_renders(self, client):
+        """Search page should render successfully."""
+        response = client.get(f'/project/{PROJECT_NAME}/search')
+        assert response.status_code == 200
+        assert '搜尋' in response.data.decode()
+
+
+class TestStartWithSegmentIds:
+
+    def test_start_with_segment_ids(self, project_with_translations):
+        """start_translation with segment_ids should queue those specific segments."""
+        TaskManager._instance = None
+        tm = TaskManager()
+
+        with patch.object(tm, '_run_translation'):
+            task = tm.start_translation(
+                PROJECT_NAME, project_with_translations,
+                segment_ids=['ch1_seg0001', 'ch1_seg0002'],
+            )
+
+        assert task.total == 2
+        assert task.state == 'running'
+
+        tm.stop_translation(PROJECT_NAME)
+        TaskManager._instance = None
+
+    def test_start_with_empty_segment_ids(self, project_with_translations):
+        """start_translation with empty segment_ids should complete immediately."""
+        TaskManager._instance = None
+        tm = TaskManager()
+
+        task = tm.start_translation(
+            PROJECT_NAME, project_with_translations,
+            segment_ids=[],
+        )
+
+        assert task.total == 0
+        assert task.state == 'completed'
+
+        TaskManager._instance = None
+
+    def test_start_with_invalid_segment_ids(self, project_with_translations):
+        """start_translation with nonexistent segment_ids should complete with 0."""
+        TaskManager._instance = None
+        tm = TaskManager()
+
+        task = tm.start_translation(
+            PROJECT_NAME, project_with_translations,
+            segment_ids=['nonexistent_id'],
+        )
+
+        assert task.total == 0
+        assert task.state == 'completed'
+
+        TaskManager._instance = None
+
+    def test_start_api_with_segment_ids(self, project_with_translations):
+        """Start API should accept segment_ids parameter."""
+        TaskManager._instance = None
+        app = create_app(projects_dir=project_with_translations)
+        app.config['TESTING'] = True
+
+        with app.test_client() as client:
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/translate/start',
+                data=json.dumps({
+                    'segment_ids': ['ch1_seg0001', 'ch1_seg0002'],
+                    'workers': 1,
+                }),
+                content_type='application/json',
+            )
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['total'] == 2
+            assert data['state'] == 'running'
+
+            tm = TaskManager()
+            tm.stop_translation(PROJECT_NAME)
+
+        TaskManager._instance = None
+
+    def test_retranslate_already_translated_segment(self, project_with_translations):
+        """segment_ids should queue segments regardless of their current status."""
+        TaskManager._instance = None
+        tm = TaskManager()
+
+        # ch1_seg0001 is already translated
+        with patch.object(tm, '_run_translation'):
+            task = tm.start_translation(
+                PROJECT_NAME, project_with_translations,
+                segment_ids=['ch1_seg0001'],
+            )
+
+        assert task.total == 1
+        # Verify the queued segment is the translated one
+        seg = task.segment_queue.get_nowait()
+        assert seg.segment_id == 'ch1_seg0001'
+
+        tm.stop_translation(PROJECT_NAME)
+        TaskManager._instance = None

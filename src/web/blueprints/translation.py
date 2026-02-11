@@ -34,7 +34,10 @@ def start_translation(project_name: str):
             num_workers = 1
         num_workers = max(1, min(num_workers, 8))
 
-        task = tm.start_translation(project_name, projects_dir, num_workers=num_workers)
+        segment_ids = data.get('segment_ids')  # list[str] | None
+        task = tm.start_translation(project_name, projects_dir,
+                                    num_workers=num_workers,
+                                    segment_ids=segment_ids)
         return jsonify({
             'status': 'ok',
             'task_id': task.task_id,

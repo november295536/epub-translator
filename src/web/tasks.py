@@ -174,8 +174,15 @@ class TaskManager:
             task.pause_event.set()  # unblock any paused workers
 
     def start_translation(self, project_name: str, projects_dir: str,
-                          num_workers: int = 1) -> TranslationTask:
-        """Start a new translation task for a project."""
+                          num_workers: int = 1,
+                          segment_ids: list[str] | None = None) -> TranslationTask:
+        """Start a new translation task for a project.
+
+        Args:
+            segment_ids: Optional list of segment IDs to retranslate.
+                         When provided, queues those specific segments regardless of status.
+                         When None, queues all pending segments (normal translation).
+        """
         existing = self.tasks.get(project_name)
         if existing and existing.state == 'running':
             raise ValueError('翻譯任務已在執行中')
@@ -195,12 +202,19 @@ class TaskManager:
             num_workers=num_workers,
         )
 
-        # Get total pending count
+        # Get segments to translate
         project_dir = os.path.join(projects_dir, project_name)
         pm = ProjectManager(project_dir)
         pm.load()
-        pending = pm.get_pending_segments()
-        task.total = len(pending)
+
+        if segment_ids is not None:
+            # Retranslate mode: queue specified segments regardless of status
+            id_set = set(segment_ids)
+            to_translate = [s for s in pm.data.segments if s.segment_id in id_set]
+        else:
+            to_translate = pm.get_pending_segments()
+
+        task.total = len(to_translate)
 
         if task.total == 0:
             task.state = 'completed'
@@ -211,7 +225,7 @@ class TaskManager:
         task.pm = pm
 
         # Fill segment queue
-        for seg in pending:
+        for seg in to_translate:
             task.segment_queue.put(seg)
 
         self.tasks[project_name] = task
