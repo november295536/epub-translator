@@ -17,13 +17,13 @@ class TestGlossaryManager:
         return GlossaryManager(path)
 
     def test_add_and_get_term(self, gm):
-        gm.add_term('machine learning', '機器學習', category='ai')
+        gm.add_term('machine learning', '機器學習', category='term')
         entry = gm.get_term('machine learning')
 
         assert entry is not None
         assert entry.term == 'machine learning'
         assert entry.translation == '機器學習'
-        assert entry.category == 'ai'
+        assert entry.category == 'term'
 
     def test_case_insensitive_lookup(self, gm):
         gm.add_term('API', '應用程式介面')
@@ -59,8 +59,8 @@ class TestGlossaryManager:
         assert entries[2].term == 'Zlib'
 
     def test_save_and_load(self, gm):
-        gm.add_term('thread', '執行緒', category='programming')
-        gm.add_term('cache', '快取', category='technology')
+        gm.add_term('thread', '執行緒', category='term')
+        gm.add_term('cache', '快取', category='term')
 
         gm2 = GlossaryManager(gm.glossary_path)
         gm2.load()
@@ -86,13 +86,13 @@ class TestGlossaryManager:
         assert 'database' not in terms
 
     def test_format_for_prompt(self, gm):
-        gm.add_term('API', '應用程式介面', category='programming')
+        gm.add_term('API', '應用程式介面', category='term')
         gm.add_term('cache', '快取')
 
         entries = gm.get_all_terms()
         formatted = gm.format_for_prompt(entries)
 
-        assert 'API → 應用程式介面 [programming]' in formatted
+        assert 'API → 應用程式介面 [術語]' in formatted
         assert 'cache → 快取' in formatted
 
     def test_format_empty(self, gm):
@@ -100,8 +100,8 @@ class TestGlossaryManager:
 
     def test_import_json(self, gm, tmp_path):
         import_data = [
-            {'term': 'thread', 'translation': '執行緒', 'category': 'programming'},
-            {'term': 'socket', 'translation': '套接字', 'category': 'networking'},
+            {'term': 'thread', 'translation': '執行緒', 'category': 'term'},
+            {'term': 'socket', 'translation': '套接字', 'category': 'term'},
         ]
         import_path = str(tmp_path / 'import.json')
         with open(import_path, 'w') as f:
@@ -128,7 +128,7 @@ class TestGlossaryManager:
 class TestTermExtractor:
 
     def test_parse_valid_json(self):
-        output = '[{"term": "API", "translation": "介面", "category": "programming"}]'
+        output = '[{"term": "API", "translation": "介面", "category": "term"}]'
         result = TermExtractor._parse_response(output)
         assert len(result) == 1
         assert result[0]['term'] == 'API'
@@ -155,7 +155,7 @@ class TestTermExtractor:
     def test_extract_from_text_calls_claude(self):
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = '[{"term": "API", "translation": "介面", "category": "programming"}]'
+        mock_result.stdout = '[{"term": "API", "translation": "介面", "category": "term"}]'
 
         extractor = TermExtractor()
         with patch('src.glossary.term_extractor.subprocess.run', return_value=mock_result):
@@ -178,7 +178,7 @@ class TestTermExtractor:
     def test_extract_from_segments_deduplicates(self):
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = '[{"term": "API", "translation": "介面", "category": "programming"}]'
+        mock_result.stdout = '[{"term": "API", "translation": "介面", "category": "term"}]'
 
         extractor = TermExtractor()
         segments = [{'text': 'First batch'}, {'text': 'Second batch'}]

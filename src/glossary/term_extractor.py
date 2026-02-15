@@ -19,24 +19,24 @@ class ExtractionError(Exception):
     """Raised when term extraction fails due to a non-recoverable error."""
     pass
 
-EXTRACT_PROMPT = """你是一位專業的技術術語提取專家。請從以下英文文本中提取「需要統一翻譯」的核心專業術語。
+EXTRACT_PROMPT = """你是一位專業的術語提取專家。請從以下英文文本中提取「需要統一翻譯」的核心術語。
 
 提取標準（嚴格遵守）：
-- 只提取該領域的核心專業術語，即翻譯時需要全書統一、且一般譯者可能拿捏不定的詞
-- 不要提取常見 IT 詞彙（如 debugging、monitoring、logs、dashboard、infrastructure、deployment 等，這些翻譯人人皆知）
-- 不要提取一般英文詞彙或片語（如 at scale、case study、stakeholders、fair use 等）
+- 只提取需要全書統一翻譯、且一般譯者可能拿捏不定的詞
+- 包含人名、地名、作品名、組織名、專業術語、慣用語等
+- 不要提取常見詞彙或一般英文片語（如 at scale、case study、stakeholders 等）
 - 不要提取同一術語的不同形態（如 trace/traces/tracing 只取一個原形）
-- 不要提取上位詞與下位詞重複（如已有 telemetry 就不要再加 telemetry pipelines、telemetry signals）
+- 不要提取上位詞與下位詞重複
 - 目標數量：寧精勿濫，通常一本書 20-40 個核心術語就夠了
 
 輸出要求：
 1. 輸出 JSON 陣列格式
 2. 每個術語包含 term（英文術語，用原形單數）、translation（繁體中文翻譯，使用台灣用語）、category（類別）
-3. 類別可選：technology, programming, data, networking, security, cloud, ai, other
+3. 類別可選：person, place, work, organization, term, expression, other
 4. 直接輸出 JSON，不要加任何說明或 markdown 格式
 
 範例輸出：
-[{{"term": "observability", "translation": "可觀測性", "category": "technology"}}, {{"term": "service-level objective", "translation": "服務等級目標", "category": "technology"}}]
+[{{"term": "Built to Last", "translation": "基業長青", "category": "work"}}, {{"term": "heuristics", "translation": "捷思法", "category": "term"}}]
 
 文本：
 {text}"""

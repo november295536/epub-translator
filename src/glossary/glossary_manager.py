@@ -8,6 +8,17 @@ import re
 from dataclasses import dataclass, asdict, field
 
 
+CATEGORY_LABELS = {
+    'person': '人名',
+    'place': '地名',
+    'work': '作品名',
+    'organization': '組織',
+    'term': '術語',
+    'expression': '慣用語',
+    'other': '其他',
+}
+
+
 @dataclass
 class GlossaryEntry:
     """A single glossary entry."""
@@ -109,7 +120,8 @@ class GlossaryManager:
         for e in entries:
             line = f'{e.term} → {e.translation}'
             if e.category:
-                line += f' [{e.category}]'
+                label = CATEGORY_LABELS.get(e.category, e.category)
+                line += f' [{label}]'
             lines.append(line)
         return '\n'.join(lines)
 
