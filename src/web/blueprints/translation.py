@@ -125,7 +125,7 @@ def translation_stream(project_name: str):
         # Send initial status
         yield f"event: status\ndata: {json.dumps({'state': task.state, 'completed': task.completed, 'total': task.total})}\n\n"
 
-        cursor = 0
+        cursor = task.progress.cursor_end
         while True:
             events, cursor = task.progress.iter_from(cursor, timeout=30)
 

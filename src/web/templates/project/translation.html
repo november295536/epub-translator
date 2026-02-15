@@ -273,11 +273,14 @@ function translationController() {
             }
 
             this.eventSource = new EventSource('/api/projects/{{ project_name }}/translate/stream');
+            this._isFirstStatus = true;
 
             this.eventSource.addEventListener('status', (e) => {
                 const data = JSON.parse(e.data);
-                // Only update progress data — state is managed by API responses
-                // and server-initiated SSE events (rate_limit, auth_error, complete, error)
+                if (this._isFirstStatus) {
+                    this.state = data.state;
+                    this._isFirstStatus = false;
+                }
                 this.completed = data.completed;
                 this.total = data.total;
                 if (this.total > 0) {
