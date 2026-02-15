@@ -91,8 +91,8 @@ def init(epub_file):
 @click.option('--project', '-p', default=None, help='Project directory path')
 @click.option('--model', '-m', type=click.Choice(['sonnet', 'opus', 'haiku']),
               default=None, help='Translation model (sonnet/opus/haiku)')
-@click.option('--workers', '-w', type=click.IntRange(1, 8), default=1,
-              help='Number of parallel workers (1-8)')
+@click.option('--workers', '-w', type=click.IntRange(1, 20), default=1,
+              help='Number of parallel workers (1-20)')
 def start(project, model, workers):
     """Start or resume translation of pending segments."""
     project_dir = _find_project(project)

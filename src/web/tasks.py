@@ -16,7 +16,7 @@ from src.glossary.glossary_manager import GlossaryManager
 
 logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 8
+MAX_WORKERS = 20
 
 
 def setup_project_logging(project_dir: str) -> logging.Handler:
