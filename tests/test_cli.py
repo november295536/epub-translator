@@ -295,5 +295,5 @@ class TestCLIWorkersOption:
         result = runner.invoke(cli, ['start', '--project', full_path, '--workers', '0'])
         assert result.exit_code != 0
 
-        result = runner.invoke(cli, ['start', '--project', full_path, '--workers', '10'])
+        result = runner.invoke(cli, ['start', '--project', full_path, '--workers', '25'])
         assert result.exit_code != 0

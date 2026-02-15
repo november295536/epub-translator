@@ -32,7 +32,7 @@ def start_translation(project_name: str):
             num_workers = int(num_workers)
         except (TypeError, ValueError):
             num_workers = 1
-        num_workers = max(1, min(num_workers, 8))
+        num_workers = max(1, min(num_workers, 20))
 
         segment_ids = data.get('segment_ids')  # list[str] | None
         task = tm.start_translation(project_name, projects_dir,

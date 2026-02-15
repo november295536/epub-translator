@@ -1012,8 +1012,8 @@ class TestMultiWorker:
 
         TaskManager._instance = None
 
-    def test_start_workers_capped_at_8(self, project_with_translations):
-        """Workers should be capped at MAX_WORKERS (8)."""
+    def test_start_workers_capped_at_max(self, project_with_translations):
+        """Workers should be capped at MAX_WORKERS (20)."""
         app = create_app(projects_dir=project_with_translations)
         app.config['TESTING'] = True
         TaskManager._instance = None
@@ -1021,12 +1021,12 @@ class TestMultiWorker:
         with app.test_client() as client:
             response = client.post(
                 f'/api/projects/{PROJECT_NAME}/translate/start',
-                data=json.dumps({'workers': 20}),
+                data=json.dumps({'workers': 50}),
                 content_type='application/json',
             )
             assert response.status_code == 200
             data = response.get_json()
-            assert data['workers'] == 8
+            assert data['workers'] == 20
 
             tm = TaskManager()
             tm.stop_translation(PROJECT_NAME)
