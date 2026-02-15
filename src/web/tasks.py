@@ -74,6 +74,12 @@ class EventBroadcaster:
                 return new_events, len(self._events)
             return [], cursor  # timeout
 
+    @property
+    def cursor_end(self) -> int:
+        """Return cursor pointing past the last event."""
+        with self._condition:
+            return len(self._events)
+
     def get_all(self):
         """Return all events (for testing)."""
         with self._condition:

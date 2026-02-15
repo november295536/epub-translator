@@ -657,16 +657,77 @@ class TestStoppedStateSSE:
         )
         tm.tasks[PROJECT_NAME] = task
 
-        # Push a stopped event
-        task.progress.put({'event': 'stopped', 'data': {
-            'completed': 1, 'remaining': 2
-        }})
+        # Push stopped event after a short delay so it arrives after SSE connects
+        def push_stopped():
+            import time
+            time.sleep(0.3)
+            task.progress.put({'event': 'stopped', 'data': {
+                'completed': 1, 'remaining': 2
+            }})
+
+        t = threading.Thread(target=push_stopped, daemon=True)
+        t.start()
 
         with app.test_client() as client:
             response = client.get(f'/api/projects/{PROJECT_NAME}/translate/stream')
             data = response.data.decode()
             assert 'event: stopped' in data
 
+        t.join(timeout=3)
+        TaskManager._instance = None
+
+    def test_sse_does_not_replay_history(self, project_with_translations):
+        """SSE stream should NOT replay old events — only new events after connect."""
+        TaskManager._instance = None
+        app = create_app(projects_dir=project_with_translations)
+        app.config['TESTING'] = True
+
+        tm = TaskManager()
+
+        task = TranslationTask(
+            task_id='test_sse_no_replay',
+            project_name=PROJECT_NAME,
+            projects_dir=project_with_translations,
+            state='running',
+            total=5,
+            completed=2,
+        )
+        tm.tasks[PROJECT_NAME] = task
+
+        # Push historical events BEFORE SSE connection
+        task.progress.put({'event': 'rate_limit', 'data': {
+            'error': 'old rate limit', 'completed': 1, 'remaining': 4,
+        }})
+        task.progress.put({'event': 'segment_complete', 'data': {
+            'segment_id': 'old_seg', 'translated_text': 'old', 'model': 'sonnet',
+        }})
+
+        # Push a new event AFTER we know cursor_end, to simulate post-connect event
+        # We'll push a 'complete' event so the SSE terminates
+        import time
+        def push_complete():
+            time.sleep(0.3)
+            task.state = 'completed'
+            task.progress.put({'event': 'complete', 'data': {
+                'total_translated': 5,
+            }})
+
+        t = threading.Thread(target=push_complete, daemon=True)
+        t.start()
+
+        with app.test_client() as client:
+            response = client.get(f'/api/projects/{PROJECT_NAME}/translate/stream')
+            data = response.data.decode()
+
+            # Should have initial status event
+            assert 'event: status' in data
+            # Should have the post-connect complete event
+            assert 'event: complete' in data
+            # Should NOT have old rate_limit or segment_complete events
+            assert 'event: rate_limit' not in data
+            assert 'event: segment_complete' not in data
+
+        t.join(timeout=3)
         TaskManager._instance = None
 
 
