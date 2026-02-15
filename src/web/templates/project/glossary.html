@@ -35,14 +35,13 @@
                         <label>類別</label>
                         <select x-model="newTerm.category">
                             <option value="">-- 選擇類別 --</option>
-                            <option value="technology">technology</option>
-                            <option value="programming">programming</option>
-                            <option value="data">data</option>
-                            <option value="networking">networking</option>
-                            <option value="security">security</option>
-                            <option value="cloud">cloud</option>
-                            <option value="ai">ai</option>
-                            <option value="other">other</option>
+                            <option value="person">person (人名)</option>
+                            <option value="place">place (地名)</option>
+                            <option value="work">work (作品名)</option>
+                            <option value="organization">organization (組織)</option>
+                            <option value="term">term (術語)</option>
+                            <option value="expression">expression (慣用語)</option>
+                            <option value="other">other (其他)</option>
                         </select>
                     </div>
                 </div>
@@ -164,14 +163,13 @@
                                     <template x-if="editingTerm === term.term">
                                         <select x-model="editData.category" class="inline-input">
                                             <option value="">--</option>
-                                            <option value="technology">technology</option>
-                                            <option value="programming">programming</option>
-                                            <option value="data">data</option>
-                                            <option value="networking">networking</option>
-                                            <option value="security">security</option>
-                                            <option value="cloud">cloud</option>
-                                            <option value="ai">ai</option>
-                                            <option value="other">other</option>
+                                            <option value="person">person (人名)</option>
+                                            <option value="place">place (地名)</option>
+                                            <option value="work">work (作品名)</option>
+                                            <option value="organization">organization (組織)</option>
+                                            <option value="term">term (術語)</option>
+                                            <option value="expression">expression (慣用語)</option>
+                                            <option value="other">other (其他)</option>
                                         </select>
                                     </template>
                                 </td>
