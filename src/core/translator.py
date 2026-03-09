@@ -1,5 +1,6 @@
 """Translation engine - calls Claude CLI to translate text segments."""
 
+import os
 import re
 import subprocess
 import logging
@@ -156,12 +157,15 @@ class TranslationEngine:
 
         for attempt in range(1, self.max_retries + 1):
             try:
+                env = {k: v for k, v in os.environ.items()
+                       if k != 'CLAUDECODE'}
                 result = subprocess.run(
                     ['claude', '-p', prompt, '--model', self.model],
                     capture_output=True,
                     text=True,
                     timeout=120,
                     cwd=tempfile.gettempdir(),
+                    env=env,
                 )
 
                 # Check for API usage limit in stdout or stderr

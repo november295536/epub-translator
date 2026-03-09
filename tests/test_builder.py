@@ -886,3 +886,143 @@ class TestTOCTranslation:
         # Ensure they are NOT all the same
         unique_zh = [t for t in titles if t != '前言']
         assert len(unique_zh) >= 2, f"Sub-entries should have distinct titles, got: {titles}"
+
+
+class TestContentDivAlignment:
+    """Tests that content divs are correctly aligned between segmenter and builder."""
+
+    def test_content_div_preserves_css_class_chinese_only(self, tmp_path):
+        """Content div with CSS class is preserved in chinese-only output."""
+        book = epub.EpubBook()
+        book.set_identifier('content-div-001')
+        book.set_title('Content Div Test')
+        book.set_language('en')
+        book.add_author('Test Author')
+
+        c1 = epub.EpubHtml(title='Chapter 1', file_name='ch01.xhtml', lang='en')
+        c1.content = (
+            '<html><body>'
+            '<h1>Chapter One</h1>'
+            '<div class="lsl">• "No, no, you can\'t do that."</div>'
+            '<div class="lsl">• "Yes, I can."</div>'
+            '<p>Regular paragraph here.</p>'
+            '</body></html>'
+        ).encode('utf-8')
+
+        book.add_item(c1)
+        book.add_item(epub.EpubNcx())
+        book.add_item(epub.EpubNav())
+        book.spine = ['nav', c1]
+
+        epub_path = str(tmp_path / 'content_div.epub')
+        epub.write_epub(epub_path, book)
+
+        from src.epub.extractor import EPUBExtractor
+        from src.core.segmenter import Segmenter
+
+        project_dir = str(tmp_path / 'cdiv_project')
+        os.makedirs(project_dir, exist_ok=True)
+
+        extractor = EPUBExtractor(epub_path)
+        extractor.load()
+        metadata = extractor.get_metadata()
+        chapters = extractor.extract_chapters()
+
+        segmenter = Segmenter()
+        all_segments = []
+        for ch in chapters:
+            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            all_segments.extend(segs)
+
+        pm = ProjectManager(project_dir)
+        pm.create(
+            epub_path=epub_path,
+            title=metadata['title'],
+            author=metadata['author'],
+            segments=all_segments,
+        )
+
+        # Translate each segment
+        for seg in pm.data.segments:
+            if '<h1' in seg.html:
+                pm.mark_translated(seg.segment_id, '<h1>第一章</h1>')
+            elif 'class="lsl"' in seg.html:
+                pm.mark_translated(seg.segment_id, seg.html.replace('No, no', '不不不').replace('Yes, I can', '是的，我可以'))
+            else:
+                pm.mark_translated(seg.segment_id, f'<p>翻譯段落</p>')
+        pm.save()
+
+        builder = EPUBBuilder(project_dir)
+        output = str(tmp_path / 'cdiv_output.epub')
+        builder.build(output, fmt='chinese-only')
+
+        soup = _get_chapter_html(output, 0)
+
+        # Content divs with class="lsl" should be preserved
+        lsl_divs = soup.find_all('div', class_='lsl')
+        assert len(lsl_divs) >= 1, f"div.lsl should be preserved, got: {soup}"
+
+    def test_container_div_recurse_heading_correct(self, tmp_path):
+        """Container div recurses, and heading inside is correctly replaced."""
+        book = epub.EpubBook()
+        book.set_identifier('container-div-001')
+        book.set_title('Container Div Test')
+        book.set_language('en')
+        book.add_author('Test Author')
+
+        c1 = epub.EpubHtml(title='Preface', file_name='preface.xhtml', lang='en')
+        c1.content = (
+            '<html><body>'
+            '<div id="preface"><h1>Preface</h1><p>Welcome to this book.</p></div>'
+            '</body></html>'
+        ).encode('utf-8')
+
+        book.add_item(c1)
+        book.add_item(epub.EpubNcx())
+        book.add_item(epub.EpubNav())
+        book.spine = ['nav', c1]
+
+        epub_path = str(tmp_path / 'container_div.epub')
+        epub.write_epub(epub_path, book)
+
+        from src.epub.extractor import EPUBExtractor
+        from src.core.segmenter import Segmenter
+
+        project_dir = str(tmp_path / 'cntdiv_project')
+        os.makedirs(project_dir, exist_ok=True)
+
+        extractor = EPUBExtractor(epub_path)
+        extractor.load()
+        metadata = extractor.get_metadata()
+        chapters = extractor.extract_chapters()
+
+        segmenter = Segmenter()
+        all_segments = []
+        for ch in chapters:
+            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            all_segments.extend(segs)
+
+        pm = ProjectManager(project_dir)
+        pm.create(
+            epub_path=epub_path,
+            title=metadata['title'],
+            author=metadata['author'],
+            segments=all_segments,
+        )
+
+        for seg in pm.data.segments:
+            if '<h1' in seg.html:
+                pm.mark_translated(seg.segment_id, '<h1>前言</h1>')
+            else:
+                pm.mark_translated(seg.segment_id, '<p>歡迎閱讀本書。</p>')
+        pm.save()
+
+        builder = EPUBBuilder(project_dir)
+        output = str(tmp_path / 'cntdiv_output.epub')
+        builder.build(output, fmt='chinese-only')
+
+        soup = _get_chapter_html(output, 0)
+
+        h1 = soup.find('h1')
+        assert h1 is not None, "h1 should exist after container div recurse"
+        assert '前言' in h1.get_text()

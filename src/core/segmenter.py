@@ -32,6 +32,26 @@ MIN_WORDS = 300
 MAX_WORDS = 500
 SMALL_SEGMENT_THRESHOLD = 100
 
+BLOCK_TAGS = frozenset({
+    'address', 'article', 'aside', 'blockquote', 'details', 'dialog',
+    'dd', 'div', 'dl', 'dt', 'fieldset', 'figcaption', 'figure',
+    'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header',
+    'hgroup', 'hr', 'li', 'main', 'nav', 'ol', 'p', 'pre', 'section',
+    'summary', 'table', 'ul',
+})
+
+
+def _is_container(tag: Tag) -> bool:
+    """Container = only block-level children + whitespace. Content = has text or inline tags."""
+    for child in tag.children:
+        if isinstance(child, NavigableString):
+            if child.strip():
+                return False
+        elif isinstance(child, Tag):
+            if child.name not in BLOCK_TAGS:
+                return False
+    return True
+
 
 class Segmenter:
     """Splits HTML content into segments of 300-500 words."""
@@ -106,8 +126,18 @@ class Segmenter:
                         'standalone': True,
                     })
             elif tag_name in ('div', 'section', 'article'):
-                inner_blocks = self._extract_blocks(child)
-                blocks.extend(inner_blocks)
+                if _is_container(child):
+                    inner_blocks = self._extract_blocks(child)
+                    blocks.extend(inner_blocks)
+                else:
+                    text = child.get_text(separator=' ', strip=True)
+                    if text:
+                        blocks.append({
+                            'html': str(child),
+                            'text': text,
+                            'type': SegmentType.TEXT,
+                            'standalone': False,
+                        })
             else:
                 text = child.get_text(separator=' ', strip=True)
                 if text:
@@ -182,18 +212,28 @@ class Segmenter:
                     if pending_word_count >= MIN_WORDS:
                         flush_pending()
                 else:
-                    sentences = self._split_sentences(block['text'])
-                    sentence_htmls = self._split_sentences(block['html'])
-
-                    for i, sentence in enumerate(sentences):
-                        swc = len(sentence.split())
-                        pending_text_parts.append(sentence)
-                        if i < len(sentence_htmls):
-                            pending_html_parts.append(sentence_htmls[i])
-                        pending_word_count += swc
-
+                    if re.search(r'<[a-zA-Z]', block['html']):
+                        # HTML block — cannot sentence-split without breaking tag structure
+                        flush_pending()
+                        pending_html_parts.append(block['html'])
+                        pending_text_parts.append(block['text'])
+                        pending_word_count = block_words
                         if pending_word_count >= MIN_WORDS:
                             flush_pending()
+                    else:
+                        # Plain text — safe to sentence-split
+                        sentences = self._split_sentences(block['text'])
+                        sentence_htmls = self._split_sentences(block['html'])
+
+                        for i, sentence in enumerate(sentences):
+                            swc = len(sentence.split())
+                            pending_text_parts.append(sentence)
+                            if i < len(sentence_htmls):
+                                pending_html_parts.append(sentence_htmls[i])
+                            pending_word_count += swc
+
+                            if pending_word_count >= MIN_WORDS:
+                                flush_pending()
 
         flush_pending()
 
