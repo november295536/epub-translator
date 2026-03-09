@@ -6,7 +6,7 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -107,12 +107,17 @@ class ProjectManager:
             raw = json.load(f)
 
         raw_segments = raw.pop('segments', [])
+        valid_fields = {f.name for f in fields(SegmentState)}
         for s in raw_segments:
             # Normalize legacy segment types: heading/table → text
             if s.get('segment_type') in ('heading', 'table'):
                 s['segment_type'] = 'text'
             # Convert status string to enum
             s['status'] = SegmentStatus(s.get('status', 'pending'))
+            # Strip unknown fields from older/experimental schemas
+            for key in list(s.keys()):
+                if key not in valid_fields:
+                    del s[key]
         segments = [SegmentState(**s) for s in raw_segments]
         self.data = ProjectData(**raw, segments=segments)
         return self.data

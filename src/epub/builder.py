@@ -10,7 +10,7 @@ from ebooklib import epub
 from bs4 import BeautifulSoup, Tag, NavigableString
 
 from src.core.project import ProjectManager, SegmentState
-from src.core.segmenter import SegmentType
+from src.core.segmenter import SegmentType, _is_container
 
 BILINGUAL_CSS = """
 .bilingual-container {
@@ -174,7 +174,12 @@ class EPUBBuilder:
             if not isinstance(child, Tag):
                 continue
             if child.name in ('div', 'section', 'article'):
-                elements.extend(self._walk_content_elements(child))
+                if _is_container(child):
+                    elements.extend(self._walk_content_elements(child))
+                else:
+                    text = child.get_text(separator=' ', strip=True)
+                    if text:
+                        elements.append(child)
             else:
                 text = child.get_text(separator=' ', strip=True)
                 if text:

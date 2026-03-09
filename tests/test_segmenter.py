@@ -1,7 +1,8 @@
 """Tests for smart segmentation module."""
 
 import pytest
-from src.core.segmenter import Segmenter, Segment, SegmentType, MIN_WORDS, MAX_WORDS, SMALL_SEGMENT_THRESHOLD
+from bs4 import BeautifulSoup, Tag
+from src.core.segmenter import Segmenter, Segment, SegmentType, MIN_WORDS, MAX_WORDS, SMALL_SEGMENT_THRESHOLD, _is_container
 
 
 @pytest.fixture
@@ -302,3 +303,140 @@ class TestSpaceExtraction:
         assert len(segments) >= 1
         # Text should have spaces between words
         assert 'Hello world' in segments[0].text or 'Hello world from Python' in segments[0].text
+
+
+def _make_tag(html: str) -> Tag:
+    """Parse HTML string and return the first Tag child."""
+    soup = BeautifulSoup(html, 'html.parser')
+    for child in soup.children:
+        if isinstance(child, Tag):
+            return child
+    raise ValueError(f"No Tag found in: {html}")
+
+
+class TestIsContainer:
+
+    def test_div_with_only_block_children(self):
+        tag = _make_tag('<div><p>Hello</p><p>World</p></div>')
+        assert _is_container(tag) is True
+
+    def test_div_with_text_content(self):
+        tag = _make_tag('<div>Some text</div>')
+        assert _is_container(tag) is False
+
+    def test_div_with_inline_tag(self):
+        tag = _make_tag('<div><span>inline</span></div>')
+        assert _is_container(tag) is False
+
+    def test_div_with_mixed_content(self):
+        tag = _make_tag('<div>Text <p>Block</p></div>')
+        assert _is_container(tag) is False
+
+    def test_div_with_whitespace_and_blocks(self):
+        tag = _make_tag('<div>\n  <h1>Title</h1>\n  <p>Paragraph</p>\n</div>')
+        assert _is_container(tag) is True
+
+    def test_empty_div(self):
+        tag = _make_tag('<div></div>')
+        assert _is_container(tag) is True
+
+    def test_div_with_nested_div_container(self):
+        tag = _make_tag('<div><div><p>Nested</p></div></div>')
+        assert _is_container(tag) is True
+
+
+class TestContentDivHandling:
+
+    def test_content_div_preserves_html_structure(self, segmenter):
+        """Content div with CSS class should be preserved as a complete element."""
+        html = '<div class="lsl">• "No, no, you can\'t do that."</div>'
+        segments = segmenter.segment_chapter('ch1', html)
+
+        assert len(segments) == 1
+        assert 'class="lsl"' in segments[0].html
+        assert '<div' in segments[0].html
+
+    def test_container_div_recurses(self, segmenter):
+        """Container div (only block children) should recurse into children."""
+        html = '<div id="chapter"><h1>Title</h1><p>Content here.</p></div>'
+        segments = segmenter.segment_chapter('ch1', html)
+
+        # Should have extracted h1 and p separately, not the wrapper div
+        assert any('<h1>' in s.html for s in segments)
+        assert all('<div' not in s.html for s in segments)
+
+    def test_content_div_with_inline_tags(self, segmenter):
+        """Div containing inline tags (span, em, etc.) is a content div."""
+        html = '<div class="note"><em>Important:</em> This is a note.</div>'
+        segments = segmenter.segment_chapter('ch1', html)
+
+        assert len(segments) == 1
+        assert 'class="note"' in segments[0].html
+        assert '<em>' in segments[0].html
+
+    def test_mixed_container_and_content_divs(self, segmenter):
+        """Mix of container and content divs handled correctly."""
+        html = (
+            '<div id="wrapper">'
+            '<div class="lsl">• Bullet point one.</div>'
+            '<div class="lsl">• Bullet point two.</div>'
+            '</div>'
+        )
+        segments = segmenter.segment_chapter('ch1', html)
+
+        # The outer div is a container (children are block-level divs)
+        # The inner divs are content divs (have text)
+        assert any('class="lsl"' in s.html for s in segments)
+
+    def test_large_content_div_not_sentence_split(self, segmenter):
+        """A large content div should not be sentence-split (would break HTML)."""
+        words = ' '.join(f'word{i}.' for i in range(600))
+        html = f'<div class="big">{words}</div>'
+        segments = segmenter.segment_chapter('ch1', html)
+
+        # The content div is a single element, so _split_large_segments keeps it intact
+        div_segs = [s for s in segments if '<div' in s.html]
+        assert len(div_segs) >= 1
+        assert 'class="big"' in div_segs[0].html
+
+    def test_multiple_small_content_divs_merged(self, segmenter):
+        """Multiple small content divs can be merged into one segment."""
+        divs = [f'<div class="item">Item {i} text.</div>' for i in range(5)]
+        html = '\n'.join(divs)
+        segments = segmenter.segment_chapter('ch1', html)
+
+        # 5 tiny divs should merge into 1 segment
+        text_segs = [s for s in segments if not s.standalone]
+        assert len(text_segs) == 1
+        assert text_segs[0].html.count('class="item"') == 5
+
+    def test_empty_div_ignored(self, segmenter):
+        """Empty content div should not produce a segment."""
+        html = '<div class="spacer"></div><p>Real content.</p>'
+        segments = segmenter.segment_chapter('ch1', html)
+
+        assert all('spacer' not in s.html for s in segments)
+        assert any('Real content' in s.text for s in segments)
+
+    def test_content_div_not_sentence_split_in_merge(self, segmenter):
+        """Content div block should not be sentence-split during merge even when it would overflow."""
+        # Create pending buffer close to MIN_WORDS, then add a content div that would overflow
+        p_words = ' '.join(f'word{i}.' for i in range(250))
+        div_words = ' '.join(f'dword{i}.' for i in range(300))
+        html = f'<p>{p_words}</p><div class="special">{div_words}</div>'
+
+        segments = segmenter.segment_chapter('ch1', html)
+
+        # The content div should appear intact in some segment
+        div_segs = [s for s in segments if 'class="special"' in s.html]
+        assert len(div_segs) == 1
+        assert '<div' in div_segs[0].html
+
+    def test_section_content_preserved(self, segmenter):
+        """Section with inline content is treated as content element."""
+        html = '<section class="note">This is an important note.</section>'
+        segments = segmenter.segment_chapter('ch1', html)
+
+        assert len(segments) == 1
+        assert '<section' in segments[0].html
+        assert 'class="note"' in segments[0].html
