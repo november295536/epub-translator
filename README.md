@@ -42,12 +42,10 @@ python3 -m pytest tests/ -v
 ### Web 介面（推薦）
 
 ```bash
-python3 -m flask --app src.web.server:create_app run --port 5001
+python3 -m flask --app src.web.server:create_app run --port 3000
 ```
 
-> macOS 的 port 5000 預設被 AirPlay 佔用，建議使用 5001 或其他 port。
-
-開啟瀏覽器 http://localhost:5001，即可進行完整流程：
+開啟瀏覽器 http://localhost:3000，即可進行完整流程：
 
 1. **首頁** — 查看所有專案，點「新增專案」上傳 EPUB
 2. **總覽** — 各章節進度統計
@@ -71,7 +69,8 @@ python3 translate.py glossary show             # 查看術語表
 python3 translate.py glossary add "API" "應用程式介面" -c programming
 
 # 開始翻譯（可中斷，再次執行自動從中斷處繼續）
-python3 translate.py start
+python3 translate.py start                          # 預設 sonnet, 1 worker
+python3 translate.py start --model opus --workers 5 # 指定模型與並行數
 
 # 開啟 Web 審閱介面
 python3 translate.py review

@@ -20,7 +20,7 @@ python3 -m pytest tests/ -v
 
 # CLI usage
 python3 translate.py init <epub_file>
-python3 translate.py start
+python3 translate.py start --model opus --workers 5
 python3 translate.py status
 python3 translate.py glossary show
 python3 translate.py glossary extract
@@ -35,16 +35,17 @@ python3 translate.py review
 1. **EPUB Extraction** (`src/epub/extractor.py`) — Parse EPUB, extract chapters as HTML
 2. **Smart Segmentation** (`src/core/segmenter.py`) — Split into 300-500 word segments at sentence boundaries; merge small segments (<100 words), split large ones (>500 words)
 3. **Terminology Extraction** (`src/glossary/term_extractor.py`) — Auto-extract technical terms via Claude CLI
-4. **Translation** (`src/core/translator.py`) — Translate via `subprocess.run(['claude', '-p', prompt], input=text)` with segment-type-aware prompts and glossary context
+4. **Translation** (`src/core/translator.py`) — Translate via `subprocess.run(['claude', '-p', prompt, '--model', model])` with segment-type-aware prompts and glossary context
 5. **Review** (`src/web/`) — Web interface for side-by-side review and editing
 6. **EPUB Reconstruction** (`src/epub/builder.py`) — Rebuild EPUB in chosen format
 
 ### Key Design Decisions
 
-- **Claude CLI Integration**: Translations go through `subprocess.run(['claude', '-p', ...])` with stdin pipe. Each segment gets a type-specific prompt (text, heading, code, table).
+- **Claude CLI Integration**: Translations go through `subprocess.run(['claude', '-p', prompt, '--model', model])`. Two segment types: `text` (prose, headings, tables) and `code` (pre/code blocks). Env var `CLAUDECODE` is stripped to avoid nested-session detection.
 - **JSON Persistence**: All state stored in `project.json` and `glossary.json` per project. No database required.
 - **Web Architecture**: Flask app factory with Blueprints. Alpine.js for frontend reactivity (no build step). SSE for real-time translation progress. Background threading for long-running tasks.
-- **Segmentation**: 300-500 words per segment, breaking at sentence boundaries. Code blocks, tables, and headings are isolated. Small consecutive text segments are merged; oversized segments are split.
+- **Segmentation**: 300-500 words per segment, breaking at sentence boundaries. Code blocks, tables, and headings are isolated as standalone segments. Content divs (with text/inline tags) are preserved as atomic elements; container divs (only block children) are recursed into. Small consecutive text segments are merged; oversized segments are split.
+- **Parallel Translation**: Coordinator+worker+result pattern. Up to 20 parallel workers (`MAX_WORKERS`). Workers translate segments and put results into `result_queue`; coordinator drains results, updates state, and emits SSE events. Model can be switched mid-translation.
 
 ### Module Structure
 
@@ -78,8 +79,9 @@ src/
 
 - **Code blocks**: Preserve formatting, translate only comments (`#`, `//`)
 - **LaTeX formulas**: `$...$` and `$$...$$` kept unchanged
-- **Tables**: `<table>` elements isolated as segments, HTML structure preserved
-- **Headings**: Simplified prompt, no extra formatting
+- **Tables**: `<table>` elements isolated as standalone segments, HTML structure preserved
+- **Headings**: Standalone segments, simplified prompt
+- **Content divs**: `<div>` with text/inline content preserved as atomic elements (CSS classes retained); container divs (only block children) recursed into transparently. Determined by `_is_container()` heuristic using `BLOCK_TAGS` set.
 
 ### Output Formats
 
@@ -96,6 +98,7 @@ src/
 - `POST /api/upload` — Upload EPUB file
 - `POST /api/epub/metadata` — Extract EPUB metadata
 - `POST /api/projects` — Create project
+- `DELETE /api/projects/<name>` — Delete project
 - `GET /project/<name>/overview` — Project detail with tabs (overview, glossary, translation, review, export)
 - `GET /api/projects/<name>` — Get project details JSON
 - `GET /api/projects/<name>/chapters` — Get chapter list
@@ -103,12 +106,19 @@ src/
 - `POST /api/projects/<name>/glossary` — Add glossary term
 - `PUT /api/projects/<name>/glossary/<term>` — Update term
 - `DELETE /api/projects/<name>/glossary/<term>` — Delete term
+- `DELETE /api/projects/<name>/glossary/batch` — Batch delete terms
 - `POST /api/projects/<name>/glossary/extract` — Auto-extract terms
-- `POST /api/projects/<name>/translate/start` — Start background translation
+- `GET /api/projects/<name>/model` — Get translation model
+- `PUT /api/projects/<name>/model` — Set translation model
+- `POST /api/projects/<name>/translate/start` — Start background translation (accepts `workers`, `segment_ids`)
 - `POST /api/projects/<name>/translate/pause` — Pause translation
+- `GET /api/projects/<name>/translate/status` — Translation task status
 - `GET /api/projects/<name>/translate/stream` — SSE progress stream
 - `POST /api/projects/<name>/segments/<id>` — Update segment translation
 - `POST /api/projects/<name>/segments/<id>/approve` — Mark segment reviewed
+- `POST /api/projects/<name>/segments/<id>/retranslate` — Re-translate segment
+- `GET /project/<name>/search` — Search page
+- `POST /api/projects/<name>/search-segments` — Search segments by keyword
 - `GET /api/projects/<name>/progress` — Get translation progress
 - `POST /api/projects/<name>/export` — Generate EPUB
 - `GET /api/projects/<name>/download/<filename>` — Download generated EPUB
@@ -150,7 +160,7 @@ python3 -m flask --app src.web.server:create_app run --port 3000
 
 ## Testing
 
-183 tests covering all modules:
+246 tests covering all modules:
 ```bash
 python3 -m pytest tests/ -v
 ```
