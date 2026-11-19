@@ -237,6 +237,33 @@ class TestModelField:
         pm2.load()
         assert pm2.data.model == 'sonnet'
 
+    def test_new_project_records_segmenter_version_2(self, project_dir, sample_segments):
+        ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments)
+        with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
+            assert json.load(f)['segmenter_version'] == 2
+        pm = ProjectManager(project_dir)
+        pm.load()
+        assert pm.data.segmenter_version == 2
+
+    def test_project_without_segmenter_version_loads_as_1_unchanged(
+            self, project_dir, sample_segments):
+        ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments)
+        path = os.path.join(project_dir, 'project.json')
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        del data['segmenter_version']
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        with open(path, 'rb') as f:
+            before = f.read()
+
+        pm = ProjectManager(project_dir)
+        pm.load()
+
+        assert pm.data.segmenter_version == 1
+        with open(path, 'rb') as f:
+            assert f.read() == before
+
     def test_set_model_without_load(self, project_dir):
         pm = ProjectManager(project_dir)
         with pytest.raises(RuntimeError, match="No project"):
