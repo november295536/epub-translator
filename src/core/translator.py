@@ -115,13 +115,13 @@ def _starts_with_commentary(text: str) -> bool:
 
 
 def _is_empty_reply(translated: str, source: str) -> bool:
-    """True when a cleaned reply holds no translation: nothing, only code-fence
-    backticks, or a single commentary line that ends with a colon (it announces
+    """True when a cleaned reply holds no translation: nothing, only backticks
+    and whitespace (unless the source holds nothing else), or a single commentary line that ends with a colon (it announces
     output that is missing) when the source does not end with one. Short
     replies such as "好的" are accepted."""
     t = translated.strip()
-    if not t.strip('`'):
-        return True
+    if not re.sub(r'[`\s]', '', t):
+        return not t or bool(re.sub(r'[`\s]', '', source))
     return ('\n' not in t and _starts_with_commentary(t)
             and t.endswith((':', '：'))
             and not source.rstrip().endswith((':', '：')))

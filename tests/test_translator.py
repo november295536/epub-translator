@@ -617,6 +617,37 @@ class TestCodeResponseCleaning:
             assert engine.translate('x = 1', segment_type=SegmentType.CODE) == 'x = 1'
         assert mock_run.call_count == 2
 
+    def test_code_reply_of_fence_markers_on_two_lines_is_retried(self):
+        # The source holds a fence, so the reply is not unwrapped; backticks
+        # and a newline remain
+        engine = TranslationEngine(max_retries=2)
+        empty, good = MagicMock(), MagicMock()
+        empty.returncode = good.returncode = 0
+        empty.stderr = good.stderr = ''
+        empty.stdout = '```\n```'
+        good.stdout = 'print("```")\n'
+
+        with patch('src.core.translator.subprocess.run',
+                   side_effect=[empty, good]) as mock_run:
+            assert engine.translate('print("```")',
+                                    segment_type=SegmentType.CODE) == 'print("```")'
+        assert mock_run.call_count == 2
+
+    @pytest.mark.parametrize('source, segment_type', [
+        ('`', SegmentType.TEXT),
+        ('`', SegmentType.CODE),
+        ('```\n```', SegmentType.CODE),
+    ])
+    def test_backtick_only_source_and_matching_reply_accepted(self, source, segment_type):
+        engine = TranslationEngine(max_retries=1)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = source
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            assert engine.translate(source, segment_type=segment_type) == source
+
     def test_text_reply_empty_after_cleanup_raises(self):
         engine = TranslationEngine(max_retries=1)
         mock_result = MagicMock()
