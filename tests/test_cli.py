@@ -71,7 +71,33 @@ class TestCLIInit:
         full_path = os.path.join(str(tmp_path), project_dir)
         assert os.path.isfile(os.path.join(full_path, 'project.json'))
         with open(os.path.join(full_path, 'project.json'), encoding='utf-8') as f:
-            assert json.load(f)['segmenter_version'] == 2
+            raw = json.load(f)
+        # Phase 2: schema 2 (was segmenter_version 2), and the project owns
+        # a copy of the book whose hash it records
+        assert raw['schema'] == 2
+        assert 'segmenter_version' not in raw
+        copy = os.path.join(full_path, 'source.epub')
+        assert raw['epub_path'] == copy
+        with open(copy, 'rb') as a, open(sample_epub, 'rb') as b:
+            data = a.read()
+            assert data == b.read()
+        import hashlib
+        assert raw['source_sha256'] == hashlib.sha256(data).hexdigest()
+
+    def test_init_reports_unparsed_chapter(self, runner, tmp_path, monkeypatch):
+        from tests.conftest import write_raw_epub, xhtml
+        monkeypatch.chdir(tmp_path)
+        items = [('a', 'a.xhtml', 'application/xhtml+xml', None),
+                 ('b', 'b.xhtml', 'application/xhtml+xml', None)]
+        members = {'OEBPS/a.xhtml': xhtml('<p>The tide came in.</p>'),
+                   'OEBPS/b.xhtml': xhtml('<p>Unclosed paragraph.</div>')}
+        epub_path = write_raw_epub(tmp_path / 'bad.epub', items, ['a', 'b'], members)
+
+        result = runner.invoke(cli, ['init', epub_path])
+
+        assert result.exit_code == 0, result.output
+        assert '無法解析的章節（不分段）：b：not well-formed XML' in result.output
+        assert '分段完成：共 1 個段落' in result.output
 
     def test_init_duplicate_project(self, runner, sample_epub, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

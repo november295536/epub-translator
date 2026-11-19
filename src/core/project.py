@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import tempfile
@@ -33,8 +34,17 @@ class SegmentStatus(str, Enum):
         return self.value
 
 
-# Segmenter behaviour recorded on projects created now (see ProjectData)
-SEGMENTER_VERSION = 2
+# project.json layout written for projects created now (see ProjectData)
+SCHEMA = 2
+
+
+def sha256_file(path: str) -> str:
+    """SHA-256 of a file, hex."""
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @dataclass
@@ -48,7 +58,8 @@ class Issue:
 
 # Per-segment fields written to project.json only when they differ from
 # these defaults, so an existing project round-trips without new keys
-_SEGMENT_DEFAULTS = {'issues': [], 'revision': 0, 'model': '', 'usage': None}
+_SEGMENT_DEFAULTS = {'issues': [], 'revision': 0, 'model': '', 'usage': None,
+                     'block_start': None, 'block_end': None, 'fingerprints': []}
 
 
 @dataclass
@@ -69,6 +80,11 @@ class SegmentState:
     revision: int = 0
     model: str = ''              # model that produced translated_text
     usage: dict | None = None    # token usage of that call, when reported
+    # Schema 2: the half-open range of the chapter's blocks the segment
+    # covers, and their fingerprints
+    block_start: int | None = None
+    block_end: int | None = None
+    fingerprints: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -83,11 +99,17 @@ class ProjectData:
     # Filled with the backend's default model on create, and on load when
     # the file has none (projects from before the field)
     model: str = ''
-    # 1: segmented before comments were skipped; never written to project.json,
-    # so projects that existed before Phase 0 remain loadable by pre-Phase-0
-    # code. 2: comments skipped; always written, so projects created after
-    # Phase 0 are not. The builder walks chapters to match.
+    # Schema 1 only. 1: segmented before comments were skipped; never written
+    # to project.json, so projects that existed before Phase 0 remain loadable
+    # by pre-Phase-0 code. 2: comments skipped; always written, so projects
+    # created after Phase 0 are not. The builder walks chapters to match.
     segmenter_version: int = 1
+    # 1: segments are matched to the chapter by the builder's walk (never
+    # written). 2: segments are block ranges with fingerprints (plan 4.2);
+    # the field is written, and segmenter_version is not.
+    schema: int = 1
+    # SHA-256 of the project's copy of the source EPUB (schema 2)
+    source_sha256: str = ''
     segments: list[SegmentState] = field(default_factory=list)
 
 
@@ -122,15 +144,15 @@ class ProjectManager:
         self.mutex = project_mutex(project_dir)
 
     def create(self, epub_path: str, title: str, author: str,
-               segments: list[Segment], chapter_ids: dict[str, str] | None = None) -> ProjectData:
-        """Create a new translation project.
+               segments: list[Segment], source_sha256: str = '') -> ProjectData:
+        """Create a new translation project (schema 2).
 
         Args:
-            epub_path: Path to the source EPUB file.
+            epub_path: Path to the project's copy of the source EPUB.
             title: Book title.
             author: Book author.
             segments: List of segments from the segmenter.
-            chapter_ids: Optional mapping of segment prefix to chapter id.
+            source_sha256: SHA-256 of that copy.
         """
         os.makedirs(self.project_dir, exist_ok=True)
 
@@ -145,6 +167,9 @@ class ProjectManager:
                 text=seg.text,
                 word_count=seg.word_count,
                 segment_type=seg.segment_type,
+                block_start=seg.block_start,
+                block_end=seg.block_end,
+                fingerprints=list(seg.fingerprints),
             ))
 
         self.data = ProjectData(
@@ -155,7 +180,8 @@ class ProjectManager:
             created_at=now,
             updated_at=now,
             model=llm.default_backend().default_model,
-            segmenter_version=SEGMENTER_VERSION,
+            schema=SCHEMA,
+            source_sha256=source_sha256,
             segments=segment_states,
         )
         self.save()
@@ -191,9 +217,14 @@ class ProjectManager:
             raise RuntimeError("No project data to save.")
         with self.mutex:
             raw = asdict(self.data)
-        if raw['segmenter_version'] == 1:
-            # Leave the field out, so pre-Phase-0 code can still load it
-            del raw['segmenter_version']
+        if raw['schema'] == 1:
+            # Leave the new fields out: a schema 1 project saves as before
+            del raw['schema'], raw['source_sha256']
+            if raw['segmenter_version'] == 1:
+                # Leave the field out, so pre-Phase-0 code can still load it
+                del raw['segmenter_version']
+        else:
+            del raw['segmenter_version']  # superseded by the schema
         for seg in raw['segments']:
             for key, default in _SEGMENT_DEFAULTS.items():
                 if seg[key] == default:

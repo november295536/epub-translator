@@ -12,6 +12,7 @@ from bs4.element import PreformattedString
 
 from src.core.project import ProjectManager, SegmentState
 from src.core.segmenter import SegmentType, _is_container
+from src.epub.blocks import BLOCK_TAGS, DESCEND_TAGS, fingerprint, normalize
 
 BILINGUAL_CSS = """
 .bilingual-container {
@@ -137,22 +138,15 @@ class EPUBBuilder:
         if not body:
             return
 
-        elements = self._walk_content_elements(body, legacy=self._legacy_walk())
+        if self.pm.data is not None and self.pm.data.schema == 2:
+            placed = self._place_by_blocks(body, segments)
+            if placed is None:
+                return  # the chapter stays in the original language
+        else:
+            placed = self._place_by_count(body, segments)
 
-        elem_idx = 0
-        for seg in segments:
-            if elem_idx >= len(elements):
-                break
-
-            n = self._count_segment_blocks(seg)
-            end_idx = min(elem_idx + n, len(elements))
-            covered = elements[elem_idx:end_idx]
-
-            if not covered:
-                elem_idx = end_idx
-                continue
-
-            if seg.translated_text:
+        for seg, covered in placed:
+            if covered and seg.translated_text:
                 if fmt == 'chinese-only':
                     self._apply_chinese_only(seg, covered, soup)
                 elif fmt == 'bilingual-vertical':
@@ -160,9 +154,37 @@ class EPUBBuilder:
                 elif fmt == 'bilingual-horizontal':
                     self._apply_bilingual_horizontal(seg, covered, soup)
 
-            elem_idx = end_idx
-
         item.set_content(str(soup).encode('utf-8'))
+
+    def _place_by_count(self, body, segments: list[SegmentState]) -> list:
+        """Schema 1: (segment, elements) pairs, each segment taking as many
+        walked elements as its stored HTML has top-level nodes."""
+        elements = self._walk_content_elements(body, legacy=self._legacy_walk())
+        placed = []
+        elem_idx = 0
+        for seg in segments:
+            if elem_idx >= len(elements):
+                break
+            end_idx = min(elem_idx + self._count_segment_blocks(seg), len(elements))
+            placed.append((seg, elements[elem_idx:end_idx]))
+            elem_idx = end_idx
+        return placed
+
+    @staticmethod
+    def _place_by_blocks(body, segments: list[SegmentState]):
+        """Schema 2: (segment, nodes) pairs from the segment's block range,
+        or None when the chapter's blocks do not match the stored
+        fingerprints. The nodes are those of its blocks that hold text."""
+        blocks = []
+        _soup_blocks(body, blocks)
+        blocks = [b for b in blocks if normalize(_nodes_text(b))]
+        placed = []
+        for seg in segments:
+            span = blocks[seg.block_start:seg.block_end]
+            if [fingerprint(_nodes_text(b)) for b in span] != seg.fingerprints:
+                return None
+            placed.append((seg, [n for b in span for n in b if _nodes_text([n]).strip()]))
+        return placed
 
     def _legacy_walk(self) -> bool:
         """True when chapters must be walked as the segmenter did before it
@@ -479,3 +501,32 @@ class EPUBBuilder:
             plain = BeautifulSoup(target.translated_text, 'html.parser').get_text()
             if plain.strip():
                 link.title = plain.strip()
+
+
+
+def _nodes_text(nodes: list) -> str:
+    return ''.join(n.get_text() if isinstance(n, Tag) else str(n) for n in nodes)
+
+
+def _soup_blocks(parent, out: list) -> None:
+    """The block walk of src/epub/blocks.py on a BeautifulSoup tree: appends
+    each block (a list of nodes) under `parent`, empty ones included."""
+    run: list = []
+    for child in parent.children:
+        if isinstance(child, PreformattedString):
+            continue  # comment, processing instruction
+        if isinstance(child, Tag) and child.name == 'br':
+            out.append(run)
+            run = []
+        elif isinstance(child, Tag) and child.name in BLOCK_TAGS:
+            out.append(run)
+            run = []
+            if child.name in DESCEND_TAGS and any(
+                    isinstance(c, Tag) and (c.name in BLOCK_TAGS or c.name == 'br')
+                    for c in child.children):
+                _soup_blocks(child, out)
+            else:
+                out.append([child])
+        else:
+            run.append(child)
+    out.append(run)

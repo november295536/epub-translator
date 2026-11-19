@@ -1424,15 +1424,39 @@ class TestWorkerContext:
 
 class TestCreateProjectMarker:
 
-    def test_web_created_project_records_segmenter_version_2(self, tmp_path, sample_epub):
+    # Phase 2: schema 2 replaces the segmenter_version marker (same intent)
+    def test_web_created_project_records_schema_2_and_source_hash(self, tmp_path, sample_epub):
+        import hashlib
         app = create_app(projects_dir=str(tmp_path / 'projects'))
         app.config['TESTING'] = True
         with app.test_client() as client:
             response = client.post('/api/projects', json={
                 'epub_path': sample_epub, 'project_name': 'marker'})
         assert response.status_code == 200, response.get_json()
+        assert response.get_json()['unparsed_chapters'] == []
         path = tmp_path / 'projects' / 'marker' / 'project.json'
-        assert json.loads(path.read_text(encoding='utf-8'))['segmenter_version'] == 2
+        raw = json.loads(path.read_text(encoding='utf-8'))
+        assert raw['schema'] == 2
+        assert 'segmenter_version' not in raw
+        with open(sample_epub, 'rb') as f:
+            assert raw['source_sha256'] == hashlib.sha256(f.read()).hexdigest()
+        assert raw['segments'][0]['block_start'] == 0
+
+    def test_unparsed_chapter_reported(self, tmp_path):
+        from tests.conftest import write_raw_epub, xhtml
+        items = [('a', 'a.xhtml', 'application/xhtml+xml', None),
+                 ('b', 'b.xhtml', 'application/xhtml+xml', None)]
+        members = {'OEBPS/a.xhtml': xhtml('<p>The tide came in.</p>'),
+                   'OEBPS/b.xhtml': xhtml('<p>Unclosed paragraph.</div>')}
+        epub_path = write_raw_epub(tmp_path / 'bad.epub', items, ['a', 'b'], members)
+        app = create_app(projects_dir=str(tmp_path / 'projects'))
+        app.config['TESTING'] = True
+        with app.test_client() as client:
+            response = client.post('/api/projects', json={
+                'epub_path': epub_path, 'project_name': 'bad'})
+        assert response.status_code == 200, response.get_json()
+        assert response.get_json()['unparsed_chapters'] == ['b']
+        assert response.get_json()['segments'] == 1
 
 
 # --- Phase 1: failed segments, revision, lock, extraction model ----------------

@@ -2,12 +2,21 @@
 
 import pytest
 from bs4 import BeautifulSoup, Tag
-from src.core.segmenter import Segmenter, Segment, SegmentType, MIN_WORDS, MAX_WORDS, SMALL_SEGMENT_THRESHOLD, _is_container
+from src.core.segmenter import Segmenter, Segment, SegmentType, MIN_WORDS, MAX_WORDS, _is_container
+from tests.conftest import body_of
+
+
+class _StringSegmenter:
+    """Segments an HTML string: a fragment is put into a <body> and parsed
+    as XML, as the extractor parses a chapter."""
+
+    def segment_chapter(self, chapter_id, html):
+        return Segmenter().segment_chapter(chapter_id, body_of(html))
 
 
 @pytest.fixture
 def segmenter():
-    return Segmenter()
+    return _StringSegmenter()
 
 
 def make_paragraph(word_count: int, index: int = 0) -> str:
@@ -216,23 +225,15 @@ class TestLargeSegmentSplitting:
         for seg in text_segs:
             assert '<p>' in seg.html, f"Split segment should contain HTML tags, got: {seg.html[:100]}"
 
-    def test_single_large_element_kept_by_split_step(self, segmenter):
-        """_split_large_segments keeps a single-element segment intact.
-
-        Note: a single 800-word <p> gets split by _merge_blocks_into_segments
-        at sentence boundaries before _split_large_segments runs. To test
-        _split_large_segments directly, we call it with a hand-crafted segment.
-        """
-        from src.core.segmenter import Segment
-        # Create a segment with a single large <p> element
+    def test_single_large_element_kept_whole(self, segmenter):
+        """A block is never divided: one 800-word <p> is one segment.
+        (Phase 2: replaces a test of the removed _split_large_segments.)"""
         big_html = make_paragraph(800)
-        seg = Segment(id='ch1_seg0001', html=big_html, text='x ' * 800,
-                       word_count=800, segment_type=SegmentType.TEXT)
-        result = segmenter._split_large_segments([seg], 'ch1')
+        result = segmenter.segment_chapter('ch1', big_html)
 
-        # Single element cannot be split at element boundaries
         assert len(result) == 1
-        assert '<p>' in result[0].html
+        assert result[0].html == big_html
+        assert result[0].word_count == 800
 
     def test_split_html_and_text_differ(self, segmenter):
         """After splitting, html should contain tags while text is plain."""
