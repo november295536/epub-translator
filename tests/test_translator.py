@@ -845,7 +845,7 @@ import threading
 
 from src.core.project import SegmentStatus
 from src.core.translator import (
-    TranslationOutcome, failure_log_path, translate_segment,
+    TranslationOutcome, failure_log_path, record_failure_log, translate_segment,
 )
 from src.llm import (
     AuthError, CancelledError, LLMError, LLMResponse, RefusalError, TransientError, Usage,
@@ -862,12 +862,20 @@ def _engine(fake, model='haiku', max_retries=3):
     return TranslationEngine(model=model, backend=fake, max_retries=max_retries)
 
 
+def _translated(engine, seg, segments, log_dir):
+    """translate_segment, then what a caller does once the outcome is
+    accepted and saved (review round 2)."""
+    outcome = translate_segment(engine, seg, segments)
+    record_failure_log(log_dir, seg.segment_id, outcome)
+    return outcome
+
+
 class TestTranslateSegment:
 
     def test_success(self, tmp_path):
         fake = FakeBackend([LLMResponse('<p>一句話。</p>', 'complete', Usage(5, 7), 'haiku')])
         seg = _seg()
-        outcome = translate_segment(_engine(fake), seg, [seg], log_dir=str(tmp_path))
+        outcome = _translated(_engine(fake), seg, [seg], str(tmp_path))
         assert outcome == TranslationOutcome(text='<p>一句話。</p>',
                                              status=SegmentStatus.TRANSLATED, issues=[],
                                              model='haiku', usage=Usage(5, 7))
@@ -938,7 +946,7 @@ class TestTranslateSegment:
         fake = FakeBackend([error, '譯文'])
         seg = _seg()
         with pytest.raises(type(error)):
-            translate_segment(_engine(fake), seg, [seg], log_dir=str(tmp_path))
+            _translated(_engine(fake), seg, [seg], str(tmp_path))
         assert len(fake.requests) == 1
         assert not os.path.exists(tmp_path / 'failed')
 
@@ -981,8 +989,7 @@ class TestFailureDiagnostics:
 
     def _fail(self, tmp_path, replies, seg_id='c1_seg0001'):
         seg = _seg(seg_id)
-        return translate_segment(_engine(FakeBackend(replies)), seg, [seg],
-                                 log_dir=str(tmp_path))
+        return _translated(_engine(FakeBackend(replies)), seg, [seg], str(tmp_path))
 
     def test_request_and_raw_replies_written(self, tmp_path):
         errors = [TransientError(f'exit {i}', raw=f'RAW-{i}') for i in (1, 2)]
@@ -1113,9 +1120,9 @@ class TestFailureLogNames:
 
     def test_success_of_one_keeps_the_other_log(self, tmp_path):
         seg_a, seg_b = _seg('a/b_seg0001'), _seg('a_b_seg0001')
-        translate_segment(_engine(FakeBackend([RefusalError('no')])), seg_a, [seg_a],
-                          log_dir=str(tmp_path))
-        translate_segment(_engine(FakeBackend(['譯文'])), seg_b, [seg_b], log_dir=str(tmp_path))
+        _translated(_engine(FakeBackend([RefusalError('no')])), seg_a, [seg_a],
+                          str(tmp_path))
+        _translated(_engine(FakeBackend(['譯文'])), seg_b, [seg_b], str(tmp_path))
         assert os.path.exists(failure_log_path(str(tmp_path), 'a/b_seg0001'))
 
     def test_long_id_bounded(self, tmp_path):
@@ -1130,8 +1137,8 @@ class TestDiagnosticWriteFailure:
         (tmp_path / 'failed').write_text('a file where the directory should be')
         seg = _seg()
         with caplog.at_level('ERROR', logger='src.core.translator'):
-            outcome = translate_segment(_engine(FakeBackend([RefusalError('no')])), seg, [seg],
-                                        log_dir=str(tmp_path))
+            outcome = _translated(_engine(FakeBackend([RefusalError('no')])), seg, [seg],
+                                        str(tmp_path))
         assert outcome.status == SegmentStatus.FAILED
         assert any('無法寫入失敗紀錄 c1_seg0001' in r.getMessage() for r in caplog.records)
 
@@ -1139,8 +1146,7 @@ class TestDiagnosticWriteFailure:
         os.makedirs(failure_log_path(str(tmp_path), 'c1_seg0001'))  # a directory: cannot remove
         seg = _seg()
         with caplog.at_level('ERROR', logger='src.core.translator'):
-            outcome = translate_segment(_engine(FakeBackend(['譯文'])), seg, [seg],
-                                        log_dir=str(tmp_path))
+            outcome = _translated(_engine(FakeBackend(['譯文'])), seg, [seg], str(tmp_path))
         assert outcome.status == SegmentStatus.TRANSLATED
         assert any('無法移除失敗紀錄 c1_seg0001' in r.getMessage() for r in caplog.records)
 
@@ -1156,7 +1162,7 @@ class TestBoundedErrorText:
         seg = _seg()
         engine = TranslationEngine(model='haiku', backend=ClaudeCLI())
         with patch('src.llm.cli.run_process', return_value=ProcessResult(1, '', huge)):
-            outcome = translate_segment(engine, seg, [seg], log_dir=str(tmp_path))
+            outcome = _translated(engine, seg, [seg], str(tmp_path))
         assert outcome.status == SegmentStatus.FAILED
         assert len(outcome.issues[0].detail) <= 2000
         size = os.path.getsize(failure_log_path(str(tmp_path), 'c1_seg0001'))
@@ -1165,8 +1171,7 @@ class TestBoundedErrorText:
     def test_huge_error_message_from_any_backend(self, tmp_path):
         seg = _seg()
         errors = [TransientError('M' * 1_000_000, raw='R')] * 3
-        outcome = translate_segment(_engine(FakeBackend(errors)), seg, [seg],
-                                    log_dir=str(tmp_path))
+        outcome = _translated(_engine(FakeBackend(errors)), seg, [seg], str(tmp_path))
         assert len(outcome.issues[0].detail) == 2000
         # the prompt plus 4 bounded messages
         assert os.path.getsize(failure_log_path(str(tmp_path), 'c1_seg0001')) < 20000
@@ -1179,7 +1184,7 @@ class TestRunLevelErrors:
         seg = _seg()
         fake = FakeBackend([BackendUnavailableError('could not be started')])
         with pytest.raises(BackendUnavailableError):
-            translate_segment(_engine(fake), seg, [seg], log_dir=str(tmp_path))
+            _translated(_engine(fake), seg, [seg], str(tmp_path))
         assert len(fake.requests) == 1
         assert not os.path.exists(tmp_path / 'failed')
 
@@ -1209,20 +1214,155 @@ class TestRound1Exact:
         (tmp_path / 'failed').write_text('not a directory')
         seg = _seg()
         with caplog.at_level('ERROR', logger='src.core.translator'):
-            translate_segment(_engine(FakeBackend([RefusalError('no')])), seg, [seg],
-                              log_dir=str(tmp_path))
+            _translated(_engine(FakeBackend([RefusalError('no')])), seg, [seg],
+                              str(tmp_path))
         assert caplog.records[-1].getMessage().startswith('無法寫入失敗紀錄 c1_seg0001: ')
         caplog.clear()
         os.remove(tmp_path / 'failed')
         os.makedirs(failure_log_path(str(tmp_path), 'c1_seg0001'))
         with caplog.at_level('ERROR', logger='src.core.translator'):
-            translate_segment(_engine(FakeBackend(['譯文'])), seg, [seg], log_dir=str(tmp_path))
+            _translated(_engine(FakeBackend(['譯文'])), seg, [seg], str(tmp_path))
         assert caplog.records[-1].getMessage().startswith('無法移除失敗紀錄 c1_seg0001: ')
 
     def test_second_failure_replaces_the_log(self, tmp_path):
         seg = _seg()
         for detail in ('first', 'second'):
-            translate_segment(_engine(FakeBackend([RefusalError(detail)])), seg, [seg],
-                              log_dir=str(tmp_path))
+            _translated(_engine(FakeBackend([RefusalError(detail)])), seg, [seg],
+                              str(tmp_path))
         content = open(failure_log_path(str(tmp_path), 'c1_seg0001'), encoding='utf-8').read()
         assert '=== attempt 1: second ===' in content
+
+
+# --- Review round 2 ---------------------------------------------------------------
+
+import errno
+
+
+def _claude_engine(monkeypatch, run):
+    """An engine on the real ClaudeCLI backend with run_process replaced."""
+    monkeypatch.setattr('src.llm.cli.run_process', run)
+    return TranslationEngine(model='haiku', backend=ClaudeCLI())
+
+
+class TestRound2StartErrorFailsSegment:
+    """Item 4: a start failure other than a missing program fails the segment."""
+
+    def test_e2big_is_a_failed_outcome(self, monkeypatch, tmp_path):
+        calls = []
+
+        def run(cmd, **kwargs):
+            calls.append(cmd)
+            raise OSError(errno.E2BIG, 'Argument list too long')
+
+        seg = _seg()
+        outcome = _translated(_claude_engine(monkeypatch, run), seg, [seg], str(tmp_path))
+        assert outcome.status == SegmentStatus.FAILED
+        assert outcome.issues[0].code == 'error'
+        assert 'could not be started' in outcome.issues[0].detail
+        assert len(calls) == 1  # not retried
+        assert os.path.exists(failure_log_path(str(tmp_path), 'c1_seg0001'))
+
+
+class TestRound2UnexpectedErrorInEntryPoint:
+    """Item 5: an unexpected exception is a FAILED outcome for every caller."""
+
+    def test_unexpected_exception_from_backend(self):
+        seg = _seg()
+        fake = FakeBackend(responder=lambda r: {}['missing'])
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert outcome.status == SegmentStatus.FAILED
+        assert outcome.model == 'haiku'
+        assert outcome.issues[0].code == 'unexpected'
+        assert "KeyError: 'missing'" in outcome.issues[0].detail
+
+    def test_undecodable_output(self, monkeypatch):
+        def run(cmd, **kwargs):
+            raise UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid start byte')
+
+        seg = _seg()
+        outcome = translate_segment(_claude_engine(monkeypatch, run), seg, [seg])
+        assert outcome.status == SegmentStatus.FAILED
+        assert outcome.issues[0].code == 'unexpected'
+
+    def test_unexpected_exception_logged(self, caplog):
+        seg = _seg()
+        with caplog.at_level('ERROR', logger='src.core.translator'):
+            translate_segment(_engine(FakeBackend([KeyError('k')])), seg, [seg])
+        assert caplog.records[-1].getMessage() == '未預期的錯誤: c1_seg0001'
+
+    @pytest.mark.parametrize('error', [AuthError('a'), CancelledError('c'),
+                                       BackendUnavailableError('b')])
+    def test_run_level_errors_still_raised(self, error):
+        seg = _seg()
+        with pytest.raises(type(error)):
+            translate_segment(_engine(FakeBackend([error])), seg, [seg])
+
+
+class TestRound2EntryPointWritesNoFile:
+    """Items 10, 17: translate_segment writes and removes no failure log; the
+    caller records it where it accepts and saves the outcome."""
+
+    def test_failure_writes_nothing(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        seg = _seg()
+        outcome = translate_segment(_engine(FakeBackend([RefusalError('no')])), seg, [seg])
+        assert outcome.status == SegmentStatus.FAILED
+        assert outcome.failure.code == 'refusal' and outcome.failure.attempts == [('no', '')]
+        assert os.listdir(tmp_path) == []
+
+    def test_success_keeps_an_existing_log(self, tmp_path):
+        seg = _seg()
+        _translated(_engine(FakeBackend([RefusalError('no')])), seg, [seg], str(tmp_path))
+        outcome = translate_segment(_engine(FakeBackend(['譯文'])), seg, [seg])
+        assert outcome.status == SegmentStatus.TRANSLATED and outcome.failure is None
+        assert os.path.exists(failure_log_path(str(tmp_path), 'c1_seg0001'))
+
+    def test_record_unexpected_failure_keeps_older_log(self, tmp_path):
+        from src.core.translator import unexpected_error_outcome
+        seg = _seg()
+        _translated(_engine(FakeBackend([RefusalError('first')])), seg, [seg], str(tmp_path))
+        record_failure_log(str(tmp_path), 'c1_seg0001', unexpected_error_outcome('m', KeyError()))
+        assert os.path.exists(failure_log_path(str(tmp_path), 'c1_seg0001'))
+
+    def test_outcomes_compare_without_the_error(self):
+        seg = _seg()
+        a = translate_segment(_engine(FakeBackend([RefusalError('no')])), seg, [seg])
+        b = translate_segment(_engine(FakeBackend([RefusalError('no')])), seg, [seg])
+        assert a == b and a.failure is not b.failure
+        assert 'failure' not in repr(a)
+
+
+class TestRound2FailureLogNameBytes:
+    """Item 13: the readable prefix is ASCII, so the name fits 255 bytes."""
+
+    def test_cjk_id(self, tmp_path):
+        seg_id = '章' * 100 + '_seg0001'
+        name = os.path.basename(failure_log_path(str(tmp_path), seg_id))
+        assert name.isascii()
+        assert len(name.encode('utf-8')) <= 255
+        assert name.startswith('_' * 100 + '-')
+
+    def test_cjk_id_log_written(self, tmp_path):
+        seg = _seg('章' * 100 + '_seg0001')
+        _translated(_engine(FakeBackend([RefusalError('no')])), seg, [seg],
+                          str(tmp_path))
+        assert os.path.exists(failure_log_path(str(tmp_path), seg.segment_id))
+
+    def test_ascii_kept(self, tmp_path):
+        name = os.path.basename(failure_log_path(str(tmp_path), 'OEBPS/ch-1.x_seg0001'))
+        assert name.startswith('OEBPS_ch-1.x_seg0001-')
+
+
+class TestRound2CodeEchoingAnErrorPhrase:
+    """Item 15: a short code segment that mentions an error phrase translates."""
+
+    CODE = 'if err["type"] == "authentication_error":\n    refresh()'
+
+    def test_code_segment_translated(self, monkeypatch):
+        def run(cmd, **kwargs):
+            return ProcessResult(0, self.CODE, '')
+
+        seg = _seg(text=self.CODE, seg_type='code')
+        outcome = translate_segment(_claude_engine(monkeypatch, run), seg, [seg])
+        assert outcome.status == SegmentStatus.TRANSLATED
+        assert outcome.text == self.CODE

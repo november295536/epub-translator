@@ -281,11 +281,12 @@ def delete_project(project_name: str):
     if not os.path.isdir(project_dir):
         return jsonify({'error': '專案不存在'}), 404
 
-    if TaskManager().task_active(project_name):
-        return jsonify({'error': '專案正在翻譯中，請先停止翻譯再刪除'}), 409
-    # Holding the lock and the mutex: no other process or request writes
-    # to the project while it is removed
+    # Holding the mutex (under which a start registers its task) and the
+    # lock: no task, other process or request writes to the project while
+    # it is removed
     with project_mutex(project_dir):
+        if TaskManager().task_active(project_name):
+            return jsonify({'error': '專案正在翻譯中，請先停止翻譯再刪除'}), 409
         try:
             lock = ProjectLock(project_dir)
             lock.acquire()

@@ -10,7 +10,7 @@ from flask import Blueprint, render_template, request, jsonify, current_app
 from src.core.project import ProjectManager, SegmentStatus
 from src.core.translator import (
     AuthError, BackendUnavailableError, RateLimitError, TranslationEngine,
-    remove_failure_log, translate_segment,
+    record_failure_log, remove_failure_log, translate_segment,
 )
 from src.glossary.glossary_manager import GlossaryManager
 from src.web.tasks import TaskManager, setup_project_logging, teardown_project_logging
@@ -80,10 +80,10 @@ def update_segment(project_name: str, segment_id: str):
         with transaction(project_name) as pm:
             pm.update_translation(segment_id, data['text'])
             pm.save()
+            # A person's version replaces the failed one: its diagnostics go too
+            remove_failure_log(_log_dir(pm), segment_id)
     except ValueError as e:
         return jsonify({'error': str(e)}), 404
-    # A person's version replaces the failed one: its diagnostics go too
-    remove_failure_log(_log_dir(pm), segment_id)
     return jsonify({'status': 'ok', 'segment_id': segment_id})
 
 
@@ -97,9 +97,9 @@ def approve_segment(project_name: str, segment_id: str):
         with transaction(project_name) as pm:
             pm.mark_reviewed(segment_id, text=text)
             pm.save()
+            remove_failure_log(_log_dir(pm), segment_id)
     except ValueError as e:
         return jsonify({'error': str(e)}), 404
-    remove_failure_log(_log_dir(pm), segment_id)
     return jsonify({'status': 'ok', 'segment_id': segment_id})
 
 
@@ -130,12 +130,12 @@ def retranslate_segment(project_name: str, segment_id: str):
     try:
         engine = TranslationEngine(model=model)
         logger.info("重新翻譯段落: %s (模型: %s)", segment_id, engine.model)
-        outcome = translate_segment(engine, seg, segments, gm,
-                                    log_dir=os.path.join(project_dir, 'log'))
+        outcome = translate_segment(engine, seg, segments, gm)
         with transaction(project_name) as pm:
             if not pm.apply_outcome(segment_id, outcome, revision=revision):
                 return jsonify({'error': '段落已在翻譯期間被編輯，未套用新譯文'}), 409
             pm.save()
+            record_failure_log(_log_dir(pm), segment_id, outcome)
         if outcome.status == SegmentStatus.FAILED:
             detail = outcome.issues[0].detail
             logger.warning("Translation error for %s: %s", segment_id, detail)

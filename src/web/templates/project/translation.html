@@ -173,6 +173,12 @@ function translationController() {
                 const data = await res.json();
                 this.availableModels = data.available;
                 this.model = data.current;
+                // A stored model the backend does not list: shown as it is,
+                // changed only when another one is picked
+                if (!this.availableModels.some(m => m.alias === this.model)) {
+                    this.availableModels = [{ alias: this.model, label: this.model, description: '目前設定，後端未列出' },
+                                            ...this.availableModels];
+                }
             } catch (e) {
                 console.error('Failed to fetch model:', e);
             }

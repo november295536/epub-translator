@@ -8,7 +8,7 @@ import re
 import logging
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 import src.llm as llm
 from src.core.project import Issue, SegmentStatus
@@ -200,6 +200,8 @@ class TranslationOutcome:
     issues: list[Issue]
     model: str
     usage: Usage | None
+    # The error of a failure, for its diagnostics (see record_failure_log)
+    failure: TranslationError | None = field(default=None, repr=False, compare=False)
 
 
 # Characters of raw output kept per failed attempt in a diagnostics file
@@ -401,7 +403,7 @@ class TranslationEngine:
 
 
 def translate_segment(engine: TranslationEngine, seg, segments,
-                      glossary=None, log_dir: str | None = None,
+                      glossary=None,
                       cancel: threading.Event | None = None) -> TranslationOutcome:
     """Translate one project segment: the single entry point for the web
     worker, both CLI modes and the re-translate endpoint.
@@ -409,21 +411,21 @@ def translate_segment(engine: TranslationEngine, seg, segments,
     Builds the request (glossary terms, same-chapter context, HTML for text
     segments), calls the engine and returns the outcome. A failed segment
     is an outcome with status FAILED and a backend issue, not an exception;
-    when `log_dir` is given its raw request and replies are written there
-    (see write_failure_log; a failure to write it is logged, the outcome
-    is returned all the same). RateLimitError, AuthError,
-    BackendUnavailableError and CancelledError are raised: they concern the
-    run, not the segment.
+    it carries the error for the diagnostics, which the caller writes with
+    record_failure_log once it has accepted and saved the outcome. Any
+    other exception also gives a FAILED outcome (issue code `unexpected`).
+    RateLimitError, AuthError, BackendUnavailableError and CancelledError
+    are raised: they concern the run, not the segment. Writes no file.
     """
-    glossary_text = ''
-    if glossary is not None and glossary.entries:
-        found = glossary.terms_for_prompt(seg.text)
-        if found:
-            glossary_text = glossary.format_for_prompt(found)
-
-    context_before, context_after = get_context(segments, seg.segment_id)
     model = engine.model
     try:
+        glossary_text = ''
+        if glossary is not None and glossary.entries:
+            found = glossary.terms_for_prompt(seg.text)
+            if found:
+                glossary_text = glossary.format_for_prompt(found)
+
+        context_before, context_after = get_context(segments, seg.segment_id)
         reply = engine.translate_reply(
             seg.text,
             segment_type=seg.segment_type,
@@ -433,18 +435,17 @@ def translate_segment(engine: TranslationEngine, seg, segments,
             html=seg.html,  # ignored for code segments
             cancel=cancel,
         )
+    except (RateLimitError, AuthError, BackendUnavailableError, CancelledError):
+        raise
     except TranslationError as e:
-        if log_dir:
-            try:
-                write_failure_log(log_dir, seg.segment_id, model, e)
-            except OSError as log_error:
-                logger.error("無法寫入失敗紀錄 %s: %s", seg.segment_id, log_error)
         return TranslationOutcome(
             text=None, status=SegmentStatus.FAILED, model=model, usage=None,
             issues=[Issue(kind='backend', code=e.code,
-                          detail=str(e)[:ERROR_MESSAGE_CHARS], blocking=True)])
-    if log_dir:
-        remove_failure_log(log_dir, seg.segment_id)
+                          detail=str(e)[:ERROR_MESSAGE_CHARS], blocking=True)],
+            failure=e)
+    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on
+        logger.exception("未預期的錯誤: %s", seg.segment_id)
+        return unexpected_error_outcome(model, e)
     return TranslationOutcome(text=reply.text, status=SegmentStatus.TRANSLATED,
                               issues=[], model=model, usage=reply.usage)
 
@@ -460,9 +461,10 @@ def unexpected_error_outcome(model: str, error: BaseException) -> TranslationOut
 
 def failure_log_path(log_dir: str, segment_id: str) -> str:
     """One file per segment, replaced by each failed run of that segment.
-    The name is the id with unsafe characters replaced (at most 100 of
-    them) and a digest of the exact id, so distinct ids never share a file."""
-    safe_id = re.sub(r'[^\w.-]', '_', segment_id)[:100]
+    The name is the id with characters other than ASCII letters, digits and
+    `_.-` replaced (at most 100 of them, so the name stays within 255
+    bytes) and a digest of the exact id, so distinct ids never share a file."""
+    safe_id = re.sub(r'[^A-Za-z0-9_.-]', '_', segment_id)[:100]
     digest = hashlib.sha256(segment_id.encode('utf-8')).hexdigest()[:10]
     return os.path.join(log_dir, 'failed', f'{safe_id}-{digest}.txt')
 
@@ -487,6 +489,19 @@ def write_failure_log(log_dir: str, segment_id: str, model: str,
                   raw[:DIAGNOSTIC_RAW_CHARS]]
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(parts) + '\n')
+
+
+def record_failure_log(log_dir: str, segment_id: str, outcome: TranslationOutcome) -> None:
+    """Where an outcome has been accepted and saved (and only there): a
+    failure's diagnostics replace the segment's earlier ones, a success
+    removes them. A failure to write is logged, not raised."""
+    if outcome.status != SegmentStatus.FAILED:
+        remove_failure_log(log_dir, segment_id)
+    elif outcome.failure:
+        try:
+            write_failure_log(log_dir, segment_id, outcome.model, outcome.failure)
+        except OSError as e:
+            logger.error("無法寫入失敗紀錄 %s: %s", segment_id, e)
 
 
 def remove_failure_log(log_dir: str, segment_id: str) -> None:
