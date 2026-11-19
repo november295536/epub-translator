@@ -31,4 +31,3 @@ uploads/
 
 # Mutation testing (mutmut)
 .mutmut-cache
-html/
