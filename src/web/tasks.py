@@ -381,9 +381,16 @@ class TaskManager:
                                 args=(task, wid),
                                 daemon=True,
                             )
-                            task._threads.append(t)
                             task.active_workers += 1
-                            t.start()
+                            try:
+                                t.start()
+                            except Exception as e:
+                                # Not started: neither listed nor counted; the
+                                # task stays paused with the workers it has
+                                task.active_workers -= 1
+                                task.error = f'無法增加 worker：{e}'
+                                return False
+                            task._threads.append(t)
                         logger.info("動態增加 %d workers (共 %d)", additional, num_workers)
 
             task.state = 'running'

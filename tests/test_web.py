@@ -3380,3 +3380,49 @@ class TestRound4RetranslateAcrossReplacement:
         seg = pm.data.segments[0]
         assert (seg.text, seg.status, seg.translated_text) == \
             ('New book line.', SegmentStatus.PENDING, '')
+
+
+class TestRound4ResumeWorkerStartFailure:
+    """Item 2: a worker added on resume whose start fails is neither listed
+    nor counted; the task can be resumed and ends normally."""
+
+    def test_added_worker_start_fails(self, project_with_translations):
+        in_flight, release = threading.Event(), threading.Event()
+
+        def respond(request):
+            if not in_flight.is_set():
+                in_flight.set()
+                assert release.wait(10)
+            return '<p>譯</p>'
+
+        task, patcher = _start(project_with_translations, respond, num_workers=1)
+        tm = TaskManager()
+        assert in_flight.wait(10)
+        assert tm.pause_translation(PROJECT_NAME)
+        release.set()
+        _wait(lambda: task.completed == 1)  # the worker now waits for the resume
+
+        real_start = threading.Thread.start
+        calls = []
+
+        def start(self):
+            calls.append(self)
+            if len(calls) == 2:  # the second added worker
+                raise RuntimeError('no more threads')
+            return real_start(self)
+
+        with patch.object(threading.Thread, 'start', start):
+            assert tm.resume_translation(PROJECT_NAME, num_workers=3) is False
+        assert task.state == 'paused'
+        assert task.error == '無法增加 worker：no more threads'
+        assert task.active_workers == 2
+        assert len(task._threads) == 2 and all(t.is_alive() for t in task._threads)
+
+        assert tm.resume_translation(PROJECT_NAME) is True
+        _finish(task, patcher)
+        assert task.state == 'completed'
+        assert task.active_workers == 0
+        assert lock_free_for_other_process(os.path.join(project_with_translations,
+                                                        PROJECT_NAME))
+        segs = _load(project_with_translations)
+        assert all(s.status == SegmentStatus.TRANSLATED for s in segs.values())
