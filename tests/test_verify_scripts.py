@@ -468,10 +468,12 @@ class TestLoadCheck:
         assert load_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 0
         out = capsys.readouterr().out.splitlines()
         assert out == [
-            'PASS project-1: segments 2, pending 0, translated 0, reviewed 0, failed 2',
-            'PASS project-2: segments 3, pending 1, translated 1, reviewed 1, failed 0',
+            'PASS project-1: segments 2, pending 0, translated 0, reviewed 0, failed 2,'
+            ' round trip equal',
+            'PASS project-2: segments 3, pending 1, translated 1, reviewed 1, failed 0,'
+            ' round trip equal',
             'TOTAL projects 2  segments 5  pending 1  translated 1  reviewed 1  failed 2'
-            '  failed projects 0',
+            '  round trip equal 2  model added 0  differs 0  failed projects 0',
         ]
 
     def test_names_without_anonymize(self, tmp_path, capsys):
@@ -569,11 +571,13 @@ class TestLoadCheckOutput:
         problems = ('project.json content changed; project.json modification time changed; '
                     'files in the project directory changed')
         assert out == [
-            f'FAIL project-1: segments 1, pending 1, translated 0, reviewed 0, failed 0; {problems}',
-            f'FAIL project-2: segments 1, pending 1, translated 0, reviewed 0, failed 0; {problems}',
+            'FAIL project-1: segments 1, pending 1, translated 0, reviewed 0, failed 0,'
+            f' round trip equal; {problems}',
+            'FAIL project-2: segments 1, pending 1, translated 0, reviewed 0, failed 0,'
+            f' round trip equal; {problems}',
             'FAIL project-3: cannot load (TypeError)',
             'TOTAL projects 3  segments 2  pending 2  translated 0  reviewed 0  failed 0'
-            '  failed projects 3',
+            '  round trip equal 2  model added 0  differs 0  failed projects 3',
         ]
 
     def test_default_projects_dir_and_help(self, tmp_path, monkeypatch, capsys):
@@ -584,10 +588,60 @@ class TestLoadCheckOutput:
         with pytest.raises(SystemExit):
             load_check.main(['--help'])
         help_text = ' '.join(capsys.readouterr().out.split())
-        assert 'Phase 1 check: every existing project loads with the new code, untouched.' \
+        assert 'Phase 1 check: every existing project loads untouched and would save unchanged.' \
             in help_text
         assert 'For each directory' not in help_text
         assert ('--projects-dir PROJECTS_DIR Directory that holds the project folders '
                 '(default: projects) --anonymize Print project-N labels; omit names and '
                 'paths') in help_text
         assert help_text.endswith('omit names and paths')
+
+
+# --- Review round 1, item 20: in-memory round trip ---------------------------------
+
+class TestLoadCheckRoundTrip:
+
+    def test_old_project_gains_only_model(self, tmp_path, capsys):
+        _write_loadable(str(tmp_path / 'a'), ['translated'])
+        directory = str(tmp_path / 'b')
+        _write_loadable(directory, ['pending'])
+        path = os.path.join(directory, 'project.json')
+        with open(path) as f:
+            data = json.load(f)
+        del data['model']
+        with open(path, 'w') as f:
+            json.dump(data, f)
+        before = open(path, 'rb').read()
+        assert load_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert out[0].endswith(', round trip equal')
+        assert out[1].startswith('PASS project-2') and out[1].endswith(', round trip model added')
+        assert out[2].endswith('round trip equal 1  model added 1  differs 0  failed projects 0')
+        assert open(path, 'rb').read() == before
+        assert os.listdir(directory) == ['project.json']
+
+    def test_other_difference_fails(self, tmp_path, capsys):
+        directory = str(tmp_path / 'a')
+        _write_loadable(directory, ['pending', 'pending'],
+                        extra={'segmenter_version': 1})  # save() would drop it
+        path = os.path.join(directory, 'project.json')
+        with open(path) as f:
+            data = json.load(f)
+        data['segments'][1]['segment_type'] = 'heading'  # load() normalizes it
+        with open(path, 'w') as f:
+            json.dump(data, f)
+        assert load_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[0] == ('FAIL project-1: segments 2, pending 2, translated 0, reviewed 0,'
+                          " failed 0, round trip differs; round trip differs: top-level keys"
+                          " ['segmenter_version'], segments 1")
+        assert out[1].endswith('round trip equal 0  model added 0  differs 1  failed projects 1')
+
+    def test_segment_count_difference_counted(self, tmp_path):
+        directory = str(tmp_path / 'a')
+        _write_loadable(directory, ['pending', 'pending', 'pending'])
+        pm = load_check.ProjectManager(directory)
+        pm.load()
+        del pm.data.segments[1:]
+        pm.data.title = 'changed'
+        assert load_check.round_trip(pm) == ('differs', "top-level keys ['title'], segments 2")
