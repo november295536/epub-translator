@@ -330,22 +330,24 @@ largest block 7899 chars`, exit code 0).
 
 ### Phase 0 — Standalone fixes
 
-No schema change; each item ships alone.
+No schema change apart from one optional `project.json` field (`segmenter_version`); each
+item ships alone.
 
 - Bug 3: stop markdown cleanup and leading-whitespace stripping on code output.
 - Bug 4: take the *end* of the previous segment as context, not the start; take context only
   from the same chapter; skip code neighbours.
-- Glossary matching with `(?<!\w)…(?!\w)` lookarounds (`\b` is not used because it fails on
-  `C++`, `C#`, `.NET`). A term ending in a letter also matches its plurals (`s`, `es`,
-  `y → ies`); if its last word has at least 4 letters it also matches `ed`/`d`, `ing`
-  (with e-drop and a doubled final consonant), `er`/`ers` and `ment`/`ments`, because the
-  extractor stores base forms. All-caps terms match case-sensitively (`IT` does not match
-  "its", `US` does not match "uses"); other terms are case-insensitive. Whitespace inside a
-  multi-word term matches any whitespace run (newline, NBSP). `.NET` does not match inside
-  `ASP.NET` (accepted). One compiled, cached pattern per term.
+- Glossary terms in the prompt: when the glossary has at most 150 entries
+  (`FULL_GLOSSARY_MAX_TERMS`) every entry goes into every text prompt, with no matching (the
+  8 real glossaries hold 0 to 6 entries). Above that, an entry is sent when the text contains
+  the term starting at a word boundary, with any continuation: `(?<!\w)` + the escaped term
+  (internal whitespace as `\s+`), case-insensitive, no trailing boundary. Accepted: other
+  words that start with the term also match (`Go` → "going", `C` in "C++"), `.NET` does not
+  match inside "ASP.NET", and a term stored in plural form does not match its singular; a
+  false positive only adds a few prompt tokens.
 - Web term extraction covers all text segments, not the first 50 segments including code
   (`glossary.py:113`).
-- Bug 5: the segmenter skips comments.
+- Bug 5: the segmenter skips comments. New projects record `segmenter_version: 2` in
+  `project.json`; the builder keeps `main`'s walk for projects without it.
 
 Acceptance (one unit test per item, each failing on the current code and passing after):
 
@@ -353,7 +355,9 @@ Acceptance (one unit test per item, each failing on the current code and passing
   line comes back unchanged.
 - Context: with a previous segment longer than 200 characters the prompt contains its tail and
   not its head; a neighbour from another chapter or a code segment is not used.
-- Glossary: `AI` does not match inside `maintain`; `API` matches `APIs`; `C++` and `.NET` match.
+- Glossary: with at most 150 entries the prompt gets all of them; above that, `AI` does not
+  match inside `maintain`, `API` matches `APIs`, `render` matches `rendering`, and `C++`,
+  `C#` and `.NET` match.
 - Web extraction: with 60 text segments and a term only in the last one, the term is sent.
 - Comments: a body with `<!-- note -->` between two paragraphs yields no segment containing
   `note`.
@@ -385,6 +389,8 @@ Acceptance:
 - Segmenter produces schema 2 segments with anchors and fingerprints. Sentence-splitting of
   bare text is removed.
 - Migration command with report.
+- The schema-2 migration supersedes Phase 0's `segmenter_version` marker in `project.json`
+  (1 or absent: comments counted by the builder walk; 2: comments skipped).
 
 Acceptance:
 

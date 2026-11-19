@@ -8,26 +8,40 @@ projects are labelled `project-1` … `project-8` (alphabetical order of directo
 
 ## Phase 0 — Standalone fixes
 
-Date: 2026-11-19. Branch: `phase-0/standalone-fixes`. Python 3.9, existing virtualenv, no new
-dependency. `<base>` below is the commit the branch starts from.
+Date: 2026-11-19 (first submission and review rounds 1 and 2). Branch:
+`phase-0/standalone-fixes`. No new runtime dependency. `<base>` below is the commit the branch
+starts from.
+
+Interpreters. The project virtualenv holds two Pythons: `venv/bin/python3` (and `python`) is
+Python 3.9.6 with `venv/lib/python3.9`, and is what `python3 -m pytest` runs; `venv/bin/pip`,
+`venv/bin/pytest` and `venv/bin/mutmut` are scripts for Python 3.12.7 with
+`venv/lib/python3.12`. `pip install -r requirements-dev.txt` therefore installs mutmut for
+3.12.7, and mutation testing (section 5) runs the tests on 3.12.7. The test suite passes on
+both.
 
 ### 1. Test suite
 
 ```
 $ cd <repo> && source venv/bin/activate && python3 -m pytest tests/ -q
-366 passed, 31 warnings in 38.20s
+419 passed, 33 warnings in 40.48s
 ```
 
-Baseline before the phase: 246 passed. First submission: 272 passed. After review round 1: 366.
-No test that exists on `<base>` was removed. Two `<base>` tests had their sample strings changed
-(an invented title instead of a published one, `test_translator.py`), with the same assertions.
-Tests added in this phase and changed in round 1 are listed in section 6.
+Baseline before the phase: 246 passed. First submission: 272. After review round 1: 366. After
+review round 2: 419. No test that exists on `<base>` was removed. Changed `<base>` tests: two
+had their sample strings changed (an invented title instead of a published one,
+`test_translator.py`), with the same assertions; `test_glossary.py::test_find_terms_in_text`
+now asserts the exact list found, and `test_cli.py::test_init_creates_project_json` also
+asserts `segmenter_version` 2. Tests added or changed in the review rounds are listed in
+sections 6 and 7.
 
 ### 2. New tests fail on the old source (first submission)
 
-This was recorded for the first submission, before review round 1 (section 6). One test named
-here was later replaced: `test_code_prefix_like_text_not_removed` is now
-`test_code_without_fence_left_alone`.
+This was recorded for the first submission, before review round 1 (section 6). Test names are
+those of that submission. Later replacements: `test_code_prefix_like_text_not_removed` is now
+`test_code_without_fence_left_alone`; in round 2 the glossary tests became
+`test_term_must_start_at_a_word_boundary`, `test_any_continuation_matches` and
+`test_terms_with_symbols`, and `TestCommentAlignment` became `TestVersion2Export` /
+`TestVersion1ExportMatchesMain` (section 7).
 
 The new tests were run against the source tree of `<base>` (tests from the branch, `src/` and
 `translate.py` from `<base>`), then the source was restored:
@@ -64,10 +78,12 @@ was already correct). Acceptance item → test that fails on `<base>`:
 Read-only; it only opens each `project.json`. It is a report, not a pass/fail gate: it exits 0
 whenever every project could be read, and its first output line says so. A line counts as a
 comment when it starts with `//`, or with `#` followed by whitespace, `!` or the end of the line
-(`#define` and `#include` are code). Translated or reviewed code segments with an empty
-translation are reported separately. `project-N` is the alphabetical position of the directory
-among the directories of `--projects-dir` that contain a `project.json`; all 8 directories do,
-so the labels are the same as elsewhere in this log.
+(`#define` and `#include` are code). A comment line's wording is ignored but its leading
+whitespace is compared (round 2). Translated or reviewed code segments with an empty
+translation are reported separately; a code segment without `text` makes the project
+unreadable. `project-N` is the alphabetical position of the directory among the directories of
+`--projects-dir` that contain a `project.json`; all 8 directories do, so the labels are the
+same as elsewhere in this log.
 
 ```
 $ python3 scripts/verify/phase0_code_segments.py --projects-dir <repo>/projects --anonymize
@@ -76,107 +92,151 @@ project-1: translated code segments 0, differ outside comment lines 0, empty tra
 project-2: translated code segments 0, differ outside comment lines 0, empty translation 0
 project-3: translated code segments 0, differ outside comment lines 0, empty translation 0
 project-4: translated code segments 0, differ outside comment lines 0, empty translation 0
-project-5: translated code segments 32, differ outside comment lines 19, empty translation 0
+project-5: translated code segments 32, differ outside comment lines 20, empty translation 0
 project-6: translated code segments 0, differ outside comment lines 0, empty translation 0
 project-7: translated code segments 0, differ outside comment lines 0, empty translation 0
 project-8: translated code segments 0, differ outside comment lines 0, empty translation 0
-TOTAL projects 8  translated code segments 32  differ outside comment lines 19  empty translation 0  unreadable 0
+TOTAL projects 8  translated code segments 32  differ outside comment lines 20  empty translation 0  unreadable 0
 $ echo $?
 0
 ```
 
 Without `--anonymize` the script prints the project names and the IDs of the listed segments;
 that output stays on the local machine. With `--anonymize`, error messages contain no paths.
-The 19 segments are candidates, not confirmed defects: a translated end-of-line comment also
-counts as a difference.
+The 20 segments (19 before round 2; one more now that comment indentation counts) are
+candidates, not confirmed defects: a translated end-of-line comment also counts as a
+difference.
 
 ### 4. Existing projects keep `main`'s builder walk
 
-The builder now chooses its walk per chapter from the stored segments (section 6, A1/B1). The
-legacy walk (comments count as text) is used only when a stored segment shows the old
-segmenter's behaviour: a top-level text node equal to the text of a comment in the chapter
-body, or a stored div/section/article that holds a comment and would otherwise be a container.
-The committed check compares, for every chapter that has segments, the element list chosen now
-with the one `main` uses:
+Since round 2 the walk is chosen by a project-level marker, not by the content of the stored
+segments. `ProjectManager.create` (used by both CLI `init` and the web project creation) writes
+`segmenter_version: 2`; a `project.json` without the field loads as version 1 and is not
+rewritten by loading. The builder uses `main`'s walk (comments counted) for version 1, and also
+when no project data is loaded; it uses the comment-skipping walk for version 2. The check
+loads each project through `EPUBBuilder` (read-only) and compares, for every chapter that has
+segments, the element list the builder chooses with the one `main` uses:
 
 ```
 $ python3 scripts/verify/phase0_builder_alignment.py --projects-dir <repo>/projects --anonymize
-PASS project-1: chapters 22, with comment-dependent walk 0, walk changed vs main 0
-PASS project-2: chapters 34, with comment-dependent walk 0, walk changed vs main 0
-PASS project-3: chapters 39, with comment-dependent walk 2, walk changed vs main 0
-PASS project-4: chapters 1763, with comment-dependent walk 0, walk changed vs main 0
-PASS project-5: chapters 35, with comment-dependent walk 2, walk changed vs main 0
-PASS project-6: chapters 108, with comment-dependent walk 0, walk changed vs main 0
-PASS project-7: chapters 68, with comment-dependent walk 0, walk changed vs main 0
-PASS project-8: chapters 87, with comment-dependent walk 0, walk changed vs main 0
+PASS project-1: segmenter_version 1, chapters 22, with comment-dependent walk 0, walk changed vs main 0
+PASS project-2: segmenter_version 1, chapters 34, with comment-dependent walk 0, walk changed vs main 0
+PASS project-3: segmenter_version 1, chapters 39, with comment-dependent walk 2, walk changed vs main 0
+PASS project-4: segmenter_version 1, chapters 1763, with comment-dependent walk 0, walk changed vs main 0
+PASS project-5: segmenter_version 1, chapters 35, with comment-dependent walk 2, walk changed vs main 0
+PASS project-6: segmenter_version 1, chapters 108, with comment-dependent walk 0, walk changed vs main 0
+PASS project-7: segmenter_version 1, chapters 68, with comment-dependent walk 0, walk changed vs main 0
+PASS project-8: segmenter_version 1, chapters 87, with comment-dependent walk 0, walk changed vs main 0
 TOTAL projects 8  chapters 2156  comment-dependent 4  changed vs main 0  failed projects 0
 $ echo $?
 0
 ```
 
-4 chapters (2 in project-3, 2 in project-5) depend on the walk; all keep `main`'s walk. The
-script exits 1 if any chapter would change. A project created after Phase 0 whose source has
-comments is expected to FAIL this check (the new walk is right for it); it is meant for
-projects created before Phase 0. Both scripts are covered by `tests/test_verify_scripts.py`.
+The `project.json` modification times of the 8 projects were the same before and after the
+run. The check still fails when an existing project's walk would differ from `main`: with the
+builder's rule temporarily changed to use the new walk for version 1, the same command printed
+`FAIL project-3 … walk changed vs main 2`, `FAIL project-5 … walk changed vs main 2` and exited
+1 (the change was reverted). A project created after Phase 0 (version 2) whose source has
+comments is expected to FAIL this check, since the new walk is right for it. Both scripts are
+covered by `tests/test_verify_scripts.py`.
 
 ### 5. Mutation testing
 
-Tool: mutmut 2.5.1, which installs and runs on Python 3.9 and whose `--use-patch-file` option
-restricts mutation to the lines of a diff (mutmut 3 was not evaluated). Development only, in `requirements-dev.txt`; installed in a
-throwaway virtualenv outside the repository, not in the project one:
+Tool: mutmut 2.5.1 (its `--use-patch-file` option restricts mutation to the lines of a diff;
+mutmut 3 was not evaluated). Development only, in `requirements-dev.txt`, installed in the
+active environment:
 
 ```
-$ python3.9 -m venv "$TMPDIR/mutvenv"
-$ "$TMPDIR/mutvenv/bin/pip" install -r requirements.txt -r requirements-dev.txt
-$ MUTATION_VENV="$TMPDIR/mutvenv" scripts/verify/mutation.sh        # base defaults to main
+$ source venv/bin/activate
+$ pip install -r requirements-dev.txt
+$ scripts/verify/mutation.sh            # base defaults to main
 ```
+
+`MUTATION_VENV=<virtualenv>` optionally takes mutmut from another virtualenv. The tests run on
+the interpreter mutmut is installed in, read from the `#!` line of its script (here Python
+3.12.7, see the header).
 
 The script mutates only the lines added or changed versus the merge base with `main`, in four
 groups of files, each with only its relevant tests (core modules; web call sites; CLI; check
-scripts). It prints every surviving, timed-out or suspicious mutant and a total line; exit 0
-when none, 1 otherwise, 2 when mutmut fails or generates no mutants. A run takes about 4
-minutes. State is in `.mutmut-cache` (git-ignored); `mutmut show <id>` prints a mutant.
+scripts). Each group starts from an empty mutmut cache, so its clean baseline is run and timed
+with that group's own tests (round 1 shared one cache, so later groups reused the first
+group's baseline). It prints every surviving, timed-out or suspicious mutant with its diff and
+1-based line number, then a total line; exit 0 when there are none, 1 otherwise, 2 when mutmut
+fails or generates no mutants. A run takes about 6 minutes.
 
-Making the tool trustworthy took three fixes, each in the script: mutmut 2 counts only exit
-code 1 as "killed" (a mutant that breaks test collection was reported as survived), so the
-runner maps every failure to 1; bytecode is not written during a run (on macOS the cache lives
-under `sys.pycache_prefix`, and a mutant and the restored file can share size and mtime
-second); and pytest runs under a watchdog thread, because on a timeout mutmut kills only the
-wrapper and an infinite-loop mutant then hung the run.
+What the script writes: mutmut edits the mutated source files in place (with `<file>.bak`
+backups) and keeps `.mutmut-cache` in the repository root while a group runs (git-ignored,
+deleted after each group). Everything else (the patch, the runner, the per-group listing,
+`TMPDIR`, pytest's `--basetemp`, the bytecode prefix) is in a private directory created with
+`mktemp -d` under the system temporary directory and removed on exit. Bytecode is neither
+written (`PYTHONDONTWRITEBYTECODE`) nor read from an existing cache (private
+`PYTHONPYCACHEPREFIX`). The script refuses to start if a mutated file has uncommitted changes
+or if any `<file>.bak` exists (each checked on its own).
 
-Results (456 mutants on the changed lines):
+Earlier fixes, still in place: mutmut 2 counts only exit code 1 as "killed", so the runner maps
+every failing exit to 1; pytest runs under a watchdog that exits when its parent is gone, since
+on a timeout mutmut kills only the wrapper.
 
-| | killed | survived | timeout | suspicious |
-|---|---|---|---|---|
-| before (tests of commit `f349272`, before the tests added for mutants; current script) | 329 | 123 | 4 | 0 |
-| after | 438 | 14 | 4 | 0 |
+Cancellation was tested by interrupting real runs during the core group, while
+`src/core/translator.py` was mutated (`git status` showed it modified and
+`translator.py.bak` present):
+
+- SIGINT sent to the script (started with SIGINT at its default disposition, as from a
+  terminal): exit 130, `restored src/core/translator.py` printed; afterwards `git status`
+  showed no change to any source file, no `.bak`, no `.mutmut-cache`, and no mutmut, runner
+  or pytest process from the run was left.
+- SIGTERM: same result, and the private temporary directory no longer existed.
+
+(SIGINT sent with `kill` to a script started in the background with `&` from a
+non-interactive shell is ignored by bash, as for any such background job; that is not a
+path a user takes from a terminal.)
+
+Results:
+
+| | mutants | killed | survived | timeout | suspicious |
+|---|---|---|---|---|---|
+| round 1, final (old script, round-1 code) | 456 | 438 | 14 | 4 | 0 |
+| round 2, after the code changes, before the survivor work (commit `a0a4713`) | 356 | 345 | 7 | 4 | 0 |
+| round 2, final (commit `2ce86b2`) | 349 | 342 | 3 | 4 | 0 |
 
 ```
-$ MUTATION_VENV=... scripts/verify/mutation.sh
+$ scripts/verify/mutation.sh
 ...
-TOTAL mutants 456  killed 438  survived 14  timeout 4  suspicious 0  untested 0
+TOTAL mutants 349  killed 342  survived 3  timeout 4  suspicious 0  untested 0
+$ echo $?
+1
 ```
 
-The 4 timeouts are infinite loops in `_split_text` (`term_extractor.py` lines 55, 58, 61:
-`len(text) + start`, `cut < 0`, `start = cut`, `start -= cut`); the tests do not finish, so
-they are detected, not survivors. Every survivor, with the reason it is equivalent or cannot
-be reached:
+The mutant count fell because the glossary inflection rules and the builder's content
+signatures were removed. The 4 timeouts are infinite loops in `_split_text`
+(`term_extractor.py` lines 56, 59 and 62 twice: `len(text) + start`, `cut < 0`, `start = cut`,
+`start -= cut`); the tests do not finish, so they are detected, not survivors.
 
-| id | location | mutation | why it is not killed |
+Survivors of the intermediate run and what was done:
+
+| mutant (line, 1-based) | disposition |
+|---|---|
+| `translator.py:134` `next(..., -1)` → `-2` | code changed: `get_context` checks membership instead of using a sentinel |
+| `translator.py:336` `partition('\n')` → `partition('XX\nXX')` on the source's first line | code changed: the commentary check takes the whole text (its patterns stop at the first newline) |
+| `phase0_code_segments.py:87` `seg.get('text', '')` → default `'XXXX'` | code changed: `seg['text']`; a code segment without text is now reported as unreadable (`test_code_segment_without_text_is_unreadable`) |
+| `phase0_builder_alignment.py:49` `SOURCE_FILE` → `'XXsource.epubXX'` | killed: `test_local_source_copy_preferred_over_epub_path` |
+| the 3 below | equivalent |
+
+The 3 remaining survivors, all equivalent:
+
+| id | location | mutation | why no input distinguishes it |
 |---|---|---|---|
-| 23 | `translator.py:134` | `next(..., -1)` → `-2` | the result is only tested with `idx < 0` |
-| 56 | `translator.py:313` | default `source=''` → `'XXXX'` | the default is only tested for containing a code fence |
-| 105 | `glossary_manager.py:25` | `_VOWELS` gets `XX` around it | only a lower-cased single character is looked up; it is never `X` |
-| 108 | `glossary_manager.py:26` | same for `_NO_DOUBLING` | same |
-| 164 | `glossary_manager.py:61` | `@lru_cache` removed | a cache: same results, only slower |
-| 167 | `glossary_manager.py:81` | `(?!)` → `XX(?!)XX` | both never match (empty term) |
-| 271 | `phase0_code_segments.py:84` | default text `''` → `'XXXX'` | differs only for a code segment with no `text` key whose translation is literally `XXXX` |
-| 337 | `phase0_builder_alignment.py:39` | `sys.path.insert(0, …)` → `insert(1, …)` | `sys.path[0]` is the script directory, which has no `src` package |
-| 347 | `phase0_builder_alignment.py:57` | default `epub_path` `''` → `'XXXX'` | both are missing files and give the same FAIL line |
-| 355 | `phase0_builder_alignment.py:69` | default type `'text'` → `'XXtextXX'` | the type is only compared with `code` |
-| 357 | `phase0_builder_alignment.py:70` | default html `''` → `'XXXX'` | matters only if a comment's text is exactly `XXXX` |
-| 371, 372 | `phase0_builder_alignment.py:84-85` | skip of a missing or non-document spine item | unreachable with ebooklib: every spine item it reads (the nav too) is a document present in the manifest; reaching it needs a hand-made OPF |
-| 379 | `phase0_builder_alignment.py:89` | skip of a chapter without `<body>` → `break` | unreachable: ebooklib can neither write nor render a document without `<body>` |
+| 15 | `translator.py:114` | `re.match(p, text + '\n')` → `text + 'XX\nXX'` | the two patterns are `^(?:prefix words)[^\n]*\n+` with `re.match`: what follows `text` matters only through its first newline, which `[^\n]*` reaches in both versions; `XX` cannot complete a prefix word (none contains `X`) |
+| 52 | `translator.py:314` | default `source=''` → `'XXXX'` | the default is used only when no source is passed (every production call passes it); both `''` and `'XXXX'` contain no code fence and do not start with a commentary word, the only two ways `source` is used |
+| 111 | `phase0_builder_alignment.py:38` | `sys.path.insert(0, root)` → `insert(1, root)` | index 0 is the script's own directory, which has no `src` package; at 0 or 1 the repository root precedes site-packages, so the same `src` is imported |
+
+Round-1 survivors that no longer exist: the glossary ones (`_VOWELS`, `_NO_DOUBLING`,
+`lru_cache`, `(?!)`) went with the code; 371/372/379 in the alignment check (skip of a missing,
+non-document or body-less spine item) were reachable after all and are killed by
+`test_missing_spine_item_is_skipped_not_the_rest`, `test_non_document_spine_item_is_skipped`
+and `test_document_without_body_is_skipped_not_the_rest` (ebooklib renders an empty document
+without `<body>`); 271 and 357 (`.get` defaults) went with the code; 347 and 355 were on lines
+removed in round 2; 337 (`sys.path` index) is 111 above.
 
 ### 6. Review round 1
 
@@ -186,7 +246,7 @@ commit before the fix.
 
 | Finding | Verdict | Evidence | Fix |
 |---|---|---|---|
-| A1 builder: equal block counts pick the wrong walk (`<div><!-- note --><h2 id>…`) | confirmed | `test_builder.py::TestWalkSelection::test_equal_count_nested_comment_keeps_heading` (3 formats) failed before | builder now chooses the walk from stored segment content |
+| A1 builder: equal block counts pick the wrong walk (`<div><!-- note --><h2 id>…`) | confirmed | `test_builder.py::TestWalkSelection::test_equal_count_nested_comment_keeps_heading` (3 formats) failed before | builder chose the walk from stored segment content (replaced in round 2 by the `segmenter_version` marker) |
 | A2 extractor turns a body-level comment into text before the segmenter sees it | confirmed | `test_extractor.py::TestCommentsThroughPipeline` failed before | comments keep their markers in the extractor |
 | A3 a single segment longer than 5000 characters is truncated in term extraction | confirmed | `test_glossary.py::…::test_oversized_segment_split_without_loss`, web test with the term past character 5000, both failed before | lossless chunking |
 | A4 existing-project export check not committed | confirmed | — | `scripts/verify/phase0_builder_alignment.py` |
@@ -196,17 +256,13 @@ commit before the fix.
 | A8 real names and published titles in prompt examples and a test | confirmed (pre-existing) | repo-wide search | invented names and titles |
 | B1 builder walk chosen by counts (scenarios A and B) | confirmed | `TestWalkSelection::test_scenario_a_new_project` (3 formats), `test_scenario_b_wrapper_div_with_comment[chinese-only]` failed before | as A1 |
 | B2 code mode keeps a commentary line and fences | confirmed | `test_translator.py::TestCodeResponseCleaning::test_code_preface_and_fence_removed` (3 cases) failed before (with the others added for this finding, 9 failures; some only because the `source` argument did not exist); the test that locked the old behaviour was replaced | source-aware unwrapping |
-| B3 inflected forms no longer match | confirmed | `test_glossary.py::…::test_find_terms_inflected_forms` failed before | decision 5 suffixes |
+| B3 inflected forms no longer match | confirmed | `test_glossary.py::…::test_find_terms_inflected_forms` failed before | decision 5 suffixes (replaced in round 2 by the start-boundary rule) |
 | B4 = A4 | confirmed | — | as A4 |
 | B5 code neighbour gives no context instead of the next text segment | confirmed | `test_translator.py::TestContext::test_code_neighbours_stepped_over_to_text` failed before | step over code within the chapter |
 | B6 oversized segment truncated; no extraction progress | partly: truncation confirmed (as A3); progress reporting confirmed but out of scope | — | truncation fixed; progress under "Not done" |
 | B7 check script: `#define` counted as a comment; exit code; labels; names | partly: `#` rule confirmed and fixed; exit code 0 is by design (a report, now stated in its header); label rule documented — all 8 directories contain `project.json`, so labels equal the plan's; names and IDs without `--anonymize` are by design | `test_verify_scripts.py::TestCodeLines::test_hash_directives_are_code` | header, docstring |
 | B8 = A5 | confirmed | as A5 | as A5 |
-| B9 regex edges | partly: `IT`/`US` and whitespace confirmed and fixed; `.NET` in `ASP.NET` accepted and documented by a test; irregular plurals (indices, analyses) not handled (not in decision 5); cost measured, see below | `test_all_caps_terms_are_case_sensitive`, `test_multi_word_terms_match_any_whitespace` failed before | decision 5 |
-
-Glossary matching cost (decision 5): 500 terms (a fifth all-caps, a seventh multi-word) on a
-3000-character text take 14 ms per segment after a one-time 57 ms compile, against a
-translation call of seconds; patterns stay one per term.
+| B9 regex edges | partly: `IT`/`US` and whitespace confirmed and fixed; `.NET` in `ASP.NET` accepted and documented by a test; irregular plurals (indices, analyses) not handled (not in decision 5); matching cost measured in round 1 (the rules were removed in round 2) | `test_all_caps_terms_are_case_sensitive`, `test_multi_word_terms_match_any_whitespace` failed before | decision 5 (replaced in round 2; whitespace rule kept) |
 
 Check that the round-1 tests fail on the pre-review source (tests from the branch; `src/`,
 `translate.py` and `scripts/` from `9693ae2`, the last commit before round 1):
@@ -218,32 +274,92 @@ $ python3 -m pytest tests/ -q
 $ git checkout HEAD -- src translate.py scripts
 ```
 
-All 68 failures are tests added or changed in round 1. The passing 298 are the earlier tests
+All 68 failures are tests added or changed in round 1 (the legacy-signature and glossary
+inflection tests among them were removed in round 2). The passing 298 are the earlier tests
 plus round-1 tests that guard behaviour which was already right. Failures per area: builder
 walk selection 8 and legacy signatures 11, CLI context 2, extractor pipeline 1, glossary
 matching 8, term extraction 4, code cleanup 13, context 1, check scripts 18, web extraction 1,
 web worker context 2.
 
+### 7. Review round 2
+
+Three reviews (A: 12 items, B: 8, C: 5). The reviewers could not run Python; each confirmed
+finding was reproduced with a test before it was fixed. The orchestrator's decisions D1 and
+D2 replaced the content signatures and the glossary inflection rules by simpler designs, so
+the items about them are "superseded" rather than patched.
+
+Check that the round-2 tests fail on the pre-round source (tests from the branch; `src/`,
+`translate.py` and the two check scripts from `093dcd4`, the last commit before round 2):
+
+```
+$ git checkout 093dcd4 -- src translate.py scripts/verify/phase0_code_segments.py scripts/verify/phase0_builder_alignment.py
+$ python3 -m pytest tests/ -q
+90 failed, 329 passed in 43.21s
+$ git checkout HEAD -- src translate.py scripts/verify
+```
+
+All 90 failures are round-2 tests. Many builder, project and check-script tests fail on the old
+source only because the `segmenter_version` field does not exist there; the substantive ones
+are listed per item below.
+
+| Item | Verdict | Evidence | Fix |
+|---|---|---|---|
+| A1 builder signatures misclassify both generations | confirmed | pre-round builder: a new project's `<!--note-->note<h1>Title</h1>` chapter selected the legacy walk; `TestVersion1ExportMatchesMain[comment_holds_markup-*-None]` (old extractor stored `<!--<p>Draft</p>-->` as a paragraph) and `[comment_equals_text-*-None]` differ from `main`'s output on the pre-round builder | `3cc2987`: `segmenter_version` marker (D1) |
+| A2 empty cleaned reply accepted | confirmed | `test_code_reply_empty_after_cleanup_is_retried` (4 shapes), `test_text_reply_empty_after_cleanup_raises` failed before | `57880dd` (D3) |
+| A3 groups share one mutmut baseline | confirmed by reading mutmut 2.5.1 (`time_test_suite` reuses the cached time when the tests-directory hash matches; the cache file is `.mutmut-cache` in the working directory) | — | `a0a4713`: empty cache per group |
+| A4 cancellation leaves the run alive | confirmed by reading (mutmut and pytest were not in a group the script controlled) | interrupt tests in section 5 | `a0a4713`: own process group, kill and restore on INT/TERM |
+| A5 writes outside the worktree | partly: patch, runner and pytest temp files were in the system temp tree; per the decision a private `mktemp -d` directory is enough | — | `a0a4713`: one private directory for patch, runner, `TMPDIR`, `--basetemp`; section 5 says what is written where |
+| A6 suffixes match unrelated words (`Go`→goes …) | superseded by simplification | — | `c9288ab` (D2); now accepted and documented: other words starting with the term match |
+| A7 survivors called equivalent although inputs distinguish them | confirmed for 271, 357, 371, 372 (and 379); 347 and 164 no longer exist | section 5 | survivors removed from code or killed by tests; remaining 3 justified |
+| A8 `C` matches inside `C++`/`C#` | superseded by simplification | — | accepted (documented in `_term_pattern`) |
+| A9 plural entries do not match singular | superseded by simplification | — | accepted (documented) |
+| A10 lost comment-line indentation not reported | confirmed | `TestCodeLines::test_lost_comment_indentation_differs` (2 cases), `test_comment_wording_ignored` failed before | `ff999f9` (D5) |
+| A11 backup guard misses a single `.bak` | confirmed by reading (`ls` of several paths fails when any is missing) | — | `a0a4713`: each path checked |
+| A12 stale bytecode can still be read | confirmed by reading; the same effect was hit by hand during this round (two same-size edits within one second, the second run used the first's bytecode from the macOS `pycache_prefix`) | — | `a0a4713`: private `PYTHONPYCACHEPREFIX` |
+| B1 legacy chapter with a comment holding markup or an entity uses the new walk | confirmed | `TestVersion1ExportMatchesMain[comment_holds_markup-*-None]`, `[comment_with_entity-*-None]` failed before | `3cc2987` (D1) |
+| B2 commentary line before unfenced code kept | confirmed | `test_code_preface_before_unfenced_code_removed` (3 cases) failed before; `test_code_preface_without_fence_not_removed`, which locked the old behaviour, replaced | `57880dd` (D4) |
+| B3 emptiness check before cleanup; single-newline empty fence not recognised | confirmed | as A2, plus `test_code_empty_fence_cleans_to_empty['```python\n```']` failed before | `57880dd` (D3) |
+| B4 suffix false matches; `C` in `C++`/`CS` | superseded by simplification | — | `c9288ab` (D2), accepted |
+| B5 plural entries; `C++11`, `Python3` no longer matched | superseded by simplification; `C++11`/`Python3` match again (no trailing boundary) | — | `c9288ab` (D2) |
+| B6 0-based line numbers | confirmed | — | `a0a4713`: 1-based; log locations corrected |
+| B7 survivors 371/372 reachable; 271 reason inexact | confirmed | spine tests (section 5) | `2ce86b2`, `3cc2987` |
+| B8 = A10 | confirmed | as A10 | `ff999f9` |
+| C1 `es`, doubling and `y` rules wrong | superseded by simplification | — | `c9288ab` (D2) |
+| C2 plural entries | superseded by simplification | — | accepted (documented) |
+| C3 empty fenced / prefaced replies saved without retry | confirmed | as A2/B3; a commentary-only reply (`以下是翻譯結果：\n`) also cleans to empty and is retried | `57880dd` (D3) |
+| C4 `C` matches inside `C++`/`C#` | superseded by simplification | — | accepted (documented) |
+| C5 = A10 | confirmed | as A10 | `ff999f9` |
+
+Accepted glossary limitations (decision D2): for a glossary of more than 150 entries, a term
+also matches other words that start with it (`Go` → "going", `C` in "C++"), `.NET` does not
+match inside "ASP.NET", and a term stored in plural form does not match its singular. For
+prompt selection a false positive only adds a few tokens. With 150 entries or fewer (all 8
+real glossaries hold 0 to 6) every entry is sent and no matching is done. Every caller of
+`find_terms_in_text` (web worker `tasks.py`, re-translate `review.py`, both CLI modes in
+`translate.py`) builds a translation prompt; they now call `terms_for_prompt`, which applies
+the size rule, and `find_terms_in_text` keeps true matching.
+
 ### Not done
 
-- Progress reporting for web term extraction (B6, decision 7): the status endpoint still only
-  reports "running" while the batches run one after another.
-- Irregular plurals (indices, analyses) in glossary matching (B9; not in decision 5).
+- Progress reporting for web term extraction (B6 of round 1, decision 7): the status endpoint
+  still only reports "running" while the batches run one after another.
 
 ### Not verified
 
 - No call to the real `claude` CLI was made. Whether the model's replies for code segments are
   now stored unchanged in practice, and whether the changed context improves translations, was
   not measured.
-- The 19 candidate code segments were not inspected one by one and were not re-translated.
+- The 20 candidate code segments were not inspected one by one and were not re-translated.
 - Web term extraction over a whole book was not run. It makes one CLI call per 5000 characters
   of text, one after another, so its duration on a full book is unknown.
-- Export of a newly created project whose source contains comments was tested on synthetic
-  chapters only (all three formats), not on a real book. The builder's legacy rule was checked
-  on the 8 real projects (section 4) but its two signatures were derived from reading the old
-  pipeline, and a legacy chapter whose comment text was sentence-split or merged into adjacent
-  bare text by the old extractor would not be recognised (none exists in the 8 projects).
+- Export of a newly created project (version 2) whose source contains comments was tested on
+  synthetic chapters only (all three formats), not on a real book. Version-1 export equals
+  `main`'s output on 7 synthetic scenarios (outputs recorded from `main`'s builder in
+  `tests/data/legacy_walk_main.json`) and the walk equals `main`'s on every chapter of the 8
+  real projects (section 4); a full export of a real project was not compared byte for byte.
 - The two existing segments that contain comment text (Bug 5, "Existing data") are unchanged;
   this phase does not migrate stored data.
-- Glossary inflection rules are heuristics: they also accept some non-words (`renderring`,
-  `debuging`) and miss others (`y → ied`, as in `queried`).
+- Prompt size with a full glossary: sending all entries of a glossary of up to 150 terms to
+  every text prompt was not measured against real translations.
+- Mutation testing ran on Python 3.12.7 (the interpreter mutmut is installed in), the normal
+  test command on 3.9.6; the full suite passes on both (419), but mutants were not run on 3.9.
