@@ -110,7 +110,7 @@ class TermExtractor:
                 current_len = 0
 
             current_batch.append(text)
-            current_len += len(text)
+            current_len += len(text) + 2  # the '\n\n' separator counts too
 
         if current_batch:
             batch_text = '\n\n'.join(current_batch)
