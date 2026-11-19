@@ -6,6 +6,7 @@ import logging
 import os
 from flask import Flask, jsonify
 
+import src.llm as llm
 from src.core.project import ProjectLockedError
 
 from src.web.blueprints import export_bp, glossary_bp, home_bp, projects_bp, review_bp, search_bp, translation_bp
@@ -51,6 +52,11 @@ def create_app(projects_dir: str | None = None) -> Flask:
     app.register_blueprint(review_bp)
     app.register_blueprint(search_bp)
     app.register_blueprint(translation_bp)
+
+    @app.context_processor
+    def backend_texts():
+        # Backend-specific wording for the templates (e.g. how to sign in again)
+        return {'auth_hint': llm.default_backend().auth_hint}
 
     @app.errorhandler(ProjectLockedError)
     def project_locked(e):

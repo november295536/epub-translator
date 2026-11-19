@@ -7,7 +7,7 @@ import os
 from flask import Blueprint, Response, jsonify, request, current_app
 
 from src.core.project import ProjectLockedError, ProjectManager
-from src.core.translator import AVAILABLE_MODELS, DEFAULT_MODEL
+from src.core.translator import available_models
 from src.web.tasks import TaskManager
 
 
@@ -172,7 +172,7 @@ def get_model(project_name: str):
 
     return jsonify({
         'current': pm.data.model,
-        'available': AVAILABLE_MODELS,
+        'available': available_models(),
     })
 
 
@@ -186,17 +186,16 @@ def set_model(project_name: str):
         return jsonify({'error': '未提供模型名稱'}), 400
 
     model = data['model']
-    valid_aliases = [m['alias'] for m in AVAILABLE_MODELS]
+    valid_aliases = [m['alias'] for m in available_models()]
     if model not in valid_aliases:
         return jsonify({'error': f'無效的模型：{model}，可用模型：{", ".join(valid_aliases)}'}), 400
 
     tm = _get_task_manager()
     try:
-        pm = tm.get_or_load_pm(project_name, projects_dir)
-    except Exception as e:
+        with tm.transaction(project_name, projects_dir) as pm:
+            pm.set_model(model)
+            pm.save()
+    except (FileNotFoundError, ValueError) as e:
         return jsonify({'error': str(e)}), 404
-
-    pm.set_model(model)
-    pm.save()
 
     return jsonify({'status': 'ok', 'model': model})

@@ -1489,7 +1489,7 @@ class TestWorkerFailedSegment:
         assert 'exit 1' in errors[0]['data']['error']
         assert task.completed == 2
         log_dir = os.path.join(project_with_translations, PROJECT_NAME, 'log', 'failed')
-        assert os.listdir(log_dir) == ['ch1_seg0003.txt']
+        assert os.listdir(log_dir) == ['ch1_seg0003-5e7e0f7e3d.txt']
         TaskManager._instance = None
 
     def test_failed_queued_only_with_retry_failed(self, client, project_with_translations):
@@ -1702,8 +1702,11 @@ class TestFailedInPages:
         assert '重試失敗段落（1）' in html
 
     def test_retry_button_hidden_without_failed(self, client):
+        # The button is always in the page (review round 1, item 22) and
+        # hidden by its x-show while the failed count is 0
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
-        assert '重試失敗段落' not in html
+        assert '重試失敗段落（0）' in html
+        assert 'failedCount: 0,' in html
         html = client.get(f'/project/{PROJECT_NAME}/overview').get_data(as_text=True)
         assert '翻譯失敗' not in html
 
@@ -1823,21 +1826,24 @@ class TestWorkerEventsAndLogs:
 class TestRetranslateDetails:
 
     def test_edit_during_retranslation_is_kept(self, client, project_with_translations):
+        """Two real requests, no shared manager patched in (review round 1, item 2)."""
         TaskManager._instance = None
-        pm = ProjectManager(os.path.join(project_with_translations, PROJECT_NAME))
-        pm.load()
+        edited = threading.Event()
 
         def respond(request):
-            pm.update_translation('ch1_seg0002', '人工譯文')  # edited meanwhile
+            response = client.application.test_client().post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002', json={'text': '人工譯文'})
+            assert response.status_code == 200
+            edited.set()
             return '<p>機器譯文</p>'
 
-        with patch('src.web.blueprints.review.get_pm', return_value=pm):
-            with use_fake_backend(FakeBackend(responder=respond)):
-                response = client.post(
-                    f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/retranslate')
+        with use_fake_backend(FakeBackend(responder=respond)):
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/retranslate')
+        assert edited.is_set()
         assert response.status_code == 409
         assert response.get_json() == {'error': '段落已在翻譯期間被編輯，未套用新譯文'}
-        assert pm.data.segments[1].translated_text == '人工譯文'
+        assert _load(project_with_translations)['ch1_seg0002'].translated_text == '人工譯文'
 
     def test_failure_diagnostics_and_logs(self, client, project_with_translations, caplog):
         import logging
@@ -1847,7 +1853,7 @@ class TestRetranslateDetails:
                 f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
         assert response.get_json() == {'error': 'Translation failed after 3 attempts: boom'}
         log_dir = os.path.join(project_with_translations, PROJECT_NAME, 'log', 'failed')
-        assert os.listdir(log_dir) == ['ch1_seg0003.txt']
+        assert os.listdir(log_dir) == ['ch1_seg0003-5e7e0f7e3d.txt']
         assert 'Translation error for ch1_seg0003: Translation failed after 3 attempts: boom' \
             in [r.getMessage() for r in caplog.records]
 
@@ -1889,3 +1895,527 @@ class TestTaskWithoutLock:
             tm._run_translation(task)  # in this thread: an exception would fail the test
         assert task.state == 'completed'
         TaskManager._instance = None
+
+
+# --- Review round 1 ---------------------------------------------------------------
+
+from src.core.translator import failure_log_path
+from src.llm import AuthError, BackendUnavailableError
+
+
+def _start(projects_dir, responder, **kwargs):
+    """Start a task with a fake backend that stays in place while it runs."""
+    TaskManager._instance = None
+    patcher = use_fake_backend(FakeBackend(responder=responder))
+    patcher.start()
+    try:
+        task = TaskManager().start_translation(PROJECT_NAME, projects_dir, **kwargs)
+    except BaseException:
+        patcher.stop()
+        raise
+    return task, patcher
+
+
+def _finish(task, patcher, timeout=20):
+    task._coordinator.join(timeout=timeout)
+    alive = task._coordinator.is_alive()
+    patcher.stop()
+    TaskManager._instance = None
+    assert not alive, 'coordinator did not end'
+
+
+class TestRetranslateTransaction:
+    """Item 2: re-translate applies its result to the current state."""
+
+    def test_edit_of_other_segment_not_reverted(self, client, project_with_translations):
+        TaskManager._instance = None
+
+        def respond(request):
+            response = client.application.test_client().post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0001', json={'text': '人工標題'})
+            assert response.status_code == 200
+            return '<p>機器譯文</p>'
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/retranslate')
+        assert response.status_code == 200
+        segs = _load(project_with_translations)
+        assert segs['ch1_seg0001'].translated_text == '人工標題'
+        assert segs['ch1_seg0002'].translated_text == '<p>機器譯文</p>'
+
+    def test_edit_from_other_thread_during_retranslation(self, client,
+                                                         project_with_translations):
+        """The edit runs in a second request thread while the call is held."""
+        TaskManager._instance = None
+        in_flight, release = threading.Event(), threading.Event()
+        result = {}
+
+        def respond(request):
+            in_flight.set()
+            assert release.wait(10)
+            return '<p>機器譯文</p>'
+
+        def retranslate():
+            result['r'] = client.application.test_client().post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/retranslate')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            t = threading.Thread(target=retranslate)
+            t.start()
+            assert in_flight.wait(10)
+            assert client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/approve',
+                               json={'text': '人工'}).status_code == 200
+            assert client.post(f'/api/projects/{PROJECT_NAME}/segments/ch2_seg0001',
+                               json={'text': '人工二'}).status_code == 200
+            release.set()
+            t.join(10)
+        assert result['r'].status_code == 409
+        segs = _load(project_with_translations)
+        assert (segs['ch1_seg0002'].status, segs['ch1_seg0002'].translated_text) == \
+            (SegmentStatus.REVIEWED, '人工')
+        assert segs['ch2_seg0001'].translated_text == '人工二'
+
+    def test_edit_while_stopped_task_is_ending_is_kept(self, client,
+                                                      project_with_translations):
+        """A stopped task whose coordinator still runs owns the project state."""
+        in_flight, release = threading.Event(), threading.Event()
+
+        def respond(request):
+            if '>Second paragraph.<' in request.messages[-1].content:
+                in_flight.set()
+                assert release.wait(10)
+            return '<p>機器譯文</p>'
+
+        task, patcher = _start(project_with_translations, respond,
+                               segment_ids=['ch1_seg0003'])
+        assert in_flight.wait(10)
+        TaskManager().stop_translation(PROJECT_NAME)
+        assert client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0001',
+                           json={'text': '人工標題'}).status_code == 200
+        release.set()
+        _finish(task, patcher)
+        assert _load(project_with_translations)['ch1_seg0001'].translated_text == '人工標題'
+
+
+class TestOverlappingTasks:
+    """Item 4: a start never overlaps a task whose threads are still alive."""
+
+    def test_start_rejected_while_old_worker_in_flight(self, client,
+                                                      project_with_translations,
+                                                      monkeypatch):
+        monkeypatch.setattr('src.web.tasks.STOP_WAIT_SECONDS', 0.2)
+        in_flight, release = threading.Event(), threading.Event()
+
+        def respond(request):
+            in_flight.set()
+            assert release.wait(10)
+            return '<p>譯</p>'
+
+        task, patcher = _start(project_with_translations, respond)
+        assert in_flight.wait(10)
+        assert TaskManager().pause_translation(PROJECT_NAME)
+        response = client.post(f'/api/projects/{PROJECT_NAME}/translate/start', json={})
+        assert response.status_code == 409
+        assert '仍在結束中' in response.get_json()['error']
+        assert TaskManager().get_task(PROJECT_NAME) is task
+        release.set()
+        _finish(task, patcher)
+        assert task.state == 'stopped'
+
+    def test_simultaneous_starts(self, project_with_translations):
+        TaskManager._instance = None
+        tm = TaskManager()
+        loading, go_on = threading.Event(), threading.Event()
+        real_load = ProjectManager.load
+        calls = []
+
+        def slow_load(self):
+            calls.append(1)
+            if len(calls) == 1:
+                loading.set()
+                assert go_on.wait(10)
+            return real_load(self)
+
+        outcomes = []
+
+        def start():
+            try:
+                outcomes.append(tm.start_translation(PROJECT_NAME, project_with_translations))
+            except ValueError as e:
+                outcomes.append(e)
+
+        hold = threading.Event()
+        with use_fake_backend(FakeBackend(responder=lambda r: hold.wait(10) and '<p>譯</p>')), \
+                patch.object(ProjectManager, 'load', slow_load):
+            first = threading.Thread(target=start)
+            first.start()
+            assert loading.wait(10)
+            second = threading.Thread(target=start)
+            second.start()
+            second.join(0.3)
+            go_on.set()
+            first.join(10)
+            second.join(10)
+            hold.set()
+            tasks = [o for o in outcomes if isinstance(o, TranslationTask)]
+            for t in tasks:
+                t._coordinator.join(20)
+        assert len(tasks) == 1
+        assert [str(o) for o in outcomes if isinstance(o, ValueError)] == ['翻譯任務已在執行中']
+        TaskManager._instance = None
+
+
+class TestStartFailures:
+    """Item 5: failures while a task starts release the project lock."""
+
+    def _project_dir(self, projects_dir):
+        return os.path.join(projects_dir, PROJECT_NAME)
+
+    def test_logging_setup_failure(self, project_with_translations):
+        TaskManager._instance = None
+        with patch('src.web.tasks.setup_project_logging', side_effect=OSError('read-only')):
+            task = TaskManager().start_translation(PROJECT_NAME, project_with_translations)
+            task._coordinator.join(10)
+        assert task.state == 'failed'
+        assert 'read-only' in task.error
+        assert lock_free_for_other_process(self._project_dir(project_with_translations))
+        TaskManager._instance = None
+
+    def test_coordinator_start_failure(self, client, project_with_translations):
+        TaskManager._instance = None
+        with patch.object(threading.Thread, 'start', side_effect=RuntimeError('no threads')):
+            response = client.post(f'/api/projects/{PROJECT_NAME}/translate/start', json={})
+        assert response.status_code == 500
+        assert lock_free_for_other_process(self._project_dir(project_with_translations))
+        with use_fake_backend(FakeBackend(responder=lambda r: '<p>譯</p>')):
+            response = client.post(f'/api/projects/{PROJECT_NAME}/translate/start', json={})
+            assert response.status_code == 200
+            TaskManager().get_task(PROJECT_NAME)._coordinator.join(20)
+        TaskManager._instance = None
+
+
+class TestCoordinatorFailure:
+    """Item 6: a failing coordinator stops and joins its workers first."""
+
+    def test_save_failure_joins_workers_and_reports_unsaved(self, project_with_translations):
+        threads = []
+
+        def respond(request):
+            threads.append(threading.current_thread())
+            if '>Chapter 2<' in request.messages[-1].content:
+                _time.sleep(1)  # still in flight when the save fails
+            return '<p>譯</p>'
+
+        TaskManager._instance = None
+        with patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
+            task, patcher = _start(project_with_translations, respond, num_workers=3)
+            _finish(task, patcher)
+        assert task.state == 'failed'
+        assert not any(t.is_alive() for t in threads + task._threads)
+        assert 'disk full' in task.error and '未儲存' in task.error
+        error = [e for e in task.progress.get_all() if e['event'] == 'error'][0]
+        assert set(error['data']['unsaved']) == {'ch1_seg0003', 'ch2_seg0001', 'ch2_seg0002'}
+        assert lock_free_for_other_process(os.path.join(project_with_translations,
+                                                        PROJECT_NAME))
+
+    def test_save_failure_wakes_paused_worker(self, project_with_translations):
+        paused = threading.Event()
+
+        def respond(request):
+            prompt = request.messages[-1].content
+            if '>Chapter 2<' in prompt:
+                raise RateLimitError('limit')
+            if '>Second paragraph.<' in prompt:
+                assert paused.wait(10)
+            return '<p>譯</p>'
+
+        TaskManager._instance = None
+        with patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
+            task, patcher = _start(project_with_translations, respond,
+                                   segment_ids=['ch1_seg0003', 'ch2_seg0001'],
+                                   num_workers=2)
+            _wait(lambda: task.state == 'paused')
+            paused.set()
+            _finish(task, patcher)
+        assert task.state == 'failed'
+        assert not any(t.is_alive() for t in task._threads)
+
+
+class TestStopThenLateRunError:
+    """Item 7: a run error after stop does not pause the ending task."""
+
+    @pytest.mark.parametrize('error', [AuthError('expired'), RateLimitError('limit')])
+    def test_stop_then_error(self, project_with_translations, error):
+        in_flight, release = threading.Event(), threading.Event()
+
+        def respond(request):
+            in_flight.set()
+            assert release.wait(10)
+            raise error
+
+        task, patcher = _start(project_with_translations, respond)
+        assert in_flight.wait(10)
+        TaskManager().stop_translation(PROJECT_NAME)
+        release.set()
+        _finish(task, patcher, timeout=10)
+        assert task.state == 'stopped'
+        assert lock_free_for_other_process(os.path.join(project_with_translations,
+                                                        PROJECT_NAME))
+
+
+class TestWorkerUnexpectedErrors:
+    """Item 9: diagnostics I/O errors and unexpected exceptions fail one segment."""
+
+    def test_unwritable_failure_log(self, project_with_translations):
+        log_dir = os.path.join(project_with_translations, PROJECT_NAME, 'log')
+        os.makedirs(log_dir)
+        with open(os.path.join(log_dir, 'failed'), 'w') as f:
+            f.write('a file where the directory should be')
+        task, patcher = _start(project_with_translations, _fail_on('Second paragraph.'),
+                               num_workers=2)
+        _finish(task, patcher)
+        assert task.state == 'completed'
+        segs = _load(project_with_translations)
+        assert segs['ch1_seg0003'].status == SegmentStatus.FAILED
+        assert segs['ch2_seg0002'].status == SegmentStatus.TRANSLATED
+
+    def test_unexpected_exception(self, project_with_translations):
+        def respond(request):
+            if '>Second paragraph.<' in request.messages[-1].content:
+                raise KeyError('surprise')
+            return '<p>譯</p>'
+
+        task, patcher = _start(project_with_translations, respond, num_workers=2)
+        _finish(task, patcher)
+        assert task.state == 'completed'
+        segs = _load(project_with_translations)
+        assert segs['ch1_seg0003'].status == SegmentStatus.FAILED
+        assert segs['ch1_seg0003'].issues[0].code == 'unexpected'
+        assert 'surprise' in segs['ch1_seg0003'].issues[0].detail
+        assert segs['ch2_seg0001'].status == SegmentStatus.TRANSLATED
+
+
+class TestBackendUnavailable:
+    """Item 15: a missing program pauses the run; no segment becomes FAILED."""
+
+    def test_task_pauses_and_segments_stay_pending(self, project_with_translations):
+        task, patcher = _start(project_with_translations,
+                               lambda r: (_ for _ in ()).throw(
+                                   BackendUnavailableError('could not be started')),
+                               num_workers=2)
+        _wait(lambda: task.state == 'paused')
+        TaskManager().stop_translation(PROJECT_NAME)
+        _finish(task, patcher)
+        events = [e for e in task.progress.get_all() if e['event'] == 'backend_error']
+        assert len(events) == 1 and 'could not be started' in events[0]['data']['error']
+        assert {s.status for s in _load(project_with_translations).values()} == \
+            {SegmentStatus.TRANSLATED, SegmentStatus.PENDING}
+
+    def test_retranslate(self, client, project_with_translations):
+        with use_fake_backend(FakeBackend([BackendUnavailableError('could not be started')])):
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
+        assert response.status_code == 503
+        assert _load(project_with_translations)['ch1_seg0003'].status == SegmentStatus.PENDING
+
+
+class TestQueuedEdits:
+    """Items 16, 17, 25: edits of queued or in-flight segments win."""
+
+    def test_dropped_result_sends_no_success_event(self, client, project_with_translations):
+        in_flight, release = threading.Event(), threading.Event()
+
+        def respond(request):
+            in_flight.set()
+            assert release.wait(10)
+            return '<p>機器譯文</p>'
+
+        task, patcher = _start(project_with_translations, respond,
+                               segment_ids=['ch1_seg0003'])
+        assert in_flight.wait(10)
+        client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003',
+                    json={'text': '人工譯文'})
+        release.set()
+        _finish(task, patcher)
+        names = [e['event'] for e in task.progress.get_all()]
+        assert 'segment_complete' not in names
+        assert names.count('progress') == 1
+
+    @pytest.mark.parametrize('action', ['edit', 'approve'])
+    def test_queued_segment_edited_before_pickup(self, client, project_with_translations,
+                                                 action):
+        in_flight, release = threading.Event(), threading.Event()
+        prompts = []
+
+        def respond(request):
+            prompts.append(request.messages[-1].content)
+            if '>Second paragraph.<' in request.messages[-1].content:
+                in_flight.set()
+                assert release.wait(10)
+            return '<p>機器譯文</p>'
+
+        task, patcher = _start(project_with_translations, respond,
+                               segment_ids=['ch1_seg0003', 'ch2_seg0001'], num_workers=1)
+        assert in_flight.wait(10)
+        url = f'/api/projects/{PROJECT_NAME}/segments/ch2_seg0001'
+        if action == 'approve':
+            url += '/approve'
+        assert client.post(url, json={'text': '人工'}).status_code == 200
+        release.set()
+        _finish(task, patcher)
+        assert _load(project_with_translations)['ch2_seg0001'].translated_text == '人工'
+        # Item 25: no call spent on the edited segment
+        assert len(prompts) == 1
+        assert task.state == 'completed' and task.completed == 2
+
+    def test_queued_reviewed_segment_is_translated_when_asked(self, client,
+                                                              project_with_translations):
+        client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/approve', json={})
+        task, patcher = _start(project_with_translations, lambda r: '<p>新譯</p>',
+                               segment_ids=['ch1_seg0002'])
+        _finish(task, patcher)
+        assert _load(project_with_translations)['ch1_seg0002'].translated_text == '<p>新譯</p>'
+
+
+class TestEditRemovesFailureLog:
+    """Item 24: a manual edit or approval removes the segment's failure log."""
+
+    @pytest.mark.parametrize('suffix', ['', '/approve'])
+    def test_failure_log_removed(self, client, project_with_translations, suffix):
+        with use_fake_backend(FakeBackend([TransientError('exit 1')] * 3)):
+            client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
+        log_dir = os.path.join(project_with_translations, PROJECT_NAME, 'log')
+        assert os.path.exists(failure_log_path(log_dir, 'ch1_seg0003'))
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003{suffix}',
+                               json={'text': '人工'})
+        assert response.status_code == 200
+        assert not os.path.exists(failure_log_path(log_dir, 'ch1_seg0003'))
+        seg = _load(project_with_translations)['ch1_seg0003']
+        assert seg.issues == [] and seg.status != SegmentStatus.FAILED
+
+
+class TestDeleteGuard:
+    """Item 18: no delete under a running task or another process's lock."""
+
+    def test_delete_refused_while_task_runs(self, client, project_with_translations):
+        in_flight, release = threading.Event(), threading.Event()
+
+        def respond(request):
+            in_flight.set()
+            assert release.wait(10)
+            return '<p>譯</p>'
+
+        task, patcher = _start(project_with_translations, respond)
+        assert in_flight.wait(10)
+        response = client.delete(f'/api/projects/{PROJECT_NAME}')
+        release.set()
+        _finish(task, patcher)
+        assert response.status_code == 409
+        assert os.path.isdir(os.path.join(project_with_translations, PROJECT_NAME))
+
+    def test_delete_refused_while_other_process_holds_lock(self, client,
+                                                          project_with_translations):
+        TaskManager._instance = None
+        project_dir = os.path.join(project_with_translations, PROJECT_NAME)
+        child = hold_lock_in_child(project_dir)
+        try:
+            response = client.delete(f'/api/projects/{PROJECT_NAME}')
+        finally:
+            child.stdin.close()
+            child.wait(timeout=10)
+        assert response.status_code == 409
+        assert '另一個程序' in response.get_json()['error']
+        assert os.path.isfile(os.path.join(project_dir, 'project.json'))
+
+
+class TestBackendModels:
+    """Item 12: models, default model and auth hint come from the backend."""
+
+    def test_model_api_uses_backend_models(self, client, project_with_translations):
+        fake = FakeBackend(replies=[])
+        with use_fake_backend(fake):
+            data = client.get(f'/api/projects/{PROJECT_NAME}/model').get_json()
+            assert data['available'] == [{'alias': 'fake-model', 'label': 'Fake',
+                                          'description': ''}]
+            assert client.put(f'/api/projects/{PROJECT_NAME}/model',
+                              json={'model': 'sonnet'}).status_code == 400
+            assert client.put(f'/api/projects/{PROJECT_NAME}/model',
+                              json={'model': 'fake-model'}).status_code == 200
+        pm = ProjectManager(os.path.join(project_with_translations, PROJECT_NAME))
+        pm.load()
+        assert pm.data.model == 'fake-model'
+
+    def test_new_project_gets_backend_default_model(self, tmp_path):
+        with use_fake_backend(FakeBackend(replies=[])):
+            pm = ProjectManager(str(tmp_path / 'p'))
+            pm.create('/x.epub', 'T', 'A', [])
+        assert pm.data.model == 'fake-model'
+
+    def test_stored_model_kept(self, project_with_translations):
+        """An existing project's stored model is used as it is."""
+        pm = ProjectManager(os.path.join(project_with_translations, PROJECT_NAME))
+        pm.load()
+        pm.set_model('opus')
+        pm.save()
+        fake = FakeBackend(responder=lambda r: '<p>譯</p>')
+        TaskManager._instance = None
+        with use_fake_backend(fake):
+            task = TaskManager().start_translation(PROJECT_NAME, project_with_translations)
+            task._coordinator.join(20)
+        assert {r.model for r in fake.requests} == {'opus'}
+        TaskManager._instance = None
+
+    def test_pages_have_no_claude_specifics(self, client):
+        with use_fake_backend(FakeBackend(replies=[])):
+            for page in ('translation', 'review/chapter/ch1'):
+                html = client.get(f'/project/{PROJECT_NAME}/{page}').get_data(as_text=True)
+                assert 'claude' not in html.lower()
+                assert 'sonnet' not in html
+                assert 'fake: sign in again' in html
+
+
+class TestTemplatesHandleErrors:
+    """Items 11 and 22: rejected saves are visible; the retry button is reactive."""
+
+    def test_review_save_and_approve_check_the_response(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1').get_data(as_text=True)
+        assert html.count('showSaveError(segId, r, data);') == 2
+        assert 'function showSaveError' in html
+        assert '未儲存' in html
+
+    def test_model_select_reverts_on_error(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
+        assert 'this.model = previous;' in html
+        assert "this.error = data.error || '模型設定失敗'" in html
+
+    def test_retry_button_reactive(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
+        assert 'failedCount: 0,' in html
+        assert 'x-show="failedCount > 0' in html
+        assert html.count('this.refreshFailedCount();') == 3  # complete, stopped, error
+
+    def test_backend_error_event_handled(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
+        assert "addEventListener('backend_error'" in html
+
+
+class TestTermExtractionStop:
+    """Item 19: a rate limit keeps the terms of finished batches."""
+
+    def test_partial_terms_kept_and_reported(self, client, project_with_translations,
+                                             monkeypatch):
+        from src.web.blueprints.glossary import _extraction_tasks
+        monkeypatch.setattr('src.glossary.term_extractor.MAX_CHARS_PER_BATCH', 20)
+        _extraction_tasks.pop(PROJECT_NAME, None)
+        fake = FakeBackend(['[{"term": "Alpha", "translation": "甲", "category": "term"}]',
+                            RateLimitError("You've hit your limit")])
+        with use_fake_backend(fake):
+            client.post(f'/api/projects/{PROJECT_NAME}/glossary/extract')
+            _wait(lambda: not _extraction_tasks[PROJECT_NAME]['running'])
+        status = client.get(f'/api/projects/{PROJECT_NAME}/glossary/extract/status').get_json()
+        _extraction_tasks.pop(PROJECT_NAME, None)
+        assert status['status'] == 'error'
+        assert 'hit your limit' in status['error'] and '1 個術語' in status['error']
+        terms = client.get(f'/api/projects/{PROJECT_NAME}/glossary').get_json()
+        assert [t['term'] for t in terms] == ['Alpha']

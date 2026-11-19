@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from flask import Blueprint, render_template, request, jsonify, current_app
 
 from src.core.project import ProjectManager, SegmentStatus
-from src.core.translator import AuthError, RateLimitError, TranslationEngine, translate_segment
+from src.core.translator import (
+    AuthError, BackendUnavailableError, RateLimitError, TranslationEngine,
+    remove_failure_log, translate_segment,
+)
 from src.glossary.glossary_manager import GlossaryManager
 from src.web.tasks import TaskManager, setup_project_logging, teardown_project_logging
 
@@ -56,47 +60,66 @@ def chapter_view(project_name: str, chapter_id: str):
                            active_tab='review')
 
 
+def transaction(project_name: str):
+    """Load, change and save the project as one step (see TaskManager.transaction)."""
+    return TaskManager().transaction(project_name, current_app.config['PROJECTS_DIR'])
+
+
+def _log_dir(pm: ProjectManager) -> str:
+    return os.path.join(pm.project_dir, 'log')
+
+
 @review_bp.route('/api/projects/<project_name>/segments/<segment_id>', methods=['POST'])
 def update_segment(project_name: str, segment_id: str):
     """Update translation text for a segment."""
-    pm = get_pm(project_name)
     data = request.get_json()
     if not data or 'text' not in data:
         return jsonify({'error': 'Missing text field'}), 400
 
     try:
-        pm.update_translation(segment_id, data['text'])
-        pm.save()
-        return jsonify({'status': 'ok', 'segment_id': segment_id})
+        with transaction(project_name) as pm:
+            pm.update_translation(segment_id, data['text'])
+            pm.save()
     except ValueError as e:
         return jsonify({'error': str(e)}), 404
+    # A person's version replaces the failed one: its diagnostics go too
+    remove_failure_log(_log_dir(pm), segment_id)
+    return jsonify({'status': 'ok', 'segment_id': segment_id})
 
 
 @review_bp.route('/api/projects/<project_name>/segments/<segment_id>/approve', methods=['POST'])
 def approve_segment(project_name: str, segment_id: str):
     """Mark a segment as reviewed."""
-    pm = get_pm(project_name)
     data = request.get_json() or {}
     text = data.get('text', '')
 
     try:
-        pm.mark_reviewed(segment_id, text=text)
-        pm.save()
-        return jsonify({'status': 'ok', 'segment_id': segment_id})
+        with transaction(project_name) as pm:
+            pm.mark_reviewed(segment_id, text=text)
+            pm.save()
     except ValueError as e:
         return jsonify({'error': str(e)}), 404
+    remove_failure_log(_log_dir(pm), segment_id)
+    return jsonify({'status': 'ok', 'segment_id': segment_id})
 
 
 @review_bp.route('/api/projects/<project_name>/segments/<segment_id>/retranslate', methods=['POST'])
 def retranslate_segment(project_name: str, segment_id: str):
-    """Re-translate a single segment using Claude CLI."""
-    pm = get_pm(project_name)
-    project_dir = pm.project_dir
+    """Re-translate a single segment using the backend.
 
-    # Find the segment
-    seg = next((s for s in pm.data.segments if s.segment_id == segment_id), None)
-    if not seg:
-        return jsonify({'error': f'Segment {segment_id} not found'}), 404
+    The model call runs outside the project mutex, on a snapshot; its result
+    is then applied to the current project state (the running task's
+    manager, otherwise a fresh load) only if the segment was not edited
+    meanwhile."""
+    with transaction(project_name) as pm:
+        seg = next((s for s in pm.data.segments if s.segment_id == segment_id), None)
+        if not seg:
+            return jsonify({'error': f'Segment {segment_id} not found'}), 404
+        revision = seg.revision
+        model = pm.data.model
+        segments = copy.deepcopy(pm.data.segments)
+        seg = next(s for s in segments if s.segment_id == segment_id)
+    project_dir = pm.project_dir
 
     # Load glossary
     glossary_path = os.path.join(project_dir, 'glossary.json')
@@ -105,14 +128,14 @@ def retranslate_segment(project_name: str, segment_id: str):
 
     handler = setup_project_logging(project_dir)
     try:
-        engine = TranslationEngine(model=pm.data.model)
+        engine = TranslationEngine(model=model)
         logger.info("重新翻譯段落: %s (模型: %s)", segment_id, engine.model)
-        revision = seg.revision
-        outcome = translate_segment(engine, seg, pm.data.segments, gm,
+        outcome = translate_segment(engine, seg, segments, gm,
                                     log_dir=os.path.join(project_dir, 'log'))
-        if not pm.apply_outcome(segment_id, outcome, revision=revision):
-            return jsonify({'error': '段落已在翻譯期間被編輯，未套用新譯文'}), 409
-        pm.save()
+        with transaction(project_name) as pm:
+            if not pm.apply_outcome(segment_id, outcome, revision=revision):
+                return jsonify({'error': '段落已在翻譯期間被編輯，未套用新譯文'}), 409
+            pm.save()
         if outcome.status == SegmentStatus.FAILED:
             detail = outcome.issues[0].detail
             logger.warning("Translation error for %s: %s", segment_id, detail)
@@ -129,6 +152,9 @@ def retranslate_segment(project_name: str, segment_id: str):
     except RateLimitError as e:
         logger.warning("Rate limit during retranslation: %s", e)
         return jsonify({'error': str(e)}), 500
+    except BackendUnavailableError as e:
+        logger.warning("Backend unavailable during retranslation: %s", e)
+        return jsonify({'error': str(e)}), 503
     finally:
         teardown_project_logging(handler)
 

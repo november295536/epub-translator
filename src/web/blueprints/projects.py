@@ -8,7 +8,7 @@ import shutil
 import uuid
 from flask import Blueprint, render_template, redirect, request, jsonify, current_app
 
-from src.core.project import ProjectManager
+from src.core.project import ProjectLock, ProjectLockedError, ProjectManager, project_mutex
 from src.core.segmenter import Segmenter
 from src.epub.extractor import EPUBExtractor
 from src.web.tasks import TaskManager
@@ -281,7 +281,20 @@ def delete_project(project_name: str):
     if not os.path.isdir(project_dir):
         return jsonify({'error': '專案不存在'}), 404
 
-    shutil.rmtree(project_dir)
+    if TaskManager().task_active(project_name):
+        return jsonify({'error': '專案正在翻譯中，請先停止翻譯再刪除'}), 409
+    # Holding the lock and the mutex: no other process or request writes
+    # to the project while it is removed
+    with project_mutex(project_dir):
+        try:
+            lock = ProjectLock(project_dir)
+            lock.acquire()
+        except ProjectLockedError as e:
+            return jsonify({'error': str(e)}), 409
+        try:
+            shutil.rmtree(project_dir)
+        finally:
+            lock.release()
     return jsonify({'status': 'ok'})
 
 
