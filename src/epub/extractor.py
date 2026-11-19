@@ -1,26 +1,49 @@
-"""EPUB extraction module - reads EPUB files and extracts chapter content."""
+"""EPUB extraction module - reads the package straight from the archive.
+
+The archive is read as a ZIP file: META-INF/container.xml names the OPF, the
+OPF manifest maps item ids to members (hrefs URL-decoded, relative to the
+OPF's directory), and the spine gives the reading order (duplicates
+removed). The navigation document and the NCX are never chapters. Each
+chapter is parsed with lxml in XML mode; a chapter that does not parse is
+not returned and is listed in `EPUBExtractor.failed`.
+"""
 
 from __future__ import annotations
 
+import io
+import posixpath
 import re
-
-import ebooklib
-from ebooklib import epub
-from bs4 import BeautifulSoup
-from bs4.element import PreformattedString
+import zipfile
 from dataclasses import dataclass
+from urllib.parse import unquote
+
+from lxml import etree
+
+from src.epub.blocks import element_text, localname
+
+# Strict XML: no entity expansion, no network, no recovery
+PARSER = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
+
+XHTML_MEDIA_TYPE = 'application/xhtml+xml'
 
 
-def _serialize(node) -> str:
-    """Serialize a body child.
+def parse_xml(data: bytes):
+    """Parse a member as XML (raises etree.XMLSyntaxError)."""
+    return etree.fromstring(data, PARSER)
 
-    str() of a comment (or CData, processing instruction, doctype) returns
-    its bare content without markers, which would turn it into visible text.
-    Those keep their markers; the segmenter then skips them.
-    """
-    if isinstance(node, PreformattedString):
-        return node.output_ready()
-    return str(node)
+
+def _xpath_local(node, *names: str) -> list:
+    """Descendants of `node` along the given local names, any namespace."""
+    path = '/'.join(f'*[local-name()="{n}"]' for n in names)
+    return node.xpath(f'.//{path}')
+
+
+@dataclass
+class SpineItem:
+    """One spine entry that is an XHTML content document."""
+    id: str
+    path: str          # member name inside the archive
+    is_nav: bool
 
 
 @dataclass
@@ -28,9 +51,45 @@ class Chapter:
     """Represents a single chapter extracted from an EPUB."""
     id: str
     title: str
-    html_content: str
+    path: str          # member name inside the archive
+    body: object       # lxml <body> element of the parsed chapter
     text_content: str
     order: int
+
+
+def read_package(zf: zipfile.ZipFile) -> tuple:
+    """Return (OPF root element, manifest, spine) of an open archive: the
+    manifest maps item id -> (member name, media type, is navigation
+    document); the spine lists its XHTML entries, duplicates removed."""
+    container = parse_xml(zf.read('META-INF/container.xml'))
+    opf_path = _xpath_local(container, 'rootfile')[0].get('full-path')
+    opf = parse_xml(zf.read(opf_path))
+    base = posixpath.dirname(opf_path)
+
+    manifest = {}
+    for item in _xpath_local(opf, 'manifest', 'item'):
+        path = posixpath.normpath(posixpath.join(base, unquote(item.get('href'))))
+        manifest[item.get('id')] = (path, item.get('media-type'),
+                                    'nav' in (item.get('properties') or '').split())
+
+    spine = []
+    seen = set()
+    for ref in _xpath_local(opf, 'spine', 'itemref'):
+        item_id = ref.get('idref')
+        if item_id in seen or item_id not in manifest:
+            continue
+        seen.add(item_id)
+        path, media_type, is_nav = manifest[item_id]
+        if media_type != XHTML_MEDIA_TYPE:
+            continue
+        spine.append(SpineItem(id=item_id, path=path, is_nav=is_nav))
+    return opf, manifest, spine
+
+
+def find_body(root):
+    """The <body> element of a parsed chapter, or None."""
+    bodies = _xpath_local(root, 'body')
+    return bodies[0] if bodies else None
 
 
 class EPUBExtractor:
@@ -38,81 +97,80 @@ class EPUBExtractor:
 
     def __init__(self, epub_path: str):
         self.epub_path = epub_path
-        self.book = None
+        self.opf = None
+        self.spine: list[SpineItem] = []
+        self.failed: list[tuple] = []     # (chapter id, reason) not segmented
+        self._zip: zipfile.ZipFile | None = None
 
     def load(self) -> None:
-        """Load the EPUB file."""
-        self.book = epub.read_epub(self.epub_path)
+        """Open the archive and read its package document."""
+        with open(self.epub_path, 'rb') as f:
+            data = f.read()
+        self._zip = zipfile.ZipFile(io.BytesIO(data))
+        self.opf, _, self.spine = read_package(self._zip)
 
     def get_metadata(self) -> dict:
         """Extract book metadata."""
-        if not self.book:
+        if self.opf is None:
             raise RuntimeError("EPUB not loaded. Call load() first.")
 
-        title = self.book.get_metadata('DC', 'title')
-        author = self.book.get_metadata('DC', 'creator')
-        language = self.book.get_metadata('DC', 'language')
+        def first(name):
+            found = _xpath_local(self.opf, 'metadata', name)
+            text = found[0].text if found else None
+            return text.strip() if text and text.strip() else 'Unknown'
 
         return {
-            'title': title[0][0] if title else 'Unknown',
-            'author': author[0][0] if author else 'Unknown',
-            'language': language[0][0] if language else 'Unknown',
+            'title': first('title'),
+            'author': first('creator'),
+            'language': first('language'),
         }
 
     def extract_chapters(self) -> list[Chapter]:
-        """Extract all document chapters from the EPUB.
+        """Parse the spine's content documents, in spine order.
 
-        Returns chapters in spine order, filtering out non-content items
-        like cover pages, table of contents, etc.
+        The navigation document is skipped, as are chapters without a body or
+        without text. A chapter that is missing from the archive or is not
+        well-formed XML is skipped and recorded in `self.failed`.
         """
-        if not self.book:
+        if self._zip is None:
             raise RuntimeError("EPUB not loaded. Call load() first.")
 
         chapters = []
-        spine_ids = [item_id for item_id, _ in self.book.spine]
-        seen_ids: set[str] = set()
-
-        for order, item_id in enumerate(spine_ids):
-            # Skip duplicate spine entries (some EPUBs have malformed spines)
-            if item_id in seen_ids:
+        self.failed = []
+        for order, item in enumerate(self.spine):
+            if item.is_nav:
                 continue
-            seen_ids.add(item_id)
-
-            item = self.book.get_item_with_id(item_id)
-            if item is None:
+            try:
+                root = parse_xml(self._zip.read(item.path))
+            except KeyError:
+                self.failed.append((item.id, 'missing from the archive'))
                 continue
-            if item.get_type() != ebooklib.ITEM_DOCUMENT:
+            except etree.XMLSyntaxError as e:
+                self.failed.append((item.id, f'not well-formed XML: {e}'))
                 continue
-
-            html_content = item.get_content().decode('utf-8')
-            soup = BeautifulSoup(html_content, 'lxml')
-
-            body = soup.find('body')
+            body = find_body(root)
             if body is None:
                 continue
-
-            text = body.get_text(separator=' ', strip=True)
-            text = re.sub(r' +', ' ', text)
-            if not text.strip():
+            text = re.sub(r'\s+', ' ', element_text(body)).strip()
+            if not text:
                 continue
-
-            title = self._extract_title(soup)
-            body_html = ''.join(_serialize(child) for child in body.children)
-
             chapters.append(Chapter(
-                id=item_id,
-                title=title,
-                html_content=body_html,
+                id=item.id,
+                title=self._extract_title(body),
+                path=item.path,
+                body=body,
                 text_content=text,
                 order=order,
             ))
-
         return chapters
 
-    def _extract_title(self, soup: BeautifulSoup) -> str:
+    @staticmethod
+    def _extract_title(body) -> str:
         """Try to extract a chapter title from heading tags."""
-        for tag in ['h1', 'h2', 'h3']:
-            heading = soup.find(tag)
-            if heading:
-                return heading.get_text(strip=True)
+        for tag in ('h1', 'h2', 'h3'):
+            for el in body.iter():
+                if localname(el) == tag:
+                    title = re.sub(r'\s+', ' ', element_text(el)).strip()
+                    if title:
+                        return title
         return 'Untitled'

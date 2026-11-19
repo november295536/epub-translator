@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import click
 
 from src import __version__
 from src.epub.extractor import EPUBExtractor
 from src.core.segmenter import Segmenter, SegmentType
-from src.core.project import ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus
+from src.core.project import (
+    ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus, sha256_file,
+)
 from src.core.translator import (
     AuthError, BackendUnavailableError, RateLimitError, TranslationEngine, available_models,
     UnexpectedStreak, record_failure_log, translate_segment,
@@ -51,9 +54,9 @@ def cli():
 def init(epub_file):
     """Initialize a translation project from an EPUB file.
 
-    Extracts chapters, segments content, and creates a project file.
+    Copies the EPUB into the project, extracts chapters, segments content,
+    and creates a project file.
     """
-    epub_path = os.path.abspath(epub_file)
     project_dir = _get_project_dir(epub_file)
 
     pm = ProjectManager(project_dir)
@@ -61,6 +64,11 @@ def init(epub_file):
         click.echo(f"專案已存在：{project_dir}")
         click.echo("如需重新初始化，請先刪除專案目錄。")
         sys.exit(1)
+
+    # The project owns its copy of the book
+    os.makedirs(project_dir, exist_ok=True)
+    epub_path = os.path.abspath(os.path.join(project_dir, 'source.epub'))
+    shutil.copy2(epub_file, epub_path)
 
     click.echo(f"正在解析 EPUB：{epub_file}")
     extractor = EPUBExtractor(epub_path)
@@ -72,11 +80,13 @@ def init(epub_file):
 
     chapters = extractor.extract_chapters()
     click.echo(f"提取了 {len(chapters)} 個章節")
+    for chapter_id, reason in extractor.failed:
+        click.echo(f"無法解析的章節（不分段）：{chapter_id}：{reason}")
 
     segmenter = Segmenter()
     all_segments = []
     for chapter in chapters:
-        segs = segmenter.segment_chapter(chapter.id, chapter.html_content)
+        segs = segmenter.segment_chapter(chapter.id, chapter.body)
         all_segments.extend(segs)
 
     click.echo(f"分段完成：共 {len(all_segments)} 個段落")
@@ -86,6 +96,7 @@ def init(epub_file):
         title=metadata['title'],
         author=metadata['author'],
         segments=all_segments,
+        source_sha256=sha256_file(epub_path),
     )
 
     click.echo(f"專案已建立：{project_dir}")
