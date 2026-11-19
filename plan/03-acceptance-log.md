@@ -23,17 +23,15 @@ both.
 
 ```
 $ cd <repo> && source venv/bin/activate && python3 -m pytest tests/ -q
-453 passed, 33 warnings in 40.01s
+444 passed, 33 warnings in 40.23s
 ```
 
 Baseline before the phase: 246 passed. First submission: 272. After review round 1: 366. After
-review round 2: 419. After review round 3: 436. After review round 4: 453. No test that exists on `<base>` was removed. Changed `<base>` tests: two
+review round 2: 419. After review round 3: 436. After review round 4: 444. No test that exists on `<base>` was removed. Changed `<base>` tests: two
 had their sample strings changed (an invented title instead of a published one,
 `test_translator.py`), with the same assertions; `test_glossary.py::test_find_terms_in_text`
 now asserts the exact list found, and `test_cli.py::test_init_creates_project_json` also
-asserts `segmenter_version` 2; in round 4 the reply mocked by five `test_cli.py` tests changed
-from `翻譯結果` (a line that starts with a commentary word) to `譯文`, with the same
-assertions. Tests added or changed in the review rounds are listed in sections 6 to 9.
+asserts `segmenter_version` 2. Tests added or changed in the review rounds are listed in sections 6 to 9.
 
 ### 2. New tests fail on the old source (first submission)
 
@@ -229,12 +227,13 @@ Results:
 | round 3, after the code changes (commit `bf0b008`) | 361 | 352 | 5 | 4 | 0 |
 | round 3, final (commit `db3c816`) | 361 | 354 | 3 | 4 | 0 |
 | round 4, after the code changes | 371 | 363 | 4 | 4 | 0 |
-| round 4, final | 370 | 363 | 3 | 4 | 0 |
+| round 4, after the check-script fix | 370 | 363 | 3 | 4 | 0 |
+| round 4, final (commentary rule removed) | 362 | 355 | 3 | 4 | 0 |
 
 ```
 $ scripts/verify/mutation.sh
 ...
-TOTAL mutants 370  killed 363  survived 3  timeout 4  suspicious 0  untested 0
+TOTAL mutants 362  killed 355  survived 3  timeout 4  suspicious 0  untested 0
 $ echo $?
 1
 ```
@@ -256,22 +255,23 @@ Survivors of the intermediate run and what was done:
 
 Round 3: the two new survivors were in `_is_empty_reply` (`translator.py:123` ``strip('`')`` →
 ``strip('XX`XX')``; `translator.py:125` `'\n' not in t` → `'XX\nXX' not in t`); killed by
-`test_short_text_reply_accepted[X-X\n]` and `test_multi_line_reply_ending_in_colon_accepted`.
+`test_short_text_reply_accepted[X-X\n]` and `test_multi_line_reply_ending_in_colon_accepted`
+(the second test and the condition it guarded were removed in round 4).
 The other three are the round-2 survivors at new line numbers and ids.
 
 Round 4: the one new survivor was the message of the `TypeError` raised for a non-string
 `text` in `phase0_code_segments.py` (string mutated to `'XX…XX'`); the script prints only the
 exception type, so the message was dropped ("refactor: drop the unused message of the
-non-string text error"). The new conditions in `_is_empty_reply` (backtick/whitespace check,
-source check, newline or more than 15 words) produced no survivors.
+non-string text error"). After the commentary rule was removed, `_is_empty_reply` keeps
+only the backtick/whitespace check and the source check; they produced no survivors.
 
 The 3 remaining survivors (ids and lines of the round-4 final run), equivalent under the stated
 condition:
 
 | id | location | mutation | why no input distinguishes it |
 |---|---|---|---|
-| 19 | `translator.py:114` | `re.match(p, text + '\n')` → `text + 'XX\nXX'` | the two patterns are `^(?:prefix words)[^\n]*\n+` with `re.match`: what follows `text` matters only through its first newline, which `[^\n]*` reaches in both versions; `XX` cannot complete a prefix word (none contains `X`). Also holds for the new caller `_is_empty_reply` |
-| 71 | `translator.py:327` | default `source=''` → `'XXXX'` | the default is used only when no source is passed (every production call passes it); both `''` and `'XXXX'` contain no code fence and do not start with a commentary word, the only two ways `source` is used |
+| 19 | `translator.py:114` | `re.match(p, text + '\n')` → `text + 'XX\nXX'` | the two patterns are `^(?:prefix words)[^\n]*\n+` with `re.match`: what follows `text` matters only through its first newline, which `[^\n]*` reaches in both versions; `XX` cannot complete a prefix word (none contains `X`). |
+| 63 | `translator.py:324` | default `source=''` → `'XXXX'` | the default is used only when no source is passed (every production call passes it); both `''` and `'XXXX'` contain no code fence and do not start with a commentary word, the only two ways `source` is used |
 | 113 | `phase0_builder_alignment.py:44` | `sys.path.insert(0, root)` → `insert(1, root)` | equivalent with default interpreter path settings: then `sys.path[0]` is the script's own directory, which has no `src` package, and at index 0 or 1 the repository root precedes `PYTHONPATH` entries and site-packages, so the same `src` is imported. Not equivalent when `sys.path[0]` is not the script's directory (`-P` or `PYTHONSAFEPATH`, Python 3.11+) and that first entry, e.g. the first `PYTHONPATH` entry, holds another `src` package (review round 3, A3); not tested |
 
 Round-1 survivors that no longer exist: the glossary ones (`_VOWELS`, `_NO_DOUBLING`,
@@ -370,7 +370,7 @@ are listed per item below.
 | B8 = A10 | confirmed | as A10 | `ff999f9` |
 | C1 `es`, doubling and `y` rules wrong | superseded by simplification | — | `c9288ab` (D2) |
 | C2 plural entries | superseded by simplification | — | accepted (documented) |
-| C3 empty fenced / prefaced replies saved without retry | confirmed | as A2/B3; for code segments a commentary-only reply (`以下是翻譯結果：\n`) also cleans to empty and is retried (text and HTML segments: round 3, A2) | `57880dd` (D3) |
+| C3 empty fenced / prefaced replies saved without retry | confirmed | as A2/B3; for code segments a commentary-only reply (`以下是翻譯結果：\n`) cleans to empty, since code cleanup removes the commentary line, and is retried; for text and HTML segments a commentary-only reply is stored (round 4, B2) | `57880dd` (D3) |
 | C4 `C` matches inside `C++`/`C#` | superseded by simplification | — | accepted (documented) |
 | C5 = A10 | confirmed | as A10 | `ff999f9` |
 
@@ -392,13 +392,13 @@ with a failing test (or, for the shell script, a real run) before the fix.
 | Item | Verdict | Evidence | Fix |
 |---|---|---|---|
 | A1 `mutation.sh`: mutmut failing clears the PID, cleanup skips group kill and restore | confirmed | section 5, round 3: killing mutmut itself now restores the file; the failure path previously set `MUTPID=""` before `exit 2` | `82d3ba9`: restore and warning run on every exit; the PID is kept on failure so the group is stopped |
-| A2 text/HTML reply of only fences (`` ```html\n``` `` → `` ``` ``) or only a commentary line is saved | confirmed | `test_text_reply_only_fence_or_commentary_is_retried` (8 cases) and `…_exhausts` (2) failed before; `test_short_text_reply_accepted` (`好的`, `當然`, `以下是步驟：` for a source ending in a colon, `X`) passes before and after | `2e5b536`: `_is_empty_reply` — empty when only backticks remain, or a single commentary line (existing start patterns) ending in a colon when the source does not end in one. Both rules were replaced in round 4 (A1, B2; section 9) |
+| A2 text/HTML reply of only fences (`` ```html\n``` `` → `` ``` ``) or only a commentary line is saved | confirmed | `test_text_reply_only_fence_or_commentary_is_retried` (8 cases) and `…_exhausts` (2) failed before; `test_short_text_reply_accepted` (`好的`, `當然`, `以下是步驟：` for a source ending in a colon, `X`) passes before and after | `2e5b536`: `_is_empty_reply` — empty when only backticks remain, or a single commentary line (existing start patterns) ending in a colon when the source does not end in one. In round 4 the backtick rule became whitespace-aware (A1) and the commentary rule was removed: a commentary-only reply is deliberately not treated as empty, an accepted limitation left to Phase 4's reply validation (B2; section 9) |
 | A3 survivor 111 not unconditionally equivalent | confirmed (by reading; not run) | `sys.path[0]` is not the script's directory under `-P`/`PYTHONSAFEPATH` (3.11+) | disposition (section 5) and the script's comment state the condition; no subprocess test, per the round-3 decision |
 | A4 code segment without `text` but with an empty translation counted as empty, not unreadable | confirmed | `test_code_segment_without_text_is_unreadable['']` failed before | `a1f7413`: source read before classifying |
 | B1 = A1 | confirmed | as A1 | `82d3ba9` |
 | B2 cleanup not protected from a second INT/TERM | confirmed by a real run of the round-2 script (section 5) | file left mutated, `.bak`, cache and private directory left | `82d3ba9`: `trap '' INT TERM` at the start of `cleanup` |
 | B3 alignment check proves only that the legacy walk is chosen, not equality with `main` | confirmed | the check compares the chosen walk with `legacy=True` of the branch's builder | `bf0b008`: output "not on legacy walk", docstring and section 4 say what it shows; equality with `main` rests on `TestVersion1ExportMatchesMain` |
-| B4 C3 row: commentary-only reply retried only for code | confirmed | — | row reworded; text/HTML now also retried (A2) |
+| B4 C3 row: commentary-only reply retried only for code | confirmed | — | row reworded (and again in round 4: text/HTML commentary-only replies are stored) |
 | B5 header says the mutmut cache goes to the private directory | confirmed | `.mutmut-cache` is in the repository root | `82d3ba9`: header corrected |
 | B6 `main`/`v1.0.0` cannot load a project created on this branch | confirmed | `v1.0.0`'s `src/` on a project created by this branch: `TypeError` | cannot be fixed on the branch; "Known consequences" and the Phase 0 section of `plan/02-improvement-plan.md` |
 
@@ -413,17 +413,17 @@ a failing test before the fix. Fixes are named by commit subject.
 | A1 code reply of only fence lines (`` ```\n``` `` for a source holding a fence) saved; a source of one backtick with the same reply rejected | confirmed | `test_code_reply_of_fence_markers_on_two_lines_is_retried` and `test_backtick_only_source_and_matching_reply_accepted` (`` ` `` as text and as code) failed before; its `` ```\n``` `` code case passed before and guards the exception | "fix: treat replies of only backticks and whitespace as empty": a reply of only backticks and whitespace is empty, unless the source holds nothing else |
 | A2 = B1 | confirmed | as B1 | as B1 |
 | B1 saving a pre-Phase-0 project writes `segmenter_version: 1`, which pre-Phase-0 code cannot load | confirmed | `test_saving_project_without_segmenter_version_keeps_it_absent` failed before; `test_version_2_project_keeps_segmenter_version_through_save` passes before and after | "fix: keep segmenter_version out of project.json when saving a version-1 project"; "Known consequences", the plan and the code comment corrected |
-| B2 commentary rule keyed on colons: commentary-only reply kept for a long source ending in a colon; `以下是一個範例：` for "Here's an example." rejected | confirmed | `test_text_reply_only_fence_or_commentary_is_retried` (6 commentary cases, now with a source of more than 15 words) and `…_exhausts` (2, long sources ending in a colon) failed before, as did `test_short_text_reply_accepted` for "Here's an example." and for a 15-word source | "fix: judge a commentary-only reply by the size of the source, not by colons": a single reply line matching the commentary start patterns is empty when the source has a newline or more than 15 words; the colon condition is gone |
+| B2 commentary rule keyed on colons: commentary-only reply kept for a long source ending in a colon; `以下是一個範例：` for "Here's an example." rejected | confirmed; resolved by removing the commentary rule | `test_short_text_reply_accepted[Here's an example.-…]` failed before | "fix: stop treating a commentary-only reply as empty" (after an intermediate commit in this round, "fix: judge a commentary-only reply by the size of the source, not by colons", which was replaced on the owner's decision because it rejected real translations): a reply is empty only when nothing but backticks and whitespace remains, in every mode. A commentary-only reply is deliberately not treated as empty (as on `main`); the first case of the finding is an accepted limitation, to be covered by Phase 4's reply validation |
 | B3 code check: `"text": null` with an empty translation counted as empty; log claimed every code segment is checked | confirmed | `test_code_segment_with_null_text_is_unreadable` failed before (`''`: counted as empty; `XXXX`: unreadable, but through `AttributeError`) | "fix: report a code segment whose text is not a string as unreadable"; section 3 reworded (translated or reviewed segments only) |
 
-Limitation of the B2 rule: a one-line reply that starts with a commentary word (`好的`, `當然`,
-`以下是`, `看起來`, `翻譯結果`, `Here is`, `Here's`, `The translation`) is retried when the
-source has a newline or more than 15 words, even if it is a real translation (e.g. `當然，…`
-for a long "Of course, …" sentence); if every attempt gives such a line, its translation fails
-with `TranslationError`. Text segments are normally sent with their HTML, and a
-reply that keeps the markup starts with a tag and is not affected; tagless replies (markup
-dropped, or a segment without HTML) are. For shorter one-line sources such a line is
-accepted, as on `main`.
+Accepted limitation (B2): a reply that is only a commentary line (e.g. `以下是翻譯結果：`) is
+stored as the translation of a text or HTML segment, as on `main`. Detecting such replies is left to Phase 4's structural validation
+of replies. Code segments are not affected in the same way: code cleanup removes a commentary
+line followed by a newline, so a commentary-only code reply cleans to empty and is retried.
+Tests: `test_text_commentary_only_reply_is_stored` documents the accepted behaviour;
+`test_long_one_line_translation_starting_with_commentary_word_accepted` (`當然，…` for a long
+sentence), `test_short_text_reply_accepted`, `test_text_reply_only_fence_is_retried` and
+`test_text_reply_only_fence_exhausts` (renamed from `…_fence_or_commentary_…`) cover the rest.
 
 ### Known consequences
 
@@ -464,4 +464,4 @@ accepted, as on `main`.
 - Prompt size with a full glossary: sending all entries of a glossary of up to 150 terms to
   every text prompt was not measured against real translations.
 - Mutation testing ran on Python 3.12.7 (the interpreter mutmut is installed in), the normal
-  test command on 3.9.6; the full suite passes on both (453), but mutants were not run on 3.9.
+  test command on 3.9.6; the full suite passes on both (444), but mutants were not run on 3.9.
