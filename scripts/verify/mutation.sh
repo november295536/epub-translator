@@ -20,7 +20,8 @@
 # .mutmut-cache (git-ignored) and deleted at the start of each run.
 # Show one mutant's diff with: "$MUTATION_VENV/bin/mutmut" show <id>
 #
-# Exit code: 0 when no mutant survived, timed out or is suspicious, else 1.
+# Exit code: 0 when no mutant survived, timed out or is suspicious, 1 when
+# some did, 2 when mutmut failed or generated no mutants.
 
 set -euo pipefail
 
@@ -50,7 +51,9 @@ MUT_GROUPS=(
 )
 
 PATCH="$(mktemp)"
-trap 'rm -f "$PATCH"' EXIT
+RUNNER="$(mktemp)"
+trap 'rm -f "$PATCH" "$RUNNER"' EXIT
+chmod +x "$RUNNER"
 
 ALL_FILES=""
 for group in "${MUT_GROUPS[@]}"; do
@@ -76,17 +79,23 @@ for group in "${MUT_GROUPS[@]}"; do
         continue
     fi
     if [[ "$tests" == *" -k "* ]]; then
-        runner="$PY -m pytest -x -q -p no:cacheprovider ${tests%% -k *} -k '${tests#* -k }'"
+        pytest_args="${tests%% -k *} -k '${tests#* -k }'"
     else
-        runner="$PY -m pytest -x -q -p no:cacheprovider $tests"
+        pytest_args="$tests"
     fi
-    # mutmut 2.x counts only exit code 1 as killed; a mutant that breaks test
-    # collection (pytest exit 2-5) would be reported as survived
-    runner="$runner || exit 1"
+    # mutmut 2.x counts only exit code 1 as killed, so a mutant that breaks
+    # test collection (pytest exit 2-5) would be reported as survived: map
+    # every failure to 1. A runner file, because mutmut runs the command both
+    # with and without a shell.
+    printf '#!/bin/sh\n"%s" -m pytest -x -q -p no:cacheprovider %s || exit 1\n' \
+        "$PY" "$pytest_args" >"$RUNNER"
     echo "== $name: mutating changed lines of $files"
-    # mutmut exits non-zero when mutants survive; totals are read from the cache below
-    "$MUTMUT" run --paths-to-mutate "$files" --use-patch-file "$PATCH" \
-        --runner "$runner" --no-progress >/dev/null || true
+    # --CI: exit 1 only on a fatal error; mutant results are read from the cache below
+    if ! "$MUTMUT" run --paths-to-mutate "$files" --use-patch-file "$PATCH" \
+        --runner "$RUNNER" --no-progress --CI >/dev/null; then
+        echo "ERROR mutmut failed for group $name" >&2
+        exit 2
+    fi
 done
 
 "$PY" - <<'EOF'
@@ -109,6 +118,9 @@ for status in ('bad_survived', 'bad_timeout', 'ok_suspicious', 'untested'):
 print(f"TOTAL mutants {len(rows)}  killed {counts['ok_killed']}  "
       f"survived {counts['bad_survived']}  timeout {counts['bad_timeout']}  "
       f"suspicious {counts['ok_suspicious']}  untested {counts['untested']}")
+if not rows:
+    print('ERROR no mutants were generated')
+    raise SystemExit(2)
 bad = counts['bad_survived'] + counts['bad_timeout'] + counts['ok_suspicious'] + counts['untested']
 raise SystemExit(1 if bad else 0)
 EOF
