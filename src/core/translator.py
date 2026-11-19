@@ -115,16 +115,13 @@ def _starts_with_commentary(text: str) -> bool:
 
 
 def _is_empty_reply(translated: str, source: str) -> bool:
-    """True when a cleaned reply holds no translation: nothing, only backticks
-    and whitespace (unless the source holds nothing else), or a single
-    commentary line (e.g. "以下是翻譯結果：") when the source has a newline or
-    more than 15 words. For a shorter one-line source such a line may be the
-    translation ("好的" for "OK") and is accepted."""
+    """True when a cleaned reply holds no translation: nothing, or only
+    backticks and whitespace unless the source holds nothing else. A reply
+    that is only a commentary line is not judged here (as on main)."""
     t = translated.strip()
-    if not re.sub(r'[`\s]', '', t):
-        return not t or bool(re.sub(r'[`\s]', '', source))
-    return ('\n' not in t and _starts_with_commentary(t)
-            and ('\n' in source or len(source.split()) > 15))
+    if re.sub(r'[`\s]', '', t):
+        return False
+    return not t or bool(re.sub(r'[`\s]', '', source))
 
 
 # Number of characters of each neighbouring segment used as context
