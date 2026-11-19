@@ -486,10 +486,60 @@ class TestCodeResponseCleaning:
             '\n\n' + CODE_SAMPLE + '  \n\n', code_mode=True)
         assert result == CODE_SAMPLE
 
-    def test_code_prefix_like_text_not_removed(self):
-        # Start/end commentary patterns are for prose; code is left alone
+    def test_code_without_fence_left_alone(self):
+        # Prose commentary patterns are not applied to unfenced code
         code = 'Here is = 1\n---\nx = 2'
-        assert TranslationEngine._clean_response(code, code_mode=True) == code
+        assert TranslationEngine._clean_response(
+            code, code_mode=True, source=code) == code
+
+    @pytest.mark.parametrize('preface', [
+        '看起來這段程式碼沒有需要翻譯的註解，原樣輸出：',
+        '以下是翻譯後的程式碼：',
+        "Here's the code with translated comments:",
+    ])
+    def test_code_preface_and_fence_removed(self, preface):
+        reply = preface + '\n```python\n' + CODE_SAMPLE + '\n```\n'
+        result = TranslationEngine._clean_response(
+            reply, code_mode=True, source=CODE_SAMPLE)
+        assert result == CODE_SAMPLE
+
+    def test_code_preface_kept_when_source_has_fence(self):
+        source = 'Here is an example:\n```\nx = 1\n```'
+        assert TranslationEngine._clean_response(
+            source, code_mode=True, source=source) == source
+
+    def test_code_fence_kept_when_source_has_fence(self):
+        source = '```\nx = 1\n```'
+        assert TranslationEngine._clean_response(
+            source, code_mode=True, source=source) == source
+
+    def test_code_preface_without_fence_not_removed(self):
+        reply = '以下是 = 1\nx = 2'
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source='x = 2') == reply
+
+    def test_code_preface_needs_fence_to_end_reply(self):
+        reply = '以下是：\n```\nx = 1\n```\ntrailing remark'
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source='x = 1') == reply
+
+    @pytest.mark.parametrize('prefix', ['', '以下是：\n'])
+    def test_code_two_fenced_blocks_not_unwrapped(self, prefix):
+        reply = prefix + '```\nx = 1\n```\nnote\n```\ny = 2\n```'
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source='x = 1\ny = 2') == reply
+
+    def test_code_translate_strips_preface_through_engine(self):
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '看起來沒有註解需要翻譯：\n```python\n' + CODE_SAMPLE + '\n```\n'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            result = engine.translate(CODE_SAMPLE, segment_type=SegmentType.CODE)
+
+        assert result == CODE_SAMPLE
 
     def test_code_whitespace_only_output_is_empty(self):
         engine = TranslationEngine(max_retries=1)
