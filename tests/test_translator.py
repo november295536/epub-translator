@@ -11,6 +11,7 @@ from src.core.translator import (
     TEXT_HTML_PROMPT,
     AVAILABLE_MODELS, DEFAULT_MODEL,
 )
+from src.core.project import SegmentState
 
 
 class TestTranslationEngine:
@@ -445,3 +446,126 @@ class TestModelSelection:
             engine.model = 'haiku'
             engine.translate('test')
             assert mock_run.call_args[0][0][4] == 'haiku'
+
+
+CODE_SAMPLE = (
+    '    # load config\n'
+    '    def __init__(self, *args, **kwargs):\n'
+    '        self.__dict__ = {}\n'
+    '        # second comment\n'
+    '        return a * b * c'
+)
+
+
+class TestCodeResponseCleaning:
+    """Bug 3: code output must not go through markdown cleanup."""
+
+    def test_code_sample_unchanged(self):
+        result = TranslationEngine._clean_response(CODE_SAMPLE, code_mode=True)
+        assert result == CODE_SAMPLE
+
+    def test_code_translate_keeps_code_and_first_line_indent(self):
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = CODE_SAMPLE + '\n'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            result = engine.translate(CODE_SAMPLE, segment_type=SegmentType.CODE)
+
+        assert result == CODE_SAMPLE
+
+    def test_code_wrapping_fence_removed(self):
+        fenced = '```python\n' + CODE_SAMPLE + '\n```\n'
+        result = TranslationEngine._clean_response(fenced, code_mode=True)
+        assert result == CODE_SAMPLE
+
+    def test_code_surrounding_blank_lines_trimmed(self):
+        result = TranslationEngine._clean_response(
+            '\n\n' + CODE_SAMPLE + '  \n\n', code_mode=True)
+        assert result == CODE_SAMPLE
+
+    def test_code_prefix_like_text_not_removed(self):
+        # Start/end commentary patterns are for prose; code is left alone
+        code = 'Here is = 1\n---\nx = 2'
+        assert TranslationEngine._clean_response(code, code_mode=True) == code
+
+    def test_code_whitespace_only_output_is_empty(self):
+        engine = TranslationEngine(max_retries=1)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '  \n\n'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            with pytest.raises(TranslationError, match='Empty translation'):
+                engine.translate('x = 1', segment_type=SegmentType.CODE)
+
+
+def _state(segment_id, chapter_id, text, segment_type=SegmentType.TEXT):
+    return SegmentState(segment_id=segment_id, chapter_id=chapter_id,
+                        html=f'<p>{text}</p>', text=text,
+                        word_count=len(text.split()), segment_type=segment_type)
+
+
+def get_context(segments, segment_id):
+    # Imported lazily so each test reports on its own if the helper is missing
+    from src.core.translator import get_context as _get_context
+    return _get_context(segments, segment_id)
+
+
+class TestContext:
+    """Bug 4: context comes from the right end, chapter and segment type."""
+
+    def test_prompt_uses_tail_of_previous_segment(self):
+        engine = TranslationEngine()
+        before = 'HEADMARK ' + 'filler ' * 60 + 'TAILMARK'
+        assert len(before) > 200
+
+        prompt = engine._build_prompt('Current text', SegmentType.TEXT,
+                                      context_before=before)
+
+        assert 'TAILMARK' in prompt
+        assert 'HEADMARK' not in prompt
+        assert before[-200:] in prompt
+
+    def test_prompt_uses_head_of_next_segment(self):
+        engine = TranslationEngine()
+        after = 'HEADMARK ' + 'filler ' * 60 + 'TAILMARK'
+
+        prompt = engine._build_prompt('Current text', SegmentType.TEXT,
+                                      context_after=after)
+
+        assert 'HEADMARK' in prompt
+        assert 'TAILMARK' not in prompt
+
+    def test_neighbours_in_same_chapter_used(self):
+        segments = [
+            _state('a_1', 'a', 'Before text.'),
+            _state('a_2', 'a', 'Current text.'),
+            _state('a_3', 'a', 'After text.'),
+        ]
+        assert get_context(segments, 'a_2') == ('Before text.', 'After text.')
+
+    def test_neighbour_from_other_chapter_not_used(self):
+        segments = [
+            _state('a_1', 'a', 'End of chapter a.'),
+            _state('b_1', 'b', 'Only segment of chapter b.'),
+            _state('c_1', 'c', 'Start of chapter c.'),
+        ]
+        assert get_context(segments, 'b_1') == ('', '')
+
+    def test_code_neighbour_not_used(self):
+        segments = [
+            _state('a_1', 'a', 'x = 1', SegmentType.CODE),
+            _state('a_2', 'a', 'Current text.'),
+            _state('a_3', 'a', 'y = 2', SegmentType.CODE),
+        ]
+        assert get_context(segments, 'a_2') == ('', '')
+
+    def test_first_last_and_unknown_segment(self):
+        segments = [_state('a_1', 'a', 'One.'), _state('a_2', 'a', 'Two.')]
+        assert get_context(segments, 'a_1') == ('', 'Two.')
+        assert get_context(segments, 'a_2') == ('One.', '')
+        assert get_context(segments, 'missing') == ('', '')
