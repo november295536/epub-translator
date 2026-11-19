@@ -182,6 +182,17 @@ class TestAlignmentCheck:
         assert 'nope' not in capsys.readouterr().out
 
 
+def _assert_help(stdout, description, anonymize_help):
+    """The description is exactly the docstring's first line and each option's
+    help text is exactly as written (whitespace normalised)."""
+    import re
+    text = ' '.join(stdout.split())
+    assert re.search(re.escape(description) + r' (optional arguments|options):', text), text
+    assert ('--projects-dir PROJECTS_DIR Directory that holds the project folders '
+            '(default: projects) --anonymize ' + anonymize_help) in text, text
+    assert text.endswith(anonymize_help), text
+
+
 def _run_script(name, args, cwd):
     """Run a check script as a separate process from a directory outside the repo."""
     path = os.path.join(ROOT, 'scripts', 'verify', f'{name}.py')
@@ -199,6 +210,7 @@ class TestCodeCheckOutput:
             _code_seg('b2', 'x = 2', 'y = 2'),
             _code_seg('b3', 'x = 3', ''),
             _code_seg('b4', 'x = 4', 'x = 4'),
+            _code_seg('b5', 'x = 5', None),
         ])
         _write_project(str(root / 'c-proj'), [
             _code_seg('c1', 'x = 1', 'z = 1'),
@@ -211,12 +223,12 @@ class TestCodeCheckOutput:
         assert capsys.readouterr().out.splitlines() == [
             code_check.HEADER,
             'ERROR a-broken: cannot read project (JSONDecodeError)',
-            'b-proj: translated code segments 4, differ outside comment lines 2, '
-            'empty translation 1; differ: b1 b2; empty: b3',
+            'b-proj: translated code segments 5, differ outside comment lines 2, '
+            'empty translation 2; differ: b1 b2; empty: b3 b5',
             'c-proj: translated code segments 2, differ outside comment lines 1, '
             'empty translation 1; differ: c1; empty: c2',
-            'TOTAL projects 3  translated code segments 6  differ outside comment lines 3  '
-            'empty translation 2  unreadable 1',
+            'TOTAL projects 3  translated code segments 7  differ outside comment lines 3  '
+            'empty translation 3  unreadable 1',
         ]
         assert code_check.HEADER == (
             'Phase 0 code segment report (candidates for re-translation; '
@@ -249,10 +261,9 @@ class TestCodeCheckOutput:
 
     def test_help(self, tmp_path):
         result = _run_script('phase0_code_segments', ['--help'], str(tmp_path))
-        text = ' '.join(result.stdout.split())
-        assert 'Phase 0 check: list translated code segments that may have been corrupted.' in text
-        assert 'Directory that holds the project folders (default: projects)' in text
-        assert 'Print project-N labels; omit names, segment IDs and paths' in text
+        _assert_help(result.stdout,
+                     'Phase 0 check: list translated code segments that may have been corrupted.',
+                     'Print project-N labels; omit names, segment IDs and paths')
 
 
 def _write_multi_chapter_project(directory, segments_by_chapter, epub_path=None):
@@ -366,7 +377,6 @@ class TestAlignmentOutput:
 
     def test_help(self, tmp_path):
         result = _run_script('phase0_builder_alignment', ['--help'], str(tmp_path))
-        text = ' '.join(result.stdout.split())
-        assert "Phase 0 check: existing projects keep the builder walk they had on main." in text
-        assert 'Directory that holds the project folders (default: projects)' in text
-        assert 'Print project-N labels; omit names, chapter IDs and paths' in text
+        _assert_help(result.stdout,
+                     'Phase 0 check: existing projects keep the builder walk they had on main.',
+                     'Print project-N labels; omit names, chapter IDs and paths')
