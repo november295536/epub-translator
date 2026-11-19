@@ -8,7 +8,7 @@ projects are labelled `project-1` … `project-8` (alphabetical order of directo
 
 ## Phase 0 — Standalone fixes
 
-Date: 2026-11-19 (first submission and review rounds 1 to 4). Branch:
+Date: 2026-11-19 (first submission and review rounds 1 to 5). Branch:
 `phase-0/standalone-fixes`. No new runtime dependency. `<base>` below is the commit the branch
 starts from.
 
@@ -23,11 +23,11 @@ both.
 
 ```
 $ cd <repo> && source venv/bin/activate && python3 -m pytest tests/ -q
-444 passed, 33 warnings in 40.23s
+444 passed, 32 warnings in 44.33s
 ```
 
 Baseline before the phase: 246 passed. First submission: 272. After review round 1: 366. After
-review round 2: 419. After review round 3: 436. After review round 4: 444. No test that exists on `<base>` was removed. Changed `<base>` tests: two
+review round 2: 419. After review round 3: 436. After review rounds 4 and 5: 444. No test that exists on `<base>` was removed. Changed `<base>` tests: two
 had their sample strings changed (an invented title instead of a published one,
 `test_translator.py`), with the same assertions; `test_glossary.py::test_find_terms_in_text`
 now asserts the exact list found, and `test_cli.py::test_init_creates_project_json` also
@@ -425,6 +425,17 @@ Tests: `test_text_commentary_only_reply_is_stored` documents the accepted behavi
 sentence), `test_short_text_reply_accepted`, `test_text_reply_only_fence_is_retried` and
 `test_text_reply_only_fence_exhausts` (renamed from `…_fence_or_commentary_…`) cover the rest.
 
+### 10. Review round 5
+
+Three reviews, all approved. One reviewer left three minor notes (it could not run Python;
+counting test functions and cases it also arrived at 444):
+
+| Item | Disposition |
+|---|---|
+| 1 a fenced code reply is not unwrapped when the source contains three backticks anywhere | accepted limitation, no code change (see "Known consequences") |
+| 2 `.gitignore` entry `html/` ignores any directory named `html`; `mutation.sh` never writes a mutmut HTML report | confirmed (the script only runs `mutmut run` and reads `.mutmut-cache`); entry removed ("chore: drop the unused html/ ignore entry") |
+| 3 `CLAUDE.md` states the old test count and test-file list; a comment in `tests/test_translator.py` still describes the removed size rule | test comment fixed (in the same commit as item 2); `CLAUDE.md` not edited in this phase (see "Not done") |
+
 ### Known consequences
 
 - A project created after this phase has `segmenter_version` in its `project.json` and cannot
@@ -440,9 +451,15 @@ sentence), `test_short_text_reply_accepted`, `test_text_reply_only_fence_is_retr
   (translating, reviewing, changing the model) does not add the field: `save()` leaves
   `segmenter_version` out when it is 1 (round 4;
   `test_saving_project_without_segmenter_version_keeps_it_absent`).
+- A code reply wrapped in a fence is not unwrapped when the source itself contains three
+  backticks anywhere (e.g. a Python string holding a fenced JSON example): the fence lines are
+  stored and appear in the exported `<pre>`. Nothing is lost, and the code-segment check
+  script (section 3) flags such a segment as differing, so it can be re-translated (review
+  round 5, item 1; accepted limitation).
 
 ### Not done
 
+- `CLAUDE.md` still states the old test count and test-file list.
 - Progress reporting for web term extraction (B6 of round 1, decision 7): the status endpoint
   still only reports "running" while the batches run one after another.
 
