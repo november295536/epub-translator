@@ -795,3 +795,74 @@ class TestRound2WorkerStartup:
         assert workers and not any(t.is_alive() for t in workers)
         assert lock_free
         assert '翻譯中斷，等待進行中的段落結束' in result.output
+
+
+# --- Review round 3 ---------------------------------------------------------------
+
+import threading as _threading
+
+from src.core.translator import UnexpectedStreak
+
+STREAK_MESSAGE = ("連續 5 個段落發生未預期的錯誤，翻譯已停止"
+                  "（最後一個：未預期的錯誤：KeyError: 'missing'）")
+
+
+class TestCLIRound3UnexpectedStreak:
+    """Item 9: five unexpected failures in a row stop the CLI run (exit 1)."""
+
+    def test_sequential(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=8)
+        fake = FakeBackend(responder=lambda r: {}['missing'])
+        with use_fake_backend(fake):
+            result = runner.invoke(cli, ['start', '--project', path])
+        assert result.exit_code == 1, result.output
+        assert f'  ✗ {STREAK_MESSAGE}\n翻譯中斷。' in result.output
+        assert len(fake.requests) == 5
+        statuses = list(_statuses(path).values())
+        assert statuses == [SegmentStatus.FAILED] * 5 + [SegmentStatus.PENDING] * 3
+
+    def test_sequential_reset_by_success(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=9)
+
+        def respond(request):
+            if '<p>Sentence MARK5.</p>' in request.messages[-1].content:
+                return '<p>譯文</p>'
+            return {}['missing']
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            result = runner.invoke(cli, ['start', '--project', path])
+        assert result.exit_code == 1
+        assert '8 個段落翻譯失敗' in result.output
+        assert '連續' not in result.output
+
+    def test_parallel(self, runner, tmp_path, monkeypatch):
+        path = _make_project(str(tmp_path / 'p'), n=8)
+        fired = _threading.Event()
+        real_add = UnexpectedStreak.add
+
+        def add(self, outcome):
+            message = real_add(self, outcome)
+            if message:
+                fired.set()
+            return message
+
+        monkeypatch.setattr(UnexpectedStreak, 'add', add)
+        calls = []
+        guard = _threading.Lock()
+
+        def respond(request):
+            with guard:
+                calls.append(1)
+                n = len(calls)
+            if n > 5:
+                assert fired.wait(10)  # held until the run has been stopped
+            return {}['missing']
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', '2'])
+        assert result.exit_code == 1, result.output
+        assert f'  ✗ {STREAK_MESSAGE}\n翻譯中斷。' in result.output
+        assert len(calls) <= 7
+        statuses = _statuses(path)
+        assert list(statuses.values()).count(SegmentStatus.FAILED) >= 5
+        assert statuses['c1_seg0008'] == SegmentStatus.PENDING

@@ -8,6 +8,7 @@ import re
 import logging
 import threading
 import time
+import traceback
 from dataclasses import asdict, dataclass, field
 
 import src.llm as llm
@@ -418,6 +419,7 @@ def translate_segment(engine: TranslationEngine, seg, segments,
     are raised: they concern the run, not the segment. Writes no file.
     """
     model = engine.model
+    context = None  # (before, after) once known: the request can then be rebuilt
     try:
         glossary_text = ''
         if glossary is not None and glossary.entries:
@@ -425,7 +427,7 @@ def translate_segment(engine: TranslationEngine, seg, segments,
             if found:
                 glossary_text = glossary.format_for_prompt(found)
 
-        context_before, context_after = get_context(segments, seg.segment_id)
+        context = context_before, context_after = get_context(segments, seg.segment_id)
         reply = engine.translate_reply(
             seg.text,
             segment_type=seg.segment_type,
@@ -445,18 +447,61 @@ def translate_segment(engine: TranslationEngine, seg, segments,
             failure=e)
     except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on
         logger.exception("未預期的錯誤: %s", seg.segment_id)
-        return unexpected_error_outcome(model, e)
+        prompt = _request_text(engine, seg, glossary_text, context) if context else ''
+        return unexpected_error_outcome(model, e, prompt)
     return TranslationOutcome(text=reply.text, status=SegmentStatus.TRANSLATED,
                               issues=[], model=model, usage=reply.usage)
 
 
-def unexpected_error_outcome(model: str, error: BaseException) -> TranslationOutcome:
+def _request_text(engine: TranslationEngine, seg, glossary_text: str, context) -> str:
+    """The request of a call that raised, for its diagnostics ('' when it
+    cannot be built)."""
+    try:
+        return engine._build_prompt(seg.text, seg.segment_type, glossary_text,
+                                    *context, html=seg.html)
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return ''
+
+
+def unexpected_error_outcome(model: str, error: BaseException,
+                             prompt: str) -> TranslationOutcome:
     """The outcome a worker reports when translating a segment raised an
-    exception nobody expected: the segment fails, the run goes on."""
+    exception nobody expected: the segment fails, the run goes on. Its
+    diagnostics hold the request (`prompt`, '' when unknown) and the
+    traceback."""
     detail = f'未預期的錯誤：{type(error).__name__}: {error}'[:ERROR_MESSAGE_CHARS]
+    trace = ''.join(traceback.format_exception(type(error), error, error.__traceback__))
     return TranslationOutcome(
         text=None, status=SegmentStatus.FAILED, model=model, usage=None,
-        issues=[Issue(kind='backend', code='unexpected', detail=detail, blocking=True)])
+        issues=[Issue(kind='backend', code='unexpected', detail=detail, blocking=True)],
+        failure=TranslationError(detail, code='unexpected', prompt=prompt,
+                                 attempts=[(f'{type(error).__name__}: {error}', trace)]))
+
+
+# A run stops after this many unexpected failures in a row: one defect
+# would otherwise spend a call on, and fail, every remaining segment
+MAX_CONSECUTIVE_UNEXPECTED = 5
+
+
+class UnexpectedStreak:
+    """Counts `unexpected` failures in a row, in the order a run receives
+    its results; any other result (also a skipped one, None) resets it."""
+
+    def __init__(self):
+        self.count = 0
+
+    def add(self, outcome: TranslationOutcome | None) -> str | None:
+        """Count one result. Returns the run-level error message once
+        MAX_CONSECUTIVE_UNEXPECTED are reached, else None."""
+        if (outcome is not None and outcome.status == SegmentStatus.FAILED
+                and outcome.issues[0].code == 'unexpected'):
+            self.count += 1
+        else:
+            self.count = 0
+        if self.count < MAX_CONSECUTIVE_UNEXPECTED:
+            return None
+        return (f'連續 {self.count} 個段落發生未預期的錯誤，翻譯已停止'
+                f'（最後一個：{outcome.issues[0].detail}）')
 
 
 def failure_log_path(log_dir: str, segment_id: str) -> str:

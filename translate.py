@@ -12,7 +12,7 @@ from src.core.segmenter import Segmenter, SegmentType
 from src.core.project import ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus
 from src.core.translator import (
     AuthError, BackendUnavailableError, RateLimitError, TranslationEngine, available_models,
-    record_failure_log, translate_segment,
+    UnexpectedStreak, record_failure_log, translate_segment,
 )
 from src.glossary.glossary_manager import GlossaryManager
 from src.epub.builder import EPUBBuilder
@@ -190,6 +190,7 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
     """Single-worker sequential translation. Returns the number of failed segments."""
     engine = TranslationEngine(model=pm.data.model)
     failed = 0
+    streak = UnexpectedStreak()
 
     for i, seg in enumerate(pending, 1):
         click.echo(f"[{progress['translated'] + i}/{progress['total']}] 翻譯段落 {seg.segment_id}...")
@@ -205,6 +206,9 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
             click.echo(f"  ✗ 翻譯失敗：{outcome.issues[0].detail}")
         else:
             click.echo(f"  ✓ 完成（{seg.word_count} 字）")
+        stop = streak.add(outcome)
+        if stop:
+            _stop_run(stop)
     return failed
 
 
@@ -249,9 +253,15 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
     failed = 0
     unsaved = []  # applied in memory since the last successful save
     applied = []  # (segment id, outcome) of the same, for their diagnostics
+    streak = UnexpectedStreak()
 
     def apply(seg_id, outcome, word_count, tag):
         nonlocal completed, failed
+        stop = streak.add(outcome)
+        if stop:
+            # Like a run-level error: no new segment is started
+            stop_errors.append(stop)
+            error_event.set()
         pm.apply_outcome(seg_id, outcome)
         unsaved.append(seg_id)
         applied.append((seg_id, outcome))
