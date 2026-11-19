@@ -1,20 +1,26 @@
 """Translation engine - calls Claude CLI to translate text segments."""
 
+from __future__ import annotations
+
 import os
 import re
-import subprocess
 import logging
-import tempfile
+import threading
+import time
+from dataclasses import asdict, dataclass, field
 
+import src.llm as llm
+from src.core.project import Issue, SegmentStatus
 from src.core.segmenter import SegmentType
+from src.llm import (  # noqa: F401  (RateLimitError, AuthError re-exported)
+    AuthError, CancelledError, LLMError, LLMRequest, Message, RateLimitError,
+    RefusalError, TransientError, Usage,
+)
+from src.llm.claude_cli import MODELS
 
 logger = logging.getLogger(__name__)
 
-AVAILABLE_MODELS = [
-    {'alias': 'sonnet', 'label': 'Sonnet', 'description': '快速且高品質，適合大多數翻譯'},
-    {'alias': 'opus', 'label': 'Opus', 'description': '最高品質，費用較高'},
-    {'alias': 'haiku', 'label': 'Haiku', 'description': '最快速度，適合簡單內容'},
-]
+AVAILABLE_MODELS = [asdict(m) for m in MODELS]
 
 DEFAULT_MODEL = 'sonnet'
 
@@ -158,39 +164,67 @@ def get_context(segments, segment_id: str) -> tuple:
 
 
 class TranslationError(Exception):
-    """Raised when translation fails."""
-    pass
+    """Raised when translation fails after all attempts.
+
+    `code` names the last failure (transient, empty_reply, refusal, error);
+    `prompt` is the request sent and `attempts` the raw output of each
+    failed attempt, for failure diagnostics. Rate-limit, auth and cancel
+    errors are not TranslationErrors: they stop or pause a run instead of
+    failing one segment.
+    """
+
+    def __init__(self, message: str, code: str = 'error', prompt: str = '',
+                 attempts: list | None = None):
+        super().__init__(message)
+        self.code = code
+        self.prompt = prompt
+        self.attempts = attempts or []
 
 
-class RateLimitError(TranslationError):
-    """Raised when API usage limit is reached."""
-    pass
+@dataclass
+class Reply:
+    text: str
+    usage: Usage | None = None
 
 
-class AuthError(TranslationError):
-    """Raised when Claude CLI authentication has expired."""
-    pass
+@dataclass
+class TranslationOutcome:
+    """Result of one translate_segment() call."""
+    text: str | None          # accepted translation, or None
+    status: SegmentStatus     # TRANSLATED or FAILED
+    issues: list[Issue] = field(default_factory=list)
+    model: str = ''
+    usage: Usage | None = None
 
 
-_RATE_LIMIT_PATTERN = re.compile(r"You've hit your limit", re.IGNORECASE)
-_AUTH_ERROR_PATTERN = re.compile(
-    r'authentication_error|OAuth token has expired|please run /login',
-    re.IGNORECASE,
-)
+# Characters of raw output kept per failed attempt in a diagnostics file
+DIAGNOSTIC_RAW_CHARS = 20000
 
 
 class TranslationEngine:
-    """Translates text segments using Claude CLI."""
+    """Translates text segments through an LLM backend."""
 
-    def __init__(self, max_retries: int = 3, model: str = DEFAULT_MODEL):
+    def __init__(self, max_retries: int = 3, model: str = DEFAULT_MODEL,
+                 backend: llm.LLMBackend | None = None, timeout: float = 120):
         self.max_retries = max_retries
         self.model = model
+        self.backend = backend if backend is not None else llm.default_backend()
+        self.timeout = timeout
 
     def translate(self, text: str, segment_type: SegmentType = SegmentType.TEXT,
                   glossary_text: str = '',
                   context_before: str = '', context_after: str = '',
                   html: str = '') -> str:
-        """Translate a text segment using Claude CLI.
+        """Translate a text segment; see translate_reply()."""
+        return self.translate_reply(text, segment_type, glossary_text,
+                                    context_before, context_after, html).text
+
+    def translate_reply(self, text: str, segment_type: SegmentType = SegmentType.TEXT,
+                        glossary_text: str = '',
+                        context_before: str = '', context_after: str = '',
+                        html: str = '',
+                        cancel: threading.Event | None = None) -> Reply:
+        """Translate a text segment through the backend.
 
         Args:
             text: The English text to translate.
@@ -201,79 +235,64 @@ class TranslationEngine:
             html: Original HTML content. When provided for non-code types,
                   the HTML-preserving prompt is used instead of the plain text prompt.
 
+            cancel: Set to abandon the call (raises CancelledError).
+
         Returns:
-            The translated Traditional Chinese text.
+            The translated Traditional Chinese text and the usage the
+            backend reported (None when it reports none).
 
         Raises:
-            TranslationError: If translation fails after all retries.
+            TranslationError: If every attempt failed (timeout, error exit,
+                empty reply) or the model refused.
+            RateLimitError, AuthError, CancelledError: at once, no retry.
         """
         is_code = segment_type == SegmentType.CODE
         use_html_mode = bool(html) and not is_code
         prompt = self._build_prompt(text, segment_type, glossary_text,
                                     context_before, context_after, html=html)
+        request = LLMRequest(system='', messages=[Message('user', prompt)],
+                             model=self.model, timeout=self.timeout)
+        if cancel is None:
+            cancel = threading.Event()
 
+        attempts = []
         for attempt in range(1, self.max_retries + 1):
             try:
-                env = {k: v for k, v in os.environ.items()
-                       if k != 'CLAUDECODE'}
-                result = subprocess.run(
-                    ['claude', '-p', prompt, '--model', self.model],
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    cwd=tempfile.gettempdir(),
-                    env=env,
-                )
+                response = self.backend.complete(request, cancel)
+            except (RateLimitError, AuthError, CancelledError):
+                raise
+            except TransientError as e:
+                logger.warning("Translation attempt %d/%d failed: %s",
+                               attempt, self.max_retries, e)
+                attempts.append((str(e), e.raw))
+                code = 'transient'
+                continue
+            except LLMError as e:
+                # A refusal or an error that a retry cannot fix
+                attempts.append((str(e), e.raw))
+                code = 'refusal' if isinstance(e, RefusalError) else 'error'
+                break
 
-                # Check for API usage limit in stdout or stderr
-                stdout = result.stdout if isinstance(result.stdout, str) else ''
-                stderr = result.stderr if isinstance(result.stderr, str) else ''
-                combined = stdout + stderr
-                if _RATE_LIMIT_PATTERN.search(combined):
-                    raise RateLimitError(combined.strip())
-                if _AUTH_ERROR_PATTERN.search(combined):
-                    raise AuthError('Claude CLI 認證已過期，請在終端執行 claude /login 重新登入')
-
-                if result.returncode != 0:
-                    logger.warning(
-                        "claude CLI returned code %d (attempt %d/%d): %s",
-                        result.returncode, attempt, self.max_retries,
-                        result.stderr.strip(),
-                    )
-                    if attempt == self.max_retries:
-                        raise TranslationError(
-                            f"claude CLI failed after {self.max_retries} attempts: {result.stderr.strip()}"
-                        )
-                    continue
-
-                # Code keeps its leading whitespace (first-line indentation)
-                raw = result.stdout if is_code else result.stdout.strip()
-                translated = self._clean_response(raw, html_mode=use_html_mode,
-                                                  code_mode=is_code, source=text)
-                if _is_empty_reply(translated, text):
-                    logger.warning(
-                        "Empty translation result (attempt %d/%d)",
-                        attempt, self.max_retries,
-                    )
-                    if attempt == self.max_retries:
-                        raise TranslationError(
-                            f"Empty translation after {self.max_retries} attempts"
-                        )
-                    continue
-
-                return translated
-
-            except subprocess.TimeoutExpired:
+            # Code keeps its leading whitespace (first-line indentation)
+            raw = response.text if is_code else response.text.strip()
+            translated = self._clean_response(raw, html_mode=use_html_mode,
+                                              code_mode=is_code, source=text)
+            if _is_empty_reply(translated, text):
                 logger.warning(
-                    "Translation timed out (attempt %d/%d)",
+                    "Empty translation result (attempt %d/%d)",
                     attempt, self.max_retries,
                 )
-                if attempt == self.max_retries:
-                    raise TranslationError(
-                        f"Translation timed out after {self.max_retries} attempts"
-                    )
+                attempts.append(('empty reply', response.text))
+                code = 'empty_reply'
+                continue
 
-        raise TranslationError("Translation failed unexpectedly")
+            return Reply(translated, response.usage)
+
+        if code == 'empty_reply':
+            message = f"Empty translation after {len(attempts)} attempts"
+        else:
+            message = f"Translation failed after {len(attempts)} attempts: {attempts[-1][0]}"
+        raise TranslationError(message, code=code, prompt=prompt, attempts=attempts)
 
     def _build_prompt(self, text: str, segment_type: SegmentType,
                       glossary_text: str = '',
@@ -371,3 +390,80 @@ class TranslationEngine:
             cleaned = _MD_ITALIC_PATTERN.sub(lambda m: m.group(1) or m.group(2), cleaned)
 
         return cleaned.strip()
+
+
+def translate_segment(engine: TranslationEngine, seg, segments,
+                      glossary=None, log_dir: str | None = None,
+                      cancel: threading.Event | None = None) -> TranslationOutcome:
+    """Translate one project segment: the single entry point for the web
+    worker, both CLI modes and the re-translate endpoint.
+
+    Builds the request (glossary terms, same-chapter context, HTML for text
+    segments), calls the engine and returns the outcome. A failed segment
+    is an outcome with status FAILED and a backend issue, not an exception;
+    when `log_dir` is given its raw request and replies are written there
+    (see write_failure_log). RateLimitError, AuthError and CancelledError
+    are raised: they concern the run, not the segment.
+    """
+    glossary_text = ''
+    if glossary is not None and glossary.entries:
+        found = glossary.terms_for_prompt(seg.text)
+        if found:
+            glossary_text = glossary.format_for_prompt(found)
+
+    context_before, context_after = get_context(segments, seg.segment_id)
+    html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
+    model = engine.model
+    try:
+        reply = engine.translate_reply(
+            seg.text,
+            segment_type=seg.segment_type,
+            glossary_text=glossary_text,
+            context_before=context_before,
+            context_after=context_after,
+            html=html_arg,
+            cancel=cancel,
+        )
+    except TranslationError as e:
+        if log_dir:
+            write_failure_log(log_dir, seg.segment_id, model, e)
+        return TranslationOutcome(
+            text=None, status=SegmentStatus.FAILED, model=model,
+            issues=[Issue(kind='backend', code=e.code, detail=str(e), blocking=True)])
+    if log_dir:
+        _remove_failure_log(log_dir, seg.segment_id)
+    return TranslationOutcome(text=reply.text, status=SegmentStatus.TRANSLATED,
+                              model=model, usage=reply.usage)
+
+
+def failure_log_path(log_dir: str, segment_id: str) -> str:
+    """One file per segment, replaced by each failed run of that segment."""
+    safe_id = re.sub(r'[^\w.-]', '_', segment_id)
+    return os.path.join(log_dir, 'failed', f'{safe_id}.txt')
+
+
+def write_failure_log(log_dir: str, segment_id: str, model: str,
+                      error: TranslationError) -> None:
+    """Keep the raw request and the raw output of each failed attempt."""
+    path = failure_log_path(log_dir, segment_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    parts = [
+        f'segment: {segment_id}',
+        f'model: {model}',
+        f'time: {time.strftime("%Y-%m-%d %H:%M:%S")}',
+        f'error: {error}',
+        '',
+        '=== request ===',
+        error.prompt,
+    ]
+    for i, (message, raw) in enumerate(error.attempts, 1):
+        parts += ['', f'=== attempt {i}: {message} ===', raw[:DIAGNOSTIC_RAW_CHARS]]
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(parts) + '\n')
+
+
+def _remove_failure_log(log_dir: str, segment_id: str) -> None:
+    try:
+        os.remove(failure_log_path(log_dir, segment_id))
+    except FileNotFoundError:
+        pass

@@ -9,9 +9,10 @@ import time
 import logging
 from dataclasses import dataclass, field
 
-from src.core.project import ProjectManager
-from src.core.segmenter import SegmentType
-from src.core.translator import TranslationEngine, TranslationError, RateLimitError, AuthError, get_context
+from src.core.project import ProjectLock, ProjectManager, SegmentStatus
+from src.core.translator import (
+    AuthError, RateLimitError, TranslationEngine, TranslationOutcome, translate_segment,
+)
 from src.glossary.glossary_manager import GlossaryManager
 
 logger = logging.getLogger(__name__)
@@ -90,10 +91,8 @@ class EventBroadcaster:
 class TranslationResult:
     """Result from a worker thread."""
     segment_id: str
-    translated_text: str = ''
-    model: str = ''
-    success: bool = True
-    error: str | None = None
+    outcome: TranslationOutcome
+    revision: int  # segment revision when the segment was dispatched
 
 
 @dataclass
@@ -125,6 +124,7 @@ class TranslationTask:
 
     # References
     pm: ProjectManager | None = field(default=None, repr=False)
+    project_lock: ProjectLock | None = field(default=None, repr=False)
     _gm: GlossaryManager | None = field(default=None, repr=False)
     _threads: list = field(default_factory=list, repr=False)
     _coordinator: threading.Thread | None = field(default=None, repr=False)
@@ -181,13 +181,20 @@ class TaskManager:
 
     def start_translation(self, project_name: str, projects_dir: str,
                           num_workers: int = 1,
-                          segment_ids: list[str] | None = None) -> TranslationTask:
+                          segment_ids: list[str] | None = None,
+                          retry_failed: bool = False) -> TranslationTask:
         """Start a new translation task for a project.
 
         Args:
             segment_ids: Optional list of segment IDs to retranslate.
                          When provided, queues those specific segments regardless of status.
                          When None, queues all pending segments (normal translation).
+            retry_failed: With segment_ids None, also queue FAILED segments.
+
+        Raises:
+            ValueError: a task is running.
+            ProjectLockedError: another process holds the project lock
+                (this task holds it until it ends).
         """
         existing = self.tasks.get(project_name)
         if existing and existing.state == 'running':
@@ -210,25 +217,33 @@ class TaskManager:
 
         # Get segments to translate
         project_dir = os.path.join(projects_dir, project_name)
-        pm = ProjectManager(project_dir)
-        pm.load()
+        lock = ProjectLock(project_dir)
+        lock.acquire()  # raises ProjectLockedError
+        try:
+            pm = ProjectManager(project_dir)
+            pm.load()
 
-        if segment_ids is not None:
-            # Retranslate mode: queue specified segments regardless of status
-            id_set = set(segment_ids)
-            to_translate = [s for s in pm.data.segments if s.segment_id in id_set]
-        else:
-            to_translate = pm.get_pending_segments()
+            if segment_ids is not None:
+                # Retranslate mode: queue specified segments regardless of status
+                id_set = set(segment_ids)
+                to_translate = [s for s in pm.data.segments if s.segment_id in id_set]
+            else:
+                to_translate = pm.get_pending_segments(include_failed=retry_failed)
+        except BaseException:
+            lock.release()
+            raise
 
         task.total = len(to_translate)
 
         if task.total == 0:
+            lock.release()
             task.state = 'completed'
             self.tasks[project_name] = task
             return task
 
         task.state = 'running'
         task.pm = pm
+        task.project_lock = lock  # released by the coordinator when it ends
 
         # Fill segment queue
         for seg in to_translate:
@@ -359,68 +374,23 @@ class TaskManager:
                     except queue.Empty:
                         break
 
-                # Process batch
-                any_success = False
+                # Process batch, then save once
                 for res in batch:
-                    if res.success:
-                        # Update segment in memory
-                        pm.mark_translated(res.segment_id, res.translated_text)
-                        with task._lock:
-                            task.completed += 1
-                            completed = task.completed
-
-                        any_success = True
-                        logger.info("段落完成 [%d/%d]: %s (%s)",
-                                    completed, task.total, res.segment_id, res.model)
-
-                        percent = round(completed / task.total * 100, 1) if task.total > 0 else 0
-                        task.progress.put({'event': 'progress', 'data': {
-                            'completed': completed,
-                            'total': task.total,
-                            'percent': percent,
-                        }})
-                        task.progress.put({'event': 'segment_complete', 'data': {
-                            'segment_id': res.segment_id,
-                            'translated_text': res.translated_text[:200],
-                            'model': res.model,
-                        }})
-                    else:
-                        logger.warning("段落翻譯失敗: %s — %s", res.segment_id, res.error)
-                        task.progress.put({'event': 'segment_error', 'data': {
-                            'segment_id': res.segment_id,
-                            'error': res.error or '',
-                        }})
-
-                # Batch save
-                if any_success:
-                    pm.save()
+                    self._apply_result(task, pm, res)
+                pm.save()
 
                 # Check if all workers are dead after processing
                 with task._lock:
-                    if task.active_workers == 0:
-                        # Drain any remaining results
-                        while True:
-                            try:
-                                remaining = task.result_queue.get_nowait()
-                                if remaining.success:
-                                    pm.mark_translated(remaining.segment_id, remaining.translated_text)
-                                    task.completed += 1
-                                    completed = task.completed
-                                    percent = round(completed / task.total * 100, 1) if task.total > 0 else 0
-                                    task.progress.put({'event': 'progress', 'data': {
-                                        'completed': completed,
-                                        'total': task.total,
-                                        'percent': percent,
-                                    }})
-                                    task.progress.put({'event': 'segment_complete', 'data': {
-                                        'segment_id': remaining.segment_id,
-                                        'translated_text': remaining.translated_text[:200],
-                                        'model': remaining.model,
-                                    }})
-                            except queue.Empty:
-                                break
-                        pm.save()
-                        break
+                    workers_done = task.active_workers == 0
+                if workers_done:
+                    # Drain any remaining results
+                    while True:
+                        try:
+                            self._apply_result(task, pm, task.result_queue.get_nowait())
+                        except queue.Empty:
+                            break
+                    pm.save()
+                    break
 
             # Set final state
             if task.stop_event.is_set() or task.state == 'stopped':
@@ -445,7 +415,42 @@ class TaskManager:
                 'error': str(e),
             }})
         finally:
+            if task.project_lock is not None:
+                task.project_lock.release()
             teardown_project_logging(handler)
+
+    def _apply_result(self, task: TranslationTask, pm: ProjectManager,
+                      res: TranslationResult) -> None:
+        """Store one worker result in memory and report it (coordinator only)."""
+        outcome = res.outcome
+        if not pm.apply_outcome(res.segment_id, outcome, revision=res.revision):
+            # Edited while its translation was in flight: the edit wins
+            logger.info("段落已在翻譯期間被編輯，捨棄結果: %s", res.segment_id)
+        elif outcome.status == SegmentStatus.FAILED:
+            detail = '; '.join(i.detail for i in outcome.issues)
+            logger.warning("段落翻譯失敗: %s — %s", res.segment_id, detail)
+            task.progress.put({'event': 'segment_error', 'data': {
+                'segment_id': res.segment_id,
+                'error': detail,
+            }})
+            return
+        with task._lock:
+            task.completed += 1
+            completed = task.completed
+        logger.info("段落完成 [%d/%d]: %s (%s)",
+                    completed, task.total, res.segment_id, outcome.model)
+        percent = round(completed / task.total * 100, 1) if task.total > 0 else 0
+        task.progress.put({'event': 'progress', 'data': {
+            'completed': completed,
+            'total': task.total,
+            'percent': percent,
+        }})
+        if outcome.status == SegmentStatus.TRANSLATED:
+            task.progress.put({'event': 'segment_complete', 'data': {
+                'segment_id': res.segment_id,
+                'translated_text': outcome.text[:200],
+                'model': outcome.model,
+            }})
 
     def _worker_loop(self, task: TranslationTask, worker_id: int):
         """Single worker loop: fetch segments from queue and translate."""
@@ -454,6 +459,7 @@ class TaskManager:
         gm = task._gm
         engine = TranslationEngine(model=pm.data.model)
         all_segments = pm.data.segments
+        log_dir = os.path.join(task.projects_dir, task.project_name, 'log')
         reduced_exit = False
 
         try:
@@ -488,32 +494,13 @@ class TaskManager:
                     logger.info("[%s] 模型切換: %s → %s", tag, engine.model, pm.data.model)
                     engine.model = pm.data.model
 
-                # Find glossary terms
-                glossary_text = ''
-                if gm.entries:
-                    found = gm.terms_for_prompt(seg.text)
-                    if found:
-                        glossary_text = gm.format_for_prompt(found)
-
-                # Get context
-                context_before, context_after = get_context(all_segments, seg.segment_id)
-
                 try:
-                    html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
-                    translated = engine.translate(
-                        seg.text,
-                        segment_type=seg.segment_type,
-                        glossary_text=glossary_text,
-                        context_before=context_before,
-                        context_after=context_after,
-                        html=html_arg,
-                    )
+                    revision = seg.revision
+                    outcome = translate_segment(engine, seg, all_segments, gm,
+                                                log_dir=log_dir)
+                    # A failed segment is a result too: recorded as FAILED
                     task.result_queue.put(TranslationResult(
-                        segment_id=seg.segment_id,
-                        translated_text=translated,
-                        model=engine.model,
-                        success=True,
-                    ))
+                        segment_id=seg.segment_id, outcome=outcome, revision=revision))
 
                 except (AuthError, RateLimitError) as e:
                     event_name = 'auth_error' if isinstance(e, AuthError) else 'rate_limit'
@@ -552,14 +539,6 @@ class TaskManager:
 
                     logger.info("[%s] 翻譯繼續", tag)
                     continue
-
-                except TranslationError as e:
-                    logger.warning("[%s] Translation failed for %s: %s", tag, seg.segment_id, e)
-                    task.result_queue.put(TranslationResult(
-                        segment_id=seg.segment_id,
-                        success=False,
-                        error=str(e),
-                    ))
 
         finally:
             if not reduced_exit:

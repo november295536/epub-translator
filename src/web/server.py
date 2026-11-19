@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
-from flask import Flask
+from flask import Flask, jsonify
+
+from src.core.project import ProjectLockedError
 
 from src.web.blueprints import export_bp, glossary_bp, home_bp, projects_bp, review_bp, search_bp, translation_bp
 
@@ -49,5 +51,10 @@ def create_app(projects_dir: str | None = None) -> Flask:
     app.register_blueprint(review_bp)
     app.register_blueprint(search_bp)
     app.register_blueprint(translation_bp)
+
+    @app.errorhandler(ProjectLockedError)
+    def project_locked(e):
+        # A save while another process (e.g. a CLI run) holds the project
+        return jsonify({'error': str(e)}), 409
 
     return app

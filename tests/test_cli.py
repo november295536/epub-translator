@@ -129,7 +129,7 @@ class TestCLIStart:
         mock_result.returncode = 0
         mock_result.stdout = '翻譯結果'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             result = runner.invoke(cli, ['start', '--project', full_path])
 
         assert result.exit_code == 0
@@ -165,7 +165,7 @@ class TestCLIStart:
         fail_result.returncode = 1
         fail_result.stderr = 'error'
 
-        with patch('src.core.translator.subprocess.run', return_value=fail_result):
+        with patch('src.llm.cli.run_process', return_value=fail_result):
             result = runner.invoke(cli, ['start', '--project', full_path])
 
         assert result.exit_code != 0
@@ -199,7 +199,7 @@ class TestCLIModelOption:
         mock_result.returncode = 0
         mock_result.stdout = '翻譯結果'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             result = runner.invoke(cli, ['start', '--project', full_path, '--model', 'opus'])
 
         assert result.exit_code == 0
@@ -237,7 +237,7 @@ class TestCLIModelOption:
         mock_result.returncode = 0
         mock_result.stdout = '翻譯結果'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             result = runner.invoke(cli, ['start', '--project', full_path])
 
         assert result.exit_code == 0
@@ -262,7 +262,7 @@ class TestCLIWorkersOption:
         mock_result.returncode = 0
         mock_result.stdout = '翻譯結果'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             result = runner.invoke(cli, ['start', '--project', full_path, '--workers', '3'])
 
         assert result.exit_code == 0
@@ -280,7 +280,7 @@ class TestCLIWorkersOption:
         mock_result.returncode = 0
         mock_result.stdout = '翻譯結果'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             result = runner.invoke(cli, ['start', '--project', full_path])
 
         assert result.exit_code == 0
@@ -309,7 +309,7 @@ class TestCLIContext:
         from tests.conftest import fake_claude_run, assert_context_prompts
         project_dir = make_context_project(str(tmp_path / 'ctx'))
 
-        with patch('src.core.translator.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    side_effect=fake_claude_run) as mock_run:
             result = runner.invoke(cli, ['start', '--project', project_dir,
                                          '--workers', workers])
@@ -318,3 +318,170 @@ class TestCLIContext:
         prompts = [c[0][0][2] for c in mock_run.call_args_list]
         assert len(prompts) == 5
         assert_context_prompts(prompts, project_dir)
+
+
+# --- Phase 1: failed segments, retry, lock, version, term extraction -----------
+
+from src.core.project import SegmentStatus
+from src.llm import AuthError, RateLimitError, TransientError
+from src.llm.fake import FakeBackend
+from tests.conftest import hold_lock_in_child, lock_free_for_other_process, use_fake_backend
+
+
+def _make_project(path, n=4):
+    segments = [Segment(id=f'c1_seg{i:04d}', html=f'<p>Sentence MARK{i}.</p>',
+                        text=f'Sentence MARK{i}.', word_count=2, segment_type='text')
+                for i in range(1, n + 1)]
+    pm = ProjectManager(path)
+    pm.create('/path/to/book.epub', 'Invented', 'Nobody', segments)
+    return path
+
+
+def _responder(fail_marks=(), error=TransientError('exit 1', raw='RAW')):
+    """Translate every segment except those whose text holds a mark in fail_marks."""
+    def respond(request):
+        prompt = request.messages[-1].content
+        for mark in fail_marks:
+            # The segment's own HTML; neighbours appear as plain-text context
+            if f'<p>Sentence {mark}.</p>' in prompt:
+                raise error
+        return '<p>譯文</p>'
+    return respond
+
+
+def _statuses(path):
+    pm = ProjectManager(path)
+    pm.load()
+    return {s.segment_id: s.status for s in pm.data.segments}
+
+
+class TestCLIFailedSegments:
+
+    @pytest.mark.parametrize('workers', ['1', '3'])
+    def test_failing_segment_recorded_and_rest_translated(self, runner, tmp_path, workers):
+        path = _make_project(str(tmp_path / 'p'))
+        fake = FakeBackend(responder=_responder(['MARK2']))
+        with use_fake_backend(fake):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', workers])
+
+        assert result.exit_code == 1, result.output
+        assert '1 個段落翻譯失敗' in result.output
+        assert _statuses(path) == {
+            'c1_seg0001': SegmentStatus.TRANSLATED,
+            'c1_seg0002': SegmentStatus.FAILED,
+            'c1_seg0003': SegmentStatus.TRANSLATED,
+            'c1_seg0004': SegmentStatus.TRANSLATED,
+        }
+        pm = ProjectManager(path)
+        pm.load()
+        failed = pm.data.segments[1]
+        assert [i.code for i in failed.issues] == ['transient']
+        assert pm.data.segments[0].model == 'sonnet'
+        # Diagnostics for the failed segment only
+        assert os.listdir(os.path.join(path, 'log', 'failed')) == ['c1_seg0002.txt']
+        # 3 attempts for the failing segment, 1 for each other
+        assert len(fake.requests) == 6
+
+    @pytest.mark.parametrize('workers', ['1', '3'])
+    def test_failed_not_retried_without_flag(self, runner, tmp_path, workers):
+        path = _make_project(str(tmp_path / 'p'))
+        with use_fake_backend(FakeBackend(responder=_responder(['MARK2']))):
+            runner.invoke(cli, ['start', '--project', path])
+
+        fake = FakeBackend(responder=_responder())
+        with use_fake_backend(fake):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', workers])
+        assert result.exit_code == 0, result.output
+        assert fake.requests == []
+        assert '--retry-failed' in result.output
+        assert _statuses(path)['c1_seg0002'] == SegmentStatus.FAILED
+
+        with use_fake_backend(fake):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', workers,
+                                         '--retry-failed'])
+        assert result.exit_code == 0, result.output
+        assert len(fake.requests) == 1
+        assert '<p>Sentence MARK2.</p>' in fake.prompts[0]
+        assert set(_statuses(path).values()) == {SegmentStatus.TRANSLATED}
+        assert os.listdir(os.path.join(path, 'log', 'failed')) == []
+
+    @pytest.mark.parametrize('workers', ['1', '3'])
+    @pytest.mark.parametrize('error', [RateLimitError("You've hit your limit"),
+                                       AuthError('expired')])
+    def test_rate_limit_or_auth_stops_run(self, runner, tmp_path, workers, error):
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        with use_fake_backend(FakeBackend([error])):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', workers])
+        assert result.exit_code == 1
+        assert '翻譯中斷' in result.output
+        assert _statuses(path) == {'c1_seg0001': SegmentStatus.PENDING}
+
+    def test_status_shows_failed(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'))
+        with use_fake_backend(FakeBackend(responder=_responder(['MARK1', 'MARK3']))):
+            runner.invoke(cli, ['start', '--project', path])
+        result = runner.invoke(cli, ['status', '--project', path])
+        assert '失敗：    2' in result.output
+
+
+class TestCLILock:
+
+    def test_start_refused_while_other_process_holds_lock(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'))
+        child = hold_lock_in_child(path)
+        fake = FakeBackend(responder=_responder())
+        try:
+            with use_fake_backend(fake):
+                result = runner.invoke(cli, ['start', '--project', path])
+        finally:
+            child.stdin.close()
+            child.wait(timeout=10)
+        assert result.exit_code == 1
+        assert '另一個程序' in result.output
+        assert fake.requests == []
+
+    def test_lock_held_during_run_and_released_after(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        seen = []
+
+        def respond(request):
+            seen.append(lock_free_for_other_process(path))
+            return '<p>譯文</p>'
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            result = runner.invoke(cli, ['start', '--project', path])
+        assert result.exit_code == 0, result.output
+        assert seen == [False]
+        assert lock_free_for_other_process(path)
+
+    # A worker thread dies on the unexpected error (as before this phase)
+    @pytest.mark.filterwarnings('ignore::pytest.PytestUnhandledThreadExceptionWarning')
+    @pytest.mark.parametrize('workers', ['1', '3'])
+    def test_lock_released_on_error(self, runner, tmp_path, workers):
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        with use_fake_backend(FakeBackend([RuntimeError('unexpected')])):
+            runner.invoke(cli, ['start', '--project', path, '--workers', workers])
+        assert lock_free_for_other_process(path)
+
+    def test_lock_released_after_rate_limit_exit(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        with use_fake_backend(FakeBackend([RateLimitError('limit')])):
+            result = runner.invoke(cli, ['start', '--project', path])
+        assert result.exit_code == 1
+        assert lock_free_for_other_process(path)
+
+
+class TestCLIGlossaryExtract:
+
+    def test_extract_uses_project_model(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=2)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.set_model('haiku')
+        pm.save()
+        fake = FakeBackend(['[{"term": "MARK1", "translation": "標記", "category": "term"}]'])
+        with use_fake_backend(fake):
+            result = runner.invoke(cli, ['glossary', 'extract', '--project', path])
+        assert result.exit_code == 0, result.output
+        assert [r.model for r in fake.requests] == ['haiku']
+        assert 'Sentence MARK1.' in fake.prompts[0]

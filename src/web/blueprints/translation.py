@@ -6,7 +6,7 @@ import json
 import os
 from flask import Blueprint, Response, jsonify, request, current_app
 
-from src.core.project import ProjectManager
+from src.core.project import ProjectLockedError, ProjectManager
 from src.core.translator import AVAILABLE_MODELS, DEFAULT_MODEL
 from src.web.tasks import TaskManager
 
@@ -35,9 +35,12 @@ def start_translation(project_name: str):
         num_workers = max(1, min(num_workers, 20))
 
         segment_ids = data.get('segment_ids')  # list[str] | None
+        # Normal start leaves FAILED segments alone unless asked to retry them
+        retry_failed = bool(data.get('retry_failed', False))
         task = tm.start_translation(project_name, projects_dir,
                                     num_workers=num_workers,
-                                    segment_ids=segment_ids)
+                                    segment_ids=segment_ids,
+                                    retry_failed=retry_failed)
         return jsonify({
             'status': 'ok',
             'task_id': task.task_id,
@@ -45,7 +48,7 @@ def start_translation(project_name: str):
             'total': task.total,
             'workers': task.num_workers,
         })
-    except ValueError as e:
+    except (ValueError, ProjectLockedError) as e:
         return jsonify({'error': str(e)}), 409
     except Exception as e:
         return jsonify({'error': str(e)}), 500

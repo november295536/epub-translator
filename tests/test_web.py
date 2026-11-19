@@ -11,6 +11,8 @@ from src.core.project import ProjectManager, SegmentStatus
 from src.core.segmenter import Segment, SegmentType
 from src.core.translator import RateLimitError
 from src.web.tasks import TaskManager, TranslationTask
+from src.llm.fake import FakeBackend
+from tests.conftest import use_fake_backend
 
 
 PROJECT_NAME = 'test_project'
@@ -346,8 +348,7 @@ class TestRateLimitPause:
             raise RateLimitError("You've hit your limit · resets 8pm (Asia/Taipei)")
 
         with patch.object(TaskManager, '__new__', return_value=tm):
-            with patch('src.web.tasks.TranslationEngine') as MockEngine:
-                MockEngine.return_value.translate.side_effect = fake_translate
+            with use_fake_backend(FakeBackend(responder=lambda request: fake_translate())):
 
                 # Run _run_translation in a thread so we can inspect state while it blocks
                 thread = threading.Thread(target=tm._run_translation, args=(task,))
@@ -392,8 +393,7 @@ class TestRateLimitPause:
             return '翻譯結果'
 
         with patch.object(TaskManager, '__new__', return_value=tm):
-            with patch('src.web.tasks.TranslationEngine') as MockEngine:
-                MockEngine.return_value.translate.side_effect = fake_translate
+            with use_fake_backend(FakeBackend(responder=lambda request: fake_translate())):
 
                 thread = threading.Thread(target=tm._run_translation, args=(task,))
                 thread.start()
@@ -624,9 +624,7 @@ class TestStoppedStateSSE:
             return '翻譯結果'
 
         with patch.object(TaskManager, '__new__', return_value=tm):
-            with patch('src.web.tasks.TranslationEngine') as MockEngine:
-                MockEngine.return_value.translate.side_effect = fake_translate
-                MockEngine.return_value.model = 'sonnet'
+            with use_fake_backend(FakeBackend(responder=lambda request: fake_translate())):
 
                 thread = threading.Thread(target=tm._run_translation, args=(task,))
                 thread.start()
@@ -747,13 +745,13 @@ class TestRetranslateModel:
         app.config['TESTING'] = True
 
         with app.test_client() as client:
-            with patch('src.web.blueprints.review.TranslationEngine') as MockEngine:
-                MockEngine.return_value.translate.return_value = '重新翻譯結果'
+            fake = FakeBackend(['重新翻譯結果'])
+            with use_fake_backend(fake):
                 response = client.post(
                     f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0001/retranslate',
                 )
                 assert response.status_code == 200
-                MockEngine.assert_called_once_with(model='opus')
+                assert [r.model for r in fake.requests] == ['opus']
 
         TaskManager._instance = None
 
@@ -777,21 +775,17 @@ class TestMidTranslationModelSwitch:
 
         models_seen = []
 
-        def tracking_translate(self_engine, *args, **kwargs):
-            """Track which model the engine has when translate is called,
-            and switch pm.data.model after first call."""
-            models_seen.append(self_engine.model)
+        def tracking_translate(request):
+            """Track the model of each request, and switch pm.data.model
+            after the first call."""
+            models_seen.append(request.model)
             # After first translation, change model (simulates set_model API)
             if len(models_seen) == 1:
                 task.pm.data.model = 'opus'
             return '翻譯結果'
 
         with patch.object(TaskManager, '__new__', return_value=tm):
-            with patch('src.web.tasks.TranslationEngine') as MockEngine:
-                mock_engine = MagicMock()
-                mock_engine.model = 'sonnet'
-                mock_engine.translate = lambda *a, **kw: tracking_translate(mock_engine, *a, **kw)
-                MockEngine.return_value = mock_engine
+            with use_fake_backend(FakeBackend(responder=tracking_translate)):
 
                 thread = threading.Thread(target=tm._run_translation, args=(task,))
                 thread.start()
@@ -822,10 +816,7 @@ class TestSegmentCompleteModel:
         _setup_task_pm(task, project_with_translations)
 
         with patch.object(TaskManager, '__new__', return_value=tm):
-            with patch('src.web.tasks.TranslationEngine') as MockEngine:
-                MockEngine.return_value.translate.return_value = '翻譯結果'
-                # model is 'sonnet' on disk; engine reads from disk each iteration
-                MockEngine.return_value.model = 'sonnet'
+            with use_fake_backend(FakeBackend(responder=lambda request: '翻譯結果')):
 
                 thread = threading.Thread(target=tm._run_translation, args=(task,))
                 thread.start()
@@ -873,9 +864,7 @@ class TestDynamicWorkers:
             return '翻譯結果'
 
         with patch.object(TaskManager, '__new__', return_value=tm):
-            with patch('src.web.tasks.TranslationEngine') as MockEngine:
-                MockEngine.return_value.translate.side_effect = fake_translate
-                MockEngine.return_value.model = 'sonnet'
+            with use_fake_backend(FakeBackend(responder=lambda request: fake_translate())):
 
                 thread = threading.Thread(target=tm._run_translation, args=(task,))
                 task._coordinator = thread
@@ -924,9 +913,7 @@ class TestDynamicWorkers:
             return '翻譯結果'
 
         with patch.object(TaskManager, '__new__', return_value=tm):
-            with patch('src.web.tasks.TranslationEngine') as MockEngine:
-                MockEngine.return_value.translate.side_effect = fake_translate
-                MockEngine.return_value.model = 'sonnet'
+            with use_fake_backend(FakeBackend(responder=lambda request: fake_translate())):
 
                 thread = threading.Thread(target=tm._run_translation, args=(task,))
                 task._coordinator = thread
@@ -1073,9 +1060,7 @@ class TestMultiWorker:
         _setup_task_pm(task, project_with_translations)
 
         with patch.object(TaskManager, '__new__', return_value=tm):
-            with patch('src.web.tasks.TranslationEngine') as MockEngine:
-                MockEngine.return_value.translate.return_value = '翻譯結果'
-                MockEngine.return_value.model = 'sonnet'
+            with use_fake_backend(FakeBackend(responder=lambda request: '翻譯結果')):
 
                 thread = threading.Thread(target=tm._run_translation, args=(task,))
                 thread.start()
@@ -1111,9 +1096,7 @@ class TestMultiWorker:
             return '翻譯結果'
 
         with patch.object(TaskManager, '__new__', return_value=tm):
-            with patch('src.web.tasks.TranslationEngine') as MockEngine:
-                MockEngine.return_value.translate.side_effect = fake_translate
-                MockEngine.return_value.model = 'sonnet'
+            with use_fake_backend(FakeBackend(responder=lambda request: fake_translate())):
 
                 thread = threading.Thread(target=tm._run_translation, args=(task,))
                 thread.start()
@@ -1366,7 +1349,7 @@ class TestTermExtractionCoverage:
         app = create_app(projects_dir=projects_dir)
         app.config['TESTING'] = True
         _extraction_tasks.pop(PROJECT_NAME, None)
-        with patch('src.glossary.term_extractor.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    return_value=mock_result) as mock_run:
             with app.test_client() as client:
                 response = client.post(
@@ -1395,7 +1378,7 @@ class TestRetranslateContext:
         mock_result.stdout = '<h2>第二章</h2>'
         mock_result.stderr = ''
 
-        with patch('src.core.translator.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    return_value=mock_result) as mock_run:
             response = client.post(
                 f'/api/projects/{PROJECT_NAME}/segments/ch2_seg0001/retranslate')
@@ -1423,7 +1406,7 @@ class TestWorkerContext:
                                total=5, num_workers=num_workers)
         _setup_task_pm(task, projects_dir)
 
-        with patch('src.core.translator.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    side_effect=fake_claude_run) as mock_run:
             thread = threading.Thread(target=tm._run_translation, args=(task,))
             thread.start()
@@ -1447,3 +1430,297 @@ class TestCreateProjectMarker:
         assert response.status_code == 200, response.get_json()
         path = tmp_path / 'projects' / 'marker' / 'project.json'
         assert json.loads(path.read_text(encoding='utf-8'))['segmenter_version'] == 2
+
+
+# --- Phase 1: failed segments, revision, lock, extraction model ----------------
+
+import time as _time
+
+from src.core.project import Issue
+from src.core.translator import TranslationOutcome
+from src.llm import TransientError
+from tests.conftest import hold_lock_in_child, lock_free_for_other_process
+
+
+def _fail_on(*texts):
+    """Responder: fail every attempt for segments whose HTML holds one of texts."""
+    def respond(request):
+        prompt = request.messages[-1].content
+        if any(f'>{t}<' in prompt for t in texts):
+            raise TransientError('exit 1', raw='RAW')
+        return '<p>譯文</p>'
+    return respond
+
+
+def _wait(predicate, timeout=10):
+    deadline = _time.time() + timeout
+    while not predicate():
+        assert _time.time() < deadline, 'timed out waiting'
+        _time.sleep(0.01)
+
+
+def _load(projects_dir):
+    pm = ProjectManager(os.path.join(projects_dir, PROJECT_NAME))
+    pm.load()
+    return {s.segment_id: s for s in pm.data.segments}
+
+
+class TestWorkerFailedSegment:
+
+    @pytest.mark.parametrize('num_workers', [1, 3])
+    def test_failing_segment_recorded_and_rest_translated(self, project_with_translations,
+                                                          num_workers):
+        TaskManager._instance = None
+        tm = TaskManager()
+        with use_fake_backend(FakeBackend(responder=_fail_on('Second paragraph.'))):
+            task = tm.start_translation(PROJECT_NAME, project_with_translations,
+                                        num_workers=num_workers)
+            task._coordinator.join(timeout=20)
+
+        assert task.state == 'completed'
+        segs = _load(project_with_translations)
+        assert segs['ch1_seg0003'].status == SegmentStatus.FAILED
+        assert segs['ch1_seg0003'].issues[0].code == 'transient'
+        assert segs['ch2_seg0001'].status == SegmentStatus.TRANSLATED
+        assert segs['ch2_seg0002'].status == SegmentStatus.TRANSLATED
+        assert segs['ch2_seg0002'].model == 'sonnet'
+        errors = [e for e in task.progress.get_all() if e['event'] == 'segment_error']
+        assert [e['data']['segment_id'] for e in errors] == ['ch1_seg0003']
+        assert 'exit 1' in errors[0]['data']['error']
+        assert task.completed == 2
+        log_dir = os.path.join(project_with_translations, PROJECT_NAME, 'log', 'failed')
+        assert os.listdir(log_dir) == ['ch1_seg0003.txt']
+        TaskManager._instance = None
+
+    def test_failed_queued_only_with_retry_failed(self, client, project_with_translations):
+        TaskManager._instance = None
+        with use_fake_backend(FakeBackend(responder=_fail_on('Second paragraph.'))):
+            client.post(f'/api/projects/{PROJECT_NAME}/translate/start', json={})
+            TaskManager().get_task(PROJECT_NAME)._coordinator.join(timeout=20)
+
+        progress = client.get(f'/api/projects/{PROJECT_NAME}/progress').get_json()
+        assert progress['failed'] == 1
+
+        fake = FakeBackend(responder=_fail_on())
+        with use_fake_backend(fake):
+            data = client.post(f'/api/projects/{PROJECT_NAME}/translate/start',
+                               json={}).get_json()
+            assert data['total'] == 0
+            data = client.post(f'/api/projects/{PROJECT_NAME}/translate/start',
+                               json={'retry_failed': True}).get_json()
+            assert data['total'] == 1
+            TaskManager().get_task(PROJECT_NAME)._coordinator.join(timeout=20)
+        assert len(fake.requests) == 1
+        assert _load(project_with_translations)['ch1_seg0003'].status == \
+            SegmentStatus.TRANSLATED
+        TaskManager._instance = None
+
+
+class TestEditDuringTranslation:
+
+    def test_result_for_segment_edited_mid_flight_is_dropped(self, client,
+                                                            project_with_translations):
+        TaskManager._instance = None
+        in_flight = threading.Event()
+        release = threading.Event()
+
+        def respond(request):
+            if '>Second paragraph.<' in request.messages[-1].content:
+                in_flight.set()
+                assert release.wait(10)
+            return '<p>機器譯文</p>'
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            client.post(f'/api/projects/{PROJECT_NAME}/translate/start', json={})
+            assert in_flight.wait(10)
+            response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003',
+                                   json={'text': '人工譯文'})
+            assert response.status_code == 200
+            release.set()
+            task = TaskManager().get_task(PROJECT_NAME)
+            task._coordinator.join(timeout=20)
+
+        assert task.state == 'completed'
+        seg = _load(project_with_translations)['ch1_seg0003']
+        assert seg.translated_text == '人工譯文'
+        assert seg.revision == 1
+        assert _load(project_with_translations)['ch2_seg0001'].translated_text == \
+            '<p>機器譯文</p>'
+        TaskManager._instance = None
+
+
+class TestRetranslateOutcome:
+
+    def test_failed_retranslation_keeps_previous_text(self, client, project_with_translations):
+        TaskManager._instance = None
+        with use_fake_backend(FakeBackend([TransientError('exit 1')] * 3)):
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/retranslate')
+        assert response.status_code == 500
+        assert 'exit 1' in response.get_json()['error']
+        seg = _load(project_with_translations)['ch1_seg0002']
+        assert seg.status == SegmentStatus.TRANSLATED
+        assert seg.translated_text == '第一段。'
+        assert [i.code for i in seg.issues] == ['transient']
+
+    def test_failed_retranslation_of_pending_segment(self, client, project_with_translations):
+        with use_fake_backend(FakeBackend([TransientError('exit 1')] * 3)):
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
+        assert response.status_code == 500
+        assert _load(project_with_translations)['ch1_seg0003'].status == \
+            SegmentStatus.FAILED
+
+    def test_retranslation_records_model(self, client, project_with_translations):
+        with use_fake_backend(FakeBackend(['<p>新譯文</p>'])):
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
+        assert response.status_code == 200
+        assert response.get_json()['translated_text'] == '<p>新譯文</p>'
+        seg = _load(project_with_translations)['ch1_seg0003']
+        assert (seg.status, seg.model) == (SegmentStatus.TRANSLATED, 'sonnet')
+
+    def test_rate_limit(self, client, project_with_translations):
+        with use_fake_backend(FakeBackend([RateLimitError("You've hit your limit")])):
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
+        assert response.status_code == 500
+        assert 'hit your limit' in response.get_json()['error']
+        assert _load(project_with_translations)['ch1_seg0003'].status == \
+            SegmentStatus.PENDING
+
+
+class TestWebProjectLock:
+
+    def _project_dir(self, projects_dir):
+        return os.path.join(projects_dir, PROJECT_NAME)
+
+    def test_start_refused_while_other_process_holds_lock(self, client,
+                                                         project_with_translations):
+        TaskManager._instance = None
+        child = hold_lock_in_child(self._project_dir(project_with_translations))
+        try:
+            response = client.post(f'/api/projects/{PROJECT_NAME}/translate/start', json={})
+        finally:
+            child.stdin.close()
+            child.wait(timeout=10)
+        assert response.status_code == 409
+        assert '另一個程序' in response.get_json()['error']
+        assert lock_free_for_other_process(self._project_dir(project_with_translations))
+        TaskManager._instance = None
+
+    def test_edit_refused_while_other_process_holds_lock(self, client,
+                                                        project_with_translations):
+        TaskManager._instance = None
+        child = hold_lock_in_child(self._project_dir(project_with_translations))
+        try:
+            response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0001',
+                                   json={'text': '改'})
+        finally:
+            child.stdin.close()
+            child.wait(timeout=10)
+        assert response.status_code == 409
+        assert _load(project_with_translations)['ch1_seg0001'].translated_text == '標題'
+
+    def test_lock_held_during_task_and_released_after(self, project_with_translations):
+        TaskManager._instance = None
+        project_dir = self._project_dir(project_with_translations)
+        seen = []
+
+        def respond(request):
+            seen.append(lock_free_for_other_process(project_dir))
+            return '<p>譯文</p>'
+
+        tm = TaskManager()
+        with use_fake_backend(FakeBackend(responder=respond)):
+            task = tm.start_translation(PROJECT_NAME, project_with_translations)
+            task._coordinator.join(timeout=30)
+        assert task.state == 'completed'
+        assert seen == [False, False, False]
+        assert lock_free_for_other_process(project_dir)
+        TaskManager._instance = None
+
+    def test_lock_released_when_nothing_to_translate(self, project_with_translations):
+        TaskManager._instance = None
+        task = TaskManager().start_translation(PROJECT_NAME, project_with_translations,
+                                               segment_ids=[])
+        assert task.state == 'completed'
+        assert lock_free_for_other_process(self._project_dir(project_with_translations))
+        TaskManager._instance = None
+
+    def test_lock_released_when_loading_fails(self, tmp_path):
+        TaskManager._instance = None
+        project_dir = tmp_path / PROJECT_NAME
+        project_dir.mkdir()
+        (project_dir / 'project.json').write_text('not json')
+        with pytest.raises(ValueError):
+            TaskManager().start_translation(PROJECT_NAME, str(tmp_path))
+        assert lock_free_for_other_process(str(project_dir))
+        TaskManager._instance = None
+
+    def test_lock_released_when_coordinator_fails(self, project_with_translations):
+        TaskManager._instance = None
+        tm = TaskManager()
+        with patch('src.web.tasks.GlossaryManager', side_effect=RuntimeError('broken')):
+            task = tm.start_translation(PROJECT_NAME, project_with_translations)
+            task._coordinator.join(timeout=10)
+        assert task.state == 'failed'
+        assert lock_free_for_other_process(self._project_dir(project_with_translations))
+        TaskManager._instance = None
+
+
+class TestFailedInPages:
+
+    def _fail_one(self, projects_dir):
+        pm = ProjectManager(os.path.join(projects_dir, PROJECT_NAME))
+        pm.load()
+        pm.apply_outcome('ch1_seg0003', TranslationOutcome(
+            text=None, status=SegmentStatus.FAILED, model='sonnet',
+            issues=[Issue('backend', 'transient', 'FAILDETAIL', True)]))
+        pm.save()
+
+    def test_search_includes_failed(self, client, project_with_translations):
+        self._fail_one(project_with_translations)
+        data = client.post(f'/api/projects/{PROJECT_NAME}/search-segments',
+                           json={'query': 'paragraph'}).get_json()
+        found = {s['segment_id']: s['status'] for s in data['segments']}
+        assert found == {'ch1_seg0002': 'translated', 'ch1_seg0003': 'failed'}
+
+    def test_search_excludes_pending(self, client):
+        data = client.post(f'/api/projects/{PROJECT_NAME}/search-segments',
+                           json={'query': 'Chapter 2'}).get_json()
+        assert data['segments'] == []
+
+    def test_pages_show_failed(self, client, project_with_translations):
+        self._fail_one(project_with_translations)
+        html = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1').get_data(as_text=True)
+        assert 'status-failed' in html
+        assert 'FAILDETAIL' in html
+        html = client.get(f'/project/{PROJECT_NAME}/overview').get_data(as_text=True)
+        assert '翻譯失敗' in html
+        html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
+        assert '重試失敗段落（1）' in html
+
+    def test_retry_button_hidden_without_failed(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
+        assert '重試失敗段落' not in html
+        html = client.get(f'/project/{PROJECT_NAME}/overview').get_data(as_text=True)
+        assert '翻譯失敗' not in html
+
+
+class TestTermExtractionModel:
+
+    def test_web_extraction_uses_project_model(self, client, project_with_translations):
+        from src.web.blueprints.glossary import _extraction_tasks
+        pm = ProjectManager(os.path.join(project_with_translations, PROJECT_NAME))
+        pm.load()
+        pm.set_model('haiku')
+        pm.save()
+        _extraction_tasks.pop(PROJECT_NAME, None)
+        fake = FakeBackend(responder=lambda request: '[]')
+        with use_fake_backend(fake):
+            assert client.post(
+                f'/api/projects/{PROJECT_NAME}/glossary/extract').status_code == 200
+            _wait(lambda: not _extraction_tasks[PROJECT_NAME]['running'])
+        _extraction_tasks.pop(PROJECT_NAME, None)
+        assert fake.requests and all(r.model == 'haiku' for r in fake.requests)

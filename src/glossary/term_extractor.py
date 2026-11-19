@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import json
-import re
-import subprocess
 import logging
+import threading
+
+import src.llm as llm
+from src.llm import AuthError, LLMError, LLMRequest, Message, RateLimitError
 
 logger = logging.getLogger(__name__)
-
-_AUTH_ERROR_PATTERN = re.compile(
-    r'authentication_error|OAuth token has expired|please run /login',
-    re.IGNORECASE,
-)
 
 
 class ExtractionError(Exception):
@@ -66,10 +63,13 @@ def _split_text(text: str, limit: int) -> list[str]:
 
 
 class TermExtractor:
-    """Extracts technical terms from text using Claude CLI."""
+    """Extracts technical terms from text through an LLM backend."""
 
-    def __init__(self, timeout: int = 180):
+    def __init__(self, model: str = '', timeout: int = 180,
+                 backend: llm.LLMBackend | None = None):
+        self.model = model
         self.timeout = timeout
+        self.backend = backend if backend is not None else llm.default_backend()
 
     def extract_from_text(self, text: str) -> list[dict]:
         """Extract terms from a single text chunk.
@@ -77,30 +77,20 @@ class TermExtractor:
         Returns list of dicts with 'term', 'translation', 'category' keys.
         """
         prompt = EXTRACT_PROMPT.format(text=text[:MAX_CHARS_PER_BATCH])
+        request = LLMRequest(system='', messages=[Message('user', prompt)],
+                             model=self.model, timeout=self.timeout)
 
         try:
-            result = subprocess.run(
-                ['claude', '-p', prompt],
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
-
-            if result.returncode != 0:
-                combined = (result.stdout or '') + (result.stderr or '')
-                if _AUTH_ERROR_PATTERN.search(combined):
-                    raise ExtractionError('Claude CLI 認證已過期，請在終端執行 claude /login 重新登入')
-                logger.warning("Term extraction failed: %s", combined.strip())
-                return []
-
-            output = result.stdout.strip()
-            return self._parse_response(output)
-
-        except subprocess.TimeoutExpired:
-            logger.warning("Term extraction timed out")
+            response = self.backend.complete(request, threading.Event())
+        except (AuthError, RateLimitError) as e:
+            # Every further batch would fail the same way
+            raise ExtractionError(str(e))
+        except LLMError as e:
+            logger.warning("Term extraction failed: %s", e)
             return []
-        except ExtractionError:
-            raise
+
+        try:
+            return self._parse_response(response.text.strip())
         except Exception as e:
             logger.warning("Term extraction error: %s", e)
             return []

@@ -24,7 +24,7 @@
             <div class="segment-header">
                 <span class="segment-id">{{ seg.segment_id }}</span>
                 {% if seg.segment_type == 'code' %}<span class="segment-type">code</span>{% endif %}
-                <span class="segment-status status-{{ seg.status }}">{{ seg.status }}</span>
+                <span class="segment-status status-{{ seg.status }}"{% if seg.issues %} title="{{ seg.issues | map(attribute='detail') | join('; ') }}"{% endif %}>{{ seg.status }}</span>
             </div>
             <div class="segment-body">
                 <div class="original" x-data="{ view: 'text' }">
