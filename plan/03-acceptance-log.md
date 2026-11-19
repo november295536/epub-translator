@@ -1391,6 +1391,23 @@ $ echo $?
 
 No survivor needed a new test, so `phase1_survivor_kills.py` gets no new entry. No timing
 assertion was added.
+
+### 20. Review round 5 (final)
+
+Static reviews by G, O and the third reviewer, all three approved with minor findings (the
+third reviewer's two findings are items 2 and 3). Nothing was changed in
+code in this round: the three minor findings below are accepted as known limitations, not
+fixed. Five rounds is the limit; each needs an unlikely failure or a very narrow
+interleaving, and none loses a saved translation silently on normal use.
+
+| # | finding | ruling | what was done | tests |
+|---|---|---|---|---|
+| 1 | two reviewers: a same-name replacement (`create_project` in `src/web/blueprints/projects.py`) saves the new `project.json` before the new EPUB is moved into place with `os.replace`; if that final move fails with an I/O error, the request answers 500 and the project has the new segments with the old `source.epub`, the old translations already overwritten | accepted as a known limitation | not fixed (below) | — |
+| 2 | all three reviewers: when five `unexpected` failures in a row stop a web run, the coordinator (`src/web/tasks.py`) drains the in-flight results while the state is still `running`, so a pause request is accepted; if it lands between a worker's stop check and its `pause_event.wait()`, that worker blocks and the project lock stays held until the user resumes or stops. The third reviewer adds: a resume with a higher worker count in that window can start workers on a stopping task | accepted as a known limitation | not fixed (below) | — |
+| 3 | two reviewers: `_fail_task` (`src/web/tasks.py`) sets the state to `failed` before it waits for the workers, and sets `task.error` and emits the `error` event only after the wait; with long calls in flight, a stream can close (or a page load) showing `failed` without the message. The third reviewer adds: a stream opened right after the state changes can refresh the failed count before the in-flight results are saved | accepted as a known limitation | not fixed (below); the message is in the project log and appears on reload after the wait | — |
+
+No mutation run was needed in this round (no code change). The test count is unchanged: 869.
+
 ### Known consequences
 
 - A project stops being loadable by `v1.0.0` (and by `main` before this phase) as soon as one
@@ -1447,6 +1464,16 @@ assertion was added.
   is counted where the coordinator (or CLI loop) receives results, so when failures are
   immediate (no model call spent) the workers can mark more than five segments FAILED before
   the run stops. Those segments are retried with retry-failed.
+- Known limitations (review round 5, not fixed): if the final `os.replace` of a same-name
+  replacement fails, the request answers 500 and the project keeps the new segments with the
+  old `source.epub` (the old translations are already overwritten). A pause request that lands
+  between a worker's stop check and its `pause_event.wait()` while a five-failure stop drains
+  in-flight results blocks that worker and keeps the project lock until the user resumes or
+  stops; a resume with more workers in that window can start workers on the stopping task.
+  `_fail_task` shows `failed` before the error message while it waits for long in-flight
+  calls; a stream closed or a page loaded in that time shows no message (it is in the project
+  log and appears on reload after the wait), and its failed count can miss the in-flight
+  results not yet saved.
 - Known limitation (review round 3): a request that itself contains a login or limit phrase,
   combined with a real error reply on stdout with exit code 0, is stored as a translation;
   output validation in Phase 4 is to catch it.
