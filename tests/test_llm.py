@@ -249,8 +249,10 @@ class TestFakeBackend:
         response = fake.complete(_request('c'), threading.Event())
         assert response.usage == Usage(3, 4)
         assert fake.prompts == ['a', 'b', 'c']
-        with pytest.raises(AssertionError):
+        from src.llm.fake import FakeBackendExhausted
+        with pytest.raises(FakeBackendExhausted):
             fake.complete(_request('d'), threading.Event())
+        FakeBackend.overcalls.clear()  # intended
 
     def test_responder(self):
         fake = FakeBackend(responder=lambda request: request.model.upper())
@@ -327,8 +329,10 @@ class TestInterfaceDetails:
             separate_system=True, multi_turn=True, reports_usage=True,
             sampling_params=True, suggested_concurrency=4)
         assert fake.list_models() == [ModelInfo('fake-model', 'Fake', '')]
-        with pytest.raises(AssertionError, match='^FakeBackend: no scripted reply left$'):
+        from src.llm.fake import FakeBackendExhausted
+        with pytest.raises(FakeBackendExhausted, match='^FakeBackend: no scripted reply left$'):
             fake.complete(_request(), threading.Event())
+        FakeBackend.overcalls.clear()  # intended
 
     def test_fake_string_reply_is_complete(self):
         response = FakeBackend(['x']).complete(_request(model='m'), threading.Event())
@@ -644,7 +648,8 @@ class TestRound2StartErrors:
             with pytest.raises(BackendUnavailableError):
                 ClaudeCLI().complete(_request(), threading.Event())
 
-    @pytest.mark.parametrize('code', [errno.E2BIG, errno.EAGAIN, errno.ENOMEM])
+    # EAGAIN and ENOMEM moved to TestRound3ResourceErrors (review round 3)
+    @pytest.mark.parametrize('code', [errno.E2BIG])
     def test_other_start_failure_concerns_the_request(self, code):
         error = OSError(code, os.strerror(code))
         with patch('src.llm.cli.run_process', side_effect=error):
@@ -850,3 +855,107 @@ class TestRound2RateLimitMessage:
     def test_message_in_stdout(self):
         error = ClaudeCLI().classify_error(_result(1, " You've hit your limit ", 'warning'))
         assert str(error) == "You've hit your limit"
+
+
+# --- Review round 3 ---------------------------------------------------------------
+
+from src.llm.fake import FakeBackendExhausted
+
+
+class TestRound3StderrNotEchoSuppressed:
+    """Item 3: the echo rule covers stdout only; stderr always counts."""
+
+    def test_auth_on_stderr_with_phrase_in_request(self):
+        result = _result(0, '', 'API Error: 401 authentication_error')
+        error = ClaudeCLI().classify_error(result, prompt='handle authentication_error here')
+        assert isinstance(error, AuthError)
+
+    def test_limit_on_stderr_with_phrase_in_request(self):
+        result = _result(0, 'x' * 1000, "You've hit your limit · resets 8pm")
+        error = ClaudeCLI().classify_error(result, prompt="print(\"You've hit your limit\")")
+        assert isinstance(error, RateLimitError)
+        assert str(error) == "You've hit your limit · resets 8pm"
+
+    def test_echo_on_stdout_still_ignored(self):
+        result = _result(0, 'authentication_error', '')
+        assert ClaudeCLI().classify_error(result, prompt='authentication_error') is None
+
+
+class TestRound3ResourceErrors:
+    """Item 4: a temporary shortage of system resources at start is retried."""
+
+    @pytest.mark.parametrize('code', [errno.EAGAIN, errno.ENOMEM, errno.EMFILE, errno.ENFILE])
+    def test_resource_error_is_transient(self, code):
+        error = OSError(code, os.strerror(code))
+        with patch('src.llm.cli.run_process', side_effect=error):
+            with pytest.raises(TransientError) as info:
+                ClaudeCLI().complete(_request(), threading.Event())
+        assert str(info.value) == f'claude-cli could not be started: {error}'
+
+    def test_blocking_io_error_is_transient(self):
+        # What a failing fork raises
+        with patch('src.llm.cli.run_process',
+                   side_effect=BlockingIOError(errno.EAGAIN, 'Resource temporarily unavailable')):
+            with pytest.raises(TransientError):
+                ClaudeCLI().complete(_request(), threading.Event())
+
+
+class TestRound3UndecodableOutput:
+    """Item 7: undecodable output is decoded with replacement, not raised."""
+
+    def test_invalid_utf8_replaced(self, tmp_path):
+        cmd = [sys.executable, '-c',
+               'import sys; sys.stdout.buffer.write(b"ok \\xff end"); '
+               'sys.stderr.buffer.write(b"\\xfe")']
+        result = run_process(cmd, timeout=30, cwd=str(tmp_path), env=dict(os.environ))
+        assert (result.returncode, result.stdout, result.stderr) == (0, 'ok \ufffd end', '\ufffd')
+
+
+class TestRound3FakeOverCall:
+    """Item 10: a FakeBackend called beyond its script is not swallowed."""
+
+    def test_exhausted_is_a_base_exception(self):
+        fake = FakeBackend(['one'])
+        assert fake.complete(_request(), threading.Event()).text == 'one'
+        with pytest.raises(FakeBackendExhausted):
+            fake.complete(_request(), threading.Event())
+        assert not isinstance(FakeBackendExhausted(), Exception)
+        assert len(FakeBackend.overcalls) == 1
+        FakeBackend.overcalls.clear()  # this test's over-call is intended
+
+    def test_not_turned_into_an_outcome(self):
+        from src.core.translator import TranslationEngine, translate_segment
+        from src.core.project import SegmentState
+        seg = SegmentState(segment_id='c1_seg0001', chapter_id='c1', html='<p>A.</p>',
+                           text='A.', word_count=1, segment_type='text')
+        engine = TranslationEngine(model='m', backend=FakeBackend([]))
+        with pytest.raises(FakeBackendExhausted):
+            translate_segment(engine, seg, [seg])
+        FakeBackend.overcalls.clear()
+
+
+class TestRound3TimeoutOutputBounded:
+    """Item 12: output kept on a late finish or a timeout is bounded."""
+
+    def test_late_finish_output_bounded(self, monkeypatch):
+        class BigProc(_FinishedProc):
+            def communicate(self, timeout=None):
+                return 'o' * 30000, 'e' * 30000
+
+        readings = iter([100.0, 104.0])
+        monkeypatch.setattr(cli_module, 'time',
+                            SimpleNamespace(monotonic=lambda: next(readings, 105.5)))
+        monkeypatch.setattr(cli_module.subprocess, 'Popen', BigProc)
+        monkeypatch.setattr(cli_module.os, 'killpg', lambda pid, sig: None)
+        with pytest.raises(_subprocess.TimeoutExpired) as info:
+            run_process(['claude'], timeout=5, cwd='.', env={})
+        assert len(info.value.output) == cli_module.KEPT_OUTPUT_CHARS
+        assert len(info.value.stderr) == cli_module.KEPT_OUTPUT_CHARS
+
+    def test_transient_raw_bounded(self):
+        expired = _subprocess.TimeoutExpired(['claude'], 5, output='o' * 20000,
+                                             stderr='e' * 20000)
+        with patch('src.llm.cli.run_process', side_effect=expired):
+            with pytest.raises(TransientError) as info:
+                ClaudeCLI().complete(_request(), threading.Event())
+        assert info.value.raw == 'o' * cli_module.KEPT_OUTPUT_CHARS

@@ -64,18 +64,21 @@ class ClaudeCLI(CLIBackend):
 
     def classify_error(self, result: ProcessResult, prompt: str = '') -> Optional[LLMError]:
         stdout, stderr = _text(result.stdout), _text(result.stderr)
-        # stderr and any failed run: both streams. A successful run: only a
-        # short reply (see SHORT_REPLY_CHARS), so translated text that
-        # mentions e.g. "authentication_error" is not taken for an error.
+        # stderr is always searched. stdout of a failed run too; of a
+        # successful run only a short reply (see SHORT_REPLY_CHARS), so
+        # translated text that mentions e.g. "authentication_error" is not
+        # taken for an error.
         if result.returncode != 0 or len(stdout) <= SHORT_REPLY_CHARS:
-            searched = stdout + stderr
+            searched = stdout
         else:
-            searched = stderr
-        # A successful run that only repeats a phrase of the request
+            searched = ''
+        # A successful reply that only repeats a phrase of the request (stdout
+        # only: the program's own diagnostics on stderr always count)
         echoed = prompt.lower() if result.returncode == 0 else ''
 
         def found(pattern) -> bool:
-            return any(m.group(0).lower() not in echoed for m in pattern.finditer(searched))
+            return (pattern.search(stderr) is not None
+                    or any(m.group(0).lower() not in echoed for m in pattern.finditer(searched)))
 
         if found(_RATE_LIMIT_PATTERN):
             # Quoted from the stream that holds it: stdout can be long
