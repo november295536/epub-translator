@@ -70,6 +70,8 @@ class TestCLIInit:
         project_dir = _get_project_dir(sample_epub)
         full_path = os.path.join(str(tmp_path), project_dir)
         assert os.path.isfile(os.path.join(full_path, 'project.json'))
+        with open(os.path.join(full_path, 'project.json'), encoding='utf-8') as f:
+            assert json.load(f)['segmenter_version'] == 2
 
     def test_init_duplicate_project(self, runner, sample_epub, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

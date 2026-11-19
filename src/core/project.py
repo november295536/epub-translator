@@ -25,6 +25,10 @@ class SegmentStatus(str, Enum):
         return self.value
 
 
+# Segmenter behaviour recorded on projects created now (see ProjectData)
+SEGMENTER_VERSION = 2
+
+
 @dataclass
 class SegmentState:
     """State of a single segment in the project."""
@@ -49,6 +53,9 @@ class ProjectData:
     created_at: str = ''
     updated_at: str = ''
     model: str = 'sonnet'
+    # 1: segmented before comments were skipped (no field in project.json);
+    # 2: comments skipped. The builder walks chapters to match.
+    segmenter_version: int = 1
     segments: list[SegmentState] = field(default_factory=list)
 
 
@@ -96,6 +103,7 @@ class ProjectManager:
             author=author,
             created_at=now,
             updated_at=now,
+            segmenter_version=SEGMENTER_VERSION,
             segments=segment_states,
         )
         self.save()

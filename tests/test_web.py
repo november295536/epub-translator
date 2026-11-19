@@ -1430,3 +1430,16 @@ class TestWorkerContext:
         assert len(prompts) == 5
         assert_context_prompts(prompts, project_dir)
         TaskManager._instance = None
+
+
+class TestCreateProjectMarker:
+
+    def test_web_created_project_records_segmenter_version_2(self, tmp_path, sample_epub):
+        app = create_app(projects_dir=str(tmp_path / 'projects'))
+        app.config['TESTING'] = True
+        with app.test_client() as client:
+            response = client.post('/api/projects', json={
+                'epub_path': sample_epub, 'project_name': 'marker'})
+        assert response.status_code == 200, response.get_json()
+        path = tmp_path / 'projects' / 'marker' / 'project.json'
+        assert json.loads(path.read_text(encoding='utf-8'))['segmenter_version'] == 2
