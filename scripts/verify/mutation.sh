@@ -2,23 +2,26 @@
 # Mutation testing over the lines changed on this branch.
 #
 # Mutates only the lines added or changed versus BASE (default: main) in the
-# source files listed in GROUPS below, and runs only the tests relevant to
-# each group, so a run takes minutes. Prints killed / survived / timeout /
-# suspicious totals and lists every surviving mutant.
+# source files listed in MUT_GROUPS below, and runs only the tests relevant to
+# each group, so a run takes minutes. Each group gets its own mutmut cache, so
+# its clean baseline is run and timed with that group's tests. Prints every
+# surviving, timed-out or suspicious mutant (with its diff) and the totals.
 #
-# Uses mutmut 2.x (supports Python 3.9). Install it in a separate virtualenv,
-# not the project one:
+# Uses mutmut 2.x from the active environment:
 #
-#   python3.9 -m venv "$TMPDIR/mutvenv"
-#   "$TMPDIR/mutvenv/bin/pip" install -r requirements.txt -r requirements-dev.txt
-#   MUTATION_VENV="$TMPDIR/mutvenv" scripts/verify/mutation.sh [BASE]
+#   pip install -r requirements-dev.txt
+#   scripts/verify/mutation.sh [BASE]
+#
+# MUTATION_VENV=<virtualenv> uses that virtualenv's mutmut instead. Tests run
+# on the Python interpreter that mutmut is installed in (read from its
+# script's #! line).
 #
 # mutmut edits the source files in place while it runs and restores them
-# afterwards; do not edit or commit while it runs. If a run is killed, a
-# mutated file and its .bak can be left behind (deliberately not ignored by
-# git, so they show up); restore with git checkout -- <file>. State is kept in
-# .mutmut-cache (git-ignored) and deleted at the start of each run.
-# Show one mutant's diff with: "$MUTATION_VENV/bin/mutmut" show <id>
+# afterwards; do not edit or commit while it runs. On Ctrl-C or SIGTERM the
+# script stops mutmut and its test processes and puts back any file mutmut
+# had mutated (from mutmut's <file>.bak). Everything else (mutmut cache,
+# patch, runner, pytest and TMPDIR temporary files) goes to a private
+# directory from mktemp -d, removed on exit.
 #
 # Exit code: 0 when no mutant survived, timed out or is suspicious, 1 when
 # some did, 2 when mutmut failed or generated no mutants.
@@ -26,17 +29,13 @@
 set -euo pipefail
 
 BASE="${1:-main}"
-VENV="${MUTATION_VENV:-}"
-if [[ -z "$VENV" || ! -x "$VENV/bin/mutmut" ]]; then
-    echo "Set MUTATION_VENV to a virtualenv with requirements.txt and requirements-dev.txt installed" >&2
+MUTMUT="$(command -v "${MUTATION_VENV:+$MUTATION_VENV/bin/}mutmut" || true)"
+PY="$( [[ -n "$MUTMUT" ]] && head -n 1 "$MUTMUT" | sed 's/^#!//' || true)"
+if [[ -z "$MUTMUT" ]] || ! "$PY" -c 'import mutmut, pytest' 2>/dev/null; then
+    echo "mutmut not found with a usable interpreter: pip install -r requirements-dev.txt" >&2
+    echo "in the active environment, or set MUTATION_VENV to a virtualenv that has it" >&2
     exit 2
 fi
-PY="$VENV/bin/python"
-# A mutant and the restored file can have the same size and mtime second, so
-# bytecode cached for one can be loaded for the other (on macOS the cache is
-# under sys.pycache_prefix, not __pycache__). Never write bytecode in this run.
-export PYTHONDONTWRITEBYTECODE=1
-MUTMUT="$VENV/bin/mutmut"
 
 cd "$(git rev-parse --show-toplevel)"
 MERGE_BASE="$(git merge-base "$BASE" HEAD)"
@@ -44,31 +43,67 @@ MERGE_BASE="$(git merge-base "$BASE" HEAD)"
 # group name | comma-separated files to mutate | pytest arguments
 # (not named GROUPS: that is a read-only bash variable)
 MUT_GROUPS=(
-    "core|src/core/segmenter.py,src/core/translator.py,src/epub/builder.py,src/epub/extractor.py,src/glossary/glossary_manager.py,src/glossary/term_extractor.py|tests/test_segmenter.py tests/test_translator.py tests/test_builder.py tests/test_extractor.py tests/test_glossary.py tests/test_verify_scripts.py"
-    "web|src/web/tasks.py,src/web/blueprints/glossary.py,src/web/blueprints/review.py|tests/test_web.py -k TermExtractionCoverage or RetranslateContext or WorkerContext"
+    "core|src/core/project.py,src/core/segmenter.py,src/core/translator.py,src/epub/builder.py,src/epub/extractor.py,src/glossary/glossary_manager.py,src/glossary/term_extractor.py|tests/test_project.py tests/test_segmenter.py tests/test_translator.py tests/test_builder.py tests/test_extractor.py tests/test_glossary.py tests/test_verify_scripts.py"
+    "web|src/web/tasks.py,src/web/blueprints/glossary.py,src/web/blueprints/review.py|tests/test_web.py -k TermExtractionCoverage or RetranslateContext or WorkerContext or CreateProjectMarker"
     "cli|translate.py|tests/test_cli.py"
     "scripts|scripts/verify/phase0_code_segments.py,scripts/verify/phase0_builder_alignment.py|tests/test_verify_scripts.py"
 )
 
-PATCH="$(mktemp)"
-RUNNER="$(mktemp)"
-trap 'rm -f "$PATCH" "$RUNNER"' EXIT
-chmod +x "$RUNNER"
-
-ALL_FILES=""
+ALL_FILES=()
 for group in "${MUT_GROUPS[@]}"; do
     IFS='|' read -r _ files _ <<<"$group"
-    ALL_FILES="$ALL_FILES ${files//,/ }"
+    IFS=',' read -r -a list <<<"$files"
+    ALL_FILES+=("${list[@]}")
 done
 # mutmut rewrites these files in place; refuse to start on uncommitted edits
 # or on a leftover backup from an interrupted run
-if [[ -n "$(git status --porcelain -- $ALL_FILES)" ]] || ls $(printf '%s.bak ' $ALL_FILES) >/dev/null 2>&1; then
-    echo "Uncommitted changes or *.bak files in the files to mutate; after an interrupted" >&2
-    echo "run restore them with: git checkout -- <file> && rm <file>.bak" >&2
+if [[ -n "$(git status --porcelain -- "${ALL_FILES[@]}")" ]]; then
+    echo "Uncommitted changes in the files to mutate; commit or restore them first" >&2
     exit 2
 fi
+for f in "${ALL_FILES[@]}"; do
+    if [[ -e "$f.bak" ]]; then
+        echo "Leftover $f.bak from an interrupted run: restore $f and remove it first" >&2
+        exit 2
+    fi
+done
 
-rm -f .mutmut-cache
+WORK="$(mktemp -d)"
+MUTPID=""
+cleanup() {
+    if [[ -n "$MUTPID" ]]; then
+        # mutmut runs in its own process group (set -m): stop it and its tests
+        kill -TERM -- "-$MUTPID" 2>/dev/null || true
+        wait "$MUTPID" 2>/dev/null || true
+        sleep 1
+        kill -KILL -- "-$MUTPID" 2>/dev/null || true
+        for f in "${ALL_FILES[@]}"; do
+            if [[ -e "$f.bak" ]]; then
+                mv -f "$f.bak" "$f"
+                echo "restored $f" >&2
+            fi
+        done
+        if [[ -n "$(git status --porcelain -- "${ALL_FILES[@]}")" ]]; then
+            echo "WARNING files still modified: git status -- ${ALL_FILES[*]}" >&2
+        fi
+    fi
+    rm -f .mutmut-cache
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+mkdir "$WORK/tmp" "$WORK/pycache"
+export TMPDIR="$WORK/tmp"
+# Never read or write cached bytecode: a mutant and the restored file can have
+# the same size and mtime second.
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPYCACHEPREFIX="$WORK/pycache"
+PATCH="$WORK/changes.patch"
+RUNNER="$WORK/runner.sh"
+TOTALS="$WORK/totals"
+set -m  # background jobs get their own process group
+
 for group in "${MUT_GROUPS[@]}"; do
     IFS='|' read -r name files tests <<<"$group"
     [[ -n "$files" ]] || { echo "empty file list in group $name" >&2; exit 2; }
@@ -103,38 +138,58 @@ def watch():
 threading.Thread(target=watch, daemon=True).start()
 import pytest
 sys.exit(pytest.main(sys.argv[1:]))
-' -x -q -p no:cacheprovider $pytest_args || exit 1
+' -x -q -p no:cacheprovider --basetemp="$WORK/pytest" $pytest_args || exit 1
 EOF
+    chmod +x "$RUNNER"
     echo "== $name: mutating changed lines of $files"
+    rm -f .mutmut-cache  # fresh cache: baseline run and timed for this group's tests
     # --CI: exit 1 only on a fatal error; mutant results are read from the cache below
-    if ! "$MUTMUT" run --paths-to-mutate "$files" --use-patch-file "$PATCH" \
-        --runner "$RUNNER" --no-progress --CI >/dev/null; then
+    "$MUTMUT" run --paths-to-mutate "$files" --use-patch-file "$PATCH" \
+        --runner "$RUNNER" --no-progress --CI >/dev/null &
+    MUTPID=$!
+    if ! wait "$MUTPID"; then
+        MUTPID=""
         echo "ERROR mutmut failed for group $name" >&2
         exit 2
     fi
-done
+    MUTPID=""
 
-"$PY" - <<'EOF'
-import sqlite3
-from collections import Counter
-
-db = sqlite3.connect('.mutmut-cache')
-rows = db.execute('''
+    "$PY" - "$name" "$TOTALS" >"$WORK/listing" <<'EOF'
+import sqlite3, sys
+name, totals = sys.argv[1], sys.argv[2]
+rows = sqlite3.connect('.mutmut-cache').execute('''
     SELECT m.id, m.status, s.filename, l.line_number
     FROM Mutant m JOIN Line l ON m.line = l.id JOIN SourceFile s ON l.sourcefile = s.id
     ORDER BY s.filename, l.line_number, m."index"
 ''').fetchall()
-counts = Counter(status for _, status, _, _ in rows)
-names = {'ok_killed': 'killed', 'bad_survived': 'survived', 'bad_timeout': 'timeout',
-         'ok_suspicious': 'suspicious', 'untested': 'untested', 'skipped': 'skipped'}
-for status in ('bad_survived', 'bad_timeout', 'ok_suspicious', 'untested'):
+names = {'bad_survived': 'survived', 'bad_timeout': 'timeout',
+         'ok_suspicious': 'suspicious', 'untested': 'untested'}
+for status in names:
     for mid, st, filename, line in rows:
         if st == status:
-            print(f'{names[st]:10} id {mid:4}  {filename}:{line}')
-print(f"TOTAL mutants {len(rows)}  killed {counts['ok_killed']}  "
+            # mutmut stores 0-based line numbers
+            print(f'{names[st]:10} {name} id {mid:4}  {filename}:{line + 1}')
+with open(totals, 'a') as f:
+    for _, st, _, _ in rows:
+        f.write(st + '\n')
+EOF
+    while read -r status group_name _ mid location; do
+        echo "$status $group_name id $mid  $location"
+        "$MUTMUT" show "$mid" </dev/null | sed -n '/^---/,$p' | sed 's/^/    /'
+    done <"$WORK/listing"
+    rm -f .mutmut-cache
+done
+
+"$PY" - "$TOTALS" <<'EOF'
+import os, sys
+from collections import Counter
+path = sys.argv[1]
+counts = Counter(open(path).read().split()) if os.path.exists(path) else Counter()
+total = sum(counts.values())
+print(f"TOTAL mutants {total}  killed {counts['ok_killed']}  "
       f"survived {counts['bad_survived']}  timeout {counts['bad_timeout']}  "
       f"suspicious {counts['ok_suspicious']}  untested {counts['untested']}")
-if not rows:
+if not total:
     print('ERROR no mutants were generated')
     raise SystemExit(2)
 bad = counts['bad_survived'] + counts['bad_timeout'] + counts['ok_suspicious'] + counts['untested']
