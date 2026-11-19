@@ -571,14 +571,15 @@ Design choices where the plan left room:
 ### 2. Test suite
 
 ```
-$ python3 -m pytest tests/ -q
-858 passed, 36 warnings in 127.44s
+$ python3 -m pytest tests/ -q -p no:cacheprovider -W ignore
+869 passed in 130.33s
 ```
 
 444 before the phase; 578 at the first submission, 622 after the mutation work (section 6),
 708 after the review round 1 fixes (section 8), 749 after the tests that kill that round's
 mutation survivors (section 10), 816 after review round 2 (section 11), 858 after review
-round 3 (section 14) and the tests that kill its mutation survivors (section 16).
+round 3 (section 14) and the tests that kill its mutation survivors (section 16), 869 after
+review round 4 (section 17).
 New test file `tests/test_llm.py`; new classes in `test_project.py`,
 `test_translator.py`, `test_cli.py`, `test_web.py`, `test_glossary.py`,
 `test_verify_scripts.py`. An autouse fixture in `tests/conftest.py` stubs `run_process`, so no
@@ -1297,6 +1298,99 @@ The five kills were confirmed with `phase1_survivor_kills.py r3-core6 r3-web23 r
 r3-web28 r3-web2` (all KILLED, `not killed 0`) and are in the full run of section 15.
 No timing assertion was added.
 
+### 17. Review round 4
+
+Static reviews by G (changes requested), O (approved with minor findings) and a third reviewer
+(approved with minor findings; its two findings became items 5 and 6). Every accepted item got
+a test that fails on the code before the fix; `scripts/verify/phase1_reverts.py` puts each
+round 4 behaviour back (rows `R4-…`, section 18). No finding was rejected as not reproducible.
+
+| # | finding | ruling | what was done | tests |
+|---|---|---|---|---|
+| 1 | G1, O3: re-translate releases its transaction during the model call; a project replaced meanwhile (same-name upload) has the segment of the same id at revision 0 again, and the old result is stored | accepted | re-translate keeps the segment's source (`html`, `text`) from its first transaction; the second transaction applies the outcome only when the current segment exists and has the same source, otherwise 409 "專案已在翻譯期間被重新建立，未套用新譯文" and nothing is written | `test_web.py::TestRound4RetranslateAcrossReplacement` (the project is re-created through the upload API while the call is held; the new segment stays PENDING with no translation) |
+| 2 | G3, O1: a worker added on resume is listed in `_threads` and counted in `active_workers` before `start()`; a failed start leaves a phantom count, the coordinator never ends and keeps the lock | accepted | the added worker is counted, started inside `try`, and listed only once started; a failed start undoes the count, sets `task.error` ("無法增加 worker：…") and `resume_translation` answers False (the endpoint answers 500 with the error and state `paused`). The task stays paused with the workers it has and can be resumed or stopped | `TestRound4ResumeWorkerStartFailure` (the second added worker fails: resume False, state `paused`, 2 counted and listed; a second resume completes the run, count 0, lock free) |
+| 3 | O2: five unexpected failures in a row end a web run through `_fail_task`, which reports the results of calls still in flight as unsaved | accepted | the coordinator sets the stop event (and wakes paused workers) instead of raising; it keeps receiving, applying and saving results until the workers have ended, then fails the task with the streak message. In-flight results are saved as in a normal stop and as in the parallel CLI | `TestRound4StreakKeepsInFlightResults` (a sixth call finishing a good translation after the streak fired: stored TRANSLATED, `unsaved` empty, state `failed`) |
+| 4 | O4: a same-name replacement overwrites `source.epub` before the new project is saved | accepted | the EPUB is copied to `source.epub.<random>.tmp` in the project directory and moved into place only after `pm.create()` saved; on any failure the temporary file is removed and the old `source.epub` and `project.json` stay | `TestRound4ReplacementFiles::test_failed_save_leaves_old_files`, `::test_new_epub_in_place_after_save` |
+| 5 | third reviewer, 1: a stream opened after the task ended (`completed`, `failed`, `stopped`) gets the initial status and then waits 30 s; the page never closes it or refreshes the failed count | accepted | the stream returns right after the initial status when the state is terminal; on a first status with a terminal state the page clears the current segment, refreshes the failed count and closes the stream | `TestRound4StreamAfterEnd` (3 states: the body is the status event only and the stream never waits; page handler) |
+| 6 | third reviewer, 2: the replacement creates the project directory before the mutex (a delete in between removes it: 500), and leaves the old book's `log/failed/` files | accepted | the directory is created under the mutex after the task check, before the file lock; after a successful replacement `log/failed/` is removed (other logs stay) | `TestRound4ReplacementFiles::test_directory_created_under_mutex`, `::test_old_failure_logs_removed` |
+| — | G2: with instantaneous failures, workers can fail more than five segments before the coordinator counts the fifth | rejected | recorded as a known consequence (below): the safeguard stops spending model calls on a broken run; instantaneous failures spend none, and the segments are retried with retry-failed | — |
+
+Changed existing tests: `TestRound3UnexpectedStreakWeb::test_run_stops_after_five` (the sixth,
+in-flight result is now saved: six segments FAILED, no unsaved suffix, `unsaved` empty);
+`TestStoppedStateSSE::test_sse_terminates_on_stopped` sets the task's state to `stopped` together
+with the event, as the coordinator does (it used to start the stream on a task already
+`stopped`, which now ends after the status); `TestTemplatesHandleErrors::test_retry_button_reactive`
+counts 4 calls of `refreshFailedCount()` (the ended first status is the fourth). No test was
+removed.
+
+### 18. Review round 4: evidence scripts
+
+Reverts whose code round 4 moved (rows 2, R3-1 and R3-9 web) follow it;
+`phase1_survivor_kills.py` entries r3-web26 and r3-web28 are re-anchored (the project creation
+of a replacement is indented one level more). Run on the commit "chore: re-anchor the
+re-translate revert after round 4" (durations and warning counts trimmed):
+
+```
+$ python3 scripts/verify/phase1_reverts.py
+…                                   (97 round 1 to 3 rows, all OK)
+OK   2 re-translate applies to its stale snapshot: 3 failed, 3 passed
+OK   R3-1 project replaced before the lock is taken: 3 failed, 1 passed
+OK   R3-9 web run goes on after five unexpected failures: 1 failed, 1 passed
+OK   R4-1 re-translation applied to a replaced project: 1 failed
+OK   R4-2 worker added on resume listed and counted before its start: 1 failed
+OK   R4-3 streak stop discards in-flight results: 1 failed
+OK   R4-4 source.epub written before the project is saved: 2 failed, 2 passed
+OK   R4-5 stream of an ended task waits for events: 3 failed, 1 passed
+OK   R4-5 page keeps the stream of an ended task: 1 failed, 3 passed
+OK   R4-6 project directory created before the mutex: 1 failed, 3 passed
+OK   R4-6 old failure logs kept after a replacement: 1 failed, 3 passed
+reverts not detected: 0
+$ python3 scripts/verify/phase1_survivor_kills.py
+KILLED core18 …                     (82 lines, all KILLED)
+not killed 0
+```
+
+The survivor-kill script was run on the commit "chore: re-anchor two survivor kills after
+round 4 moved the replacement code". The revert of row 2 was found unanchored by a first full
+run on that commit (`BAD … has the old text 0 times`, `reverts not detected: 1`) and fixed by
+the next commit; the run above is after it. The load check, run afterwards on the unmutated
+code (no mutation run in progress):
+
+```
+$ python3 scripts/verify/phase1_load_projects.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  segments 9521  pending 5333  translated 4188  reviewed 0  failed 0  round trip equal 7  model added 1  differs 0  failed projects 0
+$ echo $?
+0
+```
+
+### 19. Mutation testing after review round 4
+
+Only this round's changes: `scripts/verify/mutation.sh <BASE>` with BASE the commit "docs:
+record review round 3 of Phase 1 in the acceptance log" (passed on the command line), on the
+code of the commit "chore: revert checks for review round 4, select its web tests in the
+mutation run" (the web group's test selection now includes `Round4`; the later commits change
+only the evidence scripts and this log). Afterwards `git status` was clean and no `.bak` file
+was left; nothing was edited during the run.
+
+```
+$ scripts/verify/mutation.sh <BASE>
+== core: no changed lines
+== llm: no changed lines
+== web: mutating changed lines of src/web/tasks.py,…,src/web/blueprints/translation.py
+...
+== cli: no changed lines
+== scripts: no changed lines
+TOTAL mutants 35  killed 33  survived 2  timeout 0  suspicious 0  untested 0
+$ echo $?
+1
+```
+
+| mutant | mutation | disposition |
+|---|---|---|
+| web 16, 18 | defaults `'未知書名'`, `'未知作者'` (the lines moved into the replacement's `try`) | equivalent, as round 3's web 27/29: `EPUBExtractor.get_metadata()` always returns both keys (`'Unknown'` when absent), so the defaults are never used |
+
+No survivor needed a new test, so `phase1_survivor_kills.py` gets no new entry. No timing
+assertion was added.
 ### Known consequences
 
 - A project stops being loadable by `v1.0.0` (and by `main` before this phase) as soon as one
@@ -1341,6 +1435,18 @@ No timing assertion was added.
   translation tab. Five `unexpected` failures in a row end a web run as `failed` and a CLI run
   with exit 1; the segments already FAILED stay FAILED. A shortage of processes, memory or file
   descriptors at process start is retried, then fails the segment as `transient`.
+- Review round 4: a re-translation whose project was re-created under the same name during
+  the call answers 409 and changes nothing. A failed start of a worker added on resume leaves
+  the task paused (resume answers 500 with "無法增加 worker：…"). When five `unexpected`
+  failures in a row stop a web run, the calls in flight are awaited and their results saved
+  before the task fails, so the run can take as long to end as its slowest in-flight call. A
+  same-name replacement keeps the old `source.epub` and `project.json` when it fails, and
+  removes the old book's `log/failed/` after it succeeds. A progress stream opened on a task
+  that has already ended sends its status and ends.
+- Known consequence (review round 4, rejected G2): the five-failure cutoff is best-effort. It
+  is counted where the coordinator (or CLI loop) receives results, so when failures are
+  immediate (no model call spent) the workers can mark more than five segments FAILED before
+  the run stops. Those segments are retried with retry-failed.
 - Known limitation (review round 3): a request that itself contains a login or limit phrase,
   combined with a real error reply on stdout with exit code 0, is stored as a translation;
   output validation in Phase 4 is to catch it.
@@ -1391,3 +1497,10 @@ No timing assertion was added.
   once while files were mutated in place; it was run again afterwards on the unmutated code
   (same TOTAL line as section 5:
   `TOTAL projects 8  segments 9521  pending 5333  translated 4188  reviewed 0  failed 0  round trip equal 7  model added 1  differs 0  failed projects 0`, exit 0).
+- Review round 4: no real `claude` call. The replacement during a re-translation was made
+  through the upload API with a patched segmenter (one invented segment per book); the failed
+  save by patching `ProjectManager.save`; the delete before the create's mutex by a wrapper of
+  `project_mutex` that removes the directory; the failed worker start by patching
+  `Thread.start`. The page change (closing the stream on an ended first status) was checked
+  as rendered text, not in a browser. The load check was run after the mutation run, on
+  unmutated code.
