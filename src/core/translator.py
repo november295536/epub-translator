@@ -22,7 +22,7 @@ _SHARED_RULES = """1. 使用台灣慣用的繁體中文用語
 2. 專業術語請保留原文並用括號標註，例如：機器學習（machine learning）
 3. LaTeX 公式（$...$、$$...$$）保持不變，不要翻譯
 4. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來，並注意其他中英標點符號的使用方法，像是逗點的轉換
-5. 人名保持英文原文，嚴格禁止翻譯，例如：Nassim Taleb、Charity Majors, Miss Hyde, Lord Voldemort, Miss Pendleton 等。應該被翻譯成 Hyde 小姐、Voldemort 男爵、Pendleton 小姐等。
+5. 人名保持英文原文，嚴格禁止翻譯，例如：Orla Vintermark、Tobin Quayle, Miss Ferrowind, Lord Halvarth, Miss Dunmere 等。應該被翻譯成 Ferrowind 小姐、Halvarth 男爵、Dunmere 小姐等。
 6. 書名、文章名、論文名、組織名、電影名等：如果使用翻譯，請使用廣泛使用的翻譯版本，並務必加括號標注原文
 7. 地名、物種名稱等專有名詞：如有明確翻譯就用翻譯並加括號標註原文；如無確定翻譯則保留原文
 8. 翻譯名稱時不要出現什麼乖乖等錯誤翻譯的字眼

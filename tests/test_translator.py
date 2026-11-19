@@ -227,12 +227,12 @@ class TestResponseCleaning:
         assert TranslationEngine._clean_response('這是完全正常的翻譯文本。') == '這是完全正常的翻譯文本。'
 
     def test_removes_markdown_heading_prefix(self):
-        assert TranslationEngine._clean_response('# 可觀測性工程（Observability Engineering）') == '可觀測性工程（Observability Engineering）'
+        assert TranslationEngine._clean_response('# 霧港測量學（Harbor Fog Metrics）') == '霧港測量學（Harbor Fog Metrics）'
         assert TranslationEngine._clean_response('## 第一章 簡介') == '第一章 簡介'
         assert TranslationEngine._clean_response('### 小節標題') == '小節標題'
 
     def test_removes_markdown_bold(self):
-        assert TranslationEngine._clean_response('可觀測性更是一個**社會技術**概念') == '可觀測性更是一個社會技術概念'
+        assert TranslationEngine._clean_response('霧港測量更是一個**跨領域**概念') == '霧港測量更是一個跨領域概念'
         assert TranslationEngine._clean_response('這是__粗體__文字') == '這是粗體文字'
 
     def test_removes_markdown_italic(self):
