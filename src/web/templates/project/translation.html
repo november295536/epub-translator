@@ -312,6 +312,8 @@ function translationController() {
 
             this.eventSource.addEventListener('status', (e) => {
                 const data = JSON.parse(e.data);
+                // Ended before this stream opened: no closing event follows
+                const ended = this._isFirstStatus && ['completed', 'failed', 'stopped'].includes(data.state);
                 if (this._isFirstStatus) {
                     this.state = data.state;
                     if (data.error) this.error = data.error;
@@ -321,6 +323,12 @@ function translationController() {
                 this.total = data.total;
                 if (this.total > 0) {
                     this.percent = Math.round(this.completed / this.total * 1000) / 10;
+                }
+                if (ended) {
+                    this.currentSegment = null;
+                    this.refreshFailedCount();
+                    this.eventSource.close();
+                    this.eventSource = null;
                 }
             });
 
