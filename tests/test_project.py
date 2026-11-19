@@ -911,3 +911,81 @@ class TestRound1Exact:
     def test_mark_reviewed_with_text(self, pm):
         pm.mark_reviewed('ch1_seg0001', text='人工')
         assert pm._find('ch1_seg0001').translated_text == '人工'
+
+
+# --- Review round 2 ---------------------------------------------------------------
+
+from unittest.mock import patch as _patch
+
+
+def _closed(fd):
+    try:
+        os.fstat(fd)
+    except OSError:
+        return True
+    return False
+
+
+class TestRound2DescriptorLeaks:
+    """Item 19: no descriptor is left open on an error path."""
+
+    def test_save_closes_temporary_descriptor_when_fchmod_fails(self, project_dir):
+        import tempfile
+        pm = ProjectManager(project_dir)
+        pm.create('/b.epub', 'T', 'A', [])
+        made = []
+        real = tempfile.mkstemp
+
+        def mkstemp(**kwargs):
+            fd, path = real(**kwargs)
+            made.append(fd)
+            return fd, path
+
+        with _patch('src.core.project.tempfile.mkstemp', side_effect=mkstemp), \
+                _patch('src.core.project.os.fchmod', side_effect=OSError('denied')):
+            with pytest.raises(OSError):
+                pm.save()
+        assert made and _closed(made[0])
+        assert [f for f in os.listdir(project_dir) if f.endswith('.tmp')] == []
+
+    def test_save_still_closes_once_on_write_failure(self, project_dir):
+        pm = ProjectManager(project_dir)
+        pm.create('/b.epub', 'T', 'A', [])
+        with _patch('src.core.project.os.replace', side_effect=OSError('denied')):
+            with pytest.raises(OSError, match='denied'):
+                pm.save()
+        pm.save()  # nothing left in a bad state
+
+    def test_holder_pid_read_failure_closes_descriptor(self, project_dir):
+        os.makedirs(project_dir, exist_ok=True)
+        child = hold_lock_in_child(project_dir)
+        opened = []
+        real_open = os.open
+
+        def record(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        try:
+            with _patch('src.core.project.os.open', side_effect=record), \
+                    _patch('src.core.project.os.read', side_effect=OSError('io')):
+                with pytest.raises(OSError, match='io'):
+                    ProjectLock(project_dir).acquire()
+        finally:
+            child.stdin.close()
+            child.wait(timeout=10)
+        assert opened and _closed(opened[0])
+
+    def test_undecodable_holder(self, project_dir):
+        os.makedirs(project_dir, exist_ok=True)
+        child = hold_lock_in_child(project_dir)
+        try:
+            with open(os.path.join(project_dir, 'project.lock'), 'wb') as f:
+                f.write(b'\xff12')
+            with pytest.raises(ProjectLockedError) as info:
+                ProjectLock(project_dir).acquire()
+        finally:
+            child.stdin.close()
+            child.wait(timeout=10)
+        assert '（PID �12）' in str(info.value)
