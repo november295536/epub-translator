@@ -225,6 +225,25 @@ class TestTermExtractor:
         # Same term from both batches should be deduplicated
         assert len(terms) == 1
 
+    def test_batch_separator_counted_in_batch_size(self):
+        """Joined batch text must fit the per-call limit, so no tail is cut off."""
+        from src.glossary.term_extractor import MAX_CHARS_PER_BATCH
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '[]'
+
+        chunk = MAX_CHARS_PER_BATCH // 5
+        segments = [{'text': 'a' * chunk} for _ in range(4)]
+        segments.append({'text': 'a' * (chunk - 8) + 'TAILTERM'})
+
+        with patch('src.glossary.term_extractor.subprocess.run',
+                   return_value=mock_result) as mock_run:
+            TermExtractor().extract_from_segments(segments)
+
+        prompts = [c[0][0][2] for c in mock_run.call_args_list]
+        assert any('TAILTERM' in p for p in prompts)
+
     def test_extraction_error_propagates(self):
         """ExtractionError (e.g. auth error) should not be swallowed by broad except."""
         mock_result = MagicMock()

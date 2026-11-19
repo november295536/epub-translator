@@ -1323,3 +1323,58 @@ class TestStartWithSegmentIds:
 
         tm.stop_translation(PROJECT_NAME)
         TaskManager._instance = None
+
+
+class TestTermExtractionCoverage:
+    """Web term extraction reads every text segment and no code segment."""
+
+    def test_term_in_last_of_60_text_segments_is_sent(self, tmp_path):
+        import time
+        from src.web.blueprints.glossary import _extraction_tasks
+
+        projects_dir = str(tmp_path)
+        project_dir = os.path.join(projects_dir, PROJECT_NAME)
+        os.makedirs(project_dir, exist_ok=True)
+
+        segments = [
+            Segment(id=f'ch1_seg{i:04d}', html=f'<p>Plain filler sentence {i}.</p>',
+                    text=f'Plain filler sentence {i}.', word_count=4,
+                    segment_type=SegmentType.TEXT)
+            for i in range(1, 60)
+        ]
+        segments.insert(0, Segment(
+            id='ch1_seg0000', html='<pre>CODEONLYMARK = 1</pre>',
+            text='CODEONLYMARK = 1', word_count=3,
+            segment_type=SegmentType.CODE))
+        segments.append(Segment(
+            id='ch1_seg0060', html='<p>The zorblatt engine appears here.</p>',
+            text='The zorblatt engine appears here.', word_count=5,
+            segment_type=SegmentType.TEXT))
+        assert sum(1 for s in segments if s.segment_type == SegmentType.TEXT) == 60
+
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test Book', 'Author', segments)
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '[]'
+        mock_result.stderr = ''
+
+        app = create_app(projects_dir=projects_dir)
+        app.config['TESTING'] = True
+        _extraction_tasks.pop(PROJECT_NAME, None)
+        with patch('src.glossary.term_extractor.subprocess.run',
+                   return_value=mock_result) as mock_run:
+            with app.test_client() as client:
+                response = client.post(
+                    f'/api/projects/{PROJECT_NAME}/glossary/extract')
+                assert response.status_code == 200
+            deadline = time.time() + 10
+            while _extraction_tasks[PROJECT_NAME]['running'] and time.time() < deadline:
+                time.sleep(0.01)
+            assert not _extraction_tasks[PROJECT_NAME]['running']
+        _extraction_tasks.pop(PROJECT_NAME, None)
+
+        sent = '\n'.join(c[0][0][2] for c in mock_run.call_args_list)
+        assert 'zorblatt' in sent
+        assert 'CODEONLYMARK' not in sent
