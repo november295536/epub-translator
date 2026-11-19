@@ -448,7 +448,7 @@ class TestModelSelection:
             assert mock_run.call_args[0][0][4] == 'haiku'
 
 
-# A one-line source of more than 15 words that ends in a colon
+# A long one-line source, used where the reply is only a commentary line
 LONG_SOURCE = ('After the configuration file has been loaded and checked, '
                'the output of the first run looks like this:')
 
