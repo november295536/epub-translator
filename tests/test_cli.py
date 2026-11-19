@@ -471,6 +471,14 @@ class TestCLILock:
         assert lock_free_for_other_process(path)
 
 
+class TestCLIVersion:
+
+    def test_version(self, runner):
+        result = runner.invoke(cli, ['--version'])
+        assert result.exit_code == 0
+        assert '1.0.0' in result.output
+
+
 class TestCLIGlossaryExtract:
 
     def test_extract_uses_project_model(self, runner, tmp_path):

@@ -6,6 +6,7 @@ import os
 import sys
 import click
 
+from src import __version__
 from src.epub.extractor import EPUBExtractor
 from src.core.segmenter import Segmenter, SegmentType
 from src.core.project import ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus
@@ -36,6 +37,7 @@ def _get_glossary_path(project_dir: str) -> str:
 
 
 @click.group()
+@click.version_option(__version__, prog_name='epub-translator')
 def cli():
     """EPUB 智能翻譯系統 - Translate English EPUB books to Traditional Chinese."""
     pass
