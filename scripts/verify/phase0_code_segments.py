@@ -81,7 +81,9 @@ def check_project(project_file: str) -> tuple[int, list[str], list[str]]:
         if seg.get('status') not in TRANSLATED_STATUSES:
             continue
         translated += 1
-        source = seg['text']  # a missing source makes the project unreadable
+        source = seg['text']  # a missing or non-string source makes the project unreadable
+        if not isinstance(source, str):
+            raise TypeError('code segment text is not a string')
         output = seg.get('translated_text') or ''
         if not output.strip():
             empty.append(seg['segment_id'])
