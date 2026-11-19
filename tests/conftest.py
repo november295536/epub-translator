@@ -163,3 +163,96 @@ def epub_with_duplicate_spine(tmp_path):
     epub_path = str(tmp_path / 'duplicate_spine.epub')
     epub.write_epub(epub_path, book)
     return epub_path
+
+
+# --- Context call-site fixture ------------------------------------------------
+
+CONTEXT_CODE = '    CODEMARK = 1  # set it\n    return CODEMARK'
+
+
+def _context_segments():
+    from src.core.segmenter import Segment, SegmentType
+
+    def text(seg_id, body):
+        return Segment(id=seg_id, html=f'<p>{body}</p>', text=body,
+                       word_count=len(body.split()), segment_type=SegmentType.TEXT)
+
+    def code(seg_id):
+        return Segment(id=seg_id, html=f'<pre>{CONTEXT_CODE}</pre>', text=CONTEXT_CODE,
+                       word_count=6, segment_type=SegmentType.CODE)
+
+    long_previous = 'HEADMARK ' + 'filler words here ' * 20 + 'TAILMARK'
+    assert len(long_previous) > 200
+    return [
+        text('chA_seg0001', 'PREVCHAPTERMARK ends chapter A.'),
+        text('chB_seg0001', long_previous),
+        code('chB_seg0002'),
+        text('chB_seg0003', 'TARGETMARK is the segment under test.'),
+        code('chB_seg0004'),
+        text('chB_seg0005', 'NEXTTEXTMARK follows the code.'),
+        text('chC_seg0001', 'NEXTCHAPTERMARK starts chapter C.'),
+    ]
+
+
+@pytest.fixture
+def make_context_project():
+    """Create a project whose pending segments exercise context selection.
+
+    Chapter B is pending: a long text segment, code, the target text, code,
+    another text. Chapters A and C (one text segment each) are already
+    translated, so their text must never appear as context.
+    """
+    from src.core.project import ProjectManager
+
+    def make(project_dir):
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test Book', 'Author', _context_segments())
+        pm.mark_translated('chA_seg0001', '甲')
+        pm.mark_translated('chC_seg0001', '丙')
+        pm.save()
+        return project_dir
+
+    return make
+
+
+def fake_claude_run(cmd, *args, **kwargs):
+    """subprocess.run stand-in: echoes code back (with an indented first
+    line and a trailing newline), returns fixed HTML for text."""
+    from unittest.mock import MagicMock
+    result = MagicMock()
+    result.returncode = 0
+    result.stderr = ''
+    prompt = cmd[2]
+    result.stdout = (CONTEXT_CODE + '\n') if 'CODEMARK' in prompt and '<p>' not in prompt \
+        else '<p>譯文</p>'
+    return result
+
+
+def assert_context_prompts(prompts, project_dir):
+    """Check the prompts sent for chapter B and the stored code translation."""
+    from src.core.project import ProjectManager
+
+    def prompt_for(mark):
+        matches = [p for p in prompts if f'<p>{mark}' in p]
+        assert len(matches) == 1, mark
+        return matches[0]
+
+    first = prompt_for('HEADMARK')
+    assert 'PREVCHAPTERMARK' not in first          # other chapter
+    assert 'TARGETMARK' in first                   # code stepped over
+
+    target = prompt_for('TARGETMARK')
+    assert 'TAILMARK' in target                    # tail of the long previous
+    assert 'HEADMARK' not in target                # not its head
+    assert 'CODEMARK' not in target                # code never used as context
+    assert 'NEXTTEXTMARK' in target                # code stepped over
+
+    last = prompt_for('NEXTTEXTMARK')
+    assert 'NEXTCHAPTERMARK' not in last           # other chapter
+    assert 'TARGETMARK' in last
+
+    pm = ProjectManager(project_dir)
+    pm.load()
+    stored = {s.segment_id: s for s in pm.data.segments}
+    assert stored['chB_seg0002'].translated_text == CONTEXT_CODE
+    assert stored['chB_seg0004'].translated_text == CONTEXT_CODE
