@@ -347,7 +347,9 @@ item ships alone.
 - Web term extraction covers all text segments, not the first 50 segments including code
   (`glossary.py:113`).
 - Bug 5: the segmenter skips comments. New projects record `segmenter_version: 2` in
-  `project.json`; the builder keeps `main`'s walk for projects without it.
+  `project.json`; the builder keeps `main`'s walk for projects without it. A project created
+  after this phase cannot be loaded by pre-Phase-0 code (tag `v1.0.0`), which matters only for
+  a rollback.
 
 Acceptance (one unit test per item, each failing on the current code and passing after):
 
