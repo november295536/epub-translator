@@ -3,7 +3,7 @@
 
 Applies each surviving mutant listed below (as reported by
 scripts/verify/mutation.sh, by name <group><mutant id>; "r2-" for review
-round 2) by hand to a copy of the committed code (git archive HEAD, in a
+round 2, "r3-" for review round 3) by hand to a copy of the committed code (git archive HEAD, in a
 temporary directory removed afterwards) and runs the named tests. The tests
 must pass on the unmutated copy first (baseline); a mutant counts as killed
 only when pytest then exits 1 with failed tests (not on a collection,
@@ -64,7 +64,7 @@ M = [  # (name, file, old text, mutated text, tests)
  ('llm131','src/llm/fake.py',"auth_hint = 'fake: sign in again'","auth_hint = None",['tests/test_llm.py::TestRound1Exact::test_fake_auth_hint']),
  ('web155','src/web/blueprints/glossary.py','            stopped = None','            stopped = ""',['tests/test_web.py::TestRound1Exact::test_extraction_status_exact']),
  ('web160','src/web/blueprints/glossary.py',"f'提取中斷：{stopped}（已加入先前批次的 {count} 個術語）'","f'XX提取中斷：{stopped}（已加入先前批次的 {count} 個術語）XX'",['tests/test_web.py::TestRound1Exact::test_extraction_status_exact']),
- ('web162','src/web/blueprints/projects.py',"jsonify({'error': '專案正在翻譯中","jsonify({'XXerrorXX': '專案正在翻譯中",['tests/test_web.py::TestRound1Exact::test_delete_refused_message_exact']),
+ ('web162','src/web/blueprints/projects.py',"jsonify({'error': '專案正在翻譯中，請先停止翻譯再刪除","jsonify({'XXerrorXX': '專案正在翻譯中，請先停止翻譯再刪除",['tests/test_web.py::TestRound1Exact::test_delete_refused_message_exact']),
  ('web163','src/web/blueprints/projects.py',"'專案正在翻譯中，請先停止翻譯再刪除'","'XX專案正在翻譯中，請先停止翻譯再刪除XX'",['tests/test_web.py::TestRound1Exact::test_delete_refused_message_exact']),
  ('web171','src/web/blueprints/review.py',"        return jsonify({'error': str(e)}), 404\n    return jsonify({'status': 'ok', 'segment_id': segment_id})\n\n\n@review_bp.route('/api/projects/<project_name>/segments/<segment_id>/approve'","        return jsonify({'error': str(e)}), 404\n    return jsonify({'XXstatusXX': 'ok', 'segment_id': segment_id})\n\n\n@review_bp.route('/api/projects/<project_name>/segments/<segment_id>/approve'",['tests/test_web.py::TestRound1Exact::test_review_responses_exact']),
  ('web175','src/web/blueprints/review.py',"        return jsonify({'error': str(e)}), 404\n    return jsonify({'status': 'ok', 'segment_id': segment_id})\n\n\n@review_bp.route('/api/projects/<project_name>/segments/<segment_id>/retranslate'","        return jsonify({'error': str(e)}), 404\n    return jsonify({'status': 'XXokXX', 'segment_id': segment_id})\n\n\n@review_bp.route('/api/projects/<project_name>/segments/<segment_id>/retranslate'",['tests/test_web.py::TestRound1Exact::test_review_responses_exact']),
@@ -109,6 +109,11 @@ M = [  # (name, file, old text, mutated text, tests)
  # Round 1 survivors whose disposition review round 2 corrected (G9, G14)
  ('llm16','src/llm/cli.py','KILL_WAIT_SECONDS = 2','KILL_WAIT_SECONDS = 3',['tests/test_llm.py::TestRound2PartialOutputAfterKill::test_captured_output_kept']),
  ('llm51','src/llm/cli.py','            if time.monotonic() > deadline:','            if time.monotonic() >= deadline:',['tests/test_llm.py::TestRound2DeadlineBoundary::test_finished_exactly_at_deadline']),
+ ('r3-core6','src/core/translator.py',"    trace = ''.join(traceback","    trace = 'XXXX'.join(traceback",['tests/test_translator.py::TestRound3UnexpectedFailureLog::test_log_has_type_message_traceback_and_request']),
+ ('r3-web23','src/web/blueprints/projects.py',"final_epub_path = os.path.join(project_dir, 'source.epub')","final_epub_path = os.path.join(project_dir, 'XXsource.epubXX')",['tests/test_web.py::TestRound3ReplaceProjectUnderLock::test_replacement_written']),
+ ('r3-web26','src/web/blueprints/projects.py',"title=metadata.get('title', '未知書名'),\n                    author","title=metadata.get('XXtitleXX', '未知書名'),\n                    author",['tests/test_web.py::TestRound3ReplaceProjectUnderLock::test_replacement_written']),
+ ('r3-web28','src/web/blueprints/projects.py',"author=metadata.get('author', '未知作者'),\n                    segments","author=metadata.get('XXauthorXX', '未知作者'),\n                    segments",['tests/test_web.py::TestRound3ReplaceProjectUnderLock::test_replacement_written']),
+ ('r3-web2','src/web/tasks.py',"                raise FileNotFoundError('專案不存在')\n            with ProjectLock","                raise FileNotFoundError('XX專案不存在XX')\n            with ProjectLock",['tests/test_web.py::TestRound3MissingProject::test_set_model_creates_no_lock_file']),
 ]
 
 

@@ -136,7 +136,8 @@ r('11 model select keeps a refused model',
   [('src/web/templates/project/translation.html', '                this.model = previous;\n', '')],
   ['tests/test_web.py::TestTemplatesHandleErrors'])
 r('22 retry button rendered by the server only',
-  [('src/web/templates/project/translation.html', "                this.refreshFailedCount();\n                this.eventSource.close();", "                this.eventSource.close();")],
+  [('src/web/templates/project/translation.html', "                this.refreshFailedCount();\n                this.eventSource.close();\n                this.eventSource = null;\n            });\n\n            this.eventSource.addEventListener('error'",
+    "                this.eventSource.close();\n                this.eventSource = null;\n            });\n\n            this.eventSource.addEventListener('error'")],
   ['tests/test_web.py::TestTemplatesHandleErrors'])
 r('12 model list from the Claude module',
   [(TR, '    return [asdict(m) for m in llm.default_backend().list_models()]',
@@ -161,7 +162,7 @@ r('13 stderr quoted whole in the Claude error',
   [('src/llm/claude_cli.py', "f'{stderr.strip()[:ERROR_CHARS]}')", "f'{stderr.strip()}')")],
   ['tests/test_llm.py::TestClassificationOfReplies::test_error_messages_bounded'])
 r('14 timeout drops the output',
-  [(LLM, "                                 raw=_text(e.output) + _text(e.stderr))", "                                 )")],
+  [(LLM, "                                 raw=(_text(e.output) + _text(e.stderr))[:KEPT_OUTPUT_CHARS])", "                                 )")],
   ['tests/test_llm.py::TestTimeoutKeepsOutput'])
 r('15 missing program is a per-segment error',
   [(LLM, '            raise BackendUnavailableError(', '            raise LLMError(')],
@@ -179,7 +180,7 @@ r('17 edit keeps FAILED and issues',
     '')],
   ['tests/test_project.py::TestManualEditClearsFailure', 'tests/test_web.py::TestEditRemovesFailureLog'])
 r('18 delete ignores a running task',
-  [('src/web/blueprints/projects.py', '    if TaskManager().task_active(project_name):', '    if False:')],
+  [('src/web/blueprints/projects.py', "        if TaskManager().task_active(project_name):\n            return jsonify({'error': '專案正在翻譯中，請先停止翻譯再刪除'}", "        if False:\n            return jsonify({'error': '專案正在翻譯中，請先停止翻譯再刪除'}")],
   ['tests/test_web.py::TestDeleteGuard::test_delete_refused_while_task_runs'])
 r('18 delete ignores the lock of another process',
   [('src/web/blueprints/projects.py', '            lock.acquire()\n        except ProjectLockedError as e:',
