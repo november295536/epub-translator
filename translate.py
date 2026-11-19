@@ -9,7 +9,7 @@ import click
 from src.epub.extractor import EPUBExtractor
 from src.core.segmenter import Segmenter, SegmentType
 from src.core.project import ProjectManager
-from src.core.translator import TranslationEngine, TranslationError
+from src.core.translator import TranslationEngine, TranslationError, get_context
 from src.glossary.glossary_manager import GlossaryManager
 from src.epub.builder import EPUBBuilder
 
@@ -144,14 +144,11 @@ def _start_sequential(pm, gm, pending, all_segments, progress):
 
         glossary_text = ''
         if gm.entries:
-            found = gm.find_terms_in_text(seg.text)
+            found = gm.terms_for_prompt(seg.text)
             if found:
                 glossary_text = gm.format_for_prompt(found)
 
-        seg_idx = next((j for j, s in enumerate(all_segments)
-                        if s.segment_id == seg.segment_id), -1)
-        context_before = all_segments[seg_idx - 1].text if seg_idx > 0 else ''
-        context_after = all_segments[seg_idx + 1].text if seg_idx < len(all_segments) - 1 else ''
+        context_before, context_after = get_context(all_segments, seg.segment_id)
 
         try:
             html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
@@ -198,14 +195,11 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers):
 
             glossary_text = ''
             if gm.entries:
-                found = gm.find_terms_in_text(seg.text)
+                found = gm.terms_for_prompt(seg.text)
                 if found:
                     glossary_text = gm.format_for_prompt(found)
 
-            seg_idx = next((j for j, s in enumerate(all_segments)
-                            if s.segment_id == seg.segment_id), -1)
-            context_before = all_segments[seg_idx - 1].text if seg_idx > 0 else ''
-            context_after = all_segments[seg_idx + 1].text if seg_idx < len(all_segments) - 1 else ''
+            context_before, context_after = get_context(all_segments, seg.segment_id)
 
             try:
                 html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''

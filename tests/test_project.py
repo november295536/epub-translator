@@ -237,6 +237,71 @@ class TestModelField:
         pm2.load()
         assert pm2.data.model == 'sonnet'
 
+    def test_new_project_records_segmenter_version_2(self, project_dir, sample_segments):
+        ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments)
+        with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
+            assert json.load(f)['segmenter_version'] == 2
+        pm = ProjectManager(project_dir)
+        pm.load()
+        assert pm.data.segmenter_version == 2
+
+    def test_project_without_segmenter_version_loads_as_1_unchanged(
+            self, project_dir, sample_segments):
+        ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments)
+        path = os.path.join(project_dir, 'project.json')
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        del data['segmenter_version']
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        with open(path, 'rb') as f:
+            before = f.read()
+
+        pm = ProjectManager(project_dir)
+        pm.load()
+
+        assert pm.data.segmenter_version == 1
+        with open(path, 'rb') as f:
+            assert f.read() == before
+
+    def test_saving_project_without_segmenter_version_keeps_it_absent(
+            self, project_dir, sample_segments):
+        # Pre-Phase-0 code cannot load a project.json that has the field
+        ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments)
+        path = os.path.join(project_dir, 'project.json')
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        del data['segmenter_version']
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+
+        pm = ProjectManager(project_dir)
+        pm.load()
+        pm.set_model('opus')
+        pm.save()
+
+        with open(path, 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+        assert 'segmenter_version' not in saved
+        assert saved['model'] == 'opus'
+        pm2 = ProjectManager(project_dir)
+        pm2.load()
+        assert pm2.data.segmenter_version == 1
+
+    def test_version_2_project_keeps_segmenter_version_through_save(
+            self, project_dir, sample_segments):
+        ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments)
+        pm = ProjectManager(project_dir)
+        pm.load()
+        pm.set_model('opus')
+        pm.save()
+
+        with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
+            assert json.load(f)['segmenter_version'] == 2
+        pm2 = ProjectManager(project_dir)
+        pm2.load()
+        assert pm2.data.segmenter_version == 2
+
     def test_set_model_without_load(self, project_dir):
         pm = ProjectManager(project_dir)
         with pytest.raises(RuntimeError, match="No project"):

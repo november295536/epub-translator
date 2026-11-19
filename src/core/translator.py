@@ -22,7 +22,7 @@ _SHARED_RULES = """1. 使用台灣慣用的繁體中文用語
 2. 專業術語請保留原文並用括號標註，例如：機器學習（machine learning）
 3. LaTeX 公式（$...$、$$...$$）保持不變，不要翻譯
 4. 英文中的引號強調（"quoted term"）翻譯時使用「」括起來，並注意其他中英標點符號的使用方法，像是逗點的轉換
-5. 人名保持英文原文，嚴格禁止翻譯，例如：Nassim Taleb、Charity Majors, Miss Hyde, Lord Voldemort, Miss Pendleton 等。應該被翻譯成 Hyde 小姐、Voldemort 男爵、Pendleton 小姐等。
+5. 人名保持英文原文，嚴格禁止翻譯，例如：Orla Vintermark、Tobin Quayle, Miss Ferrowind, Lord Halvarth, Miss Dunmere 等。應該被翻譯成 Ferrowind 小姐、Halvarth 男爵、Dunmere 小姐等。
 6. 書名、文章名、論文名、組織名、電影名等：如果使用翻譯，請使用廣泛使用的翻譯版本，並務必加括號標注原文
 7. 地名、物種名稱等專有名詞：如有明確翻譯就用翻譯並加括號標註原文；如無確定翻譯則保留原文
 8. 翻譯名稱時不要出現什麼乖乖等錯誤翻譯的字眼
@@ -100,6 +100,62 @@ _MD_BOLD_PATTERN = re.compile(r'\*\*(.+?)\*\*|__(.+?)__')
 # Markdown italic: *text* or _text_ (but not inside ASCII words like 3*5 or foo_bar)
 _MD_ITALIC_PATTERN = re.compile(r'(?<![0-9a-zA-Z])\*(.+?)\*(?![0-9a-zA-Z])|(?<![0-9a-zA-Z])_(.+?)_(?![0-9a-zA-Z])')
 
+# Blank lines at the very start of a response (indentation of the first
+# non-blank line is not part of the match)
+_LEADING_BLANK_LINES = re.compile(r'\A(?:[ \t]*\r?\n)+')
+
+# A response that is entirely wrapped in one code fence (the body may be empty)
+_CODE_FENCE_PATTERN = re.compile(r'\A```[^\n]*\n(?:(.*)\n)?```\Z', re.DOTALL)
+
+
+def _starts_with_commentary(text: str) -> bool:
+    """True when the first line of text matches the first two _START_PATTERNS
+    (e.g. "看起來…原樣輸出：" or "Here is…")."""
+    return any(re.match(p, text + '\n') for p in _START_PATTERNS[:2])
+
+
+def _is_empty_reply(translated: str, source: str) -> bool:
+    """True when a cleaned reply holds no translation: nothing, or only
+    backticks and whitespace unless the source holds nothing else. A reply
+    that is only a commentary line is not judged here (as on main)."""
+    t = translated.strip()
+    if re.sub(r'[`\s]', '', t):
+        return False
+    return not t or bool(re.sub(r'[`\s]', '', source))
+
+
+# Number of characters of each neighbouring segment used as context
+CONTEXT_CHARS = 200
+
+
+def get_context(segments, segment_id: str) -> tuple:
+    """Return (context_before, context_after) source texts for a segment.
+
+    On each side, code segments are stepped over to the nearest text
+    segment; the search never crosses into another chapter. A side with no
+    such segment is an empty string.
+
+    Args:
+        segments: All project segments in reading order (objects with
+                  segment_id, chapter_id, segment_type and text).
+        segment_id: ID of the segment about to be translated.
+    """
+    ids = [s.segment_id for s in segments]
+    if segment_id not in ids:
+        return '', ''
+    idx = ids.index(segment_id)
+    chapter_id = segments[idx].chapter_id
+
+    def nearest_text(step: int) -> str:
+        i = idx + step
+        while 0 <= i < len(segments) and segments[i].chapter_id == chapter_id:
+            if segments[i].segment_type != SegmentType.CODE:
+                return segments[i].text
+            i += step
+        return ''
+
+    return nearest_text(-1), nearest_text(1)
+
 
 class TranslationError(Exception):
     """Raised when translation fails."""
@@ -151,7 +207,8 @@ class TranslationEngine:
         Raises:
             TranslationError: If translation fails after all retries.
         """
-        use_html_mode = bool(html) and segment_type != SegmentType.CODE
+        is_code = segment_type == SegmentType.CODE
+        use_html_mode = bool(html) and not is_code
         prompt = self._build_prompt(text, segment_type, glossary_text,
                                     context_before, context_after, html=html)
 
@@ -189,8 +246,11 @@ class TranslationEngine:
                         )
                     continue
 
-                translated = result.stdout.strip()
-                if not translated:
+                # Code keeps its leading whitespace (first-line indentation)
+                raw = result.stdout if is_code else result.stdout.strip()
+                translated = self._clean_response(raw, html_mode=use_html_mode,
+                                                  code_mode=is_code, source=text)
+                if _is_empty_reply(translated, text):
                     logger.warning(
                         "Empty translation result (attempt %d/%d)",
                         attempt, self.max_retries,
@@ -201,7 +261,7 @@ class TranslationEngine:
                         )
                     continue
 
-                return self._clean_response(translated, html_mode=use_html_mode)
+                return translated
 
             except subprocess.TimeoutExpired:
                 logger.warning(
@@ -239,9 +299,9 @@ class TranslationEngine:
         if context_before or context_after:
             parts = []
             if context_before:
-                parts.append(f'前文參考（不需翻譯）：\n{context_before[:200]}')
+                parts.append(f'前文參考（不需翻譯）：\n{context_before[-CONTEXT_CHARS:]}')
             if context_after:
-                parts.append(f'後文參考（不需翻譯）：\n{context_after[:200]}')
+                parts.append(f'後文參考（不需翻譯）：\n{context_after[:CONTEXT_CHARS]}')
             context_section = '\n'.join(parts) + '\n'
 
         if segment_type == SegmentType.CODE:
@@ -260,14 +320,40 @@ class TranslationEngine:
             )
 
     @staticmethod
-    def _clean_response(text: str, html_mode: bool = False) -> str:
+    def _clean_response(text: str, html_mode: bool = False,
+                        code_mode: bool = False, source: str = '') -> str:
         """Remove common Claude response prefixes, formatting artifacts, and markdown syntax.
 
         Args:
             text: The raw response from Claude.
             html_mode: If True, only strip prefix/suffix commentary but preserve
                        all HTML tags and structure (no markdown stripping).
+            code_mode: If True, the response is source code: only a wrapping
+                       code fence, surrounding blank lines and trailing
+                       whitespace are removed. Indentation and characters
+                       that look like markdown (#, *, _) are kept.
+            source: The source code (code mode only). When it contains a
+                    code fence itself, the response is not unwrapped.
+
+        In code mode, a first line matching the first two start patterns is
+        removed unless the source's first non-blank line matches them too.
+        Then, when the source has no fence, a response that is one fenced
+        block is reduced to the fenced body (an empty fence gives '').
         """
+        if code_mode:
+            cleaned = _LEADING_BLANK_LINES.sub('', text).rstrip()
+            if (_starts_with_commentary(cleaned)
+                    and not _starts_with_commentary(_LEADING_BLANK_LINES.sub('', source))):
+                cleaned = _LEADING_BLANK_LINES.sub('', cleaned.partition('\n')[2])
+            if '```' not in source:
+                fenced = _CODE_FENCE_PATTERN.match(cleaned)
+                if fenced:
+                    body = fenced.group(1) or ''
+                    # Only a single block: a fence inside the body means several
+                    if '```' not in body:
+                        cleaned = _LEADING_BLANK_LINES.sub('', body).rstrip()
+            return cleaned
+
         cleaned = text
         for pattern in _START_PATTERNS:
             cleaned = re.sub(pattern, '', cleaned)

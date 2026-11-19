@@ -8,6 +8,7 @@ import copy
 import ebooklib
 from ebooklib import epub
 from bs4 import BeautifulSoup, Tag, NavigableString
+from bs4.element import PreformattedString
 
 from src.core.project import ProjectManager, SegmentState
 from src.core.segmenter import SegmentType, _is_container
@@ -136,7 +137,7 @@ class EPUBBuilder:
         if not body:
             return
 
-        elements = self._walk_content_elements(body)
+        elements = self._walk_content_elements(body, legacy=self._legacy_walk())
 
         elem_idx = 0
         for seg in segments:
@@ -163,10 +164,23 @@ class EPUBBuilder:
 
         item.set_content(str(soup).encode('utf-8'))
 
-    def _walk_content_elements(self, parent) -> list:
-        """Walk body elements in the same order as the segmenter, flattening div/section/article."""
+    def _legacy_walk(self) -> bool:
+        """True when chapters must be walked as the segmenter did before it
+        skipped comments: projects with segmenter_version 1 (created before
+        the field existed), and when no project data is loaded."""
+        data = self.pm.data
+        return data is None or data.segmenter_version < 2
+
+    def _walk_content_elements(self, parent, legacy: bool) -> list:
+        """Walk body elements in the same order as the segmenter, flattening div/section/article.
+
+        With ``legacy=True`` comments are treated as text, as the segmenter
+        did before it skipped them (segmenter_version 1).
+        """
         elements = []
         for child in parent.children:
+            if not legacy and isinstance(child, PreformattedString):
+                continue
             if isinstance(child, NavigableString):
                 if child.strip():
                     elements.append(child)
@@ -174,8 +188,8 @@ class EPUBBuilder:
             if not isinstance(child, Tag):
                 continue
             if child.name in ('div', 'section', 'article'):
-                if _is_container(child):
-                    elements.extend(self._walk_content_elements(child))
+                if _is_container(child, legacy):
+                    elements.extend(self._walk_content_elements(child, legacy))
                 else:
                     text = child.get_text(separator=' ', strip=True)
                     if text:

@@ -1,0 +1,180 @@
+{
+  "comment_holds_markup": {
+    "chapter": "<html><body><!--<p>Draft</p>--><h1>Title</h1><p>Body.</p></body></html>",
+    "segments": [
+      {
+        "segment_id": "ch1_seg0001",
+        "chapter_id": "ch1",
+        "html": "<p>Draft</p>",
+        "text": "Draft",
+        "word_count": 1,
+        "segment_type": "text",
+        "translated_text": "<p>T0</p>"
+      },
+      {
+        "segment_id": "ch1_seg0002",
+        "chapter_id": "ch1",
+        "html": "<h1>Title</h1>",
+        "text": "Title",
+        "word_count": 1,
+        "segment_type": "text",
+        "translated_text": "<p>T1</p>"
+      },
+      {
+        "segment_id": "ch1_seg0003",
+        "chapter_id": "ch1",
+        "html": "<p>Body.</p>",
+        "text": "Body.",
+        "word_count": 1,
+        "segment_type": "text",
+        "translated_text": "<p>T2</p>"
+      }
+    ],
+    "exports": {
+      "chinese-only": "<html><body>T0<h1>T1</h1><p>T2</p></body></html>",
+      "bilingual-horizontal": "<html><body><div class=\"bilingual-container\"><div class=\"original\"><!--<p>Draft</p>--></div><div class=\"translation\"><p>T0</p></div></div><div class=\"bilingual-container\"><div class=\"original\"><h1>Title</h1></div><div class=\"translation\"><p>T1</p></div></div><div class=\"bilingual-container\"><div class=\"original\"><p>Body.</p></div><div class=\"translation\"><p>T2</p></div></div></body></html>",
+      "bilingual-vertical": "<html><body><div class=\"bilingual-vertical\"><div class=\"original\"><!--<p>Draft</p>--></div><div class=\"translation\"><p>T0</p></div></div><div class=\"bilingual-vertical\"><div class=\"original\"><h1>Title</h1></div><div class=\"translation\"><p>T1</p></div></div><div class=\"bilingual-vertical\"><div class=\"original\"><p>Body.</p></div><div class=\"translation\"><p>T2</p></div></div></body></html>"
+    }
+  },
+  "comment_with_entity": {
+    "chapter": "<html><body><!-- a &amp; b --><p>One</p><p>Two</p></body></html>",
+    "segments": [
+      {
+        "segment_id": "ch1_seg0001",
+        "chapter_id": "ch1",
+        "html": "a & b \n<p>One</p>\n<p>Two</p>",
+        "text": "a & b\nOne\nTwo",
+        "word_count": 5,
+        "segment_type": "text",
+        "translated_text": "<p>T0</p>"
+      }
+    ],
+    "exports": {
+      "chinese-only": "<html><body><p>T0</p></body></html>",
+      "bilingual-horizontal": "<html><body><div class=\"bilingual-container\"><div class=\"original\"><!-- a &amp; b --><p>One</p><p>Two</p></div><div class=\"translation\"><p>T0</p></div></div></body></html>",
+      "bilingual-vertical": "<html><body><div class=\"bilingual-vertical\"><div class=\"original\"><!-- a &amp; b --><p>One</p><p>Two</p></div><div class=\"translation\"><p>T0</p></div></div></body></html>"
+    }
+  },
+  "comment_equals_text": {
+    "chapter": "<html><body><!--note-->note<h1>Title</h1></body></html>",
+    "segments": [
+      {
+        "segment_id": "ch1_seg0001",
+        "chapter_id": "ch1",
+        "html": "notenote",
+        "text": "notenote",
+        "word_count": 1,
+        "segment_type": "text",
+        "translated_text": "T0"
+      },
+      {
+        "segment_id": "ch1_seg0002",
+        "chapter_id": "ch1",
+        "html": "<h1>Title</h1>",
+        "text": "Title",
+        "word_count": 1,
+        "segment_type": "text",
+        "translated_text": "<p>T1</p>"
+      }
+    ],
+    "exports": {
+      "chinese-only": "<html><body>T0T1<h1>Title</h1></body></html>",
+      "bilingual-horizontal": "<html><body><div class=\"bilingual-container\"><div class=\"original\"><!--note--></div><div class=\"translation\"><p>T0</p></div></div><div class=\"bilingual-container\"><div class=\"original\">note</div><div class=\"translation\"><p>T1</p></div></div><h1>Title</h1></body></html>",
+      "bilingual-vertical": "<html><body><div class=\"bilingual-vertical\"><div class=\"original\"><!--note--></div><div class=\"translation\"><p>T0</p></div></div><div class=\"bilingual-vertical\"><div class=\"original\">note</div><div class=\"translation\"><p>T1</p></div></div><h1>Title</h1></body></html>"
+    }
+  },
+  "legacy_div": {
+    "chapter": "<html><body><div class=\"box\"><!-- c --><p>One</p><p>Two</p></div><p>Three</p></body></html>",
+    "segments": [
+      {
+        "segment_id": "ch1_seg0001",
+        "chapter_id": "ch1",
+        "html": "<div class=\"box\"><!-- c --><p>One</p><p>Two</p></div>\n<p>Three</p>",
+        "text": "One Two\nThree",
+        "word_count": 3,
+        "segment_type": "text",
+        "translated_text": "<p>T0</p>"
+      }
+    ],
+    "exports": {
+      "chinese-only": "<html><body><p>T0</p></body></html>",
+      "bilingual-horizontal": "<html><body><div class=\"bilingual-container\"><div class=\"original\"><div class=\"box\"><!-- c --><p>One</p><p>Two</p></div><p>Three</p></div><div class=\"translation\"><p>T0</p></div></div></body></html>",
+      "bilingual-vertical": "<html><body><div class=\"bilingual-vertical\"><div class=\"original\"><div class=\"box\"><!-- c --><p>One</p><p>Two</p></div><p>Three</p></div><div class=\"translation\"><p>T0</p></div></div></body></html>"
+    }
+  },
+  "body_comment_text": {
+    "chapter": "<html><body><p>Zero</p><!-- c --><p>One</p></body></html>",
+    "segments": [
+      {
+        "segment_id": "ch1_seg0001",
+        "chapter_id": "ch1",
+        "html": "<p>Zero</p>\n c \n<p>One</p>",
+        "text": "Zero\nc\nOne",
+        "word_count": 3,
+        "segment_type": "text",
+        "translated_text": "<p>T0</p>"
+      }
+    ],
+    "exports": {
+      "chinese-only": "<html><body><p>T0</p></body></html>",
+      "bilingual-horizontal": "<html><body><div class=\"bilingual-container\"><div class=\"original\"><p>Zero</p><!-- c --><p>One</p></div><div class=\"translation\"><p>T0</p></div></div></body></html>",
+      "bilingual-vertical": "<html><body><div class=\"bilingual-vertical\"><div class=\"original\"><p>Zero</p><!-- c --><p>One</p></div><div class=\"translation\"><p>T0</p></div></div></body></html>"
+    }
+  },
+  "comment_between_blocks": {
+    "chapter": "<html><body><h1>Title</h1><!-- note --><p>Para one.</p><pre>x = 1</pre></body></html>",
+    "segments": [
+      {
+        "segment_id": "ch1_seg0001",
+        "chapter_id": "ch1",
+        "html": "<h1>Title</h1>",
+        "text": "Title",
+        "word_count": 1,
+        "segment_type": "text",
+        "translated_text": "<p>T0</p>"
+      },
+      {
+        "segment_id": "ch1_seg0002",
+        "chapter_id": "ch1",
+        "html": " note \n<p>Para one.</p>",
+        "text": "note\nPara one.",
+        "word_count": 3,
+        "segment_type": "text",
+        "translated_text": "<p>T1</p>"
+      },
+      {
+        "segment_id": "ch1_seg0003",
+        "chapter_id": "ch1",
+        "html": "<pre>x = 1</pre>",
+        "text": "x = 1",
+        "word_count": 3,
+        "segment_type": "code",
+        "translated_text": "<p>T2</p>"
+      }
+    ],
+    "exports": {
+      "chinese-only": "<html><body><h1>T0</h1><p>T1</p><pre>&lt;p&gt;T2&lt;/p&gt;</pre></body></html>",
+      "bilingual-horizontal": "<html><body><div class=\"bilingual-container\"><div class=\"original\"><h1>Title</h1></div><div class=\"translation\"><p>T0</p></div></div><div class=\"bilingual-container\"><div class=\"original\"><!-- note --><p>Para one.</p></div><div class=\"translation\"><p>T1</p></div></div><div class=\"bilingual-container\"><div class=\"original\"><pre>x = 1</pre></div><div class=\"translation\"><pre><code>&lt;p&gt;T2&lt;/p&gt;</code></pre></div></div></body></html>",
+      "bilingual-vertical": "<html><body><div class=\"bilingual-vertical\"><div class=\"original\"><h1>Title</h1></div><div class=\"translation\"><p>T0</p></div></div><div class=\"bilingual-vertical\"><div class=\"original\"><!-- note --><p>Para one.</p></div><div class=\"translation\"><p>T1</p></div></div><div class=\"bilingual-vertical\"><div class=\"original\"><pre>x = 1</pre></div><div class=\"translation\"><pre><code>&lt;p&gt;T2&lt;/p&gt;</code></pre></div></div></body></html>"
+    }
+  },
+  "nested_equal_count": {
+    "chapter": "<html><body><div><!-- note --><h2 id=\"s\">Heading</h2></div></body></html>",
+    "segments": [
+      {
+        "segment_id": "ch1_seg0001",
+        "chapter_id": "ch1",
+        "html": "<div><!-- note --><h2 id=\"s\">Heading</h2></div>",
+        "text": "Heading",
+        "word_count": 1,
+        "segment_type": "text",
+        "translated_text": "<p>T0</p>"
+      }
+    ],
+    "exports": {
+      "chinese-only": "<html><body><div>T0</div></body></html>",
+      "bilingual-horizontal": "<html><body><div class=\"bilingual-container\"><div class=\"original\"><div><!-- note --><h2 id=\"s\">Heading</h2></div></div><div class=\"translation\"><p>T0</p></div></div></body></html>",
+      "bilingual-vertical": "<html><body><div class=\"bilingual-vertical\"><div class=\"original\"><div><!-- note --><h2 id=\"s\">Heading</h2></div></div><div class=\"translation\"><p>T0</p></div></div></body></html>"
+    }
+  }
+}

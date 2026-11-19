@@ -1323,3 +1323,127 @@ class TestStartWithSegmentIds:
 
         tm.stop_translation(PROJECT_NAME)
         TaskManager._instance = None
+
+
+class TestTermExtractionCoverage:
+    """Web term extraction reads every text segment and no code segment."""
+
+    def test_term_in_last_of_60_text_segments_is_sent(self, tmp_path):
+        import time
+        from src.web.blueprints.glossary import _extraction_tasks
+
+        projects_dir = str(tmp_path)
+        project_dir = os.path.join(projects_dir, PROJECT_NAME)
+        os.makedirs(project_dir, exist_ok=True)
+
+        segments = [
+            Segment(id=f'ch1_seg{i:04d}', html=f'<p>Plain filler sentence {i}.</p>',
+                    text=f'Plain filler sentence {i}.', word_count=4,
+                    segment_type=SegmentType.TEXT)
+            for i in range(1, 60)
+        ]
+        segments.insert(0, Segment(
+            id='ch1_seg0000', html='<pre>CODEONLYMARK = 1</pre>',
+            text='CODEONLYMARK = 1', word_count=3,
+            segment_type=SegmentType.CODE))
+        # The term sits beyond the per-call character limit of its own segment
+        last_text = 'Long filler text. ' * 400 + 'The zorblatt engine appears here.'
+        assert last_text.index('zorblatt') > 5000
+        segments.append(Segment(
+            id='ch1_seg0060', html=f'<p>{last_text}</p>',
+            text=last_text, word_count=len(last_text.split()),
+            segment_type=SegmentType.TEXT))
+        assert sum(1 for s in segments if s.segment_type == SegmentType.TEXT) == 60
+
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test Book', 'Author', segments)
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '[]'
+        mock_result.stderr = ''
+
+        app = create_app(projects_dir=projects_dir)
+        app.config['TESTING'] = True
+        _extraction_tasks.pop(PROJECT_NAME, None)
+        with patch('src.glossary.term_extractor.subprocess.run',
+                   return_value=mock_result) as mock_run:
+            with app.test_client() as client:
+                response = client.post(
+                    f'/api/projects/{PROJECT_NAME}/glossary/extract')
+                assert response.status_code == 200
+            deadline = time.time() + 10
+            while _extraction_tasks[PROJECT_NAME]['running'] and time.time() < deadline:
+                time.sleep(0.01)
+            assert not _extraction_tasks[PROJECT_NAME]['running']
+        _extraction_tasks.pop(PROJECT_NAME, None)
+
+        sent = '\n'.join(c[0][0][2] for c in mock_run.call_args_list)
+        assert 'zorblatt' in sent
+        assert 'CODEONLYMARK' not in sent
+
+
+class TestRetranslateContext:
+    """Retranslation takes context from the same chapter only."""
+
+    def test_previous_chapter_not_used_as_context(self, client, project_with_translations):
+        from src.glossary.glossary_manager import GlossaryManager
+        GlossaryManager(os.path.join(project_with_translations, PROJECT_NAME,
+                                     'glossary.json')).add_term('GLOSSMARK', '詞彙')
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '<h2>第二章</h2>'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run',
+                   return_value=mock_result) as mock_run:
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch2_seg0001/retranslate')
+
+        assert response.status_code == 200
+        prompt = mock_run.call_args[0][0][2]
+        assert 'Second paragraph.' not in prompt   # last segment of chapter 1
+        assert 'Chapter 2 content.' in prompt      # next segment, same chapter
+        assert 'GLOSSMARK → 詞彙' in prompt         # small glossary: all entries
+
+
+class TestWorkerContext:
+    """The prompts built by the web worker use same-chapter, non-code context."""
+
+    @pytest.mark.parametrize('num_workers', [1, 3])
+    def test_worker_prompts(self, tmp_path, make_context_project, num_workers):
+        from tests.conftest import fake_claude_run, assert_context_prompts
+        projects_dir = str(tmp_path)
+        project_dir = make_context_project(os.path.join(projects_dir, PROJECT_NAME))
+
+        TaskManager._instance = None
+        tm = TaskManager()
+        task = TranslationTask(task_id='ctx', project_name=PROJECT_NAME,
+                               projects_dir=projects_dir, state='running',
+                               total=5, num_workers=num_workers)
+        _setup_task_pm(task, projects_dir)
+
+        with patch('src.core.translator.subprocess.run',
+                   side_effect=fake_claude_run) as mock_run:
+            thread = threading.Thread(target=tm._run_translation, args=(task,))
+            thread.start()
+            thread.join(timeout=20)
+
+        assert task.state == 'completed'
+        prompts = [c[0][0][2] for c in mock_run.call_args_list]
+        assert len(prompts) == 5
+        assert_context_prompts(prompts, project_dir)
+        TaskManager._instance = None
+
+
+class TestCreateProjectMarker:
+
+    def test_web_created_project_records_segmenter_version_2(self, tmp_path, sample_epub):
+        app = create_app(projects_dir=str(tmp_path / 'projects'))
+        app.config['TESTING'] = True
+        with app.test_client() as client:
+            response = client.post('/api/projects', json={
+                'epub_path': sample_epub, 'project_name': 'marker'})
+        assert response.status_code == 200, response.get_json()
+        path = tmp_path / 'projects' / 'marker' / 'project.json'
+        assert json.loads(path.read_text(encoding='utf-8'))['segmenter_version'] == 2

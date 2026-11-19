@@ -81,9 +81,60 @@ class TestGlossaryManager:
         text = 'This chapter discusses machine learning and deep learning algorithms.'
         found = gm.find_terms_in_text(text)
 
-        terms = [e.term for e in found]
-        assert 'machine learning' in terms or 'deep learning' in terms
-        assert 'database' not in terms
+        assert [e.term for e in found] == ['deep learning', 'machine learning']
+
+    def _found(self, gm, text):
+        return [e.term for e in gm.find_terms_in_text(text)]
+
+    def test_term_must_start_at_a_word_boundary(self, gm):
+        gm.add_term('AI', '人工智慧')
+        assert self._found(gm, 'We maintain the main trail.') == []
+        assert self._found(gm, 'Modern AI, explained.') == ['AI']
+        assert self._found(gm, 'the ai boom') == ['AI']  # case-insensitive
+
+    def test_any_continuation_matches(self, gm):
+        gm.add_term('API', '應用程式介面')
+        gm.add_term('render', '算繪')
+        assert self._found(gm, 'Public APIs change.') == ['API']
+        assert self._found(gm, 'The rendering step.') == ['render']
+
+    def test_terms_with_symbols(self, gm):
+        gm.add_term('C++', 'C++')
+        gm.add_term('C#', 'C#')
+        gm.add_term('.NET', '.NET')
+        assert self._found(gm, 'Written in C++, mostly.') == ['C++']
+        assert self._found(gm, 'Ported to C# later.') == ['C#']
+        assert self._found(gm, 'Runs on .NET today.') == ['.NET']
+        assert self._found(gm, 'The (.NET) runtime and (C++) code.') == ['.NET', 'C++']
+        # Accepted limitation: '.' is preceded by a word character
+        assert self._found(gm, 'Built on ASP.NET Core.') == []
+
+    def test_multi_word_terms_match_any_whitespace(self, gm):
+        gm.add_term('machine learning', '機器學習')
+        assert self._found(gm, 'About machine\nlearning.') == ['machine learning']
+        assert self._found(gm, 'About machine\xa0learning.') == ['machine learning']
+        assert self._found(gm, 'About machine  learning.') == ['machine learning']
+        assert self._found(gm, 'About machinelearning.') == []
+
+    @pytest.mark.parametrize('term', ['', '   '])
+    def test_empty_term_never_matches(self, gm, term):
+        gm.entries[term] = GlossaryEntry(term=term, translation='x')
+        assert gm.find_terms_in_text('any text at all') == []
+
+    def test_small_glossary_gives_every_entry_to_the_prompt(self, gm):
+        from src.glossary.glossary_manager import FULL_GLOSSARY_MAX_TERMS
+        assert FULL_GLOSSARY_MAX_TERMS == 150
+        for i in range(FULL_GLOSSARY_MAX_TERMS):
+            gm.entries[f'term{i:03}'] = GlossaryEntry(term=f'term{i:03}', translation='x')
+        terms = [e.term for e in gm.terms_for_prompt('unrelated text')]
+        assert terms == sorted(gm.entries)
+
+    def test_large_glossary_gives_matching_entries_to_the_prompt(self, gm):
+        from src.glossary.glossary_manager import FULL_GLOSSARY_MAX_TERMS
+        for i in range(FULL_GLOSSARY_MAX_TERMS):
+            gm.entries[f'term{i:03}'] = GlossaryEntry(term=f'term{i:03}', translation='x')
+        gm.entries['ai'] = GlossaryEntry(term='AI', translation='人工智慧')  # 151 entries
+        assert [e.term for e in gm.terms_for_prompt('We maintain term007s.')] == ['term007']
 
     def test_format_for_prompt(self, gm):
         gm.add_term('API', '應用程式介面', category='term')
@@ -188,6 +239,93 @@ class TestTermExtractor:
 
         # Same term from both batches should be deduplicated
         assert len(terms) == 1
+
+    def test_batch_separator_counted_in_batch_size(self):
+        """Joined batch text must fit the per-call limit, so no tail is cut off."""
+        from src.glossary.term_extractor import MAX_CHARS_PER_BATCH
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '[]'
+
+        chunk = MAX_CHARS_PER_BATCH // 5
+        segments = [{'text': 'a' * chunk} for _ in range(4)]
+        segments.append({'text': 'a' * (chunk - 8) + 'TAILTERM'})
+
+        with patch('src.glossary.term_extractor.subprocess.run',
+                   return_value=mock_result) as mock_run:
+            TermExtractor().extract_from_segments(segments)
+
+        prompts = [c[0][0][2] for c in mock_run.call_args_list]
+        assert any('TAILTERM' in p for p in prompts)
+
+    @staticmethod
+    def _sent_texts(mock_run):
+        marker = '文本：\n'
+        return [c[0][0][2].split(marker, 1)[1] for c in mock_run.call_args_list]
+
+    def test_oversized_segment_split_without_loss(self):
+        """A single text longer than the batch limit is split, not truncated."""
+        from src.glossary.term_extractor import MAX_CHARS_PER_BATCH
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '[]'
+
+        words = ' '.join(f'word{i}' for i in range(2000))
+        text = words[:6000] + ' BEYONDLIMIT ' + words[6000:12000] + ' ENDTERM'
+        assert text.index('BEYONDLIMIT') > MAX_CHARS_PER_BATCH
+
+        with patch('src.glossary.term_extractor.subprocess.run',
+                   return_value=mock_result) as mock_run:
+            TermExtractor().extract_from_segments(
+                [{'text': 'Short first segment.'}, {'text': text}])
+
+        sent = self._sent_texts(mock_run)
+        assert all(len(t) <= MAX_CHARS_PER_BATCH for t in sent)
+        joined = ''.join(sent)
+        assert 'BEYONDLIMIT' in joined and 'ENDTERM' in joined
+        assert any('BEYONDLIMIT' in t for t in sent)
+        # Lossless: every character of the long text was sent, in order
+        assert joined.replace('\n\n', '').endswith(text)
+
+    def test_split_text_is_lossless_and_bounded(self):
+        from src.glossary.term_extractor import _split_text
+        text = ('alpha beta gamma ' * 50) + 'x' * 120 + ' tail'
+        chunks = _split_text(text, 100)
+        assert ''.join(chunks) == text
+        assert all(0 < len(c) <= 100 for c in chunks)
+        # Breaks after whitespace where there is some
+        assert chunks[0].endswith(' ')
+        assert _split_text('short', 100) == ['short']
+        assert _split_text('', 100) == []
+
+    def test_split_text_boundaries(self):
+        from src.glossary.term_extractor import _split_text
+        assert _split_text('ab cd', 5) == ['ab cd']                 # exactly at the limit
+        assert _split_text('aaaa\nbbbb', 6) == ['aaaa\n', 'bbbb']  # newline as break
+        assert _split_text('aaaa\tbbbb', 6) == ['aaaa\t', 'bbbb']  # tab as break
+        assert _split_text(' abcdef', 4) == [' ', 'abcd', 'ef']     # break after index 0
+
+    def test_segment_without_text_sends_nothing(self):
+        with patch('src.glossary.term_extractor.subprocess.run') as mock_run:
+            assert TermExtractor().extract_from_segments([{}]) == []
+        mock_run.assert_not_called()
+
+    def test_batch_filled_exactly_to_limit_is_one_call(self):
+        from src.glossary.term_extractor import MAX_CHARS_PER_BATCH
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '[]'
+        half = (MAX_CHARS_PER_BATCH - 2) // 2
+        segments = [{'text': 'a' * half}, {'text': 'b' * half}]
+        assert len('\n\n'.join(s['text'] for s in segments)) == MAX_CHARS_PER_BATCH
+
+        with patch('src.glossary.term_extractor.subprocess.run',
+                   return_value=mock_result) as mock_run:
+            TermExtractor().extract_from_segments(segments)
+
+        assert mock_run.call_count == 1
 
     def test_extraction_error_propagates(self):
         """ExtractionError (e.g. auth error) should not be swallowed by broad except."""
