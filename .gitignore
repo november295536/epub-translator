@@ -28,3 +28,7 @@ uploads/
 
 # Git worktrees
 .worktree/
+
+# Mutation testing (mutmut)
+.mutmut-cache
+html/
