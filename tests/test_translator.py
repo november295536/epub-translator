@@ -614,6 +614,27 @@ class TestContext:
         ]
         assert get_context(segments, 'a_2') == ('', '')
 
+    def test_code_neighbours_stepped_over_to_text(self):
+        segments = [
+            _state('a_1', 'a', 'Text before.'),
+            _state('a_2', 'a', 'x = 1', SegmentType.CODE),
+            _state('a_3', 'a', 'z = 0', SegmentType.CODE),
+            _state('a_4', 'a', 'Current text.'),
+            _state('a_5', 'a', 'y = 2', SegmentType.CODE),
+            _state('a_6', 'a', 'Text after.'),
+        ]
+        assert get_context(segments, 'a_4') == ('Text before.', 'Text after.')
+
+    def test_stepping_over_code_stops_at_chapter_boundary(self):
+        segments = [
+            _state('a_1', 'a', 'Previous chapter text.'),
+            _state('b_1', 'b', 'x = 1', SegmentType.CODE),
+            _state('b_2', 'b', 'Current text.'),
+            _state('b_3', 'b', 'y = 2', SegmentType.CODE),
+            _state('c_1', 'c', 'Next chapter text.'),
+        ]
+        assert get_context(segments, 'b_2') == ('', '')
+
     def test_first_last_and_unknown_segment(self):
         segments = [_state('a_1', 'a', 'One.'), _state('a_2', 'a', 'Two.')]
         assert get_context(segments, 'a_1') == ('', 'Two.')
