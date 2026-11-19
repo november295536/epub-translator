@@ -436,6 +436,7 @@ class TaskManager:
                 task._threads.append(t)
 
             streak = UnexpectedStreak()
+            streak_stop = None  # the streak's message once it stopped the run
 
             # Result processing loop
             while True:
@@ -474,14 +475,22 @@ class TaskManager:
                 stop = None
                 for res in batch:
                     stop = streak.add(res.outcome) or stop
-                if stop:
-                    raise RuntimeError(stop)
+                if stop and streak_stop is None:
+                    # Stop dispatching; the calls in flight are still
+                    # received and saved, then the run fails
+                    streak_stop = stop
+                    with task._lock:
+                        task.stop_event.set()
+                        task.pause_event.set()
 
                 # Results that arrived meanwhile are taken by the next round
                 with task._lock:
                     workers_done = task.active_workers == 0
                 if workers_done and task.result_queue.empty():
                     break
+
+            if streak_stop:
+                raise RuntimeError(streak_stop)
 
             # Set final state
             if task.stop_event.is_set() or task.state == 'stopped':
