@@ -17,11 +17,13 @@
 # script's #! line).
 #
 # mutmut edits the source files in place while it runs and restores them
-# afterwards; do not edit or commit while it runs. On Ctrl-C or SIGTERM the
-# script stops mutmut and its test processes and puts back any file mutmut
-# had mutated (from mutmut's <file>.bak). Everything else (mutmut cache,
-# patch, runner, pytest and TMPDIR temporary files) goes to a private
-# directory from mktemp -d, removed on exit.
+# afterwards; do not edit or commit while it runs. On exit, including Ctrl-C,
+# SIGTERM or a mutmut failure, the script stops mutmut and its test processes,
+# puts back any file mutmut had mutated (from mutmut's <file>.bak) and warns if
+# a mutated file is still modified. mutmut keeps its cache in .mutmut-cache in
+# the repository root (git-ignored), deleted after each group and on exit. The
+# patch, runner, pytest and TMPDIR temporary files and the bytecode cache go to
+# a private directory from mktemp -d, removed on exit.
 #
 # Exit code: 0 when no mutant survived, timed out or is suspicious, 1 when
 # some did, 2 when mutmut failed or generated no mutants.
@@ -71,21 +73,23 @@ done
 WORK="$(mktemp -d)"
 MUTPID=""
 cleanup() {
+    trap '' INT TERM  # a second Ctrl-C must not cut the cleanup short
     if [[ -n "$MUTPID" ]]; then
         # mutmut runs in its own process group (set -m): stop it and its tests
         kill -TERM -- "-$MUTPID" 2>/dev/null || true
         wait "$MUTPID" 2>/dev/null || true
         sleep 1
         kill -KILL -- "-$MUTPID" 2>/dev/null || true
-        for f in "${ALL_FILES[@]}"; do
-            if [[ -e "$f.bak" ]]; then
-                mv -f "$f.bak" "$f"
-                echo "restored $f" >&2
-            fi
-        done
-        if [[ -n "$(git status --porcelain -- "${ALL_FILES[@]}")" ]]; then
-            echo "WARNING files still modified: git status -- ${ALL_FILES[*]}" >&2
+    fi
+    # The start-up guard ensures no .bak existed before this run
+    for f in "${ALL_FILES[@]}"; do
+        if [[ -e "$f.bak" ]]; then
+            mv -f "$f.bak" "$f"
+            echo "restored $f" >&2
         fi
+    done
+    if [[ -n "$(git status --porcelain -- "${ALL_FILES[@]}")" ]]; then
+        echo "WARNING files still modified: git status -- ${ALL_FILES[*]}" >&2
     fi
     rm -f .mutmut-cache
     rm -rf "$WORK"
@@ -148,7 +152,7 @@ EOF
         --runner "$RUNNER" --no-progress --CI >/dev/null &
     MUTPID=$!
     if ! wait "$MUTPID"; then
-        MUTPID=""
+        # MUTPID stays set: cleanup stops any test process left in its group
         echo "ERROR mutmut failed for group $name" >&2
         exit 2
     fi
