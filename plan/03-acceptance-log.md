@@ -496,7 +496,7 @@ suite, 3.12.7 for mutmut, as in Phase 0).
 | Item | Where | Main names |
 |---|---|---|
 | Backend interface (4.4) | `src/llm/base.py` | `Message`, `LLMRequest`, `LLMResponse`, `Usage`, `Capabilities`, `ModelInfo`, `LLMBackend` (Protocol); errors `LLMError` > `RateLimitError(retry_after)`, `AuthError`, `TransientError`, `RefusalError`, `CancelledError` |
-| CLI base class | `src/llm/cli.py` | `run_process` (the only process start for model calls: `Popen` in a new session, stdin empty, polls every 0.1 s for cancel and deadline, kills the process group), `CLIBackend` (environment cleaning via `env_remove`, working directory `tempfile.gettempdir()`, timeout → `TransientError`, start failure → `LLMError`), `flatten_prompt` |
+| CLI base class | `src/llm/cli.py` | `run_process` (the only process start for model calls: `Popen` in a new session, stdin empty, polls every 0.1 s for cancel, waits bounded by the deadline, kills and reaps the process group on timeout, cancel or any exception, exit hook for calls still running), `CLIBackend` (environment cleaning via `env_remove`, working directory `tempfile.gettempdir()`, timeout → `TransientError` with the output so far, start failure → `BackendUnavailableError`), `flatten_prompt` |
 | Claude CLI backend | `src/llm/claude_cli.py` | `ClaudeCLI`: `build_command`, `parse_output`, `classify_error`, `list_models`; `MODELS` (the former `AVAILABLE_MODELS` data) |
 | Fake backend | `src/llm/fake.py` | `FakeBackend(replies=… or responder=…)`, records `requests` |
 | Backend selection | `src/llm/__init__.py` | `default_backend()` (returns `ClaudeCLI()`; tests replace it) |
@@ -512,7 +512,8 @@ Design choices where the plan left room:
 
 - **Lock.** An exclusive `fcntl.flock` on `<project>/project.lock` (the file holds the
   holder's PID, for the message; it is left in place on release). Threads of one process
-  share the lock (a per-path count), other processes get `ProjectLockedError`. Taken by every
+  share the lock (a per-path count), other processes get `ProjectLockedError`; within the
+  process, one mutex per project serializes changes and saves (review round 1). Taken by every
   `save()` (briefly), by CLI `start` for the whole run, and by the web task from
   `start_translation` until its coordinator ends. The kernel drops a flock when its holder
   exits in any way, so a lock left by a dead process never blocks and no PID check is needed.
@@ -534,11 +535,11 @@ Design choices where the plan left room:
 - **Classification.** As before: "You've hit your limit" in stdout or stderr → rate limit;
   `authentication_error|OAuth token has expired|please run /login` → auth (both whatever the
   exit code); non-zero exit or timeout → transient (retried, 3 attempts); an empty reply after
-  cleanup → retried. New: the program missing (`OSError` on start) → `LLMError`, not retried
+  cleanup → retried. New: the program missing (`OSError` on start) → `BackendUnavailableError`, a run-level error (review round 1, item 15), not retried
   (before: an uncaught exception that killed the worker). Term extraction now also stops on a
   rate limit (before: only on an auth error with a non-zero exit) and passes `--model`.
-- **Diagnostics.** `<project>/log/failed/<segment id>.txt` (characters outside `[\w.-]`
-  replaced by `_`): segment, model, time, error, the request, and per failed attempt its
+- **Diagnostics.** `<project>/log/failed/<segment id>-<digest>.txt` (characters outside `[\w.-]`
+  replaced by `_`, at most 100, then the first 10 hex digits of the id's SHA-256; review round 1): segment, model, time, error, the request, and per failed attempt its
   message and raw output (stdout + stderr, at most 20 000 characters each). One file per
   segment, replaced on each failed run: bounded by the number of segments. Removed when the
   segment later translates; nothing is written for a success.
@@ -557,10 +558,12 @@ Design choices where the plan left room:
 
 ```
 $ python3 -m pytest tests/ -q
-622 passed, 32 warnings in 66.09s
+749 passed, 32 warnings in 113.50s
 ```
 
-444 before the phase; 578 at the first submission, 622 after the mutation work (section 6).
+444 before the phase; 578 at the first submission, 622 after the mutation work (section 6),
+708 after the review round 1 fixes (section 8), 749 after the tests that kill that round's
+mutation survivors (section 10).
 New test file `tests/test_llm.py`; new classes in `test_project.py`,
 `test_translator.py`, `test_cli.py`, `test_web.py`, `test_glossary.py`,
 `test_verify_scripts.py`. An autouse fixture in `tests/conftest.py` stubs `run_process`, so no
@@ -652,20 +655,26 @@ $ grep -rn "subprocess" src/ translate.py | cut -d: -f1 | sort | uniq -c
 
 ### 5. Existing projects load unchanged
 
+After review round 1 (the check now also compares an in-memory save with the file, item 20):
+
 ```
 $ python3 scripts/verify/phase1_load_projects.py --projects-dir <repo>/projects --anonymize
-PASS project-1: segments 220, pending 0, translated 220, reviewed 0, failed 0
-PASS project-2: segments 291, pending 0, translated 291, reviewed 0, failed 0
-PASS project-3: segments 4385, pending 4349, translated 36, reviewed 0, failed 0
-PASS project-4: segments 2236, pending 903, translated 1333, reviewed 0, failed 0
-PASS project-5: segments 840, pending 7, translated 833, reviewed 0, failed 0
-PASS project-6: segments 581, pending 0, translated 581, reviewed 0, failed 0
-PASS project-7: segments 637, pending 74, translated 563, reviewed 0, failed 0
-PASS project-8: segments 331, pending 0, translated 331, reviewed 0, failed 0
-TOTAL projects 8  segments 9521  pending 5333  translated 4188  reviewed 0  failed 0  failed projects 0
+PASS project-1: segments 220, pending 0, translated 220, reviewed 0, failed 0, round trip model added
+PASS project-2: segments 291, pending 0, translated 291, reviewed 0, failed 0, round trip equal
+PASS project-3: segments 4385, pending 4349, translated 36, reviewed 0, failed 0, round trip equal
+PASS project-4: segments 2236, pending 903, translated 1333, reviewed 0, failed 0, round trip equal
+PASS project-5: segments 840, pending 7, translated 833, reviewed 0, failed 0, round trip equal
+PASS project-6: segments 581, pending 0, translated 581, reviewed 0, failed 0, round trip equal
+PASS project-7: segments 637, pending 74, translated 563, reviewed 0, failed 0, round trip equal
+PASS project-8: segments 331, pending 0, translated 331, reviewed 0, failed 0, round trip equal
+TOTAL projects 8  segments 9521  pending 5333  translated 4188  reviewed 0  failed 0  round trip equal 7  model added 1  differs 0  failed projects 0
 $ echo $?
 0
 ```
+
+Size, modification time and path of every `project.json`, `project.lock` and `*.tmp` under
+`projects/` were listed before and after this run: identical (8 `project.json`, no lock or
+temporary file).
 
 A project FAILs when loading raises, when `project.json`'s SHA-256 or modification time
 (nanoseconds) changed, or when the set of files in the project directory changed (so a
@@ -673,8 +682,9 @@ created lock file would fail it). Size and modification time of every `project.j
 `project.lock` under `projects/` were also listed before and after the run: identical
 (no lock file exists there). Covered by `tests/test_verify_scripts.py::TestLoadCheck`.
 
-Round trip and `v1.0.0`, on copies of the 8 `project.json` files in a temporary directory
-(deleted afterwards): load and save with the branch, compare with the original, then load the
+Round trip is now part of the check above ("round trip"). The earlier, one-off check with
+`v1.0.0` (first submission, not repeated), on copies of the 8 `project.json` files in a
+temporary directory (deleted afterwards): load and save with the branch, compare with the original, then load the
 saved file with `v1.0.0`'s `src/core/project.py`:
 
 ```
@@ -731,9 +741,11 @@ The 5 timeouts of run 2 (`cli.py:23` `POLL_SECONDS = None`, `cli.py:54`
 `start_new_session=False`, `cli.py:63` `cancel is None`, `tasks.py` Empty path
 `workers_done = None` and `break` → `continue`) are detected: the tests do not finish.
 
-Expected for run 3: the 4 killed/changed rows above gone, the 11 equivalent or
-performance-only rows (13 mutants) left. Run 3 was started (`scripts/verify/mutation.sh`, about
-1 h) but had not finished when this entry was committed; its TOTAL line is not recorded here.
+Run 3 was started on that code but not finished; it was abandoned. The rows above marked
+performance-only for `cli.py:23` and `cli.py:66` were wrong at the time (review G10: a poll
+could accept output after the deadline or after a cancel); `run_process` was fixed in review
+round 1, after which the poll interval affects only latency. The complete run on the final
+code is in section 10.
 
 ### 7. One real call
 
@@ -766,6 +778,230 @@ Stored segment (`html`/`text` omitted): `{'segment_id': 'c1_seg0001', 'chapter_i
 project directory held `project.json` and `project.lock` afterwards, and no `log/` directory
 (nothing is written for a success). Usage: not reported by this invocation, so not stored.
 
+### 8. Review round 1
+
+Three static reviews (G, O and a third reviewer whose two extra findings became items 24 and
+25). Each accepted item got a test that fails on the code before the fix; the evidence is
+`scripts/verify/phase1_reverts.py`, which puts every old behaviour back, one at a time, into
+a copy of the committed code and runs the guarding tests (section 9). No finding was
+rejected as not reproducible.
+
+| # | finding | ruling | what was done | tests |
+|---|---|---|---|---|
+| 1 | G1, O12: saves from several `ProjectManager`s of one project share `project.json.<pid>.tmp` | accepted | `project_mutex(project_dir)`: one `RLock` per real project path, shared by every manager (`pm.mutex`); `save()` holds it and the flock, writes a `tempfile.mkstemp` file of its own (mode of the existing `project.json`, else 0644) and removes it on failure | `test_project.py::TestSharedProjectMutex` (3), `TestAtomicSave::test_original_intact_if_write_fails` (changed: the temp name is no longer predictable, so the replace is made to fail; also checks no `.tmp` is left) |
+| 2 | G2, O3: web handlers without a running task each load their own copy; re-translate saves a stale snapshot | accepted | `TaskManager.transaction()`: the project mutex plus the authoritative manager (the task's while it runs, is paused or its threads are still alive, else a fresh load). Edit, approve, set-model and re-translate use it. Re-translate snapshots the segments in one transaction, calls the model outside it, then in a second transaction rechecks the revision on the current state, applies and saves. `start_translation` loads and registers the task under the mutex | `test_web.py::TestRetranslateDetails::test_edit_during_retranslation_is_kept` (rewritten: a real edit request, no patched `get_pm`), `TestRetranslateTransaction` (3: other segment not reverted; edit from a second request thread; edit while a stopped task is still ending) |
+| 3 | G3, O5: revision check and write not atomic | accepted | `apply_outcome`, `update_translation`, `mark_reviewed`, `mark_translated`, `set_model` and the serialization in `to_json()` run under the project mutex | `test_project.py::TestApplyOutcomeAtomic` (3) |
+| 4 | G4: a start can overlap a task whose threads are alive; simultaneous starts | accepted | starts serialized by `TaskManager._start_lock`; after waiting `STOP_WAIT_SECONDS` (5) for the old coordinator, a start is refused with 409 "上一個翻譯任務仍在結束中…" while its coordinator or any worker is alive | `test_web.py::TestOverlappingTasks` (2) |
+| 5 | G5, O8: lock leaks on logging setup, thread start, PID write | accepted | logging set up inside the coordinator's `try`; a failing `coordinator.start()` releases the lock and marks the task failed (HTTP 500); `ProjectLock.acquire` closes the descriptor when anything after `flock()` fails | `test_web.py::TestStartFailures` (2), `test_project.py::TestLockAcquireFailure` |
+| 6 | G6, O8: a failing supervisor releases the lock with workers running | accepted | web: `_fail_task` sets stop and pause events, joins every worker, drains the result queue and reports the segment ids applied but not saved (task error, log, `error` event with `unsaved`). CLI parallel: on any `BaseException` stops dispatch, joins the (now daemon) workers, prints the unsaved ids, re-raises | `test_web.py::TestCoordinatorFailure` (2, one with a worker paused on a rate limit), `test_cli.py::TestCLISupervisorFailure` (`OSError` and `KeyboardInterrupt`) |
+| 7 | G7: a run error after stop re-pauses and deadlocks | accepted | the worker's handler checks `stop_event` under the task lock before clearing or waiting | `test_web.py::TestStopThenLateRunError` (auth, rate limit) |
+| 8 | G8, O1: children left running on exceptional exit | accepted | `run_process` kills the group and reaps on any exception after `Popen` (then re-raises); the post-kill `communicate` waits at most `KILL_WAIT_SECONDS` (2), then closes the pipes; live groups are tracked and killed by one `atexit` hook. No signal handlers | `test_llm.py::TestRunProcessExceptionalExit` (`KeyboardInterrupt`, a `setsid` grandchild holding the pipes, the hook called directly, a child process left in a daemon thread at interpreter exit) |
+| 9 | G9, O12: failure-log I/O errors and unexpected worker exceptions lose work | accepted | writing or removing the failure log: `OSError` logged, outcome returned. Web and CLI workers turn an unexpected exception into a FAILED outcome (issue code `unexpected`) for that segment. `test_lock_released_on_error` now asserts status and exit code (its warning filter removed) | `test_translator.py::TestDiagnosticWriteFailure` (3), `test_web.py::TestWorkerUnexpectedErrors` (2), `test_cli.py::TestCLIUnexpectedErrors` (3), `TestCLILock::test_lock_released_on_error` (changed) |
+| 10 | G10: cancel and deadline bypassable within one poll | accepted | cancel checked before `Popen`; each wait is `min(POLL_SECONDS, time left)`; after the process ends, a set cancel or a passed deadline still raises. `POLL_SECONDS` now only affects cancel latency | `test_llm.py::TestRunProcessCancelAndDeadline` (3) |
+| 11 | G11: 409 invisible in the UI | accepted | review save/approve: a non-success response marks the segment "未儲存" (failed style, error as tooltip) and alerts; model select reverts to the stored model and shows the error | `test_web.py::TestTemplatesHandleErrors` (string checks of the rendered pages) |
+| 12 | G12, O10: Claude specifics outside `src/llm/` | accepted | backends have `default_model` and `auth_hint`; `translator.available_models()` / `default_model()` ask `default_backend()` (constants `AVAILABLE_MODELS` / `DEFAULT_MODEL` removed); `--model` is checked against the backend's list when used; new projects and projects without `model` get the backend's default; templates take the auth hint from a context processor; the review button title no longer names Claude | `test_web.py::TestBackendModels` (4), `test_cli.py::TestCLIBackendModels`, `test_translator.py::TestEngineDefaultModel`, `test_llm.py::TestBackendDefaults`; `TestModelSelection` changed to the functions |
+| 13 | G13: unbounded error text | accepted | issue detail and every message in the failure log at most `ERROR_MESSAGE_CHARS` (2000); raw output per attempt 20 000 as before; `ClaudeCLI` quotes at most 500 characters of output in a message; the attempt warning log line is bounded too | `test_translator.py::TestBoundedErrorText` (2), `test_llm.py::TestClassificationOfReplies::test_error_messages_bounded` |
+| 14 | G14: output lost on timeout | accepted | the drained stdout/stderr (at most 20 000 characters each) ride on `TimeoutExpired` into `TransientError.raw` | `test_llm.py::TestTimeoutKeepsOutput` (3) |
+| 15 | O2: missing executable fails every segment | accepted | `OSError` at start → `BackendUnavailableError` (new, in `src/llm/base.py`), raised like `AuthError`: web pauses the run (`backend_error` event, shown by the page), CLI stops (exit 1), re-translate answers 503, term extraction stops; no segment becomes FAILED | `test_llm.py::TestBackendUnavailable`, `TestCLIBackendComplete::test_missing_program_is_not_transient` (changed: the type), `test_translator.py::TestRunLevelErrors`, `test_web.py::TestBackendUnavailable` (2), `test_cli.py::TestCLIBackendUnavailable` (2) |
+| 16 | O6: a dropped result emits `segment_complete` | accepted | a dropped or skipped result counts in progress but sends no success event or "段落完成" log line | `test_web.py::TestQueuedEdits::test_dropped_result_sends_no_success_event` |
+| 17 | O7: revision taken at pickup; edits keep issues and FAILED | accepted | `task.queued[segment id] = (revision, status)` at queue time; `update_translation` clears issues and turns FAILED into TRANSLATED (other statuses kept, as on `main`); `mark_reviewed` clears issues | `test_web.py::TestQueuedEdits::test_queued_segment_edited_before_pickup` (edit, approve), `test_project.py::TestManualEditClearsFailure` (3) |
+| 18 | O8: delete under a running task or another process's lock | accepted | 409 while the task runs, is paused or its threads are alive; otherwise delete holds the project mutex and the flock (409 with the holder's PID when another process has it) | `test_web.py::TestDeleteGuard` (2) |
+| 19 | O9: extraction drops finished terms on a rate limit; CLI traceback; classification | accepted | `ExtractionError.terms` carries the terms of finished batches; web adds them and reports the stop with the count; CLI saves them, prints "提取中斷：…" and exits 1. Classification checked against `main`: the translator searched stdout + stderr for both patterns whatever the exit code; the extractor only on a non-zero exit, auth only. Kept: stderr and any non-zero run are searched; on exit 0, stdout only when at most `SHORT_REPLY_CHARS` (300) long (comment in `claude_cli.py`). Not verified against the real CLI (no limit or expired login was available) | `test_glossary.py::TestExtractionStopKeepsTerms` (2), `test_web.py::TestTermExtractionStop`, `test_cli.py::TestCLIGlossaryExtractStop`, `test_llm.py::TestClassificationOfReplies` (5) |
+| 20 | O11: round trip not reproducible | accepted | `ProjectManager.to_json()` (what `save()` writes, without touching `updated_at`); the check compares it, parsed, with `project.json`: `equal`, `model added` (accepted, as on `main`), else FAIL with the differing top-level keys and segment count; per project and in TOTAL | `test_verify_scripts.py::TestLoadCheckRoundTrip` (3); exact-output tests updated |
+| 21 | G16: failure log names collide | accepted | `<id with unsafe characters replaced, at most 100>-<first 10 hex of SHA-256 of the id>.txt` | `test_translator.py::TestFailureLogNames` (3); expected file names in 4 tests updated |
+| 22 | G17: retry button only after reload | accepted | the button is always in the page, shown by `x-show="failedCount > 0 …"`; the count is fetched from `/progress` on `complete`, `stopped` and `error` | `test_web.py::TestTemplatesHandleErrors::test_retry_button_reactive`; `TestFailedInPages::test_retry_button_hidden_without_failed` (changed: the label is now in the page, hidden) |
+| 23 | G15, O4: mutation gate incomplete | accepted | `src/__init__.py` (cli group) and `src/web/blueprints/projects.py` (web group) added, with the new test classes; full runs recorded in section 10 | — |
+| 24 | third reviewer: edit/approve keep the failure log | accepted | the edit and approve endpoints remove the segment's failure log (`translator.remove_failure_log`) | `test_web.py::TestEditRemovesFailureLog` (2) |
+| 25 | third reviewer: calls spent on edited queued segments | accepted | before the call, a worker skips a segment whose revision changed since queueing, or which became REVIEWED after it was queued (a segment queued while REVIEWED, by explicit re-translation, is still translated); the skip counts in progress, no event | `TestQueuedEdits::test_queued_segment_edited_before_pickup` (asserts one call), `test_queued_reviewed_segment_is_translated_when_asked` |
+
+Rejected by the orchestrator and not done: signal handlers, timing assertions, cleanup of
+temporary files left by dead processes, and anything from later phases (cancel wiring for
+stop/pause, adaptive concurrency, output validation).
+
+Beyond the list: `ProjectData.model` defaults to `''` (filled from the backend on create and
+load); `mark_translated` and `set_model` take the mutex too; the glossary extraction docstring
+lists the stop.
+
+### 9. Review round 1: each fix fails without it
+
+`scripts/verify/phase1_reverts.py` puts each old behaviour back, one at a time, into a copy of
+the committed code (`git archive HEAD` in a temporary directory, removed afterwards) and runs
+the tests that guard it; every revert must make one of them fail. Run on the commit with the
+fixes and their tests (before the mutation-survivor tests):
+
+```
+$ python3 scripts/verify/phase1_reverts.py
+OK   1 mutex per manager, not per project: 2 failed, 1 passed
+OK   1 temp file left after a failed save: 1 failed, 1 passed
+OK   2 re-translate applies to its stale snapshot: 3 failed, 3 passed
+OK   2 stopped task still ending does not own the state: 1 failed
+OK   3 apply_outcome check and write not atomic: 2 failed, 1 passed
+OK   3 mark_reviewed outside the mutex: 1 failed
+OK   4 timed-out join treated as an end: 1 failed, 1 passed
+OK   4 starts not serialized: 1 failed
+OK   5 logging set up outside the try: 1 failed
+OK   5 coordinator start failure keeps the lock: 1 failed
+OK   5 lock descriptor leaked after flock: 1 failed
+OK   6 web coordinator failure does not join workers: 1 failed, 1 passed
+OK   6 web coordinator failure does not wake paused workers: 1 failed
+OK   6 CLI supervisor failure does not join workers: 2 failed
+OK   7 late run error after stop pauses the task: 2 failed
+OK   8 KeyboardInterrupt leaves the child running: 1 failed
+OK   8 unbounded wait after the kill: 1 failed
+OK   8 no exit hook: 1 failed
+OK   9 failure log write error propagates: 2 failed, 6 passed
+OK   9 web worker dies on an unexpected exception: 1 failed
+OK   9 CLI worker dies on an unexpected exception: 2 failed, 1 passed
+OK   10 no cancel check before the start: 1 failed
+OK   10 wait not bounded by the deadline: 1 failed
+OK   10 output of a cancelled call accepted: 1 failed
+OK   11 review save ignores a refused save: 1 failed, 3 passed
+OK   11 model select keeps a refused model: 1 failed, 3 passed
+OK   22 retry button rendered by the server only: 1 failed, 3 passed
+OK   12 model list from the Claude module: 2 failed, 3 passed
+OK   12 engine default model hard-coded: 1 failed
+OK   12 auth hint hard-coded in the page: 1 failed
+OK   13 issue detail unbounded: 1 failed, 1 passed
+OK   13 messages in the failure log unbounded: 1 failed, 1 passed
+OK   13 stderr quoted whole in the Claude error: 1 failed
+OK   14 timeout drops the output: 1 failed, 2 passed
+OK   15 missing program is a per-segment error: 3 failed
+OK   16 dropped result sends a success event: 1 failed
+OK   17 revision taken when the worker picks the segment: 2 failed
+OK   17 edit keeps FAILED and issues: 3 failed, 2 passed
+OK   18 delete ignores a running task: 1 failed
+OK   18 delete ignores the lock of another process: 1 failed
+OK   19 extraction stop drops earlier terms: 3 failed, 1 passed
+OK   19 CLI extraction stop not caught: 1 failed
+OK   19 long successful replies searched for error phrases: 3 failed, 3 passed
+OK   19 short successful replies not searched: 3 failed, 16 passed
+OK   20 no round trip in the check: 1 failed, 2 passed
+OK   21 file name without digest: 3 failed
+OK   24 edit leaves the failure log: 1 failed, 1 passed
+OK   24 approve leaves the failure log: 1 failed, 1 passed
+OK   25 call spent on a segment edited after queueing: 2 failed
+OK   25 explicitly queued reviewed segment skipped: 1 failed
+reverts not detected: 0
+```
+
+(Durations and warning counts trimmed. The 11/22 rows were run separately, after the
+others; the templates are checked as rendered text only. Item 23 is the mutation run itself.)
+
+### 10. Mutation testing after review round 1
+
+`scripts/verify/mutation.sh` with `src/__init__.py` (cli group) and
+`src/web/blueprints/projects.py` (web group) added, and the round 1 web test classes in the
+web group's `-k` (three slow pre-existing classes that cover no changed line —
+`StoppedStateSSE`, `DynamicWorkers`, `MidTranslationModelSwitch` — are not in it). Run to
+completion on the code of the commit "chore: add the revert check for the review round 1
+fixes" (all review round 1 source changes; no source file changed afterwards), about 3 h
+15 min, most of it the web group. Afterwards `git status` was clean and no
+`.bak` file was left.
+
+```
+$ scripts/verify/mutation.sh
+...
+TOTAL mutants 847  killed 733  survived 104  timeout 6  suspicious 4  untested 0
+$ echo $?
+1
+```
+
+| group | survived | timeout | suspicious |
+|---|---|---|---|
+| core | 27 | 0 | 0 |
+| llm | 18 | 0 | 4 |
+| web | 43 | 4 | 0 |
+| cli | 11 | 2 | 0 |
+| scripts | 5 | 0 | 0 |
+
+The 6 timeouts (web 4, 70, 72, 146; cli 72, 77: a run-error event name, the coordinator's and
+the CLI supervisor's exit conditions) and the 4 suspicious mutants (llm 27, 34, 39, 41:
+`_kill_live_groups` on `None`, `start_new_session=False`, `wait = None`, the cancel check
+inverted) are detected: the tests fail or never finish.
+
+Every one of the 104 survivors, by mutmut id (`<group> <id>`, line in the run's code):
+
+**Killed by a new test (77).** The tests are in the commit "test: kill the surviving mutants
+of the review round 1 code" (`TestRound1Exact` in `test_project.py`, `test_translator.py`,
+`test_llm.py`, `test_web.py`; `TestCLIRound1Exact`; `TestLoadCheckRoundTripExact`;
+`TestExtractionStopKeepsTerms::test_batches_joined_with_blank_line`; the two kill-wait tests
+and `test_output_kept_is_bounded` in `test_llm.py` now use the real constants and check the
+given-up pipes are closed). `scripts/verify/phase1_survivor_kills.py` applies each of these
+mutants by hand to a copy of the committed code and checks a test fails: all 77 killed (73 in one run, the last 4 added and run afterwards; output ends `not killed 0`).
+
+| mutants | what they changed | killing test |
+|---|---|---|
+| core 18, 19 | `ProjectData.model` default `''` | `test_project.py::TestRound1Exact::test_project_data_model_default_is_empty` |
+| core 35, 58 | "No project data to save." / "No project loaded." | `…::test_messages_without_data` |
+| core 46, 47 | temporary file prefix / suffix | `…::test_temporary_file_name` |
+| core 49, 52 | file mode kept / 0644 | `…::test_file_mode_kept_or_0644` |
+| core 62, 63 | `mark_translated` time | `…::test_mark_translated_sets_time` |
+| core 89 | `mark_reviewed` text | `…::test_mark_reviewed_with_text` |
+| core 211, 248 | log lines for failure-log write / removal errors | `test_translator.py::TestRound1Exact::test_log_messages_exact` |
+| core 214–218 | `unexpected_error_outcome` detail, kind, code, blocking | `…::test_unexpected_error_outcome` |
+| core 229 | `makedirs(exist_ok=False)` | `…::test_second_failure_replaces_the_log` |
+| core 263, 264 | batch separator | `test_glossary.py::TestExtractionStopKeepsTerms::test_batches_joined_with_blank_line` |
+| llm 92, 117 | short-reply limit 300 and `<=` | `test_llm.py::TestRound1Exact::test_short_reply_boundary` |
+| llm 17 | `KILL_WAIT_SECONDS = None` | `TestRunProcessExceptionalExit::test_kill_wait_is_bounded_when_a_descendant_keeps_the_pipes` (real constant) |
+| llm 24, 25 | given-up pipes not closed; `''` output after giving up | same test (`timeout` case: output `('', '')`, pipes closed) |
+| llm 18, 19 | `KEPT_OUTPUT_CHARS` | `TestTimeoutKeepsOutput::test_output_kept_is_bounded` (real constant) |
+| llm 44, 50 | "cancelled" messages | `TestRound1Exact::test_cancel_message_while_running`, `test_cancel_message_after_finish` |
+| llm 130, 131 | fake backend auth hint | `TestRound1Exact::test_fake_auth_hint` |
+| web 3 | `auth_error` event name | `test_web.py::TestRound1Exact::test_auth_error_event` |
+| web 14 | `threads_alive` `or` → `and` | `…::test_threads_alive_with_any_worker` |
+| web 22, 29–32 | states that own the project / `task_active` | `…::test_task_owns_state_by_state_alone` |
+| web 37, 50, 56 | "仍在結束中" message; task registered when nothing to do; coordinator a daemon | `…::test_exact_messages_and_registration` |
+| web 86–88, 93 | failure report text, log line, event key | `…::test_failure_report_exact`, `test_failure_report_lists_several_ids` |
+| web 97 | skip log line | `…::test_skip_logged` |
+| web 142 | `continue` after a skip | `…::test_worker_goes_on_after_a_skip` |
+| web 144 | unexpected-error log line | `…::test_unexpected_exception_logged` |
+| web 155, 160 | extraction `stopped` default; stop message | `…::test_extraction_status_exact` |
+| web 162, 163 | delete 409 body | `…::test_delete_refused_message_exact` |
+| web 171–176, 180–182 | edit/approve bodies; 404 body and code | `…::test_review_responses_exact` |
+| web 177 | `==` → `!=` finding the segment | `…::test_retranslate_sends_its_own_segment`, `test_review_responses_exact` |
+| web 204, 205 | 503 log line and body | `…::test_backend_unavailable_retranslate_exact` |
+| cli 7, 8 | invalid-model message | `test_cli.py::TestCLIRound1Exact::test_invalid_model_message` |
+| cli 11 | `--model` help | `…::test_model_help` |
+| cli 56 | workers not daemons | `…::test_workers_are_daemons` |
+| cli 75 | `continue` → `break` on an empty wait (results after 0.5 s lost) | `…::test_slow_result_still_applied` |
+| cli 78, 80, 82 | supervisor-failure lines | `…::test_supervisor_failure_output` |
+| cli 90 | extraction stop line | `…::test_extraction_stop_line` |
+| scripts 14, 22, 20 | detail of `equal` / `model added`; `and` → `or` | `test_verify_scripts.py::TestLoadCheckRoundTripExact` (2) |
+
+**Equivalent (18).**
+
+| mutant | mutation | condition |
+|---|---|---|
+| core 16, web 8 | `X \| None` → `X & None` in an annotation | annotations are strings (`from __future__ import annotations`), never evaluated |
+| core 124, 145 | `self._held = False` → `None` | only its truth value is used |
+| core 135 | `os.read(fd, 32)` → `33` | a PID has at most 32 digits |
+| core 138 | `ftruncate(fd, 0)` → `1` | the PID written next at offset 0 overwrites the kept byte |
+| core 203 | `glossary_text = ''` → `None` | only its truth value is used |
+| llm 26 | `stdout = stderr = ''` → `None` (after giving up on the pipes) | the value goes through `_text()`, which maps `None` to `''` |
+| llm 51 | `time.monotonic() > deadline` → `>=` after the process ended | differs only when the clock equals the deadline exactly |
+| web 10 | `queued` field `repr=False` → `True` | the task's `repr` is never used |
+| web 60 | `project_lock is None or …` → `is not None or …` in `start_translation`'s cleanup | in that branch the coordinator is never alive (nothing after `coordinator.start()` can raise), so both conditions are true |
+| web 63, 64 | `task.state = 'failed'` → other value, same branch | the task is not registered yet and is unreachable after the exception |
+| web 65 | `handler = None` → `""` | `teardown_project_logging` tests only its truth value |
+| web 147 | `break` → `continue` after a run error with stop set | the loop's first statement breaks on the set stop event; nothing runs in between |
+| web 185 | `copy.deepcopy(segments)` → `copy.copy` | a segment's source fields (text, html, type, chapter) are never modified, and those are all the call reads |
+| scripts 1 | `sys.path.insert(0, …)` → `insert(1, …)` | as Phase 0's survivor 113 (default interpreter path settings) |
+| scripts 15 | `'model' not in on_disk` → `'XXmodelXX' not in on_disk` | when `on_disk` has `model`, the dict without `model` can never equal it, so the first condition never decides |
+
+**Performance-only (9)** — only how soon something is noticed, never a result:
+
+| mutant | mutation | effect |
+|---|---|---|
+| llm 14 | `POLL_SECONDS = 0.1` → `1.1` | cancel noticed up to 1.1 s later; each wait is also bounded by the deadline and late or cancelled output is refused |
+| llm 16 | `KILL_WAIT_SECONDS = 2` → `3` | gives up on held pipes 1 s later |
+| llm 37, 38 | the wait's lower bound `0.0` → `1.0`; `deadline - now` → `deadline + now` | waits up to one poll (0.1 s) past the deadline; the output is still refused by the check after the process ends |
+| llm 45 | `>= deadline` → `> deadline` in the poll loop | at exact equality, one more zero-length wait |
+| web 75, 77 | post-batch exit check disabled | the coordinator ends through its 1 s queue-timeout path instead |
+| cli 74 | `get(timeout=0.5)` → `1.5` | the supervisor polls less often |
+| cli 76 | batch drain `while True` → `while False` | results are applied one per loop round, with a save each, instead of in a batch |
+
+No timing assertion was added for any of them.
+
 ### Known consequences
 
 - A project stops being loadable by `v1.0.0` (and by `main` before this phase) as soon as one
@@ -781,7 +1017,16 @@ project directory held `project.json` and `project.lock` afterwards, and no `log
 - The CLI exits 1 after a run with failed segments (it used to exit 1 at the first failure).
 - Term extraction now passes the project model (before: the CLI's default model) and stops
   with an error on a rate limit.
-- The temporary file of `save()` is `project.json.<pid>.tmp` (was `project.json.tmp`).
+- The temporary file of `save()` is `project.json.<random>.tmp`, one per save, removed when the
+  save fails (was `project.json.tmp`). One left by a process killed mid-save stays (not cleaned).
+- Web: deleting a project while its task runs or another process holds its lock, and starting
+  a task while the previous task's threads are still alive, answer 409.
+- A project without a `model` key loads with the backend's default model (`sonnet` for the
+  Claude CLI, as before); new projects get it too.
+- A manual edit of a FAILED segment makes it TRANSLATED; edit and approve clear its issues and
+  remove its failure log.
+- The CLI's parallel workers are daemon threads; a second Ctrl-C ends the process without
+  waiting for them, and the exit hook kills their model processes.
 - A worker result for a segment edited mid-flight is dropped and counted as done in the
   progress of that run.
 - The web coordinator ends only when all workers have exited *and* the result queue is empty.
@@ -808,3 +1053,14 @@ project directory held `project.json` and `project.lock` afterwards, and no `log
 - The web UI changes (retry button, failed card, tooltip) were checked by rendering the
   templates in tests, not in a browser.
 - Mutation testing ran on Python 3.12.7, the suite on 3.9.6 (both pass).
+- Review round 1: the reviewers' scenarios were reproduced with the fake backend and short
+  Python child processes, not with the real CLI. No real `claude` call was made in this round
+  (the one real call of section 7 predates it). The short-reply rule for exit-code-0 errors
+  (item 19) is a judgement from `main`'s behaviour, not from a captured real limit or
+  expired-login reply.
+- The template changes (items 11, 12, 22) were checked as rendered text, not in a browser.
+- `KeyboardInterrupt` in the parallel CLI was tested by raising it from `save()`, not by a real
+  Ctrl-C at a terminal; the exit hook was tested by ending a child interpreter normally.
+- Concurrency tests that need an edit to land between a check and a write use a 0.3–0.5 s
+  wait for the other thread; on a heavily loaded machine the "fails without the fix" side of
+  those tests could pass by accident (the tests never fail on the fixed code because of it).
