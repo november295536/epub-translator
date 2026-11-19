@@ -388,7 +388,7 @@ As built (2026-11-19), where it differs from 4.3/4.4:
   holder dies, so a stale lock never blocks. Not available on Windows.
 - `FAILED` segments are retried with `start --retry-failed` (CLI) or `retry_failed: true` on
   the web start API (a "retry failed segments" button on the translation tab).
-- Failure diagnostics: `log/failed/<segment id>.txt`, one file per segment, replaced by each
+- Failure diagnostics: `log/failed/<segment id>-<digest>.txt`, one file per segment, replaced by each
   failed run and removed when the segment later succeeds.
 
 Acceptance:
