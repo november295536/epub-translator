@@ -1202,12 +1202,12 @@ class TestRound1Exact:
     def test_unexpected_error_outcome(self):
         from src.core.project import Issue
         from src.core.translator import unexpected_error_outcome
-        outcome = unexpected_error_outcome('m', KeyError('k'))
+        outcome = unexpected_error_outcome('m', KeyError('k'), '')
         assert (outcome.text, outcome.status, outcome.model, outcome.usage) == \
             (None, SegmentStatus.FAILED, 'm', None)
         assert outcome.issues == [Issue(kind='backend', code='unexpected',
                                         detail="未預期的錯誤：KeyError: 'k'", blocking=True)]
-        long = unexpected_error_outcome('m', ValueError('v' * 5000))
+        long = unexpected_error_outcome('m', ValueError('v' * 5000), '')
         assert len(long.issues[0].detail) == 2000
 
     def test_log_messages_exact(self, tmp_path, caplog):
@@ -1317,12 +1317,17 @@ class TestRound2EntryPointWritesNoFile:
         assert outcome.status == SegmentStatus.TRANSLATED and outcome.failure is None
         assert os.path.exists(failure_log_path(str(tmp_path), 'c1_seg0001'))
 
-    def test_record_unexpected_failure_keeps_older_log(self, tmp_path):
+    def test_record_unexpected_failure_replaces_older_log(self, tmp_path):
+        # Review round 3, item 7: was "keeps older log" (the unexpected
+        # outcome had no diagnostics); it now writes its own
         from src.core.translator import unexpected_error_outcome
         seg = _seg()
         _translated(_engine(FakeBackend([RefusalError('first')])), seg, [seg], str(tmp_path))
-        record_failure_log(str(tmp_path), 'c1_seg0001', unexpected_error_outcome('m', KeyError()))
-        assert os.path.exists(failure_log_path(str(tmp_path), 'c1_seg0001'))
+        record_failure_log(str(tmp_path), 'c1_seg0001',
+                           unexpected_error_outcome('m', KeyError('k'), ''))
+        content = open(failure_log_path(str(tmp_path), 'c1_seg0001'), encoding='utf-8').read()
+        assert "error: 未預期的錯誤：KeyError: 'k'" in content
+        assert 'first' not in content
 
     def test_outcomes_compare_without_the_error(self):
         seg = _seg()
@@ -1366,3 +1371,97 @@ class TestRound2CodeEchoingAnErrorPhrase:
         outcome = translate_segment(_claude_engine(monkeypatch, run), seg, [seg])
         assert outcome.status == SegmentStatus.TRANSLATED
         assert outcome.text == self.CODE
+
+
+# --- Review round 3 ---------------------------------------------------------------
+
+from src.core.translator import MAX_CONSECUTIVE_UNEXPECTED, UnexpectedStreak
+from src.llm.cli import run_process as _real_run_process  # before the autouse stub
+
+
+class TestRound3UnexpectedFailureLog:
+    """Item 7: an unexpected failure writes a short failure log."""
+
+    def test_log_has_type_message_traceback_and_request(self, tmp_path):
+        seg = _seg(text='Unique source words.')
+        fake = FakeBackend(responder=lambda r: {}['missing'])
+        outcome = _translated(_engine(fake), seg, [seg], str(tmp_path))
+        assert outcome.failure.code == 'unexpected'
+        content = open(failure_log_path(str(tmp_path), 'c1_seg0001'), encoding='utf-8').read()
+        assert "error: 未預期的錯誤：KeyError: 'missing'" in content
+        assert '=== request ===\n' + fake.prompts[0] + '\n' in content
+        assert "=== attempt 1: KeyError: 'missing' ===" in content
+        assert 'Traceback (most recent call last):' in content
+        assert content.rstrip().endswith("KeyError: 'missing'")
+
+    def test_request_empty_when_not_built(self, tmp_path, monkeypatch):
+        monkeypatch.setattr('src.core.translator.get_context',
+                            lambda *a: (_ for _ in ()).throw(ValueError('broken')))
+        seg = _seg()
+        outcome = _translated(_engine(FakeBackend([])), seg, [seg], str(tmp_path))
+        assert outcome.issues[0].code == 'unexpected'
+        assert outcome.failure.prompt == ''
+        assert os.path.exists(failure_log_path(str(tmp_path), 'c1_seg0001'))
+
+    def test_request_empty_when_it_cannot_be_rebuilt(self, monkeypatch):
+        seg = _seg()
+        engine = _engine(FakeBackend(responder=lambda r: {}['missing']))
+        real = engine._build_prompt
+        calls = []
+
+        def build(*args, **kwargs):
+            calls.append(1)
+            if len(calls) > 1:
+                raise RuntimeError('no')
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(engine, '_build_prompt', build)
+        outcome = translate_segment(engine, seg, [seg])
+        assert outcome.failure.prompt == ''
+
+    def test_undecodable_output_through_the_real_process(self, monkeypatch, tmp_path):
+        import sys
+
+        def run(cmd, **kwargs):
+            return _real_run_process(
+                [sys.executable, '-c', 'import sys; sys.stdout.buffer.write(b"\\xff\\xe8\\xad\\xaf")'],
+                **kwargs)
+
+        seg = _seg()
+        outcome = translate_segment(_claude_engine(monkeypatch, run), seg, [seg])
+        assert outcome.status == SegmentStatus.TRANSLATED
+        assert outcome.text == '\ufffd譯'
+
+
+class TestRound3UnexpectedStreak:
+    """Item 9: five unexpected failures in a row stop the run."""
+
+    def _unexpected(self):
+        from src.core.translator import unexpected_error_outcome
+        return unexpected_error_outcome('m', KeyError('k'), '')
+
+    def test_threshold(self):
+        assert MAX_CONSECUTIVE_UNEXPECTED == 5
+        streak = UnexpectedStreak()
+        for _ in range(4):
+            assert streak.add(self._unexpected()) is None
+        assert streak.add(self._unexpected()) == (
+            "連續 5 個段落發生未預期的錯誤，翻譯已停止（最後一個：未預期的錯誤：KeyError: 'k'）")
+
+    @pytest.mark.parametrize('other', ['translated', 'failed', None])
+    def test_other_result_resets(self, other):
+        if other == 'translated':
+            reset = TranslationOutcome(text='x', status=SegmentStatus.TRANSLATED, issues=[],
+                                       model='m', usage=None)
+        elif other == 'failed':
+            seg = _seg()
+            reset = translate_segment(_engine(FakeBackend([RefusalError('no')])), seg, [seg])
+        else:
+            reset = None
+        streak = UnexpectedStreak()
+        for _ in range(4):
+            streak.add(self._unexpected())
+        assert streak.add(reset) is None
+        for _ in range(4):
+            assert streak.add(self._unexpected()) is None
+        assert streak.add(self._unexpected()) is not None
