@@ -12,14 +12,13 @@ from __future__ import annotations
 
 import io
 import posixpath
-import re
 import zipfile
 from dataclasses import dataclass
 from urllib.parse import unquote
 
 from lxml import etree
 
-from src.epub.blocks import element_text, localname
+from src.epub.blocks import element_text, localname, walk_blocks
 
 # Strict XML: no entity expansion, no network, no recovery
 PARSER = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
@@ -99,7 +98,7 @@ class EPUBExtractor:
         self.epub_path = epub_path
         self.opf = None
         self.spine: list[SpineItem] = []
-        self.failed: list[tuple] = []     # (chapter id, reason) not segmented
+        self.failed: list[tuple] = []     # (chapter id, reason) not segmented: set by extract_chapters
         self._zip: zipfile.ZipFile | None = None
 
     def load(self) -> None:
@@ -151,7 +150,7 @@ class EPUBExtractor:
             body = find_body(root)
             if body is None:
                 continue
-            text = re.sub(r'\s+', ' ', element_text(body)).strip()
+            text = ' '.join(' '.join(b.text.split()) for b in walk_blocks(body))
             if not text:
                 continue
             chapters.append(Chapter(
@@ -170,7 +169,7 @@ class EPUBExtractor:
         for tag in ('h1', 'h2', 'h3'):
             for el in body.iter():
                 if localname(el) == tag:
-                    title = re.sub(r'\s+', ' ', element_text(el)).strip()
+                    title = ' '.join(element_text(el).split())
                     if title:
                         return title
         return 'Untitled'
