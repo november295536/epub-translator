@@ -3077,6 +3077,17 @@ class TestRound3ReplaceProjectUnderLock:
         assert seen == [(True, False)]
         assert lock_free_for_other_process(project_dir)
 
+    def test_replacement_written(self, client, project_with_translations, sample_epub):
+        TaskManager._instance = None
+        self._create(client, sample_epub)
+        self._create(client, sample_epub)
+        project_dir = os.path.join(project_with_translations, self.NAME)
+        pm = ProjectManager(project_dir)
+        pm.load()
+        assert pm.data.epub_path == os.path.abspath(os.path.join(project_dir, 'source.epub'))
+        assert os.path.isfile(pm.data.epub_path)
+        assert (pm.data.title, pm.data.author) == ('Test Book', 'Test Author')
+
 
 class TestRound3StoppedTaskRestartable:
     """Item 2: a stopped task offers Start; the page reacts to `stopped`."""
@@ -3293,6 +3304,7 @@ class TestRound3MissingProject:
         os.makedirs(os.path.join(project_with_translations, 'empty'))
         response = client.put('/api/projects/empty/model', json={'model': 'sonnet'})
         assert response.status_code == 404
+        assert response.get_json() == {'error': '專案不存在'}
         assert os.listdir(os.path.join(project_with_translations, 'empty')) == []
 
     def test_deleted_during_retranslation(self, client, project_with_translations):
