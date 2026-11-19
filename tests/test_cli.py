@@ -70,6 +70,8 @@ class TestCLIInit:
         project_dir = _get_project_dir(sample_epub)
         full_path = os.path.join(str(tmp_path), project_dir)
         assert os.path.isfile(os.path.join(full_path, 'project.json'))
+        with open(os.path.join(full_path, 'project.json'), encoding='utf-8') as f:
+            assert json.load(f)['segmenter_version'] == 2
 
     def test_init_duplicate_project(self, runner, sample_epub, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -297,3 +299,22 @@ class TestCLIWorkersOption:
 
         result = runner.invoke(cli, ['start', '--project', full_path, '--workers', '25'])
         assert result.exit_code != 0
+
+
+class TestCLIContext:
+    """The prompts built by both CLI modes use same-chapter, non-code context."""
+
+    @pytest.mark.parametrize('workers', ['1', '3'])
+    def test_start_prompts(self, runner, tmp_path, make_context_project, workers):
+        from tests.conftest import fake_claude_run, assert_context_prompts
+        project_dir = make_context_project(str(tmp_path / 'ctx'))
+
+        with patch('src.core.translator.subprocess.run',
+                   side_effect=fake_claude_run) as mock_run:
+            result = runner.invoke(cli, ['start', '--project', project_dir,
+                                         '--workers', workers])
+
+        assert result.exit_code == 0, result.output
+        prompts = [c[0][0][2] for c in mock_run.call_args_list]
+        assert len(prompts) == 5
+        assert_context_prompts(prompts, project_dir)

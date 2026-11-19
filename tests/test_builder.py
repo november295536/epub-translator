@@ -1,10 +1,11 @@
 """Tests for EPUB builder module."""
 
+import json
 import os
 import pytest
 import ebooklib
 from ebooklib import epub
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment, Tag
 
 from src.epub.builder import EPUBBuilder, BILINGUAL_CSS
 from src.core.project import ProjectManager
@@ -1026,3 +1027,230 @@ class TestContentDivAlignment:
         h1 = soup.find('h1')
         assert h1 is not None, "h1 should exist after container div recurse"
         assert '前言' in h1.get_text()
+
+
+class _FakeItem:
+    """Minimal stand-in for an ebooklib document item."""
+
+    def __init__(self, html: str):
+        self.content = html.encode('utf-8')
+
+    def get_content(self):
+        return self.content
+
+    def set_content(self, content):
+        self.content = content
+
+
+FORMATS = ('chinese-only', 'bilingual-horizontal', 'bilingual-vertical')
+
+
+def _seg_state(segment_id, html, text, translated,
+               segment_type=SegmentType.TEXT):
+    from src.core.project import SegmentState
+    return SegmentState(segment_id=segment_id, chapter_id='ch1', html=html,
+                        text=text, word_count=len(text.split()),
+                        segment_type=segment_type, translated_text=translated)
+
+
+def _builder(tmp_path, segmenter_version):
+    """A builder whose project data has the given segmenter_version
+    (None: no project data loaded)."""
+    from src.core.project import ProjectData
+    builder = EPUBBuilder(str(tmp_path))
+    if segmenter_version is not None:
+        builder.pm.data = ProjectData(epub_path='', project_dir=str(tmp_path),
+                                      segmenter_version=segmenter_version)
+    return builder
+
+
+def _transform(builder, chapter, segments, fmt):
+    item = _FakeItem(chapter)
+    builder._transform_chapter(item, segments, fmt)
+    return item.get_content().decode('utf-8')
+
+
+def _current_states(chapter, translations):
+    """Segments as the current extractor and segmenter store them."""
+    from src.core.segmenter import Segmenter
+    from src.epub.extractor import _serialize
+    body = BeautifulSoup(chapter, 'html.parser').body
+    body_html = ''.join(_serialize(c) for c in body.children)
+    segs = Segmenter().segment_chapter('ch1', body_html)
+    assert len(segs) == len(translations)
+    return [_seg_state(s.id, s.html, s.text, t, s.segment_type)
+            for s, t in zip(segs, translations)]
+
+
+def _pairs(soup):
+    """(original text, translation text) per bilingual block."""
+    return [(o.get_text(), t.get_text()) for o, t in
+            zip(soup.find_all('div', class_='original'),
+                soup.find_all('div', class_='translation'))]
+
+
+def _words(prefix: str, n: int) -> str:
+    return ' '.join(f'{prefix}{i}.' if i % 10 == 9 else f'{prefix}{i}'
+                    for i in range(n))
+
+
+class TestWalkByMarker:
+    """The walk is chosen by the project's segmenter_version, nothing else."""
+
+    def test_project_without_field_uses_legacy_walk(self, tmp_path, sample_epub):
+        import json
+        pm = ProjectManager(str(tmp_path))
+        pm.create(sample_epub, 'T', 'A', [])
+        with open(pm.project_file, encoding='utf-8') as f:
+            raw = json.load(f)
+        del raw['segmenter_version']
+        with open(pm.project_file, 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+
+        builder = EPUBBuilder(str(tmp_path))
+        builder.pm.load()
+        assert builder._legacy_walk() is True
+
+    def test_new_project_uses_current_walk(self, tmp_path, sample_epub):
+        ProjectManager(str(tmp_path)).create(sample_epub, 'T', 'A', [])
+        builder = EPUBBuilder(str(tmp_path))
+        builder.pm.load()
+        assert builder._legacy_walk() is False
+
+    @pytest.mark.parametrize('version, legacy', [(None, True), (1, True), (2, False)])
+    def test_walk_per_version(self, tmp_path, version, legacy):
+        assert _builder(tmp_path, version)._legacy_walk() is legacy
+
+    def test_walks_differ_only_in_comments(self, tmp_path):
+        builder = _builder(tmp_path, None)
+        body = BeautifulSoup('<body><!-- c --><p>One</p></body>', 'html.parser').body
+        assert [e.name for e in builder._walk_content_elements(body, legacy=False)] == ['p']
+        assert len(builder._walk_content_elements(body, legacy=True)) == 2
+
+
+class TestVersion2Export:
+    """Projects segmented with comments skipped (segmenter_version 2) line up
+    in every format, including the reviewers' scenarios."""
+
+    @staticmethod
+    def _export(tmp_path, chapter, states, fmt):
+        html = _transform(_builder(tmp_path, 2), chapter, states, fmt)
+        return BeautifulSoup(html, 'html.parser')
+
+    CHAPTER = ('<html><body><h1>Title</h1><!-- note -->'
+               '<p>Para one.</p><pre>x = 1</pre></body></html>')
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_comment_between_blocks(self, tmp_path, fmt):
+        states = _current_states(self.CHAPTER, ['<h1>T0</h1>', '<p>T1</p>', 'T2'])
+        soup = self._export(tmp_path, self.CHAPTER, states, fmt)
+
+        if fmt == 'chinese-only':
+            assert soup.find('h1').get_text() == 'T0'
+            assert soup.find('p').get_text() == 'T1'
+            assert soup.find('pre').get_text() == 'T2'
+        else:
+            assert _pairs(soup) == [('Title', 'T0'), ('Para one.', 'T1'), ('x = 1', 'T2')]
+
+    # Round-2 reviewer A: a visible text equal to a comment's text.
+    COMMENT_EQUALS_TEXT = '<html><body><!--note-->note<h1>Title</h1></body></html>'
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_comment_equal_to_visible_text(self, tmp_path, fmt):
+        states = _current_states(self.COMMENT_EQUALS_TEXT, ['註', '<h1>標題</h1>'])
+        soup = self._export(tmp_path, self.COMMENT_EQUALS_TEXT, states, fmt)
+
+        assert [c.strip() for c in soup.find_all(string=lambda s: isinstance(s, Comment))] \
+            == ['note']
+        if fmt == 'chinese-only':
+            assert soup.find('h1').get_text() == '標題'
+            assert 'note' not in soup.get_text()
+        else:
+            assert _pairs(soup) == [('note', '註'), ('Title', '標題')]
+
+    # Round-1 reviewer A: both walks have one element, but different ones.
+    EQUAL_COUNT = ('<html><body><div><!-- note --><h2 id="s">Heading</h2></div>'
+                   '</body></html>')
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_equal_count_nested_comment_keeps_heading(self, tmp_path, fmt):
+        states = _current_states(self.EQUAL_COUNT, ['<h2 id="s">標題</h2>'])
+        soup = self._export(tmp_path, self.EQUAL_COUNT, states, fmt)
+
+        if fmt == 'chinese-only':
+            h2 = soup.find('h2', id='s')
+            assert h2 is not None and h2.get_text() == '標題'
+        else:
+            original = soup.find('div', class_='original')
+            first_tag = next(c for c in original.children if isinstance(c, Tag))
+            assert first_tag.name == 'h2' and first_tag.get('id') == 's'
+            assert '標題' in soup.find('div', class_='translation').get_text()
+
+    # Round-1 reviewer B, scenario A: body-level comment, bare text that is
+    # sentence-split.
+    SCENARIO_A = ('<html><body><!-- c --><p>' + _words('a', 350) + '</p><p>'
+                  + _words('b', 50) + '</p>' + _words('x', 550) + '</body></html>')
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_scenario_a(self, tmp_path, fmt):
+        states = _current_states(self.SCENARIO_A, ['<p>甲</p>', '<p>乙</p>丙', '丁'])
+        soup = self._export(tmp_path, self.SCENARIO_A, states, fmt)
+
+        comments = soup.find_all(string=lambda s: isinstance(s, Comment))
+        assert [c.strip() for c in comments] == ['c']
+        if fmt == 'chinese-only':
+            assert [p.get_text() for p in soup.find_all('p')] == ['甲', '乙']
+        else:
+            assert 'a0' in soup.find('div', class_='original').get_text()
+            assert soup.find('div', class_='translation').get_text() == '甲'
+
+    # Round-1 reviewer B, scenario B: a wrapper div holding a comment.
+    SCENARIO_B = ('<html><body><div class="chapter"><!-- c --><h1>Title</h1>'
+                  '<p>Short para.</p></div>' + _words('x', 550) + '</body></html>')
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_scenario_b_wrapper_div_with_comment(self, tmp_path, fmt):
+        from src.core.segmenter import Segmenter
+        n = len(Segmenter().segment_chapter('ch1', self.SCENARIO_B))
+        translations = ['<h1>標題</h1>'] + [f'<p>T{i}</p>' for i in range(1, n)]
+        states = _current_states(self.SCENARIO_B, translations)
+        soup = self._export(tmp_path, self.SCENARIO_B, states, fmt)
+
+        assert soup.find('div', class_='chapter') is not None
+        if fmt == 'chinese-only':
+            assert soup.find('h1').get_text() == '標題'
+            assert soup.find('div', class_='chapter').find('p') is not None
+        else:
+            pairs = _pairs(soup)
+            assert pairs[0] == ('Title', '標題')
+            assert pairs[1][0].startswith('Short para.') and pairs[1][1] == 'T1'
+
+
+def _main_exports():
+    path = os.path.join(os.path.dirname(__file__), 'data', 'legacy_walk_main.json')
+    with open(path, encoding='utf-8') as f:
+        return json.load(f)
+
+
+class TestVersion1ExportMatchesMain:
+    """Projects created before the marker (segmenter_version 1) export exactly
+    as on main.
+
+    tests/data/legacy_walk_main.json holds, per scenario, a chapter, the
+    segments main's extractor and segmenter stored for it (with made-up
+    translations), and the output of main's builder for each format. The
+    scenarios include the round-2 reviewers' cases: a comment that holds
+    markup (old extractor stored it as a paragraph), a comment with an
+    entity, and a comment equal to visible text.
+    """
+
+    CASES = [(name, fmt) for name in sorted(_main_exports()) for fmt in FORMATS]
+
+    @pytest.mark.parametrize('version', [1, None])
+    @pytest.mark.parametrize('name, fmt', CASES)
+    def test_export_equals_main(self, tmp_path, name, fmt, version):
+        from src.core.project import SegmentState
+        case = _main_exports()[name]
+        states = [SegmentState(**s) for s in case['segments']]
+        html = _transform(_builder(tmp_path, version), case['chapter'], states, fmt)
+        assert html == case['exports'][fmt]

@@ -7,7 +7,20 @@ import re
 import ebooklib
 from ebooklib import epub
 from bs4 import BeautifulSoup
+from bs4.element import PreformattedString
 from dataclasses import dataclass
+
+
+def _serialize(node) -> str:
+    """Serialize a body child.
+
+    str() of a comment (or CData, processing instruction, doctype) returns
+    its bare content without markers, which would turn it into visible text.
+    Those keep their markers; the segmenter then skips them.
+    """
+    if isinstance(node, PreformattedString):
+        return node.output_ready()
+    return str(node)
 
 
 @dataclass
@@ -84,7 +97,7 @@ class EPUBExtractor:
                 continue
 
             title = self._extract_title(soup)
-            body_html = ''.join(str(child) for child in body.children)
+            body_html = ''.join(_serialize(child) for child in body.children)
 
             chapters.append(Chapter(
                 id=item_id,

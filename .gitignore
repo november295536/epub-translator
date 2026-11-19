@@ -25,3 +25,9 @@ venv/
 # Translation project data (user-specific, generated at runtime)
 projects/
 uploads/
+
+# Git worktrees
+.worktree/
+
+# Mutation testing (mutmut)
+.mutmut-cache

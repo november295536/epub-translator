@@ -8,6 +8,7 @@ from dataclasses import asdict
 from flask import Blueprint, request, jsonify, current_app
 
 from src.core.project import ProjectManager
+from src.core.segmenter import SegmentType
 from src.glossary.glossary_manager import GlossaryManager
 from src.glossary.term_extractor import TermExtractor
 
@@ -112,7 +113,9 @@ def extract_terms(project_name: str):
 
     # Get project segments for extraction
     pm = _get_pm(project_name)
-    segments = [{'text': s.text} for s in pm.data.segments[:50]]  # Limit to first 50
+    # All text segments; TermExtractor splits them into bounded batches
+    segments = [{'text': s.text} for s in pm.data.segments
+                if s.segment_type != SegmentType.CODE]
 
     _extraction_tasks[project_name] = {
         'running': True,

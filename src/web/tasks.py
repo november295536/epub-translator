@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from src.core.project import ProjectManager
 from src.core.segmenter import SegmentType
-from src.core.translator import TranslationEngine, TranslationError, RateLimitError, AuthError
+from src.core.translator import TranslationEngine, TranslationError, RateLimitError, AuthError, get_context
 from src.glossary.glossary_manager import GlossaryManager
 
 logger = logging.getLogger(__name__)
@@ -491,15 +491,12 @@ class TaskManager:
                 # Find glossary terms
                 glossary_text = ''
                 if gm.entries:
-                    found = gm.find_terms_in_text(seg.text)
+                    found = gm.terms_for_prompt(seg.text)
                     if found:
                         glossary_text = gm.format_for_prompt(found)
 
                 # Get context
-                seg_idx = next((j for j, s in enumerate(all_segments)
-                                if s.segment_id == seg.segment_id), -1)
-                context_before = all_segments[seg_idx - 1].text if seg_idx > 0 else ''
-                context_after = all_segments[seg_idx + 1].text if seg_idx < len(all_segments) - 1 else ''
+                context_before, context_after = get_context(all_segments, seg.segment_id)
 
                 try:
                     html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''

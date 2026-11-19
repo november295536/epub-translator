@@ -25,6 +25,10 @@ class SegmentStatus(str, Enum):
         return self.value
 
 
+# Segmenter behaviour recorded on projects created now (see ProjectData)
+SEGMENTER_VERSION = 2
+
+
 @dataclass
 class SegmentState:
     """State of a single segment in the project."""
@@ -49,6 +53,11 @@ class ProjectData:
     created_at: str = ''
     updated_at: str = ''
     model: str = 'sonnet'
+    # 1: segmented before comments were skipped; never written to project.json,
+    # so projects that existed before Phase 0 remain loadable by pre-Phase-0
+    # code. 2: comments skipped; always written, so projects created after
+    # Phase 0 are not. The builder walks chapters to match.
+    segmenter_version: int = 1
     segments: list[SegmentState] = field(default_factory=list)
 
 
@@ -96,6 +105,7 @@ class ProjectManager:
             author=author,
             created_at=now,
             updated_at=now,
+            segmenter_version=SEGMENTER_VERSION,
             segments=segment_states,
         )
         self.save()
@@ -130,6 +140,9 @@ class ProjectManager:
         with self._save_lock:
             self.data.updated_at = time.strftime('%Y-%m-%d %H:%M:%S')
             raw = asdict(self.data)
+            if raw['segmenter_version'] == 1:
+                # Leave the field out, so pre-Phase-0 code can still load it
+                del raw['segmenter_version']
             tmp_file = self.project_file + '.tmp'
             with open(tmp_file, 'w', encoding='utf-8') as f:
                 json.dump(raw, f, ensure_ascii=False, indent=2)

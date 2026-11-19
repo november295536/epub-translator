@@ -11,6 +11,7 @@ from src.core.translator import (
     TEXT_HTML_PROMPT,
     AVAILABLE_MODELS, DEFAULT_MODEL,
 )
+from src.core.project import SegmentState
 
 
 class TestTranslationEngine:
@@ -226,12 +227,12 @@ class TestResponseCleaning:
         assert TranslationEngine._clean_response('這是完全正常的翻譯文本。') == '這是完全正常的翻譯文本。'
 
     def test_removes_markdown_heading_prefix(self):
-        assert TranslationEngine._clean_response('# 可觀測性工程（Observability Engineering）') == '可觀測性工程（Observability Engineering）'
+        assert TranslationEngine._clean_response('# 霧港測量學（Harbor Fog Metrics）') == '霧港測量學（Harbor Fog Metrics）'
         assert TranslationEngine._clean_response('## 第一章 簡介') == '第一章 簡介'
         assert TranslationEngine._clean_response('### 小節標題') == '小節標題'
 
     def test_removes_markdown_bold(self):
-        assert TranslationEngine._clean_response('可觀測性更是一個**社會技術**概念') == '可觀測性更是一個社會技術概念'
+        assert TranslationEngine._clean_response('霧港測量更是一個**跨領域**概念') == '霧港測量更是一個跨領域概念'
         assert TranslationEngine._clean_response('這是__粗體__文字') == '這是粗體文字'
 
     def test_removes_markdown_italic(self):
@@ -445,3 +446,394 @@ class TestModelSelection:
             engine.model = 'haiku'
             engine.translate('test')
             assert mock_run.call_args[0][0][4] == 'haiku'
+
+
+# A long one-line source, used where the reply is only a commentary line
+LONG_SOURCE = ('After the configuration file has been loaded and checked, '
+               'the output of the first run looks like this:')
+
+CODE_SAMPLE = (
+    '    # load config\n'
+    '    def __init__(self, *args, **kwargs):\n'
+    '        self.__dict__ = {}\n'
+    '        # second comment\n'
+    '        return a * b * c'
+)
+
+
+class TestCodeResponseCleaning:
+    """Bug 3: code output must not go through markdown cleanup."""
+
+    def test_code_sample_unchanged(self):
+        result = TranslationEngine._clean_response(CODE_SAMPLE, code_mode=True)
+        assert result == CODE_SAMPLE
+
+    def test_code_translate_keeps_code_and_first_line_indent(self):
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = CODE_SAMPLE + '\n'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            result = engine.translate(CODE_SAMPLE, segment_type=SegmentType.CODE)
+
+        assert result == CODE_SAMPLE
+
+    def test_code_wrapping_fence_removed(self):
+        fenced = '```python\n' + CODE_SAMPLE + '\n```\n'
+        result = TranslationEngine._clean_response(fenced, code_mode=True)
+        assert result == CODE_SAMPLE
+
+    def test_code_surrounding_blank_lines_trimmed(self):
+        result = TranslationEngine._clean_response(
+            '\n\n' + CODE_SAMPLE + '  \n\n', code_mode=True)
+        assert result == CODE_SAMPLE
+
+    def test_code_without_fence_left_alone(self):
+        # Prose commentary patterns are not applied to unfenced code
+        code = 'Here is = 1\n---\nx = 2'
+        assert TranslationEngine._clean_response(
+            code, code_mode=True, source=code) == code
+
+    @pytest.mark.parametrize('preface', [
+        '看起來這段程式碼沒有需要翻譯的註解，原樣輸出：',
+        '以下是翻譯後的程式碼：',
+        "Here's the code with translated comments:",
+    ])
+    def test_code_preface_and_fence_removed(self, preface):
+        reply = preface + '\n```python\n' + CODE_SAMPLE + '\n```\n'
+        result = TranslationEngine._clean_response(
+            reply, code_mode=True, source=CODE_SAMPLE)
+        assert result == CODE_SAMPLE
+
+    def test_code_preface_kept_when_source_has_fence(self):
+        source = 'Here is an example:\n```\nx = 1\n```'
+        assert TranslationEngine._clean_response(
+            source, code_mode=True, source=source) == source
+
+    def test_code_fence_kept_when_source_has_fence(self):
+        source = '```\nx = 1\n```'
+        assert TranslationEngine._clean_response(
+            source, code_mode=True, source=source) == source
+
+    @pytest.mark.parametrize('preface', [
+        '以下是翻譯後的程式碼：', "Here's the code:", 'The translation:'])
+    def test_code_preface_before_unfenced_code_removed(self, preface):
+        reply = preface + '\n\n# 載入設定\nx = 1'
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source='# load config\nx = 1') == '# 載入設定\nx = 1'
+
+    def test_code_preface_kept_when_source_starts_like_one(self):
+        source = '\n以下是 = 1\nx = 2'
+        reply = '以下是 = 1\nx = 2'
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source=source) == reply
+
+    def test_code_only_first_line_can_be_a_preface(self):
+        reply = 'x = 1\nHere is = 2'
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source='x = 1\ny = 2') == reply
+
+    def test_code_preface_removed_but_fence_with_trailing_text_kept(self):
+        reply = '以下是：\n```\nx = 1\n```\ntrailing remark'
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source='x = 1') == '```\nx = 1\n```\ntrailing remark'
+
+    @pytest.mark.parametrize('prefix', ['', '以下是：\n'])
+    def test_code_two_fenced_blocks_not_unwrapped(self, prefix):
+        blocks = '```\nx = 1\n```\nnote\n```\ny = 2\n```'
+        assert TranslationEngine._clean_response(
+            prefix + blocks, code_mode=True, source='x = 1\ny = 2') == blocks
+
+    @pytest.mark.parametrize('reply', [
+        '```python\n\n```',
+        '```python\n```',
+        '```\n```\n',
+        '以下是翻譯結果：\n```python\n  \n```\n',
+        '以下是翻譯結果：\n```python\n```',
+        '以下是翻譯結果：\n',
+    ])
+    def test_code_empty_fence_cleans_to_empty(self, reply):
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source='x = 1') == ''
+
+    def test_code_fence_body_leading_blank_lines_trimmed(self):
+        reply = '```python\n\n' + CODE_SAMPLE + '\n```'
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source=CODE_SAMPLE) == CODE_SAMPLE
+
+    def test_code_separator_line_is_not_a_preface(self):
+        # Only commentary lines count as a preface, not a '---' separator
+        reply = '---\n```\nx = 1\n```'
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source='x = 1') == reply
+
+    def _translate(self, stdout, text='x', **kwargs):
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = stdout
+        mock_result.stderr = ''
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            return engine.translate(text, **kwargs)
+
+    def test_text_without_html_gets_markdown_stripped(self):
+        assert self._translate('**粗體**與*斜體*') == '粗體與斜體'
+
+    def test_text_with_html_keeps_markdown_like_characters(self):
+        reply = '<p>*重要*與**強調**</p>'
+        assert self._translate(reply, html='<p>x</p>') == reply
+
+    def test_code_with_html_argument_still_code_mode(self):
+        assert self._translate('    **kwargs\n', text='    **kwargs',
+                               segment_type=SegmentType.CODE,
+                               html='<pre>x</pre>') == '    **kwargs'
+
+    def test_code_translate_strips_preface_through_engine(self):
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '看起來沒有註解需要翻譯：\n```python\n' + CODE_SAMPLE + '\n```\n'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            result = engine.translate(CODE_SAMPLE, segment_type=SegmentType.CODE)
+
+        assert result == CODE_SAMPLE
+
+    @pytest.mark.parametrize('reply', [
+        '```python\n\n```\n',
+        '```python\n```\n',
+        '以下是翻譯結果：\n```python\n  \n```\n',
+        '以下是翻譯結果：\n```\n```',
+    ])
+    def test_code_reply_empty_after_cleanup_is_retried(self, reply):
+        engine = TranslationEngine(max_retries=2)
+        empty, good = MagicMock(), MagicMock()
+        empty.returncode = good.returncode = 0
+        empty.stderr = good.stderr = ''
+        empty.stdout = reply
+        good.stdout = 'x = 1\n'
+
+        with patch('src.core.translator.subprocess.run',
+                   side_effect=[empty, good]) as mock_run:
+            assert engine.translate('x = 1', segment_type=SegmentType.CODE) == 'x = 1'
+        assert mock_run.call_count == 2
+
+    def test_code_reply_of_fence_markers_on_two_lines_is_retried(self):
+        # The source holds a fence, so the reply is not unwrapped; backticks
+        # and a newline remain
+        engine = TranslationEngine(max_retries=2)
+        empty, good = MagicMock(), MagicMock()
+        empty.returncode = good.returncode = 0
+        empty.stderr = good.stderr = ''
+        empty.stdout = '```\n```'
+        good.stdout = 'print("```")\n'
+
+        with patch('src.core.translator.subprocess.run',
+                   side_effect=[empty, good]) as mock_run:
+            assert engine.translate('print("```")',
+                                    segment_type=SegmentType.CODE) == 'print("```")'
+        assert mock_run.call_count == 2
+
+    @pytest.mark.parametrize('source, segment_type', [
+        ('`', SegmentType.TEXT),
+        ('`', SegmentType.CODE),
+        ('```\n```', SegmentType.CODE),
+    ])
+    def test_backtick_only_source_and_matching_reply_accepted(self, source, segment_type):
+        engine = TranslationEngine(max_retries=1)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = source
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            assert engine.translate(source, segment_type=segment_type) == source
+
+    def test_text_reply_empty_after_cleanup_raises(self):
+        engine = TranslationEngine(max_retries=1)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '** **\n'   # markdown cleanup leaves only a space
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            with pytest.raises(TranslationError, match='Empty translation'):
+                engine.translate('Some text.')
+
+    @pytest.mark.parametrize('reply', ['```html\n```\n', '```\n```', '```\n  \n```'])
+    @pytest.mark.parametrize('html', ['', '<p>Some text.</p>'])
+    def test_text_reply_only_fence_is_retried(self, reply, html):
+        engine = TranslationEngine(max_retries=2)
+        empty, good = MagicMock(), MagicMock()
+        empty.returncode = good.returncode = 0
+        empty.stderr = good.stderr = ''
+        empty.stdout = reply
+        good.stdout = '一些文字。\n'
+
+        with patch('src.core.translator.subprocess.run',
+                   side_effect=[empty, good]) as mock_run:
+            assert engine.translate('Some text.', html=html) == '一些文字。'
+        assert mock_run.call_count == 2
+
+    def test_text_reply_only_fence_exhausts(self):
+        engine = TranslationEngine(max_retries=2)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '```html\n```\n'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run',
+                   return_value=mock_result) as mock_run:
+            with pytest.raises(TranslationError, match='Empty translation'):
+                engine.translate('Some text.')
+        assert mock_run.call_count == 2
+
+    @pytest.mark.parametrize('html', ['', '<p>x</p>'])
+    def test_text_commentary_only_reply_is_stored(self, html):
+        # Accepted limitation: a reply that is only a commentary line is not
+        # treated as empty (as on main); validating replies is left to Phase 4
+        engine = TranslationEngine(max_retries=1)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '以下是翻譯結果：\n'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            assert engine.translate(LONG_SOURCE, html=html) == '以下是翻譯結果：'
+
+    def test_long_one_line_translation_starting_with_commentary_word_accepted(self):
+        engine = TranslationEngine(max_retries=1)
+        reply = '當然，這條規則也有例外，我們會在下一章更詳細地討論這些例外情況。'
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = reply + '\n'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            assert engine.translate(
+                'Of course, there are exceptions to this rule, and we will discuss '
+                'them in more detail in the next chapter.') == reply
+
+    @pytest.mark.parametrize('source, reply', [
+        ('OK', '好的\n'),
+        ('Of course', '當然\n'),
+        ('Here are the steps:', '以下是步驟：\n'),
+        ("Here's an example.", '以下是一個範例：\n'),
+        ('以下是：', '以下是：\n'),   # source left untranslated
+        ('X', 'X\n'),
+    ])
+    def test_short_text_reply_accepted(self, source, reply):
+        engine = TranslationEngine(max_retries=1)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = reply
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            assert engine.translate(source) == reply.strip()
+
+    def test_code_whitespace_only_output_is_empty(self):
+        engine = TranslationEngine(max_retries=1)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '  \n\n'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            with pytest.raises(TranslationError, match='Empty translation'):
+                engine.translate('x = 1', segment_type=SegmentType.CODE)
+
+
+def _state(segment_id, chapter_id, text, segment_type=SegmentType.TEXT):
+    return SegmentState(segment_id=segment_id, chapter_id=chapter_id,
+                        html=f'<p>{text}</p>', text=text,
+                        word_count=len(text.split()), segment_type=segment_type)
+
+
+def get_context(segments, segment_id):
+    # Imported lazily so each test reports on its own if the helper is missing
+    from src.core.translator import get_context as _get_context
+    return _get_context(segments, segment_id)
+
+
+class TestContext:
+    """Bug 4: context comes from the right end, chapter and segment type."""
+
+    def test_prompt_uses_tail_of_previous_segment(self):
+        engine = TranslationEngine()
+        before = 'HEADMARK ' + 'filler ' * 60 + 'TAILMARK'
+        assert len(before) > 200
+
+        prompt = engine._build_prompt('Current text', SegmentType.TEXT,
+                                      context_before=before)
+
+        assert 'TAILMARK' in prompt
+        assert 'HEADMARK' not in prompt
+        assert '前文參考（不需翻譯）：\n' + before[-200:] + '\n' in prompt
+        assert before[-201:] not in prompt
+
+    def test_prompt_uses_head_of_next_segment(self):
+        engine = TranslationEngine()
+        after = 'HEADMARK ' + 'filler ' * 60 + 'TAILMARK'
+
+        prompt = engine._build_prompt('Current text', SegmentType.TEXT,
+                                      context_after=after)
+
+        assert 'HEADMARK' in prompt
+        assert 'TAILMARK' not in prompt
+        assert '後文參考（不需翻譯）：\n' + after[:200] + '\n' in prompt
+        assert after[:201] not in prompt
+
+    def test_neighbours_in_same_chapter_used(self):
+        segments = [
+            _state('a_1', 'a', 'Before text.'),
+            _state('a_2', 'a', 'Current text.'),
+            _state('a_3', 'a', 'After text.'),
+        ]
+        assert get_context(segments, 'a_2') == ('Before text.', 'After text.')
+
+    def test_neighbour_from_other_chapter_not_used(self):
+        segments = [
+            _state('a_1', 'a', 'End of chapter a.'),
+            _state('b_1', 'b', 'Only segment of chapter b.'),
+            _state('c_1', 'c', 'Start of chapter c.'),
+        ]
+        assert get_context(segments, 'b_1') == ('', '')
+
+    def test_code_neighbour_not_used(self):
+        segments = [
+            _state('a_1', 'a', 'x = 1', SegmentType.CODE),
+            _state('a_2', 'a', 'Current text.'),
+            _state('a_3', 'a', 'y = 2', SegmentType.CODE),
+        ]
+        assert get_context(segments, 'a_2') == ('', '')
+
+    def test_code_neighbours_stepped_over_to_text(self):
+        segments = [
+            _state('a_1', 'a', 'Text before.'),
+            _state('a_2', 'a', 'x = 1', SegmentType.CODE),
+            _state('a_3', 'a', 'z = 0', SegmentType.CODE),
+            _state('a_4', 'a', 'Current text.'),
+            _state('a_5', 'a', 'y = 2', SegmentType.CODE),
+            _state('a_6', 'a', 'Text after.'),
+        ]
+        assert get_context(segments, 'a_4') == ('Text before.', 'Text after.')
+
+    def test_stepping_over_code_stops_at_chapter_boundary(self):
+        segments = [
+            _state('a_1', 'a', 'Previous chapter text.'),
+            _state('b_1', 'b', 'x = 1', SegmentType.CODE),
+            _state('b_2', 'b', 'Current text.'),
+            _state('b_3', 'b', 'y = 2', SegmentType.CODE),
+            _state('c_1', 'c', 'Next chapter text.'),
+        ]
+        assert get_context(segments, 'b_2') == ('', '')
+
+    def test_first_last_and_unknown_segment(self):
+        segments = [_state('a_1', 'a', 'One.'), _state('a_2', 'a', 'Two.')]
+        assert get_context(segments, 'a_1') == ('', 'Two.')
+        assert get_context(segments, 'a_2') == ('One.', '')
+        assert get_context(segments, 'missing') == ('', '')
