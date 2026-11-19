@@ -440,3 +440,48 @@ class TestContentDivHandling:
         assert len(segments) == 1
         assert '<section' in segments[0].html
         assert 'class="note"' in segments[0].html
+
+
+class TestCommentHandling:
+    """Bug 5: comments are not book text."""
+
+    def test_body_comment_between_paragraphs_skipped(self, segmenter):
+        html = ('<html><body><p>First paragraph.</p>'
+                '<!-- note -->'
+                '<p>Second paragraph.</p></body></html>')
+        segments = segmenter.segment_chapter('ch1', html)
+
+        assert segments
+        for seg in segments:
+            assert 'note' not in seg.text
+            assert 'note' not in seg.html
+        joined = ' '.join(s.text for s in segments)
+        assert 'First paragraph.' in joined
+        assert 'Second paragraph.' in joined
+
+    def test_comment_only_body_yields_no_segment(self, segmenter):
+        segments = segmenter.segment_chapter('ch1', '<html><body><!-- note --></body></html>')
+        assert segments == []
+
+    def test_processing_instruction_skipped(self, segmenter):
+        html = '<html><body><p>Visible text.</p><?hidden marker?></body></html>'
+        segments = segmenter.segment_chapter('ch1', html)
+        assert all('marker' not in s.text for s in segments)
+
+    def test_is_container_ignores_comment(self):
+        tag = _make_tag('<div><!-- note --><p>Para 1</p><p>Para 2</p></div>')
+        assert _is_container(tag) is True
+
+    def test_is_container_legacy_counts_comment(self):
+        tag = _make_tag('<div><!-- note --><p>Para 1</p><p>Para 2</p></div>')
+        assert _is_container(tag, legacy=True) is False
+
+    def test_container_div_with_comment_recursed(self, segmenter):
+        html = ('<html><body><div><!-- note -->'
+                '<p>Para one.</p><pre>x = 1</pre><p>Para two.</p>'
+                '</div></body></html>')
+        segments = segmenter.segment_chapter('ch1', html)
+
+        assert [s.segment_type for s in segments] == [
+            SegmentType.TEXT, SegmentType.CODE, SegmentType.TEXT]
+        assert all('note' not in s.html for s in segments)

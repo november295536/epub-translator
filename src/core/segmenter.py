@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from bs4 import BeautifulSoup, Tag, NavigableString
+from bs4.element import PreformattedString
 
 
 class SegmentType(str, Enum):
@@ -41,9 +42,17 @@ BLOCK_TAGS = frozenset({
 })
 
 
-def _is_container(tag: Tag) -> bool:
-    """Container = only block-level children + whitespace. Content = has text or inline tags."""
+def _is_container(tag: Tag, legacy: bool = False) -> bool:
+    """Container = only block-level children + whitespace. Content = has text or inline tags.
+
+    Comments and other non-text strings (CData, ProcessingInstruction,
+    Doctype) are ignored. ``legacy=True`` restores the old behaviour of
+    counting them as text; the builder needs it for projects that were
+    segmented before comments were skipped.
+    """
     for child in tag.children:
+        if not legacy and isinstance(child, PreformattedString):
+            continue
         if isinstance(child, NavigableString):
             if child.strip():
                 return False
@@ -82,6 +91,9 @@ class Segmenter:
         """Extract logical blocks from HTML, classifying each as text or code."""
         blocks = []
         for child in element.children:
+            if isinstance(child, PreformattedString):
+                # Comment, CData, ProcessingInstruction, Doctype: not book text
+                continue
             if isinstance(child, NavigableString):
                 text = str(child).strip()
                 if text:
