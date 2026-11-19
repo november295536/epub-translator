@@ -371,7 +371,8 @@ class TestAtomicSave:
         # Now mutate in memory but make save fail
         pm.mark_translated('ch1_seg0002', '第一段')
 
-        tmp_file = pm.project_file + '.tmp'
+        # The temporary file name is unique per process
+        tmp_file = f'{pm.project_file}.{os.getpid()}.tmp'
         os.makedirs(tmp_file, exist_ok=True)
 
         with pytest.raises(IsADirectoryError):
