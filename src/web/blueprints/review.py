@@ -114,7 +114,7 @@ def retranslate_segment(project_name: str, segment_id: str):
             return jsonify({'error': '段落已在翻譯期間被編輯，未套用新譯文'}), 409
         pm.save()
         if outcome.status == SegmentStatus.FAILED:
-            detail = '; '.join(i.detail for i in outcome.issues)
+            detail = outcome.issues[0].detail
             logger.warning("Translation error for %s: %s", segment_id, detail)
             return jsonify({'error': detail}), 500
         logger.info("重新翻譯完成: %s (%s)", segment_id, engine.model)

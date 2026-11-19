@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import threading
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional
 
 from src.llm.base import Capabilities, LLMRequest, LLMResponse, ModelInfo
-
-Reply = Union[str, LLMResponse, BaseException]
 
 
 class FakeBackend:
@@ -21,15 +19,16 @@ class FakeBackend:
         sampling_params=True, suggested_concurrency=4,
     )
 
-    def __init__(self, replies: Optional[List[Reply]] = None,
-                 responder: Optional[Callable[[LLMRequest], Reply]] = None):
+    # A reply is a str, an LLMResponse or an exception to raise
+    def __init__(self, replies: Optional[list] = None,
+                 responder: Optional[Callable[[LLMRequest], object]] = None):
         self.replies = list(replies or [])
         self.responder = responder
         self.requests: List[LLMRequest] = []
         self._lock = threading.Lock()
 
     def list_models(self) -> List[ModelInfo]:
-        return [ModelInfo('fake-model', 'Fake')]
+        return [ModelInfo('fake-model', 'Fake', '')]
 
     def complete(self, request: LLMRequest,
                  cancel: threading.Event) -> LLMResponse:

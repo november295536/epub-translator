@@ -1023,3 +1023,72 @@ class TestFailureDiagnostics:
         outcome = translate_segment(_engine(FakeBackend([RefusalError('no')])), seg, [seg])
         assert outcome.status == SegmentStatus.FAILED
         assert os.listdir(tmp_path) == []
+
+
+class TestRequestAndMessages:
+    """Exact request, error messages and log lines (Phase 1 mutation survivors)."""
+
+    def test_request_is_one_user_message_without_system(self):
+        from src.llm import Message
+        fake = FakeBackend(['譯文'])
+        engine = _engine(fake)
+        engine.translate('Some text.', SegmentType.TEXT, '', '', '', '<p>Some text.</p>')
+        request = fake.requests[0]
+        prompt = engine._build_prompt('Some text.', SegmentType.TEXT, html='<p>Some text.</p>')
+        assert request.system == ''
+        assert request.messages == [Message('user', prompt)]
+
+    def test_prompt_passed_to_cli_unchanged(self):
+        mock_result = MagicMock(returncode=0, stdout='譯文', stderr='')
+        engine = TranslationEngine()
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
+            engine.translate('Some text.')
+        assert mock_run.call_args[0][0][2] == engine._build_prompt('Some text.', SegmentType.TEXT)
+
+    def test_default_three_attempts(self):
+        fake = FakeBackend([TransientError('x')] * 4)
+        with pytest.raises(TranslationError):
+            TranslationEngine(backend=fake).translate('x')
+        assert len(fake.requests) == 3
+
+    def test_exhaustion_messages(self):
+        with pytest.raises(TranslationError) as info:
+            _engine(FakeBackend([TransientError('a'), TransientError('boom')]),
+                    max_retries=2).translate('x')
+        assert str(info.value) == 'Translation failed after 2 attempts: boom'
+        with pytest.raises(TranslationError) as info:
+            _engine(FakeBackend(['', '']), max_retries=2).translate('x')
+        assert str(info.value) == 'Empty translation after 2 attempts'
+
+    def test_log_lines(self, caplog):
+        import logging
+        caplog.set_level(logging.WARNING, logger='src.core.translator')
+        with pytest.raises(TranslationError):
+            _engine(FakeBackend([TransientError('boom'), '']), max_retries=2).translate('x')
+        assert [r.getMessage() for r in caplog.records] == [
+            'Translation attempt 1/2 failed: boom',
+            'Empty translation result (attempt 2/2)',
+        ]
+
+    def test_no_glossary_section_without_glossary(self):
+        fake = FakeBackend(['譯文'])
+        seg = _seg()
+        translate_segment(_engine(fake), seg, [seg])
+        assert '術語表' not in fake.prompts[0]
+
+
+class TestFailureLogFormat:
+
+    def test_exact_content(self, tmp_path, monkeypatch):
+        import src.core.translator as translator
+        monkeypatch.setattr(translator.time, 'strftime',
+                            lambda fmt: 'STAMP' if fmt == '%Y-%m-%d %H:%M:%S' else 'WRONG')
+        error = TranslationError('final message', code='transient', prompt='THE PROMPT',
+                                 attempts=[('first', 'R1'), ('second', 'x' * 20001)])
+        translator.write_failure_log(str(tmp_path), 'c1_seg0001', 'haiku', error)
+        content = (tmp_path / 'failed' / 'c1_seg0001.txt').read_text(encoding='utf-8')
+        assert content == (
+            'segment: c1_seg0001\nmodel: haiku\ntime: STAMP\nerror: final message\n\n'
+            '=== request ===\nTHE PROMPT\n\n'
+            '=== attempt 1: first ===\nR1\n\n'
+            '=== attempt 2: second ===\n' + 'x' * 20000 + '\n')

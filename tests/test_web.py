@@ -1675,7 +1675,7 @@ class TestFailedInPages:
         pm = ProjectManager(os.path.join(projects_dir, PROJECT_NAME))
         pm.load()
         pm.apply_outcome('ch1_seg0003', TranslationOutcome(
-            text=None, status=SegmentStatus.FAILED, model='sonnet',
+            text=None, status=SegmentStatus.FAILED, model='sonnet', usage=None,
             issues=[Issue('backend', 'transient', 'FAILDETAIL', True)]))
         pm.save()
 
@@ -1724,3 +1724,151 @@ class TestTermExtractionModel:
             _wait(lambda: not _extraction_tasks[PROJECT_NAME]['running'])
         _extraction_tasks.pop(PROJECT_NAME, None)
         assert fake.requests and all(r.model == 'haiku' for r in fake.requests)
+
+
+class TestWorkerEventsAndLogs:
+    """Exact events and log lines of the coordinator (mutation survivors)."""
+
+    def _run(self, projects_dir, responder, segment_ids=None):
+        TaskManager._instance = None
+        tm = TaskManager()
+        with use_fake_backend(FakeBackend(responder=responder)):
+            task = tm.start_translation(PROJECT_NAME, projects_dir, segment_ids=segment_ids)
+            task._coordinator.join(timeout=20)
+        TaskManager._instance = None
+        return task
+
+    def test_events_for_one_success_and_one_failure(self, project_with_translations, caplog):
+        import logging
+        caplog.set_level(logging.INFO, logger='src.web.tasks')
+        long_text = '<p>' + '譯' * 300 + '</p>'
+
+        def respond(request):
+            if '>Chapter 2<' in request.messages[-1].content:
+                raise TransientError('boom')
+            return long_text
+
+        task = self._run(project_with_translations, respond,
+                         segment_ids=['ch1_seg0003', 'ch2_seg0001'])
+        events = [e for e in task.progress.get_all()
+                  if e['event'] in ('progress', 'segment_complete', 'segment_error')]
+        assert events == [
+            {'event': 'progress', 'data': {'completed': 1, 'total': 2, 'percent': 50.0}},
+            {'event': 'segment_complete', 'data': {'segment_id': 'ch1_seg0003',
+                                                   'translated_text': long_text[:200],
+                                                   'model': 'sonnet'}},
+            {'event': 'segment_error', 'data': {
+                'segment_id': 'ch2_seg0001',
+                'error': 'Translation failed after 3 attempts: boom'}},
+        ]
+        messages = [r.getMessage() for r in caplog.records]
+        assert '段落完成 [1/2]: ch1_seg0003 (sonnet)' in messages
+        assert ('段落翻譯失敗: ch2_seg0001 — Translation failed after 3 attempts: boom'
+                in messages)
+
+    def test_percent_rounding_with_three_segments(self, project_with_translations):
+        task = self._run(project_with_translations, lambda request: '<p>譯</p>')
+        percents = [e['data']['percent'] for e in task.progress.get_all()
+                    if e['event'] == 'progress']
+        assert percents == [33.3, 66.7, 100.0]
+
+    def test_single_segment_is_100_percent(self, project_with_translations):
+        task = self._run(project_with_translations, lambda request: '<p>譯</p>',
+                         segment_ids=['ch1_seg0003'])
+        assert [e['data'] for e in task.progress.get_all() if e['event'] == 'progress'] == \
+            [{'completed': 1, 'total': 1, 'percent': 100.0}]
+
+    def test_dropped_result_logged(self, client, project_with_translations, caplog):
+        import logging
+        caplog.set_level(logging.INFO, logger='src.web.tasks')
+        TaskManager._instance = None
+        in_flight = threading.Event()
+        release = threading.Event()
+
+        def respond(request):
+            in_flight.set()
+            assert release.wait(10)
+            return '<p>機器譯文</p>'
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            client.post(f'/api/projects/{PROJECT_NAME}/translate/start',
+                        json={'segment_ids': ['ch1_seg0003']})
+            assert in_flight.wait(10)
+            client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/approve',
+                        json={'text': '人工譯文'})
+            release.set()
+            TaskManager().get_task(PROJECT_NAME)._coordinator.join(timeout=20)
+        assert '段落已在翻譯期間被編輯，捨棄結果: ch1_seg0003' in \
+            [r.getMessage() for r in caplog.records]
+        seg = _load(project_with_translations)['ch1_seg0003']
+        assert (seg.status, seg.translated_text) == (SegmentStatus.REVIEWED, '人工譯文')
+        TaskManager._instance = None
+
+    def test_start_without_retry_failed_skips_failed(self, project_with_translations):
+        pm = ProjectManager(os.path.join(project_with_translations, PROJECT_NAME))
+        pm.load()
+        pm.apply_outcome('ch1_seg0003', TranslationOutcome(
+            text=None, status=SegmentStatus.FAILED, model='sonnet', usage=None,
+            issues=[Issue('backend', 'transient', 'x', True)]))
+        pm.save()
+        TaskManager._instance = None
+        tm = TaskManager()
+        with patch.object(tm, '_run_translation'):
+            task = tm.start_translation(PROJECT_NAME, project_with_translations)
+        assert task.total == 2
+        task.project_lock.release()
+        TaskManager._instance = None
+
+
+class TestRetranslateDetails:
+
+    def test_edit_during_retranslation_is_kept(self, client, project_with_translations):
+        TaskManager._instance = None
+        pm = ProjectManager(os.path.join(project_with_translations, PROJECT_NAME))
+        pm.load()
+
+        def respond(request):
+            pm.update_translation('ch1_seg0002', '人工譯文')  # edited meanwhile
+            return '<p>機器譯文</p>'
+
+        with patch('src.web.blueprints.review.get_pm', return_value=pm):
+            with use_fake_backend(FakeBackend(responder=respond)):
+                response = client.post(
+                    f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/retranslate')
+        assert response.status_code == 409
+        assert response.get_json() == {'error': '段落已在翻譯期間被編輯，未套用新譯文'}
+        assert pm.data.segments[1].translated_text == '人工譯文'
+
+    def test_failure_diagnostics_and_logs(self, client, project_with_translations, caplog):
+        import logging
+        caplog.set_level(logging.WARNING, logger='src.web.blueprints.review')
+        with use_fake_backend(FakeBackend([TransientError('boom')] * 3)):
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
+        assert response.get_json() == {'error': 'Translation failed after 3 attempts: boom'}
+        log_dir = os.path.join(project_with_translations, PROJECT_NAME, 'log', 'failed')
+        assert os.listdir(log_dir) == ['ch1_seg0003.txt']
+        assert 'Translation error for ch1_seg0003: Translation failed after 3 attempts: boom' \
+            in [r.getMessage() for r in caplog.records]
+
+    def test_rate_limit_logged(self, client, caplog):
+        import logging
+        caplog.set_level(logging.WARNING, logger='src.web.blueprints.review')
+        with use_fake_backend(FakeBackend([RateLimitError('limit hit')])):
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
+        assert response.get_json() == {'error': 'limit hit'}
+        assert 'Rate limit during retranslation: limit hit' in \
+            [r.getMessage() for r in caplog.records]
+
+
+class TestLockedSaveResponse:
+
+    def test_exact_409_body(self, client, project_with_translations):
+        from src.core.project import ProjectLockedError
+        with patch('src.web.blueprints.review.ProjectManager.save',
+                   side_effect=ProjectLockedError('held elsewhere')):
+            response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0001',
+                                   json={'text': '改'})
+        assert response.status_code == 409
+        assert response.get_json() == {'error': 'held elsewhere'}

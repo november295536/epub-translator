@@ -55,14 +55,14 @@ class Capabilities:
 class ModelInfo:
     alias: str
     label: str
-    description: str = ''
+    description: str
 
 
 class LLMError(Exception):
     """A model call failed. `raw` holds the backend's raw output, if any,
     for failure diagnostics."""
 
-    def __init__(self, message: str = '', raw: str = ''):
+    def __init__(self, message: str, raw: str = ''):
         super().__init__(message)
         self.raw = raw
 
@@ -70,7 +70,7 @@ class LLMError(Exception):
 class RateLimitError(LLMError):
     """Usage limit reached. `retry_after` in seconds when the backend knows it."""
 
-    def __init__(self, message: str = '', raw: str = '',
+    def __init__(self, message: str, raw: str = '',
                  retry_after: Optional[float] = None):
         super().__init__(message, raw)
         self.retry_after = retry_after

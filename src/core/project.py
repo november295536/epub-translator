@@ -353,10 +353,10 @@ class ProjectLock:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except OSError:
-                    holder = os.read(fd, 32).decode(errors='replace').strip()
+                    holder = os.read(fd, 32).decode().strip()
                     os.close(fd)
                     raise ProjectLockedError(
-                        f'專案正由另一個程序使用（PID {holder or "?"}）：{self.path}')
+                        f'專案正由另一個程序使用（PID {holder}）：{self.path}')
                 os.ftruncate(fd, 0)
                 os.write(fd, str(os.getpid()).encode())
                 _held_locks[self.path] = [fd, 1]
