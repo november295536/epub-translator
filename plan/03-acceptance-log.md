@@ -401,7 +401,12 @@ with a failing test (or, for the shell script, a real run) before the fix.
   `src/` on a project created by this branch, in a temporary directory), and its project
   listing (`/`) calls `load()` without catching that. This matters only for a rollback or
   for a pre-Phase-0 checkout sharing the same `projects/` directory; it cannot be fixed on
-  this branch. Projects created before this phase are not rewritten and stay loadable.
+  this branch.
+- Projects that existed before this phase remain loadable by pre-Phase-0 code; projects
+  created after it are not. A project without the field loads as version 1, and saving it
+  (translating, reviewing, changing the model) does not add the field: `save()` leaves
+  `segmenter_version` out when it is 1 (round 4;
+  `test_saving_project_without_segmenter_version_keeps_it_absent`).
 
 ### Not done
 
