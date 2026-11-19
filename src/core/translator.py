@@ -104,16 +104,15 @@ _MD_ITALIC_PATTERN = re.compile(r'(?<![0-9a-zA-Z])\*(.+?)\*(?![0-9a-zA-Z])|(?<![
 # non-blank line is not part of the match)
 _LEADING_BLANK_LINES = re.compile(r'\A(?:[ \t]*\r?\n)+')
 
-# A response that is entirely wrapped in one code fence
-_CODE_FENCE_PATTERN = re.compile(r'\A```[^\n]*\n(.*)\n```\Z', re.DOTALL)
+# A response that is entirely wrapped in one code fence (the body may be empty)
+_CODE_FENCE_PATTERN = re.compile(r'\A```[^\n]*\n(?:(.*)\n)?```\Z', re.DOTALL)
 
-# A code response that is one fenced block preceded only by a commentary line
-# (the first two _START_PATTERNS, e.g. "看起來…原樣輸出：" or "Here is…")
-_CODE_PREFACED_FENCE_PATTERN = re.compile(
-    r'\A(?:' + '|'.join(p[1:] for p in _START_PATTERNS[:2]) + r')'
-    r'```[^\n]*\n(.*)\n```\Z',
-    re.DOTALL,
-)
+
+def _is_commentary_line(line: str) -> bool:
+    """True when a line matches the first two _START_PATTERNS
+    (e.g. "看起來…原樣輸出：" or "Here is…")."""
+    return any(re.match(p, line + '\n') for p in _START_PATTERNS[:2])
+
 
 # Number of characters of each neighbouring segment used as context
 CONTEXT_CHARS = 200
@@ -238,7 +237,9 @@ class TranslationEngine:
                     continue
 
                 # Code keeps its leading whitespace (first-line indentation)
-                translated = result.stdout if is_code else result.stdout.strip()
+                raw = result.stdout if is_code else result.stdout.strip()
+                translated = self._clean_response(raw, html_mode=use_html_mode,
+                                                  code_mode=is_code, source=text)
                 if not translated.strip():
                     logger.warning(
                         "Empty translation result (attempt %d/%d)",
@@ -250,8 +251,7 @@ class TranslationEngine:
                         )
                     continue
 
-                return self._clean_response(translated, html_mode=use_html_mode,
-                                            code_mode=is_code, source=text)
+                return translated
 
             except subprocess.TimeoutExpired:
                 logger.warning(
@@ -325,18 +325,24 @@ class TranslationEngine:
             source: The source code (code mode only). When it contains a
                     code fence itself, the response is not unwrapped.
 
-        In code mode, when the source has no fence, a response that is one
-        fenced block, optionally preceded by a single commentary line
-        matching the start patterns, is reduced to the fenced body.
+        In code mode, a first line matching the first two start patterns is
+        removed unless the source's first non-blank line matches them too.
+        Then, when the source has no fence, a response that is one fenced
+        block is reduced to the fenced body (an empty fence gives '').
         """
         if code_mode:
             cleaned = _LEADING_BLANK_LINES.sub('', text).rstrip()
+            first_line, _, rest = cleaned.partition('\n')
+            source_first_line = _LEADING_BLANK_LINES.sub('', source).partition('\n')[0]
+            if _is_commentary_line(first_line) and not _is_commentary_line(source_first_line):
+                cleaned = _LEADING_BLANK_LINES.sub('', rest)
             if '```' not in source:
-                fenced = (_CODE_FENCE_PATTERN.match(cleaned)
-                          or _CODE_PREFACED_FENCE_PATTERN.match(cleaned))
-                # Only a single block: a fence inside the body means several
-                if fenced and '```' not in fenced.group(1):
-                    cleaned = _LEADING_BLANK_LINES.sub('', fenced.group(1)).rstrip()
+                fenced = _CODE_FENCE_PATTERN.match(cleaned)
+                if fenced:
+                    body = fenced.group(1) or ''
+                    # Only a single block: a fence inside the body means several
+                    if '```' not in body:
+                        cleaned = _LEADING_BLANK_LINES.sub('', body).rstrip()
             return cleaned
 
         cleaned = text

@@ -513,21 +513,46 @@ class TestCodeResponseCleaning:
         assert TranslationEngine._clean_response(
             source, code_mode=True, source=source) == source
 
-    def test_code_preface_without_fence_not_removed(self):
+    @pytest.mark.parametrize('preface', [
+        '以下是翻譯後的程式碼：', "Here's the code:", 'The translation:'])
+    def test_code_preface_before_unfenced_code_removed(self, preface):
+        reply = preface + '\n\n# 載入設定\nx = 1'
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source='# load config\nx = 1') == '# 載入設定\nx = 1'
+
+    def test_code_preface_kept_when_source_starts_like_one(self):
+        source = '\n以下是 = 1\nx = 2'
         reply = '以下是 = 1\nx = 2'
         assert TranslationEngine._clean_response(
-            reply, code_mode=True, source='x = 2') == reply
+            reply, code_mode=True, source=source) == reply
 
-    def test_code_preface_needs_fence_to_end_reply(self):
+    def test_code_only_first_line_can_be_a_preface(self):
+        reply = 'x = 1\nHere is = 2'
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source='x = 1\ny = 2') == reply
+
+    def test_code_preface_removed_but_fence_with_trailing_text_kept(self):
         reply = '以下是：\n```\nx = 1\n```\ntrailing remark'
         assert TranslationEngine._clean_response(
-            reply, code_mode=True, source='x = 1') == reply
+            reply, code_mode=True, source='x = 1') == '```\nx = 1\n```\ntrailing remark'
 
     @pytest.mark.parametrize('prefix', ['', '以下是：\n'])
     def test_code_two_fenced_blocks_not_unwrapped(self, prefix):
-        reply = prefix + '```\nx = 1\n```\nnote\n```\ny = 2\n```'
+        blocks = '```\nx = 1\n```\nnote\n```\ny = 2\n```'
         assert TranslationEngine._clean_response(
-            reply, code_mode=True, source='x = 1\ny = 2') == reply
+            prefix + blocks, code_mode=True, source='x = 1\ny = 2') == blocks
+
+    @pytest.mark.parametrize('reply', [
+        '```python\n\n```',
+        '```python\n```',
+        '```\n```\n',
+        '以下是翻譯結果：\n```python\n  \n```\n',
+        '以下是翻譯結果：\n```python\n```',
+        '以下是翻譯結果：\n',
+    ])
+    def test_code_empty_fence_cleans_to_empty(self, reply):
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source='x = 1') == ''
 
     def test_code_fence_body_leading_blank_lines_trimmed(self):
         reply = '```python\n\n' + CODE_SAMPLE + '\n```'
@@ -572,6 +597,36 @@ class TestCodeResponseCleaning:
             result = engine.translate(CODE_SAMPLE, segment_type=SegmentType.CODE)
 
         assert result == CODE_SAMPLE
+
+    @pytest.mark.parametrize('reply', [
+        '```python\n\n```\n',
+        '```python\n```\n',
+        '以下是翻譯結果：\n```python\n  \n```\n',
+        '以下是翻譯結果：\n```\n```',
+    ])
+    def test_code_reply_empty_after_cleanup_is_retried(self, reply):
+        engine = TranslationEngine(max_retries=2)
+        empty, good = MagicMock(), MagicMock()
+        empty.returncode = good.returncode = 0
+        empty.stderr = good.stderr = ''
+        empty.stdout = reply
+        good.stdout = 'x = 1\n'
+
+        with patch('src.core.translator.subprocess.run',
+                   side_effect=[empty, good]) as mock_run:
+            assert engine.translate('x = 1', segment_type=SegmentType.CODE) == 'x = 1'
+        assert mock_run.call_count == 2
+
+    def test_text_reply_empty_after_cleanup_raises(self):
+        engine = TranslationEngine(max_retries=1)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '** **\n'   # markdown cleanup leaves only a space
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            with pytest.raises(TranslationError, match='Empty translation'):
+                engine.translate('Some text.')
 
     def test_code_whitespace_only_output_is_empty(self):
         engine = TranslationEngine(max_retries=1)
