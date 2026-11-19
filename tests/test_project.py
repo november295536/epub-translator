@@ -363,7 +363,9 @@ class TestAtomicSave:
         assert pm2.data.title == 'Test'
 
     def test_original_intact_if_write_fails(self, project_dir, sample_segments):
-        """If save() fails writing tmp file, original project.json stays intact."""
+        """If save() fails before the replace, original project.json stays intact
+        and the temporary file is removed."""
+        from unittest.mock import patch
         pm = ProjectManager(project_dir)
         pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
         pm.mark_translated('ch1_seg0001', '標題')
@@ -372,15 +374,11 @@ class TestAtomicSave:
         # Now mutate in memory but make save fail
         pm.mark_translated('ch1_seg0002', '第一段')
 
-        # The temporary file name is unique per process
-        tmp_file = f'{pm.project_file}.{os.getpid()}.tmp'
-        os.makedirs(tmp_file, exist_ok=True)
-
-        with pytest.raises(IsADirectoryError):
-            pm.save()
-
-        # Clean up the directory we made
-        os.rmdir(tmp_file)
+        # The temporary file name is unique per save: fail the replace instead
+        with patch('src.core.project.os.replace', side_effect=OSError('disk full')):
+            with pytest.raises(OSError):
+                pm.save()
+        assert not [n for n in os.listdir(project_dir) if n.endswith('.tmp')]
 
         # Original file should still be valid with only the first translation
         pm2 = ProjectManager(project_dir)
@@ -391,8 +389,6 @@ class TestAtomicSave:
         # Second translation should NOT have been persisted
         seg2 = [s for s in pm2.data.segments if s.segment_id == 'ch1_seg0002'][0]
         assert seg2.status == SegmentStatus.PENDING
-
-
 
 
 # --- Phase 1: FAILED status, issues, revision, compatibility, lock -------------
@@ -724,3 +720,147 @@ class TestSaveFormat:
         text = open(os.path.join(project_dir, 'project.json'), encoding='utf-8').read()
         assert '"translated_text": "標題"' in text
         assert '\n  "epub_path"' in text
+
+
+# --- Review round 1 ---------------------------------------------------------------
+
+class TestSharedProjectMutex:
+    """Item 1: managers of one project share one mutex; saves never collide."""
+
+    def test_managers_of_one_project_share_the_mutex(self, pm, project_dir):
+        from src.core.project import project_mutex
+        other = ProjectManager(os.path.join(project_dir, '.', ''))
+        assert other.mutex is pm.mutex is project_mutex(project_dir)
+        assert ProjectManager(project_dir + '-other').mutex is not pm.mutex
+
+    def test_concurrent_saves_from_several_managers(self, pm, project_dir):
+        managers = []
+        for _ in range(4):
+            m = ProjectManager(project_dir)
+            m.load()
+            managers.append(m)
+        barrier = threading.Barrier(len(managers) * 2)
+        errors = []
+
+        def run(m):
+            barrier.wait()
+            try:
+                for _ in range(30):
+                    m.save()
+            except Exception as e:  # noqa: BLE001 - reported below
+                errors.append(e)
+
+        threads = [threading.Thread(target=run, args=(m,))
+                   for m in managers for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == []
+        with open(pm.project_file, encoding='utf-8') as f:
+            assert json.load(f)['title'] == 'Test'
+        assert not [n for n in os.listdir(project_dir) if n.endswith('.tmp')]
+
+    def test_save_waits_for_the_project_mutex(self, pm, project_dir):
+        other = ProjectManager(project_dir)
+        other.load()
+        other.mark_translated('ch1_seg0001', '後來')
+        with pm.mutex:
+            t = threading.Thread(target=other.save)
+            t.start()
+            t.join(timeout=0.3)
+            assert t.is_alive()  # blocked while the mutex is held
+        t.join(timeout=10)
+        assert not t.is_alive()
+
+
+class _EditWhileIterated:
+    """Issues list whose iteration (inside apply_outcome, after the revision
+    check) runs `action` in another thread and waits up to 0.5 s for it."""
+
+    def __init__(self, action):
+        self.action = action
+        self.finished_during_apply = None
+
+    def __iter__(self):
+        t = threading.Thread(target=self.action)
+        t.start()
+        t.join(timeout=0.5)
+        self.finished_during_apply = not t.is_alive()
+        self.thread = t
+        return iter([])
+
+
+class TestApplyOutcomeAtomic:
+    """Item 3: the revision check and the write are one step."""
+
+    def test_edit_cannot_slip_between_check_and_write(self, pm):
+        rev = pm._find('ch1_seg0002').revision
+        issues = _EditWhileIterated(lambda: pm.update_translation('ch1_seg0002', '人工'))
+        outcome = TranslationOutcome(text='機器', status=SegmentStatus.TRANSLATED,
+                                     issues=issues, model='haiku', usage=None)
+        pm.apply_outcome('ch1_seg0002', outcome, revision=rev)
+        issues.thread.join(timeout=10)
+        assert issues.finished_during_apply is False
+        seg = pm._find('ch1_seg0002')
+        assert (seg.translated_text, seg.revision) == ('人工', rev + 1)
+
+    def test_save_does_not_see_half_applied_outcome(self, pm, project_dir):
+        issues = _EditWhileIterated(pm.save)
+        outcome = TranslationOutcome(text='機器', status=SegmentStatus.TRANSLATED,
+                                     issues=issues, model='haiku', usage=None)
+        pm.apply_outcome('ch1_seg0002', outcome)
+        issues.thread.join(timeout=10)
+        assert issues.finished_during_apply is False
+        other = ProjectManager(project_dir)
+        other.load()
+        assert other._find('ch1_seg0002').translated_text == '機器'
+
+    def test_mark_reviewed_waits_for_the_mutex(self, pm):
+        with pm.mutex:
+            t = threading.Thread(target=pm.mark_reviewed, args=('ch1_seg0001',))
+            t.start()
+            t.join(timeout=0.3)
+            assert t.is_alive()
+        t.join(timeout=10)
+        assert pm._find('ch1_seg0001').status == SegmentStatus.REVIEWED
+
+
+class TestManualEditClearsFailure:
+    """Item 17: a manual edit clears issues and takes a segment out of FAILED."""
+
+    def test_edit_of_failed_segment(self, pm):
+        pm.apply_outcome('ch1_seg0002', _failed())
+        pm.update_translation('ch1_seg0002', '人工')
+        seg = pm._find('ch1_seg0002')
+        assert (seg.status, seg.issues) == (SegmentStatus.TRANSLATED, [])
+
+    def test_edit_keeps_other_statuses(self, pm):
+        pm.update_translation('ch1_seg0001', '人工')
+        assert pm._find('ch1_seg0001').status == SegmentStatus.PENDING
+        pm.apply_outcome('ch1_seg0002', _ok())
+        pm.apply_outcome('ch1_seg0002', _failed())  # issue attached, still translated
+        pm.update_translation('ch1_seg0002', '人工')
+        seg = pm._find('ch1_seg0002')
+        assert (seg.status, seg.issues) == (SegmentStatus.TRANSLATED, [])
+
+    def test_approve_clears_issues(self, pm):
+        pm.apply_outcome('ch1_seg0002', _failed())
+        pm.mark_reviewed('ch1_seg0002', text='人工')
+        seg = pm._find('ch1_seg0002')
+        assert (seg.status, seg.issues) == (SegmentStatus.REVIEWED, [])
+
+
+class TestLockAcquireFailure:
+    """Item 5: a failure after flock() closes the descriptor."""
+
+    def test_pid_write_failure_releases_lock(self, project_dir):
+        from unittest.mock import patch
+        os.makedirs(project_dir, exist_ok=True)
+        with patch('src.core.project.os.write', side_effect=OSError('no space')):
+            with pytest.raises(OSError):
+                ProjectLock(project_dir).acquire()
+        assert lock_free_for_other_process(project_dir)
+        lock = ProjectLock(project_dir)
+        lock.acquire()  # a leaked descriptor would make this fail in-process
+        lock.release()
