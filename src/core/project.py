@@ -371,8 +371,7 @@ class ProjectLock:
             entry[1] -= 1
             if entry[1] == 0:
                 del _held_locks[self.path]
-                fcntl.flock(entry[0], fcntl.LOCK_UN)
-                os.close(entry[0])
+                os.close(entry[0])  # closing the only descriptor drops the flock
 
     def __enter__(self) -> ProjectLock:
         self.acquire()

@@ -505,7 +505,8 @@ class TestCLIMessages:
 
     def test_retry_failed_help(self, runner):
         output = ' '.join(runner.invoke(cli, ['start', '--help']).output.split())
-        assert 'Also translate segments whose earlier translation failed' in output
+        assert ('--retry-failed Also translate segments whose earlier translation failed '
+                '--help') in output
 
     def test_sequential_output(self, runner, tmp_path):
         path = _make_project(str(tmp_path / 'p'), n=3)
