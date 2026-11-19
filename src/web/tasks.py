@@ -124,7 +124,7 @@ class TranslationTask:
 
     # References
     pm: ProjectManager | None = field(default=None, repr=False)
-    project_lock: ProjectLock | None = field(default=None, repr=False)
+    project_lock: ProjectLock | None = None
     _gm: GlossaryManager | None = field(default=None, repr=False)
     _threads: list = field(default_factory=list, repr=False)
     _coordinator: threading.Thread | None = field(default=None, repr=False)
@@ -360,10 +360,12 @@ class TaskManager:
                 try:
                     result = task.result_queue.get(timeout=1)
                 except queue.Empty:
-                    # Check if all workers are dead
+                    # Done when all workers have exited and nothing is left
+                    # (a worker puts its last result before it exits)
                     with task._lock:
-                        if task.active_workers == 0:
-                            break
+                        workers_done = task.active_workers == 0
+                    if workers_done and task.result_queue.empty():
+                        break
                     continue
 
                 # Drain remaining results (batch)
@@ -379,17 +381,10 @@ class TaskManager:
                     self._apply_result(task, pm, res)
                 pm.save()
 
-                # Check if all workers are dead after processing
+                # Results that arrived meanwhile are taken by the next round
                 with task._lock:
                     workers_done = task.active_workers == 0
-                if workers_done:
-                    # Drain any remaining results
-                    while True:
-                        try:
-                            self._apply_result(task, pm, task.result_queue.get_nowait())
-                        except queue.Empty:
-                            break
-                    pm.save()
+                if workers_done and task.result_queue.empty():
                     break
 
             # Set final state
@@ -427,7 +422,7 @@ class TaskManager:
             # Edited while its translation was in flight: the edit wins
             logger.info("段落已在翻譯期間被編輯，捨棄結果: %s", res.segment_id)
         elif outcome.status == SegmentStatus.FAILED:
-            detail = '; '.join(i.detail for i in outcome.issues)
+            detail = outcome.issues[0].detail
             logger.warning("段落翻譯失敗: %s — %s", res.segment_id, detail)
             task.progress.put({'event': 'segment_error', 'data': {
                 'segment_id': res.segment_id,
@@ -439,11 +434,10 @@ class TaskManager:
             completed = task.completed
         logger.info("段落完成 [%d/%d]: %s (%s)",
                     completed, task.total, res.segment_id, outcome.model)
-        percent = round(completed / task.total * 100, 1) if task.total > 0 else 0
         task.progress.put({'event': 'progress', 'data': {
             'completed': completed,
-            'total': task.total,
-            'percent': percent,
+            'total': task.total,  # > 0: a task with nothing to do has no workers
+            'percent': round(completed / task.total * 100, 1),
         }})
         if outcome.status == SegmentStatus.TRANSLATED:
             task.progress.put({'event': 'segment_complete', 'data': {

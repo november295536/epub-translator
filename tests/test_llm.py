@@ -256,3 +256,78 @@ class TestFakeBackend:
         assert response.text == 'HAIKU'
         assert response.model == 'haiku'
         assert response.usage is None
+
+
+class TestInterfaceDetails:
+    """Exact values of the interface types and backends (mutation survivors)."""
+
+    def test_request_hints_default_to_none(self):
+        request = _request()
+        assert (request.temperature, request.max_output_tokens, request.effort) == \
+            (None, None, None)
+
+    def test_error_fields(self):
+        assert LLMError('m').raw == ''
+        assert str(LLMError('m', raw='r')) == 'm'
+        error = RateLimitError('limit', raw='r', retry_after=5.0)
+        assert (str(error), error.raw, error.retry_after) == ('limit', 'r', 5.0)
+        assert RateLimitError('limit').raw == ''
+
+    def test_claude_cli_identity(self):
+        from src.llm import Capabilities, ModelInfo
+        backend = ClaudeCLI()
+        assert backend.name == 'claude-cli'
+        assert backend.capabilities == Capabilities(
+            separate_system=False, multi_turn=False, reports_usage=False,
+            sampling_params=False, suggested_concurrency=1)
+        assert backend.list_models() == [
+            ModelInfo('sonnet', 'Sonnet', '快速且高品質，適合大多數翻譯'),
+            ModelInfo('opus', 'Opus', '最高品質，費用較高'),
+            ModelInfo('haiku', 'Haiku', '最快速度，適合簡單內容'),
+        ]
+
+    def test_auth_message(self):
+        error = ClaudeCLI().classify_error(_result(1, '', 'OAuth token has expired'))
+        assert str(error) == 'Claude CLI 認證已過期，請在終端執行 claude /login 重新登入'
+
+    def test_non_string_stderr_in_message(self):
+        error = ClaudeCLI().classify_error(ProcessResult(1, None, None))
+        assert str(error) == 'claude CLI exited with code 1: '
+
+    def test_base_environment_keeps_everything(self, monkeypatch):
+        monkeypatch.setenv('CLAUDECODE', '1')
+        assert CLIBackend().environment() == dict(os.environ)
+
+    def test_messages(self):
+        import subprocess
+        with patch('src.llm.cli.run_process', side_effect=subprocess.TimeoutExpired('c', 2)):
+            with pytest.raises(TransientError) as info:
+                ClaudeCLI().complete(_request(timeout=2.5), threading.Event())
+        assert str(info.value) == 'claude-cli timed out after 2.5 s'
+        with patch('src.llm.cli.run_process', side_effect=FileNotFoundError('nope')):
+            with pytest.raises(LLMError) as info:
+                ClaudeCLI().complete(_request(), threading.Event())
+        assert str(info.value) == 'claude-cli could not be started: nope'
+
+    def test_cancel_message(self, tmp_path):
+        cancel = threading.Event()
+        cancel.set()
+        with pytest.raises(CancelledError) as info:
+            run_process([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=30,
+                        cwd=str(tmp_path), env=dict(os.environ), cancel=cancel)
+        assert str(info.value) == 'cancelled'
+
+    def test_fake_identity(self):
+        from src.llm import Capabilities, ModelInfo
+        fake = FakeBackend()
+        assert fake.name == 'fake'
+        assert fake.capabilities == Capabilities(
+            separate_system=True, multi_turn=True, reports_usage=True,
+            sampling_params=True, suggested_concurrency=4)
+        assert fake.list_models() == [ModelInfo('fake-model', 'Fake', '')]
+        with pytest.raises(AssertionError, match='^FakeBackend: no scripted reply left$'):
+            fake.complete(_request(), threading.Event())
+
+    def test_fake_string_reply_is_complete(self):
+        response = FakeBackend(['x']).complete(_request(model='m'), threading.Event())
+        assert response == LLMResponse(text='x', stop_reason='complete', usage=None, model='m')

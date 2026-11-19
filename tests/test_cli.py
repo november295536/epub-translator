@@ -493,3 +493,84 @@ class TestCLIGlossaryExtract:
         assert result.exit_code == 0, result.output
         assert [r.model for r in fake.requests] == ['haiku']
         assert 'Sentence MARK1.' in fake.prompts[0]
+
+
+class TestCLIMessages:
+    """Exact CLI output (mutation survivors)."""
+
+    FAIL = 'Translation failed after 3 attempts: exit 1'
+
+    def test_version_line(self, runner):
+        assert runner.invoke(cli, ['--version']).output == 'epub-translator, version 1.0.0\n'
+
+    def test_retry_failed_help(self, runner):
+        output = ' '.join(runner.invoke(cli, ['start', '--help']).output.split())
+        assert 'Also translate segments whose earlier translation failed' in output
+
+    def test_sequential_output(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=3)
+        with use_fake_backend(FakeBackend(responder=_responder(['MARK1', 'MARK3']))):
+            result = runner.invoke(cli, ['start', '--project', path])
+        lines = result.output.splitlines()
+        assert lines[-8:] == [
+            '[1/3] 翻譯段落 c1_seg0001...',
+            f'  ✗ 翻譯失敗：{self.FAIL}',
+            '[2/3] 翻譯段落 c1_seg0002...',
+            '  ✓ 完成（2 字）',
+            '[3/3] 翻譯段落 c1_seg0003...',
+            f'  ✗ 翻譯失敗：{self.FAIL}',
+            '',
+            f"翻譯結束：2 個段落翻譯失敗，其餘已完成。失敗紀錄在 "
+            f"{os.path.join(path, 'log', 'failed')}，可用 start --retry-failed 重試。",
+        ]
+
+    def test_parallel_output(self, runner, tmp_path):
+        import re
+        path = _make_project(str(tmp_path / 'p'), n=4)
+        with use_fake_backend(FakeBackend(responder=_responder(['MARK1', 'MARK3']))):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', '2'])
+        lines = result.output.splitlines()
+        failed = sorted(l for l in lines if '✗' in l)
+        assert [re.sub(r'\[W\d\]', '[W]', l) for l in failed] == [
+            f'  [W] ✗ c1_seg0001 翻譯失敗：{self.FAIL}',
+            f'  [W] ✗ c1_seg0003 翻譯失敗：{self.FAIL}',
+        ]
+        done = [re.fullmatch(r'  \[W\d\] \[(\d)/4\] ✓ (c1_seg000\d)（2 字）', l)
+                for l in lines if '✓' in l]
+        assert all(done)
+        assert sorted(m.group(1) for m in done) == ['1', '2']
+        assert sorted(m.group(2) for m in done) == ['c1_seg0002', 'c1_seg0004']
+        assert lines[-1].startswith('翻譯結束：2 個段落翻譯失敗，其餘已完成。')
+
+    def test_parallel_counts_continue_from_translated(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=3)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.mark_translated('c1_seg0001', '已譯')
+        pm.save()
+        with use_fake_backend(FakeBackend(responder=_responder())):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', '2'])
+        counts = sorted(l.split('] [')[1].split(']')[0] for l in result.output.splitlines()
+                        if '✓' in l)
+        assert counts == ['2/3', '3/3']
+
+    def test_failed_left_over_message(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=2)
+        with use_fake_backend(FakeBackend(responder=_responder(['MARK1', 'MARK2']))):
+            runner.invoke(cli, ['start', '--project', path])
+        result = runner.invoke(cli, ['start', '--project', path])
+        assert result.output.splitlines() == [
+            '所有段落已翻譯完成！',
+            '2 個段落先前翻譯失敗，可用 start --retry-failed 重試。',
+        ]
+        assert '失敗：    2' in runner.invoke(cli, ['status', '--project', path]).output.splitlines()
+
+    @pytest.mark.parametrize('workers', ['1', '2'])
+    def test_stop_message(self, runner, tmp_path, workers):
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        with use_fake_backend(FakeBackend([RateLimitError('limit reached')])):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', workers])
+        assert result.output.splitlines()[-2:] == [
+            '  ✗ limit reached',
+            '翻譯中斷。已完成的進度已儲存，可用 start 繼續。',
+        ]

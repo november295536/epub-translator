@@ -544,3 +544,48 @@ class TestLoadCheck:
                                 capture_output=True, text=True, cwd=str(tmp_path))
         assert result.returncode == 0, result.stderr
         assert result.stdout.startswith('PASS alpha')
+
+
+class TestLoadCheckOutput:
+    """Exact output of the Phase 1 check (mutation survivors)."""
+
+    def _broken_load(self, monkeypatch, action):
+        original = load_check.ProjectManager.load
+
+        def load(self):
+            data = original(self)
+            action(self)
+            return data
+
+        monkeypatch.setattr(load_check.ProjectManager, 'load', load)
+
+    def test_exact_fail_lines_and_count(self, tmp_path, capsys, monkeypatch):
+        _write_loadable(str(tmp_path / 'a'), ['pending'])
+        _write_loadable(str(tmp_path / 'b'), ['pending'])
+        _write_loadable(str(tmp_path / 'c'), ['pending'], extra={'unknown_field': 1})
+        self._broken_load(monkeypatch, lambda pm: pm.save())
+        assert load_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
+        out = capsys.readouterr().out.splitlines()
+        problems = ('project.json content changed; project.json modification time changed; '
+                    'files in the project directory changed')
+        assert out == [
+            f'FAIL project-1: segments 1, pending 1, translated 0, reviewed 0, failed 0; {problems}',
+            f'FAIL project-2: segments 1, pending 1, translated 0, reviewed 0, failed 0; {problems}',
+            'FAIL project-3: cannot load (TypeError)',
+            'TOTAL projects 3  segments 2  pending 2  translated 0  reviewed 0  failed 0'
+            '  failed projects 3',
+        ]
+
+    def test_default_projects_dir_and_help(self, tmp_path, monkeypatch, capsys):
+        _write_loadable(str(tmp_path / 'projects' / 'alpha'), ['pending'])
+        monkeypatch.chdir(tmp_path)
+        assert load_check.main([]) == 0
+        assert capsys.readouterr().out.startswith('PASS alpha')
+        with pytest.raises(SystemExit):
+            load_check.main(['--help'])
+        help_text = ' '.join(capsys.readouterr().out.split())
+        assert 'Phase 1 check: every existing project loads with the new code, untouched.' \
+            in help_text
+        assert 'For each directory' not in help_text
+        assert 'Directory that holds the project folders (default: projects)' in help_text
+        assert 'Print project-N labels; omit names and paths' in help_text

@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import threading
 import pytest
 
@@ -403,13 +404,13 @@ from tests.conftest import hold_lock_in_child, lock_free_for_other_process
 
 
 def _ok(text='譯文', model='haiku', usage=None):
-    return TranslationOutcome(text=text, status=SegmentStatus.TRANSLATED,
+    return TranslationOutcome(text=text, status=SegmentStatus.TRANSLATED, issues=[],
                               model=model, usage=usage)
 
 
 def _failed(detail='boom'):
     return TranslationOutcome(text=None, status=SegmentStatus.FAILED, model='haiku',
-                              issues=[Issue('backend', 'transient', detail, True)])
+                              usage=None, issues=[Issue('backend', 'transient', detail, True)])
 
 
 @pytest.fixture
@@ -428,11 +429,11 @@ class TestApplyOutcome:
         assert seg.translated_text == '譯文'
         assert seg.model == 'haiku'
         assert seg.usage == {'input_tokens': 10, 'output_tokens': 20}
-        assert seg.translated_at
+        assert re.fullmatch(r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d', seg.translated_at)
         assert seg.issues == []
 
     def test_failure_of_pending_segment_is_failed_with_issue(self, pm):
-        pm.apply_outcome('ch1_seg0001', _failed('timed out'))
+        assert pm.apply_outcome('ch1_seg0001', _failed('timed out')) is True
         seg = pm.data.segments[0]
         assert seg.status == SegmentStatus.FAILED
         assert seg.translated_text == ''
@@ -482,19 +483,23 @@ class TestApplyOutcome:
         seg = pm.data.segments[0]
         assert seg.revision == 0
         pm.update_translation('ch1_seg0001', 'a')
+        pm.update_translation('ch1_seg0001', 'b')
+        assert seg.revision == 2
         pm.mark_reviewed('ch1_seg0001')
-        pm.mark_reviewed('ch1_seg0001', 'b')
-        assert seg.revision == 3
+        pm.mark_reviewed('ch1_seg0001', 'c')
+        assert seg.revision == 4
         pm.apply_outcome('ch1_seg0001', _ok())
-        assert seg.revision == 3
+        assert seg.revision == 4
 
     def test_unknown_segment(self, pm):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match='^Segment not found: nope$'):
             pm.apply_outcome('nope', _ok())
 
     def test_without_load(self, project_dir):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match='^No project loaded.$'):
             ProjectManager(project_dir).apply_outcome('x', _ok())
+        with pytest.raises(RuntimeError, match='^No project loaded.$'):
+            ProjectManager(project_dir).get_pending_segments(include_failed=True)
 
 
 class TestFailedStatus:
@@ -516,6 +521,14 @@ class TestFailedStatus:
         assert progress['percent'] == 33.3
         assert pm.get_chapters() == [{'chapter_id': 'ch1', 'total': 3, 'translated': 1,
                                       'reviewed': 0, 'failed': 1}]
+
+    def test_chapters_count_each_failed_and_not_pending(self, pm):
+        pm.apply_outcome('ch1_seg0001', _failed())
+        pm.apply_outcome('ch1_seg0002', _failed())
+        assert pm.get_chapters()[0]['failed'] == 2
+        pm.apply_outcome('ch1_seg0001', _ok())
+        pm.apply_outcome('ch1_seg0002', _ok())
+        assert pm.get_chapters()[0]['failed'] == 0  # the pending one is not failed
 
     def test_failed_status_and_issues_persist(self, pm, project_dir):
         pm.apply_outcome('ch1_seg0002', _failed('timed out'))
@@ -660,6 +673,54 @@ class TestProjectLock:
         assert lock_free_for_other_process(project_dir)
 
     def test_lock_file_records_holder_pid(self, project_dir):
-        with ProjectLock(project_dir):
-            content = open(os.path.join(project_dir, ProjectLock.FILE)).read()
+        path = os.path.join(project_dir, 'project.lock')
+        with open(path, 'w') as f:
+            f.write('stale content longer than a pid')
+        old_umask = os.umask(0o022)
+        try:
+            with ProjectLock(project_dir):
+                content = open(path).read()
+        finally:
+            os.umask(old_umask)
         assert content == str(os.getpid())
+
+    def test_new_lock_file_mode(self, tmp_path):
+        old_umask = os.umask(0)
+        try:
+            with ProjectLock(str(tmp_path)):
+                pass
+        finally:
+            os.umask(old_umask)
+        assert os.stat(tmp_path / 'project.lock').st_mode & 0o777 == 0o644
+
+    def test_error_message_names_holder_and_file(self, project_dir):
+        child = hold_lock_in_child(project_dir)
+        try:
+            with pytest.raises(ProjectLockedError) as info:
+                ProjectLock(project_dir).acquire()
+        finally:
+            child.stdin.close()
+            child.wait(timeout=10)
+        path = os.path.realpath(os.path.join(project_dir, 'project.lock'))
+        assert str(info.value) == f'專案正由另一個程序使用（PID {child.pid}）：{path}'
+
+    def test_release_closes_only_the_lock_file(self, project_dir):
+        # Keep descriptor 0 open, so the lock file never gets number 0
+        try:
+            os.fstat(0)
+        except OSError:
+            os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
+        with ProjectLock(project_dir):
+            pass
+        os.fstat(0)  # still open
+        assert lock_free_for_other_process(project_dir)
+
+
+class TestSaveFormat:
+
+    def test_utf8_and_two_space_indent(self, pm, project_dir):
+        pm.mark_translated('ch1_seg0001', '標題')
+        pm.save()
+        text = open(os.path.join(project_dir, 'project.json'), encoding='utf-8').read()
+        assert '"translated_text": "標題"' in text
+        assert '\n  "epub_path"' in text

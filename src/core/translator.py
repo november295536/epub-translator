@@ -7,7 +7,7 @@ import re
 import logging
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 
 import src.llm as llm
 from src.core.project import Issue, SegmentStatus
@@ -173,18 +173,17 @@ class TranslationError(Exception):
     failing one segment.
     """
 
-    def __init__(self, message: str, code: str = 'error', prompt: str = '',
-                 attempts: list | None = None):
+    def __init__(self, message: str, *, code: str, prompt: str, attempts: list):
         super().__init__(message)
         self.code = code
         self.prompt = prompt
-        self.attempts = attempts or []
+        self.attempts = attempts
 
 
 @dataclass
 class Reply:
     text: str
-    usage: Usage | None = None
+    usage: Usage | None
 
 
 @dataclass
@@ -192,9 +191,9 @@ class TranslationOutcome:
     """Result of one translate_segment() call."""
     text: str | None          # accepted translation, or None
     status: SegmentStatus     # TRANSLATED or FAILED
-    issues: list[Issue] = field(default_factory=list)
-    model: str = ''
-    usage: Usage | None = None
+    issues: list[Issue]
+    model: str
+    usage: Usage | None
 
 
 # Characters of raw output kept per failed attempt in a diagnostics file
@@ -219,10 +218,8 @@ class TranslationEngine:
         return self.translate_reply(text, segment_type, glossary_text,
                                     context_before, context_after, html).text
 
-    def translate_reply(self, text: str, segment_type: SegmentType = SegmentType.TEXT,
-                        glossary_text: str = '',
-                        context_before: str = '', context_after: str = '',
-                        html: str = '',
+    def translate_reply(self, text: str, segment_type: SegmentType, glossary_text: str,
+                        context_before: str, context_after: str, html: str,
                         cancel: threading.Event | None = None) -> Reply:
         """Translate a text segment through the backend.
 
@@ -412,7 +409,6 @@ def translate_segment(engine: TranslationEngine, seg, segments,
             glossary_text = glossary.format_for_prompt(found)
 
     context_before, context_after = get_context(segments, seg.segment_id)
-    html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
     model = engine.model
     try:
         reply = engine.translate_reply(
@@ -421,19 +417,19 @@ def translate_segment(engine: TranslationEngine, seg, segments,
             glossary_text=glossary_text,
             context_before=context_before,
             context_after=context_after,
-            html=html_arg,
+            html=seg.html,  # ignored for code segments
             cancel=cancel,
         )
     except TranslationError as e:
         if log_dir:
             write_failure_log(log_dir, seg.segment_id, model, e)
         return TranslationOutcome(
-            text=None, status=SegmentStatus.FAILED, model=model,
+            text=None, status=SegmentStatus.FAILED, model=model, usage=None,
             issues=[Issue(kind='backend', code=e.code, detail=str(e), blocking=True)])
     if log_dir:
         _remove_failure_log(log_dir, seg.segment_id)
     return TranslationOutcome(text=reply.text, status=SegmentStatus.TRANSLATED,
-                              model=model, usage=reply.usage)
+                              issues=[], model=model, usage=reply.usage)
 
 
 def failure_log_path(log_dir: str, segment_id: str) -> str:

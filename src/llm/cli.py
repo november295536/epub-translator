@@ -85,7 +85,6 @@ class CLIBackend:
     directory. Subclasses supply build_command, parse_output,
     classify_error and list_models."""
 
-    name = 'cli'
     # Environment variables removed before starting the program
     env_remove = ()
 

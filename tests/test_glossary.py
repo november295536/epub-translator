@@ -398,3 +398,25 @@ class TestTermExtractorBackend:
         fake = self._fake(['[]'])
         with patch.object(TermExtractor, '_parse_response', side_effect=TypeError('bad')):
             assert TermExtractor(backend=fake).extract_from_text('x') == []
+
+
+class TestTermExtractorRequest:
+
+    def test_default_timeout_and_one_user_message(self):
+        from src.llm import Message
+        from src.llm.fake import FakeBackend
+        from src.glossary.term_extractor import EXTRACT_PROMPT
+        fake = FakeBackend(['[]'])
+        TermExtractor(backend=fake).extract_from_text('Some text')
+        request = fake.requests[0]
+        assert request.timeout == 180
+        assert request.system == ''
+        assert request.messages == [Message('user', EXTRACT_PROMPT.format(text='Some text'))]
+
+    def test_failure_logged(self, caplog):
+        import logging
+        from src.llm import TransientError
+        from src.llm.fake import FakeBackend
+        caplog.set_level(logging.WARNING, logger='src.glossary.term_extractor')
+        TermExtractor(backend=FakeBackend([TransientError('boom')])).extract_from_text('x')
+        assert [r.getMessage() for r in caplog.records] == ['Term extraction failed: boom']
