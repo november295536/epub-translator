@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 review_bp = Blueprint('review', __name__)
 
 
+@review_bp.errorhandler(FileNotFoundError)
+def project_missing(e):
+    # No project.json: never existed, or deleted (also during a re-translation)
+    return jsonify({'error': '專案不存在'}), 404
+
+
 def get_pm(project_name: str) -> ProjectManager:
     """Get ProjectManager: reuse running task's PM if available, else load from disk."""
     tm = TaskManager()
