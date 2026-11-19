@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 1, review rounds 1 and 2: each fixed behaviour is guarded by a test.
+"""Phase 1, review rounds 1 to 3: each fixed behaviour is guarded by a test.
 
 Puts each old behaviour back, one at a time, into a copy of the committed
 code (git archive HEAD, in a temporary directory removed afterwards) and
@@ -11,7 +11,8 @@ Usage:
 
 Round 1 reverts whose code review round 2 moved put back the same old
 behaviour at the new place (items 8, 9, 24); the round 2 reverts are named
-"R2-<item>".
+"R2-<item>"; round 3 moved the code of 9, 10, R2-1, R2-5, R2-16 and
+R2-20, whose reverts follow it, and adds the reverts "R3-<item>".
 
 Exit code: 0 when every revert is detected, 1 otherwise.
 """
@@ -109,10 +110,10 @@ r('9 failure log write error propagates',
   ['tests/test_translator.py::TestDiagnosticWriteFailure', 'tests/test_web.py::TestWorkerUnexpectedErrors',
    'tests/test_cli.py::TestCLIUnexpectedErrors'])
 r('9 web worker dies on an unexpected exception',
-  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        return unexpected_error_outcome(model, e)\n', '')],
+  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        prompt = _request_text(engine, seg, glossary_text, context) if context else \'\'\n        return unexpected_error_outcome(model, e, prompt)\n', '')],
   ['tests/test_web.py::TestWorkerUnexpectedErrors::test_unexpected_exception'])
 r('9 CLI worker dies on an unexpected exception',
-  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        return unexpected_error_outcome(model, e)\n', '')],
+  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        prompt = _request_text(engine, seg, glossary_text, context) if context else \'\'\n        return unexpected_error_outcome(model, e, prompt)\n', '')],
   ['tests/test_cli.py::TestCLIUnexpectedErrors::test_unexpected_worker_exception',
    'tests/test_cli.py::TestCLILock::test_lock_released_on_error'])
 r('10 no cancel check before the start',
@@ -120,7 +121,7 @@ r('10 no cancel check before the start',
   ['tests/test_llm.py::TestRunProcessCancelAndDeadline::test_cancelled_before_start_starts_nothing'])
 r('10 wait not bounded by the deadline',
   [(LLM, 'wait = min(POLL_SECONDS, max(0.0, deadline - time.monotonic()))', 'wait = POLL_SECONDS'),
-   (LLM, '            if time.monotonic() > deadline:\n                raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)\n', '')],
+   (LLM, '            if time.monotonic() > deadline:\n                raise subprocess.TimeoutExpired(cmd, timeout,\n                                                output=stdout[:KEPT_OUTPUT_CHARS],\n                                                stderr=stderr[:KEPT_OUTPUT_CHARS])\n', '')],
   ['tests/test_llm.py::TestRunProcessCancelAndDeadline::test_deadline_not_stretched_by_poll_interval'])
 r('10 output of a cancelled call accepted',
   [(LLM, "            # Finished: still refuse the output of a cancelled or late call\n            if cancel is not None and cancel.is_set():\n                raise CancelledError('cancelled')\n",
@@ -226,8 +227,7 @@ CL, PR, TRL, TPL = ('src/llm/claude_cli.py', 'src/web/blueprints/projects.py',
                     'src/web/blueprints/translation.py', 'src/web/templates/project/translation.html')
 
 r('R2-1 transaction without the file lock',
-  [(T, '        with project_mutex(project_dir), ProjectLock(project_dir):\n            yield',
-    '        with project_mutex(project_dir):\n            yield')],
+  [(T, '            with ProjectLock(project_dir):\n                yield', '            if True:\n                yield')],
   ['tests/test_web.py::TestRound2TransactionAcrossProcesses'])
 r('R2-2 delete checks the task outside the mutex',
   [(PR, "    with project_mutex(project_dir):\n        if TaskManager().task_active(project_name):\n            return jsonify({'error': '專案正在翻譯中，請先停止翻譯再刪除'}), 409\n",
@@ -242,7 +242,7 @@ r('R2-4 every start error stops the run',
     '            if True:')],
   ['tests/test_llm.py::TestRound2StartErrors', 'tests/test_translator.py::TestRound2StartErrorFailsSegment'])
 r('R2-5 unexpected exception escapes the entry point',
-  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        return unexpected_error_outcome(model, e)\n', '')],
+  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        prompt = _request_text(engine, seg, glossary_text, context) if context else \'\'\n        return unexpected_error_outcome(model, e, prompt)\n', '')],
   ['tests/test_translator.py::TestRound2UnexpectedErrorInEntryPoint',
    'tests/test_cli.py::TestCLIUnexpectedErrors::test_unexpected_worker_exception'])
 r('R2-6 group left alone when the parent has exited',
@@ -292,7 +292,7 @@ r('R2-15 echoed phrase taken for an error',
   [(CL, "        echoed = prompt.lower() if result.returncode == 0 else ''", "        echoed = ''")],
   ['tests/test_llm.py::TestRound2RequestEcho', 'tests/test_translator.py::TestRound2CodeEchoingAnErrorPhrase'])
 r('R2-16 no project check before the lock',
-  [(T, "            if not os.path.isfile(os.path.join(project_dir, ProjectManager.PROJECT_FILE)):\n                raise FileNotFoundError('專案不存在')\n", '')],
+  [(T, "            # No lock file in a directory that is not (or no longer) a project\n            if not os.path.isfile(os.path.join(project_dir, ProjectManager.PROJECT_FILE)):\n                raise FileNotFoundError('專案不存在')\n", '')],
   ['tests/test_web.py::TestRound2StartChecks'])
 r('R2-16 file lock before the mutex',
   [(T, '        with project_mutex(project_dir):\n            # No lock file', '        lock.acquire()\n        with project_mutex(project_dir):\n            # No lock file'),
@@ -309,12 +309,97 @@ r('R2-19 lock descriptor leaked when the holder cannot be read',
 r('R2-20 stale and skipped results reported as unsaved',
   [(T, '                    unsaved.extend(res.segment_id for res in accepted)',
     '                    unsaved.extend(res.segment_id for res in batch)'),
-   (T, '            if res.outcome is not None:  # a skipped segment had nothing to save\n', '            if True:\n')],
+   (T, '                if (res.outcome is not None\n                        and task.pm._find(res.segment_id).revision == res.revision):\n', '                if True:\n')],
   ['tests/test_web.py::TestRound2UnsavedReport'])
 r('R2-21 rate-limit message cut from long stdout',
   [(CL, '            source = stderr if _RATE_LIMIT_PATTERN.search(stderr) else stdout\n            return RateLimitError(source.strip()[:ERROR_CHARS])',
     '            return RateLimitError(searched.strip()[:ERROR_CHARS])')],
   ['tests/test_llm.py::TestRound2RateLimitMessage'])
+
+FAKE = 'src/llm/fake.py'
+r('R3-1 project replaced before the lock is taken',
+  [(PR, "        with project_mutex(project_dir):\n            if TaskManager().task_active(project_name):\n                return jsonify({'error': '專案正在翻譯中，請先停止翻譯再重新建立'}), 409\n            try:\n                lock = ProjectLock(project_dir)\n                lock.acquire()\n            except ProjectLockedError as e:\n                return jsonify({'error': str(e)}), 409\n            try:",
+    "        if True:\n            lock = ProjectLock(project_dir)\n            try:")],
+  ['tests/test_web.py::TestRound3ReplaceProjectUnderLock'])
+r('R3-2 no Start for a stopped task',
+  [(TPL, " || state === 'failed' || state === 'stopped'\">", " || state === 'failed'\">")],
+  ['tests/test_web.py::TestRound3StoppedTaskRestartable'])
+r('R3-2 stopped event leaves state and stream',
+  [(TPL, "                this.state = 'stopped';\n                this.currentSegment = null;\n                this.refreshFailedCount();\n                this.eventSource.close();\n                this.eventSource = null;\n",
+    '                this.refreshFailedCount();\n')],
+  ['tests/test_web.py::TestRound3StoppedTaskRestartable'])
+r('R3-3 echo rule hides stderr',
+  [(CL, '            return (pattern.search(stderr) is not None\n                    or any(m.group(0).lower() not in echoed for m in pattern.finditer(searched)))',
+    '            return any(m.group(0).lower() not in echoed for m in pattern.finditer(searched + stderr))')],
+  ['tests/test_llm.py::TestRound3StderrNotEchoSuppressed'])
+r('R3-4 resource errors at start fail the segment',
+  [(LLM, '            if e.errno in RESOURCE_ERRNOS:', '            if False:')],
+  ['tests/test_llm.py::TestRound3ResourceErrors'])
+r('R3-5 unstarted workers joined',
+  [(T, '                try:\n                    t.start()\n                except BaseException:\n                    with task._lock:\n                        task.active_workers -= num_workers - i  # never started\n                    raise\n                task._threads.append(t)\n',
+    '                task._threads.append(t)\n                t.start()\n')],
+  ['tests/test_web.py::TestRound3WorkerStartFailure'])
+r('R3-6 initial status without the error',
+  [(TRL, "'total': task.total, 'error': task.error}", "'total': task.total}")],
+  ['tests/test_web.py::TestRound3InitialStatusError'])
+r('R3-6 cursor taken after the snapshot',
+  [(TRL, '        cursor = task.progress.cursor_end\n        # Initial status', '        # Initial status'),
+   (TRL, '        yield f"event: status\\ndata: {json.dumps(status, ensure_ascii=False)}\\n\\n"\n',
+    '        yield f"event: status\\ndata: {json.dumps(status, ensure_ascii=False)}\\n\\n"\n        cursor = task.progress.cursor_end\n')],
+  ['tests/test_web.py::TestRound3InitialStatusError::test_event_after_snapshot_delivered'])
+r('R3-6 page ignores the initial error',
+  [(TPL, '                    if (data.error) this.error = data.error;\n', '')],
+  ['tests/test_web.py::TestRound3InitialStatusError'])
+r('R3-7 strict decoding of the output',
+  [(LLM, "encoding='utf-8', errors='replace',", 'text=True,')],
+  ['tests/test_llm.py::TestRound3UndecodableOutput', 'tests/test_translator.py::TestRound3UnexpectedFailureLog'])
+r('R3-7 unexpected failure without diagnostics',
+  [(TR, "blocking=True)],\n        failure=TranslationError(detail, code='unexpected', prompt=prompt,\n                                 attempts=[(f'{type(error).__name__}: {error}', trace)]))",
+    'blocking=True)])')],
+  ['tests/test_translator.py::TestRound3UnexpectedFailureLog',
+   'tests/test_translator.py::TestRound2EntryPointWritesNoFile'])
+r('R3-7 request not in the unexpected-failure log',
+  [(TR, "        prompt = _request_text(engine, seg, glossary_text, context) if context else ''",
+    "        prompt = ''")],
+  ['tests/test_translator.py::TestRound3UnexpectedFailureLog'])
+r('R3-8 stale result in the failure drain reported as unsaved',
+  [(T, '                if (res.outcome is not None\n                        and task.pm._find(res.segment_id).revision == res.revision):\n',
+    '                if res.outcome is not None:\n')],
+  ['tests/test_web.py::TestRound3StaleResultInFailureDrain'])
+r('R3-9 web run goes on after five unexpected failures',
+  [(T, '                if stop:\n                    raise RuntimeError(stop)\n', '')],
+  ['tests/test_web.py::TestRound3UnexpectedStreakWeb'])
+r('R3-9 sequential CLI goes on after five unexpected failures',
+  [(CLI, '        if stop:\n            _stop_run(stop)\n', '')],
+  ['tests/test_cli.py::TestCLIRound3UnexpectedStreak'])
+r('R3-9 parallel CLI goes on after five unexpected failures',
+  [(CLI, '            stop_errors.append(stop)\n            error_event.set()\n', '            pass\n')],
+  ['tests/test_cli.py::TestCLIRound3UnexpectedStreak::test_parallel'])
+r('R3-9 streak not reset by another result',
+  [(TR, '        else:\n            self.count = 0\n        if self.count', '        if self.count')],
+  ['tests/test_translator.py::TestRound3UnexpectedStreak', 'tests/test_web.py::TestRound3UnexpectedStreakWeb',
+   'tests/test_cli.py::TestCLIRound3UnexpectedStreak'])
+r('R3-10 fake over-call is an ordinary exception',
+  [(FAKE, "raise FakeBackendExhausted('FakeBackend: no scripted reply left')",
+    "raise AssertionError('FakeBackend: no scripted reply left')")],
+  ['tests/test_llm.py::TestRound3FakeOverCall'])
+r('R3-11 transaction takes the lock of a missing project',
+  [(T, "            if not os.path.isfile(os.path.join(project_dir, ProjectManager.PROJECT_FILE)):\n                raise FileNotFoundError('專案不存在')\n            with ProjectLock",
+    '            with ProjectLock')],
+  ['tests/test_web.py::TestRound3MissingProject'])
+r('R3-11 delete takes the lock of a directory without project.json',
+  [(PR, "        if not os.path.isfile(os.path.join(project_dir, ProjectManager.PROJECT_FILE)):\n            return jsonify({'error': '專案不存在'}), 404\n", '')],
+  ['tests/test_web.py::TestRound3MissingProject'])
+r('R3-11 review endpoints answer 500 for a missing project',
+  [(REV, '@review_bp.errorhandler(FileNotFoundError)\n', '')],
+  ['tests/test_web.py::TestRound3MissingProject'])
+r('R3-12 late finish keeps unbounded output',
+  [(LLM, 'output=stdout[:KEPT_OUTPUT_CHARS],\n                                                stderr=stderr[:KEPT_OUTPUT_CHARS])',
+    'output=stdout, stderr=stderr)')],
+  ['tests/test_llm.py::TestRound3TimeoutOutputBounded'])
+r('R3-12 timeout raw not bounded',
+  [(LLM, 'raw=(_text(e.output) + _text(e.stderr))[:KEPT_OUTPUT_CHARS])', 'raw=_text(e.output) + _text(e.stderr))')],
+  ['tests/test_llm.py::TestRound3TimeoutOutputBounded'])
 
 undetected = 0
 for name, edits, tests in R:
