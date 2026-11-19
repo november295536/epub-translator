@@ -14,6 +14,8 @@ Round 1 mutants whose line review round 2 removed (llm25: the empty output
 after giving up on the pipes; web144: the worker's unexpected-error log
 line) are no longer listed; llm44 and web171-176 use the round 2 text
 around the same mutated code.
+Round 4 indented the replacement's project creation: r3-web26 and r3-web28
+follow it. Round 4's mutation run left no killable survivor.
 
 Usage:
     python3 scripts/verify/phase1_survivor_kills.py [name ...]
@@ -111,8 +113,8 @@ M = [  # (name, file, old text, mutated text, tests)
  ('llm51','src/llm/cli.py','            if time.monotonic() > deadline:','            if time.monotonic() >= deadline:',['tests/test_llm.py::TestRound2DeadlineBoundary::test_finished_exactly_at_deadline']),
  ('r3-core6','src/core/translator.py',"    trace = ''.join(traceback","    trace = 'XXXX'.join(traceback",['tests/test_translator.py::TestRound3UnexpectedFailureLog::test_log_has_type_message_traceback_and_request']),
  ('r3-web23','src/web/blueprints/projects.py',"final_epub_path = os.path.join(project_dir, 'source.epub')","final_epub_path = os.path.join(project_dir, 'XXsource.epubXX')",['tests/test_web.py::TestRound3ReplaceProjectUnderLock::test_replacement_written']),
- ('r3-web26','src/web/blueprints/projects.py',"title=metadata.get('title', '未知書名'),\n                    author","title=metadata.get('XXtitleXX', '未知書名'),\n                    author",['tests/test_web.py::TestRound3ReplaceProjectUnderLock::test_replacement_written']),
- ('r3-web28','src/web/blueprints/projects.py',"author=metadata.get('author', '未知作者'),\n                    segments","author=metadata.get('XXauthorXX', '未知作者'),\n                    segments",['tests/test_web.py::TestRound3ReplaceProjectUnderLock::test_replacement_written']),
+ ('r3-web26','src/web/blueprints/projects.py',"title=metadata.get('title', '未知書名'),\n                        author","title=metadata.get('XXtitleXX', '未知書名'),\n                        author",['tests/test_web.py::TestRound3ReplaceProjectUnderLock::test_replacement_written']),
+ ('r3-web28','src/web/blueprints/projects.py',"author=metadata.get('author', '未知作者'),\n                        segments","author=metadata.get('XXauthorXX', '未知作者'),\n                        segments",['tests/test_web.py::TestRound3ReplaceProjectUnderLock::test_replacement_written']),
  ('r3-web2','src/web/tasks.py',"                raise FileNotFoundError('專案不存在')\n            with ProjectLock","                raise FileNotFoundError('XX專案不存在XX')\n            with ProjectLock",['tests/test_web.py::TestRound3MissingProject::test_set_model_creates_no_lock_file']),
 ]
 
