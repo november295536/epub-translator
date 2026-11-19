@@ -30,8 +30,10 @@ AUTH_MESSAGE = f'Claude CLI 認證已過期，{AUTH_HINT}'
 # only when its stdout is at most this long. main searched stdout + stderr
 # whatever the exit code, because the CLI can print these errors as a short
 # reply with exit code 0; that is kept. But a translation can contain the
-# same words, so a longer reply is not searched. Accepted risk: a reply this
-# short that quotes one of the phrases is still taken for an error.
+# same words, so a longer reply is not searched, and a phrase that the
+# request itself contains (e.g. code returned unchanged) is not taken for an
+# error in a successful run. Accepted risk: a short reply that quotes one of
+# the phrases on its own is still taken for an error.
 SHORT_REPLY_CHARS = 300
 
 
@@ -60,7 +62,7 @@ class ClaudeCLI(CLIBackend):
         return LLMResponse(text=result.stdout, stop_reason='complete',
                            usage=None, model=request.model)
 
-    def classify_error(self, result: ProcessResult) -> Optional[LLMError]:
+    def classify_error(self, result: ProcessResult, prompt: str = '') -> Optional[LLMError]:
         stdout, stderr = _text(result.stdout), _text(result.stderr)
         # stderr and any failed run: both streams. A successful run: only a
         # short reply (see SHORT_REPLY_CHARS), so translated text that
@@ -69,9 +71,17 @@ class ClaudeCLI(CLIBackend):
             searched = stdout + stderr
         else:
             searched = stderr
-        if _RATE_LIMIT_PATTERN.search(searched):
-            return RateLimitError(searched.strip()[:ERROR_CHARS])
-        if _AUTH_ERROR_PATTERN.search(searched):
+        # A successful run that only repeats a phrase of the request
+        echoed = prompt.lower() if result.returncode == 0 else ''
+
+        def found(pattern) -> bool:
+            return any(m.group(0).lower() not in echoed for m in pattern.finditer(searched))
+
+        if found(_RATE_LIMIT_PATTERN):
+            # Quoted from the stream that holds it: stdout can be long
+            source = stderr if _RATE_LIMIT_PATTERN.search(stderr) else stdout
+            return RateLimitError(source.strip()[:ERROR_CHARS])
+        if found(_AUTH_ERROR_PATTERN):
             return AuthError(AUTH_MESSAGE)
         if result.returncode != 0:
             return TransientError(

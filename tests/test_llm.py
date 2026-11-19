@@ -423,11 +423,12 @@ class TestRunProcessExceptionalExit:
         t.join(timeout=20)  # the default KILL_WAIT_SECONDS, not the grandchild's 60 s
         os.kill(int(pid_file.read_text()), 9)
         assert not t.is_alive()
-        # The pipes are given up: no output, even what was written before
-        assert outcome == (['cancelled'] if ending == 'cancel' else [('', '')])
+        # The pipes are given up; what was written before is kept (review round 2)
+        assert outcome == (['cancelled'] if ending == 'cancel' else [('partial\n', '')])
         assert made[0].stdout.closed and made[0].stderr.closed and made[0].returncode is not None
 
-    def test_atexit_hook_kills_live_groups(self, tmp_path):
+    def test_atexit_hook_kills_live_groups(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli_module, '_shutting_down', False)  # restored afterwards
         pid_file = tmp_path / 'pid'
         errors = []
 
@@ -622,3 +623,230 @@ class TestRound1Exact:
 
     def test_fake_auth_hint(self):
         assert FakeBackend().auth_hint == 'fake: sign in again'
+
+
+# --- Review round 2 ---------------------------------------------------------------
+
+import errno
+from types import SimpleNamespace
+
+
+class TestRound2StartErrors:
+    """Item 4: only a missing or non-executable program concerns the run."""
+
+    @pytest.mark.parametrize('error', [
+        FileNotFoundError(errno.ENOENT, 'No such file'),
+        PermissionError(errno.EACCES, 'Permission denied'),
+        OSError(errno.ENOEXEC, 'Exec format error'),
+    ])
+    def test_program_unusable_is_run_level(self, error):
+        with patch('src.llm.cli.run_process', side_effect=error):
+            with pytest.raises(BackendUnavailableError):
+                ClaudeCLI().complete(_request(), threading.Event())
+
+    @pytest.mark.parametrize('code', [errno.E2BIG, errno.EAGAIN, errno.ENOMEM])
+    def test_other_start_failure_concerns_the_request(self, code):
+        error = OSError(code, os.strerror(code))
+        with patch('src.llm.cli.run_process', side_effect=error):
+            with pytest.raises(LLMError) as info:
+                ClaudeCLI().complete(_request(), threading.Event())
+        # Neither run-level nor retried
+        assert type(info.value) is LLMError
+        assert str(info.value) == f'claude-cli could not be started: {error}'
+
+
+class TestRound2GroupKilledAfterParentExit:
+    """Item 6: an exceptional end kills the group even if the parent has exited."""
+
+    def test_cancel_after_parent_exit_kills_its_child(self, tmp_path, monkeypatch):
+        pid_file = tmp_path / 'pid'
+        cancel = threading.Event()
+
+        class CancelOnceFinished(_subprocess.Popen):
+            def communicate(self, *args, **kwargs):
+                result = super().communicate(*args, **kwargs)
+                cancel.set()  # noticed only after the parent has exited
+                return result
+
+        monkeypatch.setattr(cli_module.subprocess, 'Popen', CancelOnceFinished)
+        # The parent starts a child in its group with the pipes redirected,
+        # waits until the child has recorded its PID, and exits
+        child = _sleeper(pid_file)
+        cmd = [sys.executable, '-c',
+               'import os,subprocess,time; '
+               f'subprocess.Popen({child!r}, stdout=subprocess.DEVNULL, '
+               'stderr=subprocess.DEVNULL)\n'
+               f'while not (os.path.exists({str(pid_file)!r}) '
+               f'and open({str(pid_file)!r}).read()): time.sleep(0.02)']
+        with pytest.raises(CancelledError):
+            run_process(cmd, timeout=60, cwd=str(tmp_path), env=dict(os.environ),
+                        cancel=cancel)
+        pid = int(pid_file.read_text())
+        try:
+            assert _gone(pid)
+        finally:
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+        assert cli_module._live_groups == set()
+
+
+class TestRound2ExitHook:
+    """Item 7: after the exit hook no process is started."""
+
+    def test_no_start_after_hook(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli_module, '_shutting_down', False)
+        cli_module._kill_live_groups()
+        assert cli_module._shutting_down is True
+        with patch('src.llm.cli.subprocess.Popen', side_effect=AssertionError('started')):
+            with pytest.raises(CancelledError) as info:
+                run_process(['true'], timeout=30, cwd=str(tmp_path), env=dict(os.environ))
+        assert str(info.value) == 'shutting down'
+
+    def test_backend_call_after_hook_is_not_retried(self, monkeypatch):
+        monkeypatch.setattr(cli_module, '_shutting_down', False)
+        monkeypatch.setattr(cli_module, 'run_process', run_process)  # the real one
+        cli_module._kill_live_groups()
+        from src.core.translator import TranslationEngine
+        engine = TranslationEngine(model='haiku', backend=ClaudeCLI())
+        with patch('src.llm.cli.subprocess.Popen', side_effect=AssertionError('started')):
+            with pytest.raises(CancelledError):
+                engine.translate('One sentence.')
+
+    def test_hook_takes_the_guard(self, monkeypatch):
+        monkeypatch.setattr(cli_module, '_shutting_down', False)
+        cli_module._live_groups_guard.acquire()
+        t = threading.Thread(target=cli_module._kill_live_groups)
+        try:
+            t.start()
+            t.join(timeout=0.5)
+            assert t.is_alive() and cli_module._shutting_down is False
+        finally:
+            cli_module._live_groups_guard.release()
+        t.join(timeout=10)
+        assert cli_module._shutting_down is True
+
+
+class _GivingUpProc:
+    """A killed process whose pipes a descendant keeps open."""
+    pid = 4194301
+    returncode = -9
+
+    def __init__(self, output, stderr):
+        self._expired = _subprocess.TimeoutExpired(['claude'], 2, output=output, stderr=stderr)
+        self.stdout, self.stderr = MagicMock(), MagicMock()
+        self.timeouts = []
+
+    def communicate(self, timeout=None):
+        self.timeouts.append(timeout)
+        raise self._expired
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+class TestRound2PartialOutputAfterKill:
+    """Item 9: giving up on held pipes keeps the output captured so far."""
+
+    def test_captured_output_kept(self, monkeypatch):
+        monkeypatch.setattr(cli_module.os, 'killpg', lambda pid, sig: None)
+        proc = _GivingUpProc('partial reply\n'.encode('utf-8'), 'an error 錯誤'.encode('utf-8'))
+        assert cli_module._kill_group(proc) == ('partial reply\n', 'an error 錯誤')
+        proc.stdout.close.assert_called_once_with()
+        proc.stderr.close.assert_called_once_with()
+        assert proc.timeouts == [2]  # KILL_WAIT_SECONDS
+
+    def test_kept_output_bounded_and_decoded(self, monkeypatch):
+        monkeypatch.setattr(cli_module.os, 'killpg', lambda pid, sig: None)
+        proc = _GivingUpProc(b'x' * 30000, b'\xff' + b'y' * 30000)
+        stdout, stderr = cli_module._kill_group(proc)
+        assert stdout == 'x' * 20000
+        assert stderr == '�' + 'y' * 19999
+
+    def test_nothing_captured(self, monkeypatch):
+        monkeypatch.setattr(cli_module.os, 'killpg', lambda pid, sig: None)
+        assert cli_module._kill_group(_GivingUpProc(None, None)) == ('', '')
+
+    def test_kill_wait_seconds(self):
+        assert cli_module.KILL_WAIT_SECONDS == 2
+
+
+class _FinishedProc:
+    pid = 4194302
+    returncode = 0
+    stdout = stderr = None
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def communicate(self, timeout=None):
+        return 'out', ''
+
+
+class TestRound2DeadlineBoundary:
+    """Item 14: a call that ends exactly at the deadline is accepted."""
+
+    def test_finished_exactly_at_deadline(self, monkeypatch):
+        readings = iter([100.0])
+        monkeypatch.setattr(cli_module, 'time',
+                            SimpleNamespace(monotonic=lambda: next(readings, 105.0)))
+        monkeypatch.setattr(cli_module.subprocess, 'Popen', _FinishedProc)
+        result = run_process(['claude'], timeout=5, cwd='.', env={})
+        assert (result.returncode, result.stdout) == (0, 'out')
+
+    def test_finished_after_deadline(self, monkeypatch):
+        readings = iter([100.0, 104.0])
+        monkeypatch.setattr(cli_module, 'time',
+                            SimpleNamespace(monotonic=lambda: next(readings, 105.5)))
+        monkeypatch.setattr(cli_module.subprocess, 'Popen', _FinishedProc)
+        monkeypatch.setattr(cli_module.os, 'killpg', lambda pid, sig: None)
+        with pytest.raises(_subprocess.TimeoutExpired) as info:
+            run_process(['claude'], timeout=5, cwd='.', env={})
+        assert info.value.output == 'out'
+
+
+class TestRound2RequestEcho:
+    """Item 15: an exit-0 reply that echoes a phrase of the request is no error."""
+
+    CODE = 'if err["type"] == "authentication_error":\n    refresh()'
+
+    def test_phrase_in_request_not_an_error(self):
+        result = _result(0, self.CODE)
+        assert ClaudeCLI().classify_error(result, prompt=f'Translate:\n{self.CODE}') is None
+        limit = "print(\"You've hit your limit\")"
+        assert ClaudeCLI().classify_error(_result(0, limit), prompt=limit) is None
+
+    def test_phrase_not_in_request_still_an_error(self):
+        result = _result(0, self.CODE)
+        assert isinstance(ClaudeCLI().classify_error(result, prompt='Translate: x'), AuthError)
+
+    def test_other_phrase_than_the_echoed_one_is_an_error(self):
+        result = _result(0, self.CODE + '\nPlease run /login')
+        assert isinstance(ClaudeCLI().classify_error(result, prompt=self.CODE), AuthError)
+
+    def test_failed_run_always_an_error(self):
+        result = _result(1, self.CODE)
+        assert isinstance(ClaudeCLI().classify_error(result, prompt=self.CODE), AuthError)
+
+    def test_case_insensitive_echo(self):
+        result = _result(0, 'AUTHENTICATION_ERROR')
+        assert ClaudeCLI().classify_error(result, prompt='authentication_error') is None
+
+    def test_complete_passes_the_prompt(self):
+        with patch('src.llm.cli.run_process', return_value=_result(0, self.CODE)):
+            response = ClaudeCLI().complete(_request(prompt=self.CODE), threading.Event())
+        assert response.text == self.CODE
+
+
+class TestRound2RateLimitMessage:
+    """Item 21: the rate-limit message comes from the stream that holds it."""
+
+    def test_long_stdout_does_not_hide_the_message(self):
+        error = ClaudeCLI().classify_error(
+            _result(1, 'x' * 1000, "You've hit your limit · resets 8pm\n"))
+        assert str(error) == "You've hit your limit · resets 8pm"
+
+    def test_message_in_stdout(self):
+        error = ClaudeCLI().classify_error(_result(1, " You've hit your limit ", 'warning'))
+        assert str(error) == "You've hit your limit"

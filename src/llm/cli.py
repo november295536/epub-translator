@@ -7,6 +7,7 @@ starts processes for model calls.
 from __future__ import annotations
 
 import atexit
+import errno
 import os
 import signal
 import subprocess
@@ -35,6 +36,8 @@ KEPT_OUTPUT_CHARS = 20000
 # Process groups of calls in progress, killed at interpreter exit
 _live_groups: set = set()
 _live_groups_guard = threading.Lock()
+# Set by the exit hook (under the guard): no process is started after it
+_shutting_down = False
 
 
 @dataclass
@@ -53,20 +56,29 @@ def _kill_group(proc: subprocess.Popen) -> tuple:
         pass
     try:
         stdout, stderr = proc.communicate(timeout=KILL_WAIT_SECONDS)
-    except subprocess.TimeoutExpired:
-        # A descendant outside the group holds the pipes: give up on them
+    except subprocess.TimeoutExpired as e:
+        # A descendant outside the group holds the pipes: give up on them,
+        # keeping what was captured so far (bytes, even in text mode)
         for pipe in (proc.stdout, proc.stderr):
             if pipe is not None:
                 pipe.close()
         proc.wait()
-        stdout = stderr = ''
+        stdout, stderr = _decoded(e.output), _decoded(e.stderr)
     return _text(stdout)[:KEPT_OUTPUT_CHARS], _text(stderr)[:KEPT_OUTPUT_CHARS]
+
+
+def _decoded(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode('utf-8', 'replace')
+    return _text(value)
 
 
 def _kill_live_groups() -> None:
     """At interpreter exit: kill the process groups of calls still running
-    (e.g. in daemon worker threads)."""
+    (e.g. in daemon worker threads), and let no new one start."""
+    global _shutting_down
     with _live_groups_guard:
+        _shutting_down = True
         groups = list(_live_groups)
     for pgid in groups:
         try:
@@ -93,12 +105,16 @@ def run_process(cmd: List[str], *, timeout: float, cwd: str, env: dict,
     if cancel is not None and cancel.is_set():
         raise CancelledError('cancelled')
     deadline = time.monotonic() + timeout
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, cwd=cwd, env=env,
-        start_new_session=True,
-    )
+    # Started and registered under the guard: the exit hook either sees the
+    # process or stops it from starting
     with _live_groups_guard:
+        if _shutting_down:
+            raise CancelledError('shutting down')
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, cwd=cwd, env=env,
+            start_new_session=True,
+        )
         _live_groups.add(proc.pid)
     try:
         while True:
@@ -108,12 +124,9 @@ def run_process(cmd: List[str], *, timeout: float, cwd: str, env: dict,
                 stdout, stderr = proc.communicate(timeout=wait)
             except subprocess.TimeoutExpired:
                 if cancel is not None and cancel.is_set():
-                    _kill_group(proc)
                     raise CancelledError('cancelled')
                 if time.monotonic() >= deadline:
-                    stdout, stderr = _kill_group(proc)
-                    raise subprocess.TimeoutExpired(cmd, timeout, output=stdout,
-                                                    stderr=stderr)
+                    raise subprocess.TimeoutExpired(cmd, timeout)  # output added below
                 continue
             # Finished: still refuse the output of a cancelled or late call
             if cancel is not None and cancel.is_set():
@@ -121,9 +134,11 @@ def run_process(cmd: List[str], *, timeout: float, cwd: str, env: dict,
             if time.monotonic() > deadline:
                 raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
             return ProcessResult(proc.returncode, stdout, stderr)
-    except BaseException:
-        if proc.returncode is None:
-            _kill_group(proc)
+    except BaseException as e:
+        # Also when the program itself has ended: what it started may still run
+        stdout, stderr = _kill_group(proc)
+        if isinstance(e, subprocess.TimeoutExpired) and e.output is None:
+            e.output, e.stderr = stdout, stderr  # timed out while running
         raise
     finally:
         with _live_groups_guard:
@@ -160,7 +175,8 @@ class CLIBackend:
 
     def complete(self, request: LLMRequest,
                  cancel: threading.Event) -> LLMResponse:
-        cmd = self.build_command(flatten_prompt(request), request)
+        prompt = flatten_prompt(request)
+        cmd = self.build_command(prompt, request)
         try:
             result = run_process(cmd, timeout=request.timeout,
                                  cwd=self.working_directory(),
@@ -170,10 +186,14 @@ class CLIBackend:
             raise TransientError(f'{self.name} timed out after {request.timeout:g} s',
                                  raw=_text(e.output) + _text(e.stderr))
         except OSError as e:
-            # Missing or not executable: every call would fail the same way
-            raise BackendUnavailableError(
-                f'{self.name} could not be started: {str(e)[:ERROR_CHARS]}')
-        error = self.classify_error(result)
+            message = f'{self.name} could not be started: {str(e)[:ERROR_CHARS]}'
+            if isinstance(e, (FileNotFoundError, PermissionError)) or e.errno == errno.ENOEXEC:
+                # Missing or not executable: every call would fail the same way
+                raise BackendUnavailableError(message)
+            # Anything else (e.g. E2BIG for a very long prompt) concerns this
+            # request: not retried, the segment fails
+            raise LLMError(message)
+        error = self.classify_error(result, prompt)
         if error is not None:
             error.raw = (_text(result.stdout) + _text(result.stderr))[:KEPT_OUTPUT_CHARS]
             raise error
@@ -185,8 +205,9 @@ class CLIBackend:
     def parse_output(self, result: ProcessResult, request: LLMRequest) -> LLMResponse:
         raise NotImplementedError
 
-    def classify_error(self, result: ProcessResult) -> Optional[LLMError]:
-        """Return the error a finished run represents, or None on success."""
+    def classify_error(self, result: ProcessResult, prompt: str = '') -> Optional[LLMError]:
+        """Return the error a finished run represents, or None on success.
+        `prompt` is the request text that was sent."""
         raise NotImplementedError
 
     def list_models(self) -> List[ModelInfo]:
