@@ -122,9 +122,9 @@ CONTEXT_CHARS = 200
 def get_context(segments, segment_id: str) -> tuple:
     """Return (context_before, context_after) source texts for a segment.
 
-    Only the immediate neighbours are considered. A neighbour is used only
-    if it belongs to the same chapter and is not a code segment; otherwise
-    that side is an empty string.
+    On each side, code segments are stepped over to the nearest text
+    segment; the search never crosses into another chapter. A side with no
+    such segment is an empty string.
 
     Args:
         segments: All project segments in reading order (objects with
@@ -135,19 +135,17 @@ def get_context(segments, segment_id: str) -> tuple:
                 if s.segment_id == segment_id), -1)
     if idx < 0:
         return '', ''
-    current = segments[idx]
+    chapter_id = segments[idx].chapter_id
 
-    def usable(i: int) -> str:
-        if i < 0 or i >= len(segments):
-            return ''
-        neighbour = segments[i]
-        if neighbour.chapter_id != current.chapter_id:
-            return ''
-        if neighbour.segment_type == SegmentType.CODE:
-            return ''
-        return neighbour.text
+    def nearest_text(step: int) -> str:
+        i = idx + step
+        while 0 <= i < len(segments) and segments[i].chapter_id == chapter_id:
+            if segments[i].segment_type != SegmentType.CODE:
+                return segments[i].text
+            i += step
+        return ''
 
-    return usable(idx - 1), usable(idx + 1)
+    return nearest_text(-1), nearest_text(1)
 
 
 class TranslationError(Exception):
