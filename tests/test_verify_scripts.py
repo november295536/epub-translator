@@ -117,8 +117,9 @@ class TestCodeCheckMain:
         assert 'ERROR project-1: cannot read project' in out
         assert 'secret-name' not in out
 
-    def test_code_segment_without_text_is_unreadable(self, tmp_path, capsys):
-        seg = _code_seg('s', 'unused', 'XXXX')
+    @pytest.mark.parametrize('translated', ['XXXX', ''])
+    def test_code_segment_without_text_is_unreadable(self, tmp_path, capsys, translated):
+        seg = _code_seg('s', 'unused', translated)
         del seg['text']
         _write_project(str(tmp_path / 'p'), [seg])
 
