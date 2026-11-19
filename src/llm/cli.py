@@ -33,6 +33,9 @@ KILL_WAIT_SECONDS = 2
 # Characters of output kept from a call that timed out or was killed
 KEPT_OUTPUT_CHARS = 20000
 
+# Start errors caused by a temporary shortage of system resources
+RESOURCE_ERRNOS = (errno.EAGAIN, errno.ENOMEM, errno.EMFILE, errno.ENFILE)
+
 # Process groups of calls in progress, killed at interpreter exit
 _live_groups: set = set()
 _live_groups_guard = threading.Lock()
@@ -112,7 +115,8 @@ def run_process(cmd: List[str], *, timeout: float, cwd: str, env: dict,
             raise CancelledError('shutting down')
         proc = subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, cwd=cwd, env=env,
+            stderr=subprocess.PIPE, encoding='utf-8', errors='replace',
+            cwd=cwd, env=env,
             start_new_session=True,
         )
         _live_groups.add(proc.pid)
@@ -132,7 +136,9 @@ def run_process(cmd: List[str], *, timeout: float, cwd: str, env: dict,
             if cancel is not None and cancel.is_set():
                 raise CancelledError('cancelled')
             if time.monotonic() > deadline:
-                raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+                raise subprocess.TimeoutExpired(cmd, timeout,
+                                                output=stdout[:KEPT_OUTPUT_CHARS],
+                                                stderr=stderr[:KEPT_OUTPUT_CHARS])
             return ProcessResult(proc.returncode, stdout, stderr)
     except BaseException as e:
         # Also when the program itself has ended: what it started may still run
@@ -184,12 +190,15 @@ class CLIBackend:
         except subprocess.TimeoutExpired as e:
             # What the program wrote before it hung, for the diagnostics
             raise TransientError(f'{self.name} timed out after {request.timeout:g} s',
-                                 raw=_text(e.output) + _text(e.stderr))
+                                 raw=(_text(e.output) + _text(e.stderr))[:KEPT_OUTPUT_CHARS])
         except OSError as e:
             message = f'{self.name} could not be started: {str(e)[:ERROR_CHARS]}'
             if isinstance(e, (FileNotFoundError, PermissionError)) or e.errno == errno.ENOEXEC:
                 # Missing or not executable: every call would fail the same way
                 raise BackendUnavailableError(message)
+            if e.errno in RESOURCE_ERRNOS:
+                # Out of processes, memory or file descriptors for now: retried
+                raise TransientError(message)
             # Anything else (e.g. E2BIG for a very long prompt) concerns this
             # request: not retried, the segment fails
             raise LLMError(message)

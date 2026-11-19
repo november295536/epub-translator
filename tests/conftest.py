@@ -312,6 +312,19 @@ def lock_free_for_other_process(project_dir):
 
 
 @pytest.fixture(autouse=True)
+def no_fake_backend_overcalls():
+    """A scripted FakeBackend called more often than scripted fails the test,
+    also when the call was made in a worker thread (where the exception
+    only ends the thread)."""
+    from src.llm.fake import FakeBackend
+    FakeBackend.overcalls.clear()
+    yield
+    overcalls = list(FakeBackend.overcalls)
+    FakeBackend.overcalls.clear()
+    assert not overcalls, f'FakeBackend called {len(overcalls)} time(s) beyond its script'
+
+
+@pytest.fixture(autouse=True)
 def no_real_model_calls(monkeypatch):
     """No test starts the real `claude` program: a call that reaches the
     process layer without a test's own stub fails like an error exit.
