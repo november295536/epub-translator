@@ -1346,9 +1346,12 @@ class TestTermExtractionCoverage:
             id='ch1_seg0000', html='<pre>CODEONLYMARK = 1</pre>',
             text='CODEONLYMARK = 1', word_count=3,
             segment_type=SegmentType.CODE))
+        # The term sits beyond the per-call character limit of its own segment
+        last_text = 'Long filler text. ' * 400 + 'The zorblatt engine appears here.'
+        assert last_text.index('zorblatt') > 5000
         segments.append(Segment(
-            id='ch1_seg0060', html='<p>The zorblatt engine appears here.</p>',
-            text='The zorblatt engine appears here.', word_count=5,
+            id='ch1_seg0060', html=f'<p>{last_text}</p>',
+            text=last_text, word_count=len(last_text.split()),
             segment_type=SegmentType.TEXT))
         assert sum(1 for s in segments if s.segment_type == SegmentType.TEXT) == 60
 

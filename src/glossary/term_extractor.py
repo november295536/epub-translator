@@ -44,6 +44,27 @@ EXTRACT_PROMPT = """你是一位專業的術語提取專家。請從以下英文
 MAX_CHARS_PER_BATCH = 5000
 
 
+def _split_text(text: str, limit: int) -> list[str]:
+    """Split text into chunks of at most `limit` characters, without loss.
+
+    ''.join(result) == text. Each chunk ends after the last whitespace
+    before the limit when there is one, so words are not cut; a run of
+    more than `limit` characters without whitespace is cut at the limit.
+    """
+    chunks = []
+    start = 0
+    while len(text) - start > limit:
+        window = text[start:start + limit]
+        cut = max(window.rfind(' '), window.rfind('\n'), window.rfind('\t')) + 1
+        if cut <= 0:
+            cut = limit
+        chunks.append(text[start:start + cut])
+        start += cut
+    if start < len(text):
+        chunks.append(text[start:])
+    return chunks
+
+
 class TermExtractor:
     """Extracts technical terms from text using Claude CLI."""
 
@@ -97,8 +118,11 @@ class TermExtractor:
         current_batch = []
         current_len = 0
 
-        for seg in segments:
-            text = seg.get('text', '')
+        # A text longer than one batch is split into bounded chunks first, so
+        # extract_from_text() never has to truncate it.
+        texts = (chunk for seg in segments
+                 for chunk in _split_text(seg.get('text', ''), MAX_CHARS_PER_BATCH))
+        for text in texts:
             if current_len + len(text) > MAX_CHARS_PER_BATCH and current_batch:
                 batch_text = '\n\n'.join(current_batch)
                 terms = self.extract_from_text(batch_text)

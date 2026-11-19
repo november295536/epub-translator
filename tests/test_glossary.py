@@ -312,6 +312,47 @@ class TestTermExtractor:
         prompts = [c[0][0][2] for c in mock_run.call_args_list]
         assert any('TAILTERM' in p for p in prompts)
 
+    @staticmethod
+    def _sent_texts(mock_run):
+        marker = '文本：\n'
+        return [c[0][0][2].split(marker, 1)[1] for c in mock_run.call_args_list]
+
+    def test_oversized_segment_split_without_loss(self):
+        """A single text longer than the batch limit is split, not truncated."""
+        from src.glossary.term_extractor import MAX_CHARS_PER_BATCH
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '[]'
+
+        words = ' '.join(f'word{i}' for i in range(2000))
+        text = words[:6000] + ' BEYONDLIMIT ' + words[6000:12000] + ' ENDTERM'
+        assert text.index('BEYONDLIMIT') > MAX_CHARS_PER_BATCH
+
+        with patch('src.glossary.term_extractor.subprocess.run',
+                   return_value=mock_result) as mock_run:
+            TermExtractor().extract_from_segments(
+                [{'text': 'Short first segment.'}, {'text': text}])
+
+        sent = self._sent_texts(mock_run)
+        assert all(len(t) <= MAX_CHARS_PER_BATCH for t in sent)
+        joined = ''.join(sent)
+        assert 'BEYONDLIMIT' in joined and 'ENDTERM' in joined
+        assert any('BEYONDLIMIT' in t for t in sent)
+        # Lossless: every character of the long text was sent, in order
+        assert joined.replace('\n\n', '').endswith(text)
+
+    def test_split_text_is_lossless_and_bounded(self):
+        from src.glossary.term_extractor import _split_text
+        text = ('alpha beta gamma ' * 50) + 'x' * 120 + ' tail'
+        chunks = _split_text(text, 100)
+        assert ''.join(chunks) == text
+        assert all(0 < len(c) <= 100 for c in chunks)
+        # Breaks after whitespace where there is some
+        assert chunks[0].endswith(' ')
+        assert _split_text('short', 100) == ['short']
+        assert _split_text('', 100) == []
+
     def test_extraction_error_propagates(self):
         """ExtractionError (e.g. auth error) should not be swallowed by broad except."""
         mock_result = MagicMock()
