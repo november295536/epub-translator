@@ -3323,3 +3323,60 @@ class TestRound3MissingProject:
         assert response.get_json() == {'error': '專案不存在'}
         assert not os.path.exists(os.path.join(project_dir, 'project.json'))
         assert not os.path.exists(os.path.join(project_dir, 'project.lock'))
+
+
+# --- Review round 4 ---------------------------------------------------------------
+
+import shutil as _shutil
+
+
+class TestRound4RetranslateAcrossReplacement:
+    """Item 1: a re-translation whose project was replaced during the call
+    leaves the new project's segment of the same id untouched."""
+
+    NAME = 'replaced'
+
+    def _create(self, client, sample_epub, text):
+        first = [True]
+
+        def segment_chapter(self, chapter_id, html):
+            if not first[0]:
+                return []
+            first[0] = False
+            return [Segment(id='ch1_seg0001', html=f'<p>{text}</p>', text=text,
+                            word_count=2, segment_type=SegmentType.TEXT)]
+
+        with patch('src.web.blueprints.projects.Segmenter.segment_chapter', segment_chapter):
+            response = client.application.test_client().post('/api/projects', json={
+                'epub_path': sample_epub, 'project_name': self.NAME})
+        assert response.status_code == 200, response.get_json()
+
+    def test_replaced_during_call(self, client, sample_epub):
+        TaskManager._instance = None
+        self._create(client, sample_epub, 'Old book line.')
+        in_flight, release = threading.Event(), threading.Event()
+        result = {}
+
+        def respond(request):
+            in_flight.set()
+            assert release.wait(10)
+            return '<p>舊書譯文</p>'
+
+        def retranslate():
+            result['r'] = client.application.test_client().post(
+                f'/api/projects/{self.NAME}/segments/ch1_seg0001/retranslate')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            t = threading.Thread(target=retranslate)
+            t.start()
+            assert in_flight.wait(10)
+            self._create(client, sample_epub, 'New book line.')
+            release.set()
+            t.join(10)
+        assert result['r'].status_code == 409
+        assert result['r'].get_json() == {'error': '專案已在翻譯期間被重新建立，未套用新譯文'}
+        pm = ProjectManager(os.path.join(os.path.dirname(sample_epub), self.NAME))
+        pm.load()
+        seg = pm.data.segments[0]
+        assert (seg.text, seg.status, seg.translated_text) == \
+            ('New book line.', SegmentStatus.PENDING, '')
