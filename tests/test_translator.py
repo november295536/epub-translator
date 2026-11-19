@@ -667,6 +667,7 @@ class TestCodeResponseCleaning:
         ('Of course', '當然\n'),
         ('Here are the steps:', '以下是步驟：\n'),
         ('以下是：', '以下是：\n'),   # source left untranslated
+        ('X', 'X\n'),
     ])
     def test_short_text_reply_accepted(self, source, reply):
         engine = TranslationEngine(max_retries=1)
@@ -677,6 +678,18 @@ class TestCodeResponseCleaning:
 
         with patch('src.core.translator.subprocess.run', return_value=mock_result):
             assert engine.translate(source) == reply.strip()
+
+    def test_multi_line_reply_ending_in_colon_accepted(self):
+        # Only a single commentary line counts as empty; here the first line
+        # is removed by the start pattern and two lines remain
+        engine = TranslationEngine(max_retries=1)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '當然。\n以下是項目清單\n例如：\n'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            assert engine.translate('Sure.\nHere is a list\nfor example') == '以下是項目清單\n例如：'
 
     def test_code_whitespace_only_output_is_empty(self):
         engine = TranslationEngine(max_retries=1)
