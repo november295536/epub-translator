@@ -137,15 +137,7 @@ class EPUBBuilder:
         if not body:
             return
 
-        # Projects segmented before the segmenter skipped comments counted a
-        # comment as a block. Keep that walk unless only the comment-skipping
-        # walk lines up with the stored segments.
-        elements = self._walk_content_elements(body, legacy=True)
-        expected = sum(self._count_segment_blocks(seg) for seg in segments)
-        if len(elements) != expected:
-            current = self._walk_content_elements(body)
-            if len(current) == expected:
-                elements = current
+        elements, _ = self._select_elements(body, segments)
 
         elem_idx = 0
         for seg in segments:
@@ -171,6 +163,55 @@ class EPUBBuilder:
             elem_idx = end_idx
 
         item.set_content(str(soup).encode('utf-8'))
+
+    def _select_elements(self, body, segments: list[SegmentState]) -> tuple[list, bool]:
+        """Return (elements, legacy) for a chapter body, choosing the walk by content.
+
+        Projects segmented before comments were skipped stored them in one of
+        two recognisable ways, and only then is the legacy walk (comments
+        count as text) used; otherwise the current walk is used.
+        """
+        legacy = self._segments_are_legacy(body, segments)
+        return self._walk_content_elements(body, legacy=legacy), legacy
+
+    @staticmethod
+    def _segments_are_legacy(body, segments: list[SegmentState]) -> bool:
+        """True when the stored segments show the pre-comment-skipping segmenter.
+
+        Two signatures, both read from the stored segment HTML:
+
+        1. A top-level text node (or one of its lines; merged blocks are
+           joined with newlines) equals the text of a comment or other
+           non-text string in the chapter body. The old extractor turned a
+           body-level comment into bare text, and the old segmenter stored it.
+        2. A stored top-level div/section/article is a container under the
+           current rule but not under the legacy rule, i.e. the old segmenter
+           kept it as one block only because it holds a comment.
+        """
+        hidden = {
+            ' '.join(s.split())
+            for s in body.find_all(string=lambda s: isinstance(s, PreformattedString))
+        }
+        hidden.discard('')
+
+        for seg in segments:
+            if seg.segment_type == SegmentType.CODE:
+                continue
+            frag = BeautifulSoup(seg.html, 'html.parser')
+            for child in frag.children:
+                if isinstance(child, PreformattedString):
+                    continue
+                if isinstance(child, NavigableString):
+                    if hidden:
+                        texts = [str(child)] + str(child).split('\n')
+                        if any(' '.join(t.split()) in hidden for t in texts):
+                            return True
+                elif (isinstance(child, Tag)
+                      and child.name in ('div', 'section', 'article')
+                      and _is_container(child)
+                      and not _is_container(child, legacy=True)):
+                    return True
+        return False
 
     def _walk_content_elements(self, parent, legacy: bool = False) -> list:
         """Walk body elements in the same order as the segmenter, flattening div/section/article.

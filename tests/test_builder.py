@@ -4,7 +4,7 @@ import os
 import pytest
 import ebooklib
 from ebooklib import epub
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment, Tag
 
 from src.epub.builder import EPUBBuilder, BILINGUAL_CSS
 from src.core.project import ProjectManager
@@ -1089,3 +1089,130 @@ class TestCommentAlignment:
 
         assert soup.find('h1').get_text() == 'T0'
         assert soup.find('pre').get_text() == 'T2'
+
+
+def _words(prefix: str, n: int) -> str:
+    return ' '.join(f'{prefix}{i}.' if i % 10 == 9 else f'{prefix}{i}'
+                    for i in range(n))
+
+
+class TestWalkSelection:
+    """The builder picks the walk from the stored segments' content, not from counts."""
+
+    FORMATS = ('chinese-only', 'bilingual-horizontal', 'bilingual-vertical')
+
+    def _transform(self, tmp_path, chapter, segments, fmt):
+        builder = EPUBBuilder(str(tmp_path))
+        item = _FakeItem(chapter)
+        builder._transform_chapter(item, segments, fmt)
+        return BeautifulSoup(item.get_content().decode('utf-8'), 'html.parser')
+
+    @staticmethod
+    def _states(chapter, translations):
+        from src.core.segmenter import Segmenter
+        segs = Segmenter().segment_chapter('ch1', chapter)
+        assert len(segs) == len(translations)
+        return [_seg_state(s.id, s.html, s.text, t, s.segment_type)
+                for s, t in zip(segs, translations)]
+
+    # Reviewer A: both walks have one element, but they are different elements.
+    EQUAL_COUNT = ('<html><body><div><!-- note --><h2 id="s">Heading</h2></div>'
+                   '</body></html>')
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_equal_count_nested_comment_keeps_heading(self, tmp_path, fmt):
+        states = self._states(self.EQUAL_COUNT, ['<h2 id="s">標題</h2>'])
+        soup = self._transform(tmp_path, self.EQUAL_COUNT, states, fmt)
+
+        if fmt == 'chinese-only':
+            h2 = soup.find('h2', id='s')
+            assert h2 is not None and h2.get_text() == '標題'
+        else:
+            original = soup.find('div', class_='original')
+            first_tag = next(c for c in original.children if isinstance(c, Tag))
+            assert first_tag.name == 'h2' and first_tag.get('id') == 's'
+            assert '標題' in soup.find('div', class_='translation').get_text()
+
+    # Reviewer B, scenario A: body-level comment, bare text that is sentence-split,
+    # so the stored block count equals the comment-as-element walk by accident.
+    SCENARIO_A = ('<html><body><!-- c --><p>' + _words('a', 350) + '</p><p>'
+                  + _words('b', 50) + '</p>' + _words('x', 550) + '</body></html>')
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_scenario_a_new_project(self, tmp_path, fmt):
+        states = self._states(self.SCENARIO_A, ['<p>甲</p>', '<p>乙</p>丙', '丁'])
+        soup = self._transform(tmp_path, self.SCENARIO_A, states, fmt)
+
+        comments = soup.find_all(string=lambda s: isinstance(s, Comment))
+        assert [c.strip() for c in comments] == ['c']
+        if fmt == 'chinese-only':
+            assert [p.get_text() for p in soup.find_all('p')] == ['甲', '乙']
+        else:
+            assert 'a0' in soup.find('div', class_='original').get_text()
+            assert soup.find('div', class_='translation').get_text() == '甲'
+
+    # Reviewer B, scenario B: a wrapper div holding a comment, plus a count
+    # mismatch elsewhere. Neither walk's count matches the stored segments.
+    SCENARIO_B = ('<html><body><div class="chapter"><!-- c --><h1>Title</h1>'
+                  '<p>Short para.</p></div>' + _words('x', 550) + '</body></html>')
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_scenario_b_wrapper_div_with_comment(self, tmp_path, fmt):
+        from src.core.segmenter import Segmenter
+        segs = Segmenter().segment_chapter('ch1', self.SCENARIO_B)
+        translations = ['<h1>標題</h1>'] + [f'<p>T{i}</p>' for i in range(1, len(segs))]
+        states = [_seg_state(s.id, s.html, s.text, t, s.segment_type)
+                  for s, t in zip(segs, translations)]
+        soup = self._transform(tmp_path, self.SCENARIO_B, states, fmt)
+
+        assert soup.find('div', class_='chapter') is not None
+        if fmt == 'chinese-only':
+            assert soup.find('h1').get_text() == '標題'
+            assert soup.find('div', class_='chapter').find('p') is not None
+        else:
+            assert soup.find('h1', string='Title') is not None
+            assert soup.find('h1', string='標題') is not None
+            assert soup.find('p', string='Short para.') is not None
+
+    # Legacy data: a wrapper div with a comment was stored as one block.
+    LEGACY_DIV = ('<html><body><div class="box"><!-- c --><p>One</p><p>Two</p>'
+                  '</div><p>Three</p></body></html>')
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_legacy_div_with_comment_stored_as_one_block(self, tmp_path, fmt):
+        states = [_seg_state(
+            'ch1_seg0001',
+            '<div class="box"><!-- c --><p>One</p><p>Two</p></div>\n<p>Three</p>',
+            'One Two\nThree',
+            '<div class="box"><p>一</p><p>二</p></div>\n<p>三</p>')]
+        soup = self._transform(tmp_path, self.LEGACY_DIV, states, fmt)
+
+        if fmt == 'chinese-only':
+            assert len(soup.find_all('div', class_='box')) == 1
+            assert [p.get_text() for p in soup.find_all('p')] == ['一', '二', '三']
+        else:
+            # Paired 1:1 with the two stored blocks: the box div and <p>Three</p>
+            assert len(soup.find_all('div', class_='original')) == 2
+
+    def test_legacy_body_comment_stored_as_text(self, tmp_path):
+        chapter = '<html><body><p>Zero</p><!-- c --><p>One</p></body></html>'
+        states = [
+            _seg_state('ch1_seg0001', '<p>Zero</p>\n c \n<p>One</p>',
+                       'Zero\nc\nOne', '<p>零</p>\n註\n<p>一</p>'),
+        ]
+        soup = self._transform(tmp_path, chapter, states, 'chinese-only')
+        assert [p.get_text() for p in soup.find_all('p')] == ['零', '一']
+
+    def test_selection_reports_walk(self, tmp_path):
+        builder = EPUBBuilder(str(tmp_path))
+        body = BeautifulSoup(self.LEGACY_DIV, 'html.parser').body
+        legacy_states = [_seg_state(
+            'ch1_seg0001',
+            '<div class="box"><!-- c --><p>One</p><p>Two</p></div>\n<p>Three</p>',
+            'One Two\nThree', 'x')]
+        new_states = self._states(self.LEGACY_DIV, ['x'])
+
+        elements, legacy = builder._select_elements(body, legacy_states)
+        assert legacy is True and len(elements) == 2
+        elements, legacy = builder._select_elements(body, new_states)
+        assert legacy is False and len(elements) == 3
