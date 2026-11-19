@@ -460,11 +460,9 @@ class TestCLILock:
         with use_fake_backend(FakeBackend([RuntimeError('unexpected')])):
             result = runner.invoke(cli, ['start', '--project', path, '--workers', workers])
         assert lock_free_for_other_process(path)
-        # Review round 1, item 9: sequential stops on it; a parallel worker
-        # turns it into a failed segment
+        # Review round 2, item 5: a failed segment in both modes
         assert result.exit_code == 1
-        expected = SegmentStatus.PENDING if workers == '1' else SegmentStatus.FAILED
-        assert _statuses(path) == {'c1_seg0001': expected}
+        assert _statuses(path) == {'c1_seg0001': SegmentStatus.FAILED}
 
     def test_lock_released_after_rate_limit_exit(self, runner, tmp_path):
         path = _make_project(str(tmp_path / 'p'), n=1)
@@ -630,11 +628,12 @@ class TestCLIUnexpectedErrors:
         assert statuses['c1_seg0002'] == SegmentStatus.FAILED
         assert statuses['c1_seg0004'] == SegmentStatus.TRANSLATED
 
-    def test_unexpected_worker_exception(self, runner, tmp_path):
+    @pytest.mark.parametrize('workers', ['1', '3'])  # review round 2, item 5
+    def test_unexpected_worker_exception(self, runner, tmp_path, workers):
         path = _make_project(str(tmp_path / 'p'))
         with use_fake_backend(FakeBackend(responder=_responder(['MARK2'],
                                                                error=KeyError('surprise')))):
-            result = runner.invoke(cli, ['start', '--project', path, '--workers', '3'])
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', workers])
         assert result.exit_code == 1, result.output
         assert '1 個段落翻譯失敗' in result.output
         pm = ProjectManager(path)
@@ -757,3 +756,42 @@ class TestCLIRound1Exact:
         with use_fake_backend(FakeBackend(['[]', RateLimitError('limit')])):
             result = runner.invoke(cli, ['glossary', 'extract', '--project', path])
         assert '提取中斷：limit' in result.output.splitlines()
+
+
+# --- Review round 2 ---------------------------------------------------------------
+
+class TestRound2WorkerStartup:
+    """Item 3: workers that started are stopped and joined when a later start
+    fails or is interrupted, before the lock is released."""
+
+    @pytest.mark.parametrize('error', [RuntimeError("can't start new thread"),
+                                       KeyboardInterrupt()])
+    def test_later_start_fails(self, runner, tmp_path, monkeypatch, error):
+        path = _make_project(str(tmp_path / 'p'), n=4)
+        started, workers = [], []
+        in_flight = threading.Event()
+        real_start = threading.Thread.start
+
+        def start(self):
+            if getattr(self, '_target', None) is not None and \
+                    getattr(self._target, '__name__', '') == 'worker':
+                started.append(self)
+                if len(started) == 2:
+                    assert in_flight.wait(10)
+                    raise error
+            real_start(self)
+
+        def respond(request):
+            workers.append(threading.current_thread())
+            in_flight.set()
+            _time.sleep(0.3)  # still in flight when the second start fails
+            return '<p>譯文</p>'
+
+        monkeypatch.setattr(threading.Thread, 'start', start)
+        with use_fake_backend(FakeBackend(responder=respond)):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', '3'])
+        lock_free = lock_free_for_other_process(path)
+        assert result.exit_code != 0
+        assert workers and not any(t.is_alive() for t in workers)
+        assert lock_free
+        assert '翻譯中斷，等待進行中的段落結束' in result.output

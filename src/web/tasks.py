@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from src.core.project import ProjectLock, ProjectManager, SegmentStatus, project_mutex
 from src.core.translator import (
     AuthError, BackendUnavailableError, RateLimitError, TranslationEngine,
-    TranslationOutcome, translate_segment, unexpected_error_outcome,
+    TranslationOutcome, record_failure_log, translate_segment,
 )
 from src.glossary.glossary_manager import GlossaryManager
 
@@ -201,9 +201,12 @@ class TaskManager:
     @contextmanager
     def transaction(self, project_name: str, projects_dir: str):
         """Load, change and save a project as one step: holds the project's
-        mutex and yields the authoritative manager (the task's, otherwise a
-        fresh load from disk). The caller saves inside the block."""
-        with project_mutex(os.path.join(projects_dir, project_name)):
+        mutex and its file lock (other processes; ProjectLockedError when
+        another process has it) and yields the authoritative manager (the
+        task's, otherwise a fresh load from disk). The caller saves inside
+        the block."""
+        project_dir = os.path.join(projects_dir, project_name)
+        with project_mutex(project_dir), ProjectLock(project_dir):
             yield self.get_or_load_pm(project_name, projects_dir)
 
     def task_active(self, project_name: str) -> bool:
@@ -236,6 +239,7 @@ class TaskManager:
             retry_failed: With segment_ids None, also queue FAILED segments.
 
         Raises:
+            FileNotFoundError: the project does not exist.
             ValueError: a task is running.
             ProjectLockedError: another process holds the project lock
                 (this task holds it until it ends).
@@ -271,11 +275,15 @@ class TaskManager:
         # Get segments to translate
         project_dir = os.path.join(projects_dir, project_name)
         lock = ProjectLock(project_dir)
-        lock.acquire()  # raises ProjectLockedError
-        try:
-            # Under the project mutex until the task is registered: an edit
-            # either lands before the load or goes to the task's manager
-            with project_mutex(project_dir):
+        # The mutex, then the file lock, as everywhere. Under the mutex until
+        # the task is registered: an edit either lands before the load or
+        # goes to the task's manager, and a delete sees the task
+        with project_mutex(project_dir):
+            # No lock file in a directory that is not (or no longer) a project
+            if not os.path.isfile(os.path.join(project_dir, ProjectManager.PROJECT_FILE)):
+                raise FileNotFoundError('專案不存在')
+            lock.acquire()  # raises ProjectLockedError
+            try:
                 pm = ProjectManager(project_dir)
                 pm.load()
 
@@ -310,12 +318,12 @@ class TaskManager:
                 task._coordinator = coordinator
                 coordinator.start()
                 self.tasks[project_name] = task
-        except BaseException:
-            if task.project_lock is None or not task.threads_alive():
-                # Nothing started that would release it
-                task.state = 'failed'
-                lock.release()
-            raise
+            except BaseException:
+                if task.project_lock is None or not task.threads_alive():
+                    # Nothing started that would release it
+                    task.state = 'failed'
+                    lock.release()
+                raise
 
         return task
 
@@ -375,6 +383,7 @@ class TaskManager:
                         logger.info("動態增加 %d workers (共 %d)", additional, num_workers)
 
             task.state = 'running'
+            task.error = None  # the run-level error that paused it
             task.pause_event.set()
         return True
 
@@ -382,7 +391,8 @@ class TaskManager:
         """Coordinator: set up resources, launch workers, process results."""
         project_dir = os.path.join(task.projects_dir, task.project_name)
         handler = None
-        unsaved = []  # results applied in memory since the last save
+        unsaved = []  # results accepted in memory since the last save
+        log_dir = os.path.join(project_dir, 'log')
         try:
             handler = setup_project_logging(project_dir)
             pm = task.pm
@@ -436,12 +446,16 @@ class TaskManager:
                     except queue.Empty:
                         break
 
-                # Process batch, then save once
-                for res in batch:
-                    self._apply_result(task, pm, res)
-                    unsaved.append(res.segment_id)
-                pm.save()
-                unsaved.clear()
+                # Process batch, save once, then the diagnostics of what was
+                # accepted: one step under the mutex, so an edit cannot
+                # come between
+                with pm.mutex:
+                    accepted = [res for res in batch if self._apply_result(task, pm, res)]
+                    unsaved.extend(res.segment_id for res in accepted)
+                    pm.save()
+                    unsaved.clear()
+                    for res in accepted:
+                        record_failure_log(log_dir, res.segment_id, res.outcome)
 
                 # Results that arrived meanwhile are taken by the next round
                 with task._lock:
@@ -483,9 +497,11 @@ class TaskManager:
             t.join()
         while True:
             try:
-                unsaved.append(task.result_queue.get_nowait().segment_id)
+                res = task.result_queue.get_nowait()
             except queue.Empty:
                 break
+            if res.outcome is not None:  # a skipped segment had nothing to save
+                unsaved.append(res.segment_id)
         message = str(error)
         if unsaved:
             message += f'（{len(unsaved)} 個段落的結果未儲存：{", ".join(unsaved)}）'
@@ -497,8 +513,9 @@ class TaskManager:
         }})
 
     def _apply_result(self, task: TranslationTask, pm: ProjectManager,
-                      res: TranslationResult) -> None:
-        """Store one worker result in memory and report it (coordinator only)."""
+                      res: TranslationResult) -> bool:
+        """Store one worker result in memory and report it (coordinator only).
+        True when the outcome was accepted (not skipped, not stale)."""
         outcome = res.outcome
         if outcome is None:
             # Skipped by the worker: edited or approved after it was queued
@@ -514,7 +531,7 @@ class TaskManager:
                 'segment_id': res.segment_id,
                 'error': detail,
             }})
-            return
+            return True
         with task._lock:
             task.completed += 1
             completed = task.completed
@@ -524,7 +541,7 @@ class TaskManager:
             'percent': round(completed / task.total * 100, 1),
         }})
         if outcome is None:
-            return  # nothing of the machine's was kept: no success event
+            return False  # nothing of the machine's was kept: no success event
         logger.info("段落完成 [%d/%d]: %s (%s)",
                     completed, task.total, res.segment_id, outcome.model)
         task.progress.put({'event': 'segment_complete', 'data': {
@@ -532,6 +549,7 @@ class TaskManager:
             'translated_text': outcome.text[:200],
             'model': outcome.model,
         }})
+        return True
 
     def _worker_loop(self, task: TranslationTask, worker_id: int):
         """Single worker loop: fetch segments from queue and translate."""
@@ -540,7 +558,6 @@ class TaskManager:
         gm = task._gm
         engine = TranslationEngine(model=pm.data.model)
         all_segments = pm.data.segments
-        log_dir = os.path.join(task.projects_dir, task.project_name, 'log')
         reduced_exit = False
 
         try:
@@ -589,15 +606,9 @@ class TaskManager:
                     continue
 
                 try:
-                    try:
-                        outcome = translate_segment(engine, seg, all_segments, gm,
-                                                    log_dir=log_dir)
-                    except RUN_ERRORS:
-                        raise
-                    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on
-                        logger.exception("[%s] 未預期的錯誤: %s", tag, seg.segment_id)
-                        outcome = unexpected_error_outcome(engine.model, e)
-                    # A failed segment is a result too: recorded as FAILED
+                    # A failed segment, also one with an unexpected error, is
+                    # an outcome: recorded as FAILED
+                    outcome = translate_segment(engine, seg, all_segments, gm)
                     task.result_queue.put(TranslationResult(
                         segment_id=seg.segment_id, outcome=outcome, revision=revision))
 
@@ -616,6 +627,7 @@ class TaskManager:
                         # Only first worker to hit this sends the event
                         if task.state == 'running':
                             task.state = 'paused'
+                            task.error = str(e)  # for a page opened later
                             task.progress.put({'event': event_name, 'data': {
                                 'error': str(e),
                                 'completed': task.completed,

@@ -12,7 +12,7 @@ from src.core.segmenter import Segmenter, SegmentType
 from src.core.project import ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus
 from src.core.translator import (
     AuthError, BackendUnavailableError, RateLimitError, TranslationEngine, available_models,
-    translate_segment, unexpected_error_outcome,
+    record_failure_log, translate_segment,
 )
 from src.glossary.glossary_manager import GlossaryManager
 from src.epub.builder import EPUBBuilder
@@ -194,11 +194,12 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
     for i, seg in enumerate(pending, 1):
         click.echo(f"[{progress['translated'] + i}/{progress['total']}] 翻譯段落 {seg.segment_id}...")
         try:
-            outcome = translate_segment(engine, seg, all_segments, gm, log_dir=log_dir)
+            outcome = translate_segment(engine, seg, all_segments, gm)
         except RUN_ERRORS as e:
             _stop_run(e)
         pm.apply_outcome(seg.segment_id, outcome)
         pm.save()
+        record_failure_log(log_dir, seg.segment_id, outcome)
         if outcome.status == SegmentStatus.FAILED:
             failed += 1
             click.echo(f"  ✗ 翻譯失敗：{outcome.issues[0].detail}")
@@ -233,32 +234,27 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
                 break
 
             try:
-                outcome = translate_segment(engine, seg, all_segments, gm, log_dir=log_dir)
+                outcome = translate_segment(engine, seg, all_segments, gm)
             except RUN_ERRORS as e:
                 stop_errors.append(e)
                 error_event.set()
                 break
-            except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on
-                outcome = unexpected_error_outcome(engine.model, e)
             result_queue.put((seg.segment_id, outcome, seg.word_count, tag))
 
     actual_workers = min(num_workers, len(pending))
-    threads = []
-    for i in range(actual_workers):
-        # Daemon: a second Ctrl-C ends the process without waiting for them
-        t = threading.Thread(target=worker, args=(i,), daemon=True)
-        threads.append(t)
-        t.start()
+    threads = []  # the workers that started
 
     # Process results in main thread
     completed = 0
     failed = 0
     unsaved = []  # applied in memory since the last successful save
+    applied = []  # (segment id, outcome) of the same, for their diagnostics
 
     def apply(seg_id, outcome, word_count, tag):
         nonlocal completed, failed
         pm.apply_outcome(seg_id, outcome)
         unsaved.append(seg_id)
+        applied.append((seg_id, outcome))
         if outcome.status == SegmentStatus.FAILED:
             failed += 1
             click.echo(f"  [{tag}] ✗ {seg_id} 翻譯失敗：{outcome.issues[0].detail}")
@@ -267,6 +263,14 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
             click.echo(f"  [{tag}] [{base_translated + completed}/{total}] ✓ {seg_id}（{word_count} 字）")
 
     try:
+        # Started inside the try: if a later start fails or is interrupted,
+        # the workers already running are stopped and joined below
+        for i in range(actual_workers):
+            # Daemon: a second Ctrl-C ends the process without waiting for them
+            t = threading.Thread(target=worker, args=(i,), daemon=True)
+            t.start()
+            threads.append(t)
+
         while any(t.is_alive() for t in threads) or not result_queue.empty():
             try:
                 apply(*result_queue.get(timeout=0.5))
@@ -281,6 +285,9 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
                     break
             pm.save()
             unsaved.clear()
+            for seg_id, outcome in applied:
+                record_failure_log(log_dir, seg_id, outcome)
+            applied.clear()
     except BaseException:
         # The supervisor failed (a save raised, Ctrl-C): stop dispatching,
         # wait for the calls in flight, then report what was not saved

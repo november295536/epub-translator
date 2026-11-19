@@ -48,6 +48,8 @@ def start_translation(project_name: str):
             'total': task.total,
             'workers': task.num_workers,
         })
+    except FileNotFoundError:
+        return jsonify({'error': '專案不存在'}), 404
     except (ValueError, ProjectLockedError) as e:
         return jsonify({'error': str(e)}), 409
     except Exception as e:
