@@ -14,7 +14,9 @@
 #   MUTATION_VENV="$TMPDIR/mutvenv" scripts/verify/mutation.sh [BASE]
 #
 # mutmut edits the source files in place while it runs and restores them
-# afterwards; do not edit or commit while it runs. State is kept in
+# afterwards; do not edit or commit while it runs. If a run is killed, a
+# mutated file and its .bak can be left behind (deliberately not ignored by
+# git, so they show up); restore with git checkout -- <file>. State is kept in
 # .mutmut-cache (git-ignored) and deleted at the start of each run.
 # Show one mutant's diff with: "$MUTATION_VENV/bin/mutmut" show <id>
 #
@@ -35,7 +37,8 @@ cd "$(git rev-parse --show-toplevel)"
 MERGE_BASE="$(git merge-base "$BASE" HEAD)"
 
 # group name | comma-separated files to mutate | pytest arguments
-GROUPS=(
+# (not named GROUPS: that is a read-only bash variable)
+MUT_GROUPS=(
     "core|src/core/segmenter.py,src/core/translator.py,src/epub/builder.py,src/epub/extractor.py,src/glossary/glossary_manager.py,src/glossary/term_extractor.py|tests/test_segmenter.py tests/test_translator.py tests/test_builder.py tests/test_extractor.py tests/test_glossary.py tests/test_verify_scripts.py"
     "web|src/web/tasks.py,src/web/blueprints/glossary.py,src/web/blueprints/review.py|tests/test_web.py -k TermExtractionCoverage or RetranslateContext or WorkerContext"
     "cli|translate.py|tests/test_cli.py"
@@ -45,9 +48,23 @@ GROUPS=(
 PATCH="$(mktemp)"
 trap 'rm -f "$PATCH"' EXIT
 
+ALL_FILES=""
+for group in "${MUT_GROUPS[@]}"; do
+    IFS='|' read -r _ files _ <<<"$group"
+    ALL_FILES="$ALL_FILES ${files//,/ }"
+done
+# mutmut rewrites these files in place; refuse to start on uncommitted edits
+# or on a leftover backup from an interrupted run
+if [[ -n "$(git status --porcelain -- $ALL_FILES)" ]] || ls $(printf '%s.bak ' $ALL_FILES) >/dev/null 2>&1; then
+    echo "Uncommitted changes or *.bak files in the files to mutate; after an interrupted" >&2
+    echo "run restore them with: git checkout -- <file> && rm <file>.bak" >&2
+    exit 2
+fi
+
 rm -f .mutmut-cache
-for group in "${GROUPS[@]}"; do
+for group in "${MUT_GROUPS[@]}"; do
     IFS='|' read -r name files tests <<<"$group"
+    [[ -n "$files" ]] || { echo "empty file list in group $name" >&2; exit 2; }
     # Working tree versus the merge base, so line numbers match the files mutmut edits
     git diff --no-prefix "$MERGE_BASE" -- ${files//,/ } >"$PATCH"
     if [[ ! -s "$PATCH" ]]; then
