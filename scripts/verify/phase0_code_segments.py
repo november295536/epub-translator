@@ -84,7 +84,7 @@ def check_project(project_file: str) -> tuple[int, list[str], list[str]]:
         output = seg.get('translated_text') or ''
         if not output.strip():
             empty.append(seg['segment_id'])
-        elif code_lines(seg.get('text', '')) != code_lines(output):
+        elif code_lines(seg['text']) != code_lines(output):
             differing.append(seg['segment_id'])
     return translated, differing, empty
 
