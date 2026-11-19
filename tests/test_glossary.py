@@ -89,7 +89,8 @@ class TestGlossaryManager:
         gm.add_term('AI', '人工智慧')
         assert gm.find_terms_in_text('We maintain the main trail.') == []
         assert [e.term for e in gm.find_terms_in_text('Modern AI, explained.')] == ['AI']
-        assert [e.term for e in gm.find_terms_in_text('the ai boom')] == ['AI']
+        # All-caps terms are matched case-sensitively (decision 5)
+        assert gm.find_terms_in_text('the ai boom') == []
 
     def test_find_terms_plural_forms(self, gm):
         gm.add_term('API', '應用程式介面')
@@ -120,6 +121,73 @@ class TestGlossaryManager:
         assert found('Runs on .NET today.') == ['.NET']
         assert found('The (.NET) runtime and (C++) code.') == ['.NET', 'C++']
         assert found('Send a magnet or abc# tag.') == []
+
+    def test_find_terms_inflected_forms(self, gm):
+        for term in ('render', 'deploy', 'refactor', 'cache', 'debug',
+                     'query', 'manage'):
+            gm.add_term(term, term)
+
+        def found(text):
+            return [e.term for e in gm.find_terms_in_text(text)]
+
+        for word in ('rendering', 'rendered', 'renderer', 'renderers', 'renders'):
+            assert found(f'The {word} step.') == ['render'], word
+        for word in ('deployment', 'deployments', 'deployed', 'deploying', 'deployer'):
+            assert found(f'A {word} here.') == ['deploy'], word
+        assert found('Some refactoring.') == ['refactor']
+        for word in ('caching', 'cached', 'cacher', 'caches'):
+            assert found(f'The {word} layer.') == ['cache'], word
+        for word in ('debugging', 'debugged', 'debugger', 'debuggers', 'debugs'):
+            assert found(f'A {word} session.') == ['debug'], word
+        assert found('Two queries ran.') == ['query']
+        assert found('Good management.') == ['manage']
+        # Not inflections: other words that merely start with the term
+        assert found('Renderman, deployx, cachet, debugx.') == []
+        assert found('A cacheing typo.') == []
+
+    def test_short_terms_take_plurals_only(self, gm):
+        gm.add_term('Go', 'Go')
+        gm.add_term('tag', '標籤')
+
+        def found(text):
+            return [e.term for e in gm.find_terms_in_text(text)]
+
+        assert found('We are going to say good things.') == []
+        assert found('Tagged and tagging and tagger.') == []
+        assert found('Two tags and Go.') == ['Go', 'tag']
+
+    def test_all_caps_terms_are_case_sensitive(self, gm):
+        gm.add_term('IT', '資訊科技')
+        gm.add_term('US', '美國')
+        gm.add_term('API', '應用程式介面')
+
+        def found(text):
+            return [e.term for e in gm.find_terms_in_text(text)]
+
+        assert found('Its value is it. It uses us.') == []
+        assert found('The IT team in the US.') == ['IT', 'US']
+        assert found('Public APIs.') == ['API']
+        assert found('An api call.') == []
+
+    def test_mixed_case_terms_are_case_insensitive(self, gm):
+        gm.add_term('Kubernetes', 'Kubernetes')
+        assert [e.term for e in gm.find_terms_in_text('kubernetes pods')] == ['Kubernetes']
+
+    def test_multi_word_terms_match_any_whitespace(self, gm):
+        gm.add_term('machine learning', '機器學習')
+
+        def found(text):
+            return [e.term for e in gm.find_terms_in_text(text)]
+
+        assert found('About machine\nlearning.') == ['machine learning']
+        assert found('About machine\xa0learning.') == ['machine learning']
+        assert found('About machine  learning.') == ['machine learning']
+        assert found('About machinelearning.') == []
+
+    def test_dotnet_not_matched_inside_aspnet(self, gm):
+        # Documented limitation: '.' is preceded by a word character
+        gm.add_term('.NET', '.NET')
+        assert gm.find_terms_in_text('Built on ASP.NET Core.') == []
 
     def test_format_for_prompt(self, gm):
         gm.add_term('API', '應用程式介面', category='term')
