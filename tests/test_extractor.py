@@ -1,6 +1,7 @@
 """Tests for EPUB extraction module."""
 
 import pytest
+from ebooklib import epub
 from src.epub.extractor import EPUBExtractor
 
 
@@ -96,3 +97,38 @@ class TestEPUBExtractor:
         assert len(content_chapters) == 2
         assert any('Chapter One' in c.title for c in content_chapters)
         assert any('Chapter Two' in c.title for c in content_chapters)
+
+
+class TestCommentsThroughPipeline:
+    """Body-level comments must not reach the segmenter as visible text."""
+
+    def test_body_comment_not_in_any_segment(self, tmp_path):
+        from src.core.segmenter import Segmenter
+
+        book = epub.EpubBook()
+        book.set_identifier('comment-test')
+        book.set_title('Comment Test')
+        book.set_language('en')
+        chapter = epub.EpubHtml(title='One', file_name='one.xhtml', lang='en')
+        chapter.content = ('<html><body><p>First paragraph.</p>'
+                           '<!-- hiddennote -->'
+                           '<p>Second paragraph.</p></body></html>')
+        book.add_item(chapter)
+        book.spine = [chapter]
+        book.add_item(epub.EpubNcx())
+        book.add_item(epub.EpubNav())
+        path = str(tmp_path / 'comment.epub')
+        epub.write_epub(path, book)
+
+        extractor = EPUBExtractor(path)
+        extractor.load()
+        chapters = extractor.extract_chapters()
+        assert len(chapters) == 1
+        assert 'hiddennote' not in chapters[0].text_content
+
+        segments = Segmenter().segment_chapter(chapters[0].id, chapters[0].html_content)
+        assert segments
+        for seg in segments:
+            assert 'hiddennote' not in seg.text
+        joined = ' '.join(seg.text for seg in segments)
+        assert 'First paragraph.' in joined and 'Second paragraph.' in joined
