@@ -6,7 +6,6 @@ import json
 import os
 import re
 from dataclasses import dataclass, asdict, field
-from functools import lru_cache
 
 
 CATEGORY_LABELS = {
@@ -20,77 +19,26 @@ CATEGORY_LABELS = {
 }
 
 
-# Suffixes accepted after a term that ends in a letter and whose last word
-# has at least INFLECTION_MIN_LETTERS letters.
-INFLECTION_MIN_LETTERS = 4
-_VOWELS = 'aeiou'
-_NO_DOUBLING = _VOWELS + 'wxy'
+# Up to this many entries the whole glossary goes into every translation
+# prompt; above it, only the entries found in the segment text.
+FULL_GLOSSARY_MAX_TERMS = 150
 
 
-def _escape_words(text: str) -> str:
-    """Escape text for a regex; any run of whitespace matches \\s+."""
-    return r'\s+'.join(re.escape(part) for part in text.split())
+def _term_pattern(term: str) -> str:
+    """Regex for a glossary term: it starts at a word boundary, with any
+    continuation, case-insensitive.
 
+    (?<!\w) is used instead of \b so that terms starting with a non-word
+    character (.NET) work; there is no trailing boundary, so every suffix
+    inflection matches (API -> APIs, render -> rendering). Whitespace inside
+    a term matches any whitespace run (newline, NBSP).
 
-def _term_forms(term: str) -> list[tuple[str, tuple[str, ...]]]:
-    """Return (stem, suffixes) pairs; a match is a stem followed by one suffix."""
-    if not term[-1].isalpha():
-        return [(term, ('',))]
-
-    last = term[-1].lower()
-    if last == 'y' and len(term) > 1:
-        forms = [(term, ('', 's')), (term[:-1], ('ies',))]
-    else:
-        forms = [(term, ('', 's', 'es'))]
-
-    last_word = re.search(r'[^\W\d_]+$', term).group()
-    if len(last_word) < INFLECTION_MIN_LETTERS:
-        return forms
-
-    if last == 'e':
-        # cache -> cached, cacher(s), caching; manage -> management(s)
-        forms.append((term, ('d', 'r', 'rs', 'ment', 'ments')))
-        forms.append((term[:-1], ('ing',)))
-    else:
-        forms.append((term, ('ed', 'ing', 'er', 'ers', 'ment', 'ments')))
-        if last not in _NO_DOUBLING and term[-2].lower() in _VOWELS:
-            # debug -> debugged, debugging, debugger(s)
-            forms.append((term + term[-1], ('ed', 'ing', 'er', 'ers')))
-    return forms
-
-
-@lru_cache(maxsize=None)
-def _term_pattern(term: str) -> re.Pattern:
-    """Compile a whole-word pattern for a glossary term.
-
-    Lookarounds are used instead of \\b so that terms starting or ending
-    with a non-word character (C++, C#, .NET) still match. Because of the
-    leading (?<!\\w), '.NET' does not match inside 'ASP.NET'.
-
-    - A term ending in a letter also matches its plurals (s, es, y -> ies).
-    - If its last word has at least INFLECTION_MIN_LETTERS letters, it also
-      matches ed/d, ing (with e-drop and a doubled final consonant), er/ers
-      and ment/ments.
-    - All-caps terms (API, IT, US) are case-sensitive, so IT does not match
-      "its"; the suffix itself may be in any case. Other terms are
-      case-insensitive.
-    - Whitespace inside a multi-word term matches any whitespace run
-      (newline, NBSP).
+    Accepted, since a false positive only adds a few prompt tokens: other
+    words that start with the term also match (Go -> going, C inside C++),
+    '.NET' does not match inside 'ASP.NET', and a term stored in plural form
+    does not match its singular.
     """
-    term = term.strip()
-    if not term:
-        return re.compile(r'(?!)')
-    case_sensitive = any(c.isalpha() for c in term) and term == term.upper()
-
-    alternatives = []
-    for stem, suffixes in _term_forms(term):
-        suffix_group = '|'.join(suffixes)
-        if case_sensitive:
-            suffix_group = '(?i:' + suffix_group + ')'
-        alternatives.append(_escape_words(stem) + '(?:' + suffix_group + ')')
-
-    flags = 0 if case_sensitive else re.IGNORECASE
-    return re.compile(r'(?<!\w)(?:' + '|'.join(alternatives) + r')(?!\w)', flags)
+    return r'(?<!\w)' + r'\s+'.join(re.escape(part) for part in term.split())
 
 
 @dataclass
@@ -176,12 +124,21 @@ class GlossaryManager:
         return sorted(self.entries.values(), key=lambda e: e.term.lower())
 
     def find_terms_in_text(self, text: str) -> list[GlossaryEntry]:
-        """Find all glossary terms that appear in the given text."""
+        """Find all glossary terms that appear in the given text (see _term_pattern).
+
+        An empty or whitespace-only term never matches."""
         found = []
         for entry in self.entries.values():
-            if _term_pattern(entry.term).search(text):
+            if entry.term.strip() and re.search(_term_pattern(entry.term), text, re.IGNORECASE):
                 found.append(entry)
         return sorted(found, key=lambda e: e.term.lower())
+
+    def terms_for_prompt(self, text: str) -> list[GlossaryEntry]:
+        """Entries to put in the translation prompt for a segment: all of
+        them when the glossary is small, otherwise those found in the text."""
+        if len(self.entries) <= FULL_GLOSSARY_MAX_TERMS:
+            return self.get_all_terms()
+        return self.find_terms_in_text(text)
 
     def format_for_prompt(self, entries: list[GlossaryEntry] | None = None) -> str:
         """Format glossary entries as a string for inclusion in a translation prompt."""

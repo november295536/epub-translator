@@ -1386,7 +1386,10 @@ class TestTermExtractionCoverage:
 class TestRetranslateContext:
     """Retranslation takes context from the same chapter only."""
 
-    def test_previous_chapter_not_used_as_context(self, client):
+    def test_previous_chapter_not_used_as_context(self, client, project_with_translations):
+        from src.glossary.glossary_manager import GlossaryManager
+        GlossaryManager(os.path.join(project_with_translations, PROJECT_NAME,
+                                     'glossary.json')).add_term('GLOSSMARK', '詞彙')
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = '<h2>第二章</h2>'
@@ -1401,6 +1404,7 @@ class TestRetranslateContext:
         prompt = mock_run.call_args[0][0][2]
         assert 'Second paragraph.' not in prompt   # last segment of chapter 1
         assert 'Chapter 2 content.' in prompt      # next segment, same chapter
+        assert 'GLOSSMARK → 詞彙' in prompt         # small glossary: all entries
 
 
 class TestWorkerContext:

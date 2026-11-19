@@ -144,7 +144,7 @@ def _start_sequential(pm, gm, pending, all_segments, progress):
 
         glossary_text = ''
         if gm.entries:
-            found = gm.find_terms_in_text(seg.text)
+            found = gm.terms_for_prompt(seg.text)
             if found:
                 glossary_text = gm.format_for_prompt(found)
 
@@ -195,7 +195,7 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers):
 
             glossary_text = ''
             if gm.entries:
-                found = gm.find_terms_in_text(seg.text)
+                found = gm.terms_for_prompt(seg.text)
                 if found:
                     glossary_text = gm.format_for_prompt(found)
 

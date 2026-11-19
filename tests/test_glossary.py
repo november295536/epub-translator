@@ -81,168 +81,60 @@ class TestGlossaryManager:
         text = 'This chapter discusses machine learning and deep learning algorithms.'
         found = gm.find_terms_in_text(text)
 
-        terms = [e.term for e in found]
-        assert 'machine learning' in terms or 'deep learning' in terms
-        assert 'database' not in terms
+        assert [e.term for e in found] == ['deep learning', 'machine learning']
 
-    def test_find_terms_whole_word_only(self, gm):
+    def _found(self, gm, text):
+        return [e.term for e in gm.find_terms_in_text(text)]
+
+    def test_term_must_start_at_a_word_boundary(self, gm):
         gm.add_term('AI', '人工智慧')
-        assert gm.find_terms_in_text('We maintain the main trail.') == []
-        assert [e.term for e in gm.find_terms_in_text('Modern AI, explained.')] == ['AI']
-        # All-caps terms are matched case-sensitively (decision 5)
-        assert gm.find_terms_in_text('the ai boom') == []
+        assert self._found(gm, 'We maintain the main trail.') == []
+        assert self._found(gm, 'Modern AI, explained.') == ['AI']
+        assert self._found(gm, 'the ai boom') == ['AI']  # case-insensitive
 
-    def test_find_terms_plural_forms(self, gm):
+    def test_any_continuation_matches(self, gm):
         gm.add_term('API', '應用程式介面')
-        gm.add_term('batch', '批次')
-        gm.add_term('dependency', '相依性')
-        gm.add_term('key', '鍵')
+        gm.add_term('render', '算繪')
+        assert self._found(gm, 'Public APIs change.') == ['API']
+        assert self._found(gm, 'The rendering step.') == ['render']
 
-        def found(text):
-            return [e.term for e in gm.find_terms_in_text(text)]
-
-        assert found('Public APIs change.') == ['API']
-        assert found('Two batches ran.') == ['batch']
-        assert found('Too many dependencies.') == ['dependency']
-        assert found('Rotate the keys.') == ['key']
-        assert found('One dependency.') == ['dependency']
-        assert found('A rapid keystroke.') == []
-
-    def test_find_terms_with_symbols(self, gm):
+    def test_terms_with_symbols(self, gm):
         gm.add_term('C++', 'C++')
         gm.add_term('C#', 'C#')
         gm.add_term('.NET', '.NET')
-
-        def found(text):
-            return [e.term for e in gm.find_terms_in_text(text)]
-
-        assert found('Written in C++, mostly.') == ['C++']
-        assert found('Ported to C# later.') == ['C#']
-        assert found('Runs on .NET today.') == ['.NET']
-        assert found('The (.NET) runtime and (C++) code.') == ['.NET', 'C++']
-        assert found('Send a magnet or abc# tag.') == []
-
-    def test_find_terms_inflected_forms(self, gm):
-        for term in ('render', 'deploy', 'refactor', 'cache', 'debug',
-                     'query', 'manage'):
-            gm.add_term(term, term)
-
-        def found(text):
-            return [e.term for e in gm.find_terms_in_text(text)]
-
-        for word in ('rendering', 'rendered', 'renderer', 'renderers', 'renders'):
-            assert found(f'The {word} step.') == ['render'], word
-        for word in ('deployment', 'deployments', 'deployed', 'deploying', 'deployer'):
-            assert found(f'A {word} here.') == ['deploy'], word
-        assert found('Some refactoring.') == ['refactor']
-        for word in ('caching', 'cached', 'cacher', 'caches'):
-            assert found(f'The {word} layer.') == ['cache'], word
-        for word in ('debugging', 'debugged', 'debugger', 'debuggers', 'debugs'):
-            assert found(f'A {word} session.') == ['debug'], word
-        assert found('Two queries ran.') == ['query']
-        assert found('Good management.') == ['manage']
-        # Not inflections: other words that merely start with the term
-        assert found('Renderman, deployx, cachet, debugx.') == []
-        assert found('A cacheing typo.') == []
-
-    def test_four_letter_terms_take_inflections(self, gm):
-        gm.add_term('load', '載入')
-        for word in ('loading', 'loaded', 'loader', 'loaders'):
-            assert [e.term for e in gm.find_terms_in_text(f'The {word}.')] == ['load'], word
-
-    def test_suffix_lists_are_complete(self, gm):
-        gm.add_term('cache', '快取')
-        gm.add_term('manage', '管理')
-        gm.add_term('deploy', '部署')
-
-        def found(text):
-            return [e.term for e in gm.find_terms_in_text(text)]
-
-        assert found('Two cachers.') == ['cache']
-        assert found('Two managements.') == ['manage']
-        assert found('Two deployments.') == ['deploy']
-
-    def test_no_doubling_unless_vowel_then_consonant(self, gm):
-        gm.add_term('build', '建置')
-        gm.add_term('deploy', '部署')
-        gm.add_term('render', '算繪')
-
-        def found(text):
-            return [e.term for e in gm.find_terms_in_text(text)]
-
-        assert found('A buildding step.') == []   # consonant before final consonant
-        assert found('A deployying step.') == []  # final y is never doubled
-        gm.add_term('debug', '除錯')
-        assert found('A debugging step.') == ['debug']
-
-    def test_terms_not_ending_in_a_letter(self, gm):
-        gm.add_term('Web3', 'Web3')
-        gm.add_term('C', 'C')
-
-        def found(text):
-            return [e.term for e in gm.find_terms_in_text(text)]
-
-        assert found('Web3 apps and C code.') == ['C', 'Web3']
-        assert found('Some Web3s.') == []
-
-    def test_y_terms_by_length(self, gm):
-        gm.add_term('y', 'y')
-        gm.add_term('xy', 'xy')
-
-        def found(text):
-            return [e.term for e in gm.find_terms_in_text(text)]
-
-        assert found('An ies file.') == []
-        assert found('Several xies.') == ['xy']
-
-    def test_all_caps_multi_word_term(self, gm):
-        gm.add_term('ABC DEF', 'ABC DEF')
-        assert [e.term for e in gm.find_terms_in_text('the ABC\nDEF unit')] == ['ABC DEF']
-        assert gm.find_terms_in_text('the abc def unit') == []
-
-    def test_short_terms_take_plurals_only(self, gm):
-        gm.add_term('Go', 'Go')
-        gm.add_term('tag', '標籤')
-
-        def found(text):
-            return [e.term for e in gm.find_terms_in_text(text)]
-
-        assert found('We are going to say good things.') == []
-        assert found('Tagged and tagging and tagger.') == []
-        assert found('Two tags and Go.') == ['Go', 'tag']
-
-    def test_all_caps_terms_are_case_sensitive(self, gm):
-        gm.add_term('IT', '資訊科技')
-        gm.add_term('US', '美國')
-        gm.add_term('API', '應用程式介面')
-
-        def found(text):
-            return [e.term for e in gm.find_terms_in_text(text)]
-
-        assert found('Its value is it. It uses us.') == []
-        assert found('The IT team in the US.') == ['IT', 'US']
-        assert found('Public APIs.') == ['API']
-        assert found('An api call.') == []
-
-    def test_mixed_case_terms_are_case_insensitive(self, gm):
-        gm.add_term('Kubernetes', 'Kubernetes')
-        assert [e.term for e in gm.find_terms_in_text('kubernetes pods')] == ['Kubernetes']
+        assert self._found(gm, 'Written in C++, mostly.') == ['C++']
+        assert self._found(gm, 'Ported to C# later.') == ['C#']
+        assert self._found(gm, 'Runs on .NET today.') == ['.NET']
+        assert self._found(gm, 'The (.NET) runtime and (C++) code.') == ['.NET', 'C++']
+        # Accepted limitation: '.' is preceded by a word character
+        assert self._found(gm, 'Built on ASP.NET Core.') == []
 
     def test_multi_word_terms_match_any_whitespace(self, gm):
         gm.add_term('machine learning', '機器學習')
+        assert self._found(gm, 'About machine\nlearning.') == ['machine learning']
+        assert self._found(gm, 'About machine\xa0learning.') == ['machine learning']
+        assert self._found(gm, 'About machine  learning.') == ['machine learning']
+        assert self._found(gm, 'About machinelearning.') == []
 
-        def found(text):
-            return [e.term for e in gm.find_terms_in_text(text)]
+    @pytest.mark.parametrize('term', ['', '   '])
+    def test_empty_term_never_matches(self, gm, term):
+        gm.entries[term] = GlossaryEntry(term=term, translation='x')
+        assert gm.find_terms_in_text('any text at all') == []
 
-        assert found('About machine\nlearning.') == ['machine learning']
-        assert found('About machine\xa0learning.') == ['machine learning']
-        assert found('About machine  learning.') == ['machine learning']
-        assert found('About machinelearning.') == []
+    def test_small_glossary_gives_every_entry_to_the_prompt(self, gm):
+        from src.glossary.glossary_manager import FULL_GLOSSARY_MAX_TERMS
+        assert FULL_GLOSSARY_MAX_TERMS == 150
+        for i in range(FULL_GLOSSARY_MAX_TERMS):
+            gm.entries[f'term{i:03}'] = GlossaryEntry(term=f'term{i:03}', translation='x')
+        terms = [e.term for e in gm.terms_for_prompt('unrelated text')]
+        assert terms == sorted(gm.entries)
 
-    def test_dotnet_not_matched_inside_aspnet(self, gm):
-        # Documented limitation: '.' is preceded by a word character
-        gm.add_term('.NET', '.NET')
-        assert gm.find_terms_in_text('Built on ASP.NET Core.') == []
+    def test_large_glossary_gives_matching_entries_to_the_prompt(self, gm):
+        from src.glossary.glossary_manager import FULL_GLOSSARY_MAX_TERMS
+        for i in range(FULL_GLOSSARY_MAX_TERMS):
+            gm.entries[f'term{i:03}'] = GlossaryEntry(term=f'term{i:03}', translation='x')
+        gm.entries['ai'] = GlossaryEntry(term='AI', translation='人工智慧')  # 151 entries
+        assert [e.term for e in gm.terms_for_prompt('We maintain term007s.')] == ['term007']
 
     def test_format_for_prompt(self, gm):
         gm.add_term('API', '應用程式介面', category='term')
