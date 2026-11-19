@@ -84,11 +84,27 @@ for group in "${MUT_GROUPS[@]}"; do
         pytest_args="$tests"
     fi
     # mutmut 2.x counts only exit code 1 as killed, so a mutant that breaks
-    # test collection (pytest exit 2-5) would be reported as survived: map
-    # every failure to 1. A runner file, because mutmut runs the command both
-    # with and without a shell.
-    printf '#!/bin/sh\n"%s" -m pytest -x -q -p no:cacheprovider %s || exit 1\n' \
-        "$PY" "$pytest_args" >"$RUNNER"
+    # test collection (pytest exit 2-5) would be reported as survived: the
+    # runner maps every failure to 1. It is a file because mutmut runs the
+    # command both with and without a shell. On a timeout mutmut kills only
+    # the wrapper, so pytest runs under a watchdog that exits as soon as its
+    # parent is gone (otherwise an infinite-loop mutant keeps the output pipe
+    # open and the run hangs).
+    cat >"$RUNNER" <<EOF
+#!/bin/sh
+"$PY" -c '
+import os, sys, threading, time
+parent = os.getppid()
+def watch():
+    while True:
+        time.sleep(0.5)
+        if os.getppid() != parent:
+            os._exit(1)
+threading.Thread(target=watch, daemon=True).start()
+import pytest
+sys.exit(pytest.main(sys.argv[1:]))
+' -x -q -p no:cacheprovider $pytest_args || exit 1
+EOF
     echo "== $name: mutating changed lines of $files"
     # --CI: exit 1 only on a fatal error; mutant results are read from the cache below
     if ! "$MUTMUT" run --paths-to-mutate "$files" --use-patch-file "$PATCH" \
