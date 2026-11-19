@@ -318,7 +318,10 @@ Each phase therefore delivers, together with the code:
    that prints a pass/fail line per project and exits non-zero on failure. `projects/` is not
    in git, so these scripts run on the user's machine and are not part of the test suite;
 3. a short entry in `plan/03-acceptance-log.md`: the commands, their output, the date, and
-   anything that was not verified.
+   anything that was not verified;
+4. a mutation-test run over the code changed in the phase, reproducible with one command
+   (`scripts/verify/mutation.sh`), with every surviving mutant in changed code either killed
+   by a new test or justified individually as equivalent in the acceptance log.
 
 Numbers quoted in this plan must be reproducible the same way. The migration dry-run figures in
 4.2 come from `python3 plan/experiments/migrate_dryrun.py --strict` (expected last line:
@@ -332,8 +335,14 @@ No schema change; each item ships alone.
 - Bug 3: stop markdown cleanup and leading-whitespace stripping on code output.
 - Bug 4: take the *end* of the previous segment as context, not the start; take context only
   from the same chapter; skip code neighbours.
-- Glossary matching with `(?<!\w)…(?!\w)` lookarounds and plural tolerance (`s`, `es`,
-  `y → ies`). `\b` is not used because it fails on `C++`, `C#`, `.NET`.
+- Glossary matching with `(?<!\w)…(?!\w)` lookarounds (`\b` is not used because it fails on
+  `C++`, `C#`, `.NET`). A term ending in a letter also matches its plurals (`s`, `es`,
+  `y → ies`); if its last word has at least 4 letters it also matches `ed`/`d`, `ing`
+  (with e-drop and a doubled final consonant), `er`/`ers` and `ment`/`ments`, because the
+  extractor stores base forms. All-caps terms match case-sensitively (`IT` does not match
+  "its", `US` does not match "uses"); other terms are case-insensitive. Whitespace inside a
+  multi-word term matches any whitespace run (newline, NBSP). `.NET` does not match inside
+  `ASP.NET` (accepted). One compiled, cached pattern per term.
 - Web term extraction covers all text segments, not the first 50 segments including code
   (`glossary.py:113`).
 - Bug 5: the segmenter skips comments.
