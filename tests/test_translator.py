@@ -1189,3 +1189,40 @@ class TestEngineDefaultModel:
 
     def test_backend_default(self):
         assert TranslationEngine(backend=FakeBackend()).model == 'fake-model'
+
+
+class TestRound1Exact:
+    """Exact values of the round 1 translator code (mutation survivors)."""
+
+    def test_unexpected_error_outcome(self):
+        from src.core.project import Issue
+        from src.core.translator import unexpected_error_outcome
+        outcome = unexpected_error_outcome('m', KeyError('k'))
+        assert (outcome.text, outcome.status, outcome.model, outcome.usage) == \
+            (None, SegmentStatus.FAILED, 'm', None)
+        assert outcome.issues == [Issue(kind='backend', code='unexpected',
+                                        detail="未預期的錯誤：KeyError: 'k'", blocking=True)]
+        long = unexpected_error_outcome('m', ValueError('v' * 5000))
+        assert len(long.issues[0].detail) == 2000
+
+    def test_log_messages_exact(self, tmp_path, caplog):
+        (tmp_path / 'failed').write_text('not a directory')
+        seg = _seg()
+        with caplog.at_level('ERROR', logger='src.core.translator'):
+            translate_segment(_engine(FakeBackend([RefusalError('no')])), seg, [seg],
+                              log_dir=str(tmp_path))
+        assert caplog.records[-1].getMessage().startswith('無法寫入失敗紀錄 c1_seg0001: ')
+        caplog.clear()
+        os.remove(tmp_path / 'failed')
+        os.makedirs(failure_log_path(str(tmp_path), 'c1_seg0001'))
+        with caplog.at_level('ERROR', logger='src.core.translator'):
+            translate_segment(_engine(FakeBackend(['譯文'])), seg, [seg], log_dir=str(tmp_path))
+        assert caplog.records[-1].getMessage().startswith('無法移除失敗紀錄 c1_seg0001: ')
+
+    def test_second_failure_replaces_the_log(self, tmp_path):
+        seg = _seg()
+        for detail in ('first', 'second'):
+            translate_segment(_engine(FakeBackend([RefusalError(detail)])), seg, [seg],
+                              log_dir=str(tmp_path))
+        content = open(failure_log_path(str(tmp_path), 'c1_seg0001'), encoding='utf-8').read()
+        assert '=== attempt 1: second ===' in content

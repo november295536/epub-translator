@@ -382,25 +382,35 @@ class TestRunProcessExceptionalExit:
             os.kill(pid, 0)
         assert cli_module._live_groups == set()
 
-    def test_kill_wait_is_bounded_when_a_descendant_keeps_the_pipes(self, tmp_path,
+    @pytest.mark.parametrize('ending', ['cancel', 'timeout'])
+    def test_kill_wait_is_bounded_when_a_descendant_keeps_the_pipes(self, tmp_path, ending,
                                                                     monkeypatch):
-        monkeypatch.setattr(cli_module, 'KILL_WAIT_SECONDS', 0.5)
+        made = []
+
+        class RecordingPopen(_subprocess.Popen):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                made.append(self)
+
+        monkeypatch.setattr(cli_module.subprocess, 'Popen', RecordingPopen)
         pid_file = tmp_path / 'pid'
-        # The grandchild leaves the process group (setsid) and inherits stdout
+        # The grandchild leaves the process group (setsid) and inherits the pipes
         grandchild = (f'import os,time; os.setsid(); '
                       f'open({str(pid_file)!r},"w").write(str(os.getpid())); time.sleep(60)')
         cmd = [sys.executable, '-c',
-               f'import subprocess,sys,time; subprocess.Popen([sys.executable,"-c",{grandchild!r}]); '
-               'time.sleep(60)']
+               'import subprocess,sys,time; print("partial", flush=True); '
+               f'subprocess.Popen([sys.executable,"-c",{grandchild!r}]); time.sleep(60)']
         cancel = threading.Event()
         outcome = []
 
         def call():
             try:
-                run_process(cmd, timeout=60, cwd=str(tmp_path), env=dict(os.environ),
-                            cancel=cancel)
+                run_process(cmd, timeout=60 if ending == 'cancel' else 1, cwd=str(tmp_path),
+                            env=dict(os.environ), cancel=cancel)
             except CancelledError:
                 outcome.append('cancelled')
+            except _subprocess.TimeoutExpired as e:
+                outcome.append((e.output, e.stderr))
 
         t = threading.Thread(target=call)
         t.start()
@@ -408,12 +418,14 @@ class TestRunProcessExceptionalExit:
         while not (pid_file.exists() and pid_file.read_text()):
             assert time.monotonic() < deadline
             time.sleep(0.05)
-        cancel.set()
-        t.join(timeout=20)
-        grandchild_pid = int(pid_file.read_text())
-        os.kill(grandchild_pid, 9)
+        if ending == 'cancel':
+            cancel.set()
+        t.join(timeout=20)  # the default KILL_WAIT_SECONDS, not the grandchild's 60 s
+        os.kill(int(pid_file.read_text()), 9)
         assert not t.is_alive()
-        assert outcome == ['cancelled']
+        # The pipes are given up: no output, even what was written before
+        assert outcome == (['cancelled'] if ending == 'cancel' else [('', '')])
+        assert made[0].stdout.closed and made[0].stderr.closed and made[0].returncode is not None
 
     def test_atexit_hook_kills_live_groups(self, tmp_path):
         pid_file = tmp_path / 'pid'
@@ -507,13 +519,14 @@ class TestTimeoutKeepsOutput:
                 ClaudeCLI().complete(_request(), threading.Event())
         assert info.value.raw == 'partial replyan error line'
 
-    def test_output_kept_is_bounded(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(cli_module, 'KEPT_OUTPUT_CHARS', 10)
+    def test_output_kept_is_bounded(self, tmp_path):
         cmd = [sys.executable, '-c',
-               'import time; print("x" * 1000, flush=True); time.sleep(60)']
+               'import sys,time; print("x" * 30000, flush=True); '
+               'print("y" * 30000, file=sys.stderr, flush=True); time.sleep(60)']
         with pytest.raises(_subprocess.TimeoutExpired) as info:
             run_process(cmd, timeout=1, cwd=str(tmp_path), env=dict(os.environ))
-        assert info.value.output == 'x' * 10
+        assert info.value.output == 'x' * 20000
+        assert info.value.stderr == 'y' * 20000
 
 
 class TestBackendUnavailable:
@@ -567,3 +580,45 @@ class TestBackendDefaults:
         backend = FakeBackend()
         assert backend.default_model == 'fake-model'
         assert [m.alias for m in backend.list_models()] == ['fake-model']
+
+
+class TestRound1Exact:
+    """Exact values of the round 1 backend code (mutation survivors)."""
+
+    def test_short_reply_boundary(self):
+        phrase = 'please run /login'
+        at_limit = phrase + 'x' * (300 - len(phrase))
+        assert isinstance(ClaudeCLI().classify_error(_result(0, at_limit)), AuthError)
+        assert ClaudeCLI().classify_error(_result(0, at_limit + 'x')) is None
+
+    def test_cancel_messages(self, tmp_path):
+        cancel = threading.Event()
+        cancel.set()
+        with pytest.raises(CancelledError) as info:
+            run_process(['true'], timeout=30, cwd=str(tmp_path), env=dict(os.environ),
+                        cancel=cancel)
+        assert str(info.value) == 'cancelled'
+
+    def test_cancel_message_after_finish(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli_module, 'POLL_SECONDS', 5)
+        cancel = threading.Event()
+        timer = threading.Timer(0.2, cancel.set)
+        timer.start()
+        with pytest.raises(CancelledError) as info:
+            run_process([sys.executable, '-c', 'import time; time.sleep(1)'], timeout=30,
+                        cwd=str(tmp_path), env=dict(os.environ), cancel=cancel)
+        timer.join()
+        assert str(info.value) == 'cancelled'
+
+    def test_cancel_message_while_running(self, tmp_path):
+        cancel = threading.Event()
+        timer = threading.Timer(0.3, cancel.set)
+        timer.start()
+        with pytest.raises(CancelledError) as info:
+            run_process([sys.executable, '-c', 'import time; time.sleep(60)'], timeout=60,
+                        cwd=str(tmp_path), env=dict(os.environ), cancel=cancel)
+        timer.join()
+        assert str(info.value) == 'cancelled'
+
+    def test_fake_auth_hint(self):
+        assert FakeBackend().auth_hint == 'fake: sign in again'

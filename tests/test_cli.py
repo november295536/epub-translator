@@ -693,3 +693,67 @@ class TestCLIGlossaryExtractStop:
         gm = GlossaryManager(os.path.join(path, 'glossary.json'))
         gm.load()
         assert [e.term for e in gm.get_all_terms()] == ['Alpha']
+
+
+class TestCLIRound1Exact:
+    """Exact output of the round 1 CLI code (mutation survivors)."""
+
+    def test_invalid_model_message(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        result = runner.invoke(cli, ['start', '--project', path, '--model', 'nope'])
+        assert result.exit_code == 2
+        assert "Invalid value for '--model' / '-m': 'nope' is not one of sonnet, opus, haiku" \
+            in result.output
+
+    def test_model_help(self, runner):
+        output = ' '.join(runner.invoke(cli, ['start', '--help']).output.split())
+        assert "--model TEXT Translation model: one of the backend's models " in output
+
+    def test_workers_are_daemons(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=2)
+        daemons = []
+
+        def respond(request):
+            daemons.append(threading.current_thread().daemon)
+            return '<p>譯文</p>'
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            runner.invoke(cli, ['start', '--project', path, '--workers', '2'])
+        assert daemons == [True, True]
+
+    def test_slow_result_still_applied(self, runner, tmp_path):
+        """A result arriving after the supervisor's 0.5 s wait is still taken."""
+        path = _make_project(str(tmp_path / 'p'), n=2)
+
+        def respond(request):
+            _time.sleep(0.8)
+            return '<p>譯文</p>'
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', '2'])
+        assert result.exit_code == 0, result.output
+        assert set(_statuses(path).values()) == {SegmentStatus.TRANSLATED}
+
+    def test_supervisor_failure_output(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=2)
+        both = threading.Barrier(2)
+
+        def respond(request):
+            both.wait(10)
+            return '<p>譯文</p>'
+
+        with use_fake_backend(FakeBackend(responder=respond)), \
+                patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', '2'])
+        lines = result.output.splitlines()
+        assert '翻譯中斷，等待進行中的段落結束……' in lines
+        assert lines[-1] in (
+            '未儲存的結果（2 個段落，下次 start 會重新翻譯）：c1_seg0001, c1_seg0002',
+            '未儲存的結果（2 個段落，下次 start 會重新翻譯）：c1_seg0002, c1_seg0001')
+
+    def test_extraction_stop_line(self, runner, tmp_path, monkeypatch):
+        monkeypatch.setattr('src.glossary.term_extractor.MAX_CHARS_PER_BATCH', 20)
+        path = _make_project(str(tmp_path / 'p'), n=3)
+        with use_fake_backend(FakeBackend(['[]', RateLimitError('limit')])):
+            result = runner.invoke(cli, ['glossary', 'extract', '--project', path])
+        assert '提取中斷：limit' in result.output.splitlines()

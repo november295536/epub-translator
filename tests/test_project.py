@@ -864,3 +864,50 @@ class TestLockAcquireFailure:
         lock = ProjectLock(project_dir)
         lock.acquire()  # a leaked descriptor would make this fail in-process
         lock.release()
+
+
+class TestRound1Exact:
+    """Exact values of the round 1 project code (mutation survivors)."""
+
+    def test_project_data_model_default_is_empty(self):
+        assert ProjectData(epub_path='', project_dir='').model == ''
+
+    def test_messages_without_data(self, project_dir):
+        pm = ProjectManager(project_dir)
+        with pytest.raises(RuntimeError) as info:
+            pm.to_json()
+        assert str(info.value) == 'No project data to save.'
+        with pytest.raises(RuntimeError) as info:
+            pm.mark_translated('x', 'y')
+        assert str(info.value) == 'No project loaded.'
+
+    def test_temporary_file_name(self, pm, project_dir):
+        from unittest.mock import patch
+        names = []
+        real_replace = os.replace
+
+        def replace(src, dst):
+            names.append(os.path.basename(src))
+            return real_replace(src, dst)
+
+        with patch('src.core.project.os.replace', side_effect=replace):
+            pm.save()
+        assert len(names) == 1
+        assert re.fullmatch(r'project\.json\.[^.]+\.tmp', names[0]), names[0]
+
+    def test_file_mode_kept_or_0644(self, pm, project_dir):
+        import stat
+        path = pm.project_file
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o644  # created by create()
+        os.chmod(path, 0o640)
+        pm.save()
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o640
+
+    def test_mark_translated_sets_time(self, pm):
+        pm.mark_translated('ch1_seg0001', '標題')
+        assert re.fullmatch(r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d',
+                            pm._find('ch1_seg0001').translated_at)
+
+    def test_mark_reviewed_with_text(self, pm):
+        pm.mark_reviewed('ch1_seg0001', text='人工')
+        assert pm._find('ch1_seg0001').translated_text == '人工'

@@ -645,3 +645,32 @@ class TestLoadCheckRoundTrip:
         del pm.data.segments[1:]
         pm.data.title = 'changed'
         assert load_check.round_trip(pm) == ('differs', "top-level keys ['title'], segments 2")
+
+
+class TestLoadCheckRoundTripExact:
+    """round_trip() results (mutation survivors)."""
+
+    def _pm(self, tmp_path, drop_model=False, title=None):
+        directory = str(tmp_path / 'a')
+        _write_loadable(directory, ['pending'])
+        path = os.path.join(directory, 'project.json')
+        with open(path) as f:
+            data = json.load(f)
+        if drop_model:
+            del data['model']
+        if title is not None:
+            data['title'] = title
+        with open(path, 'w') as f:
+            json.dump(data, f)
+        pm = load_check.ProjectManager(directory)
+        pm.load()
+        return pm
+
+    def test_equal_and_model_added_have_no_detail(self, tmp_path):
+        assert load_check.round_trip(self._pm(tmp_path)) == ('equal', '')
+        assert load_check.round_trip(self._pm(tmp_path, drop_model=True)) == ('model added', '')
+
+    def test_missing_model_and_another_difference(self, tmp_path):
+        pm = self._pm(tmp_path, drop_model=True)
+        pm.data.title = 'changed'
+        assert load_check.round_trip(pm) == ('differs', "top-level keys ['model', 'title'], segments 0")

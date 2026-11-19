@@ -445,6 +445,17 @@ class TestExtractionStopKeepsTerms:
             assert str(info.value) == str(stop)
             assert len(fake.requests) == 2
 
+    def test_batches_joined_with_blank_line(self, monkeypatch):
+        from src.glossary.term_extractor import TermExtractor
+        from src.llm.fake import FakeBackend
+        monkeypatch.setattr('src.glossary.term_extractor.MAX_CHARS_PER_BATCH', 20)
+        fake = FakeBackend(['[]', '[]'])
+        TermExtractor(model='m', backend=fake).extract_from_segments(
+            [{'text': 'aaaa'}, {'text': 'bbbb'}, {'text': 'c' * 15}, {'text': 'dd'}])
+        assert len(fake.prompts) == 2
+        assert fake.prompts[0].endswith('aaaa\n\nbbbb')
+        assert fake.prompts[1].endswith('c' * 15 + '\n\ndd')
+
     def test_error_without_terms(self):
         from src.glossary.term_extractor import ExtractionError
         assert ExtractionError('x').terms == []

@@ -2419,3 +2419,204 @@ class TestTermExtractionStop:
         assert 'hit your limit' in status['error'] and '1 個術語' in status['error']
         terms = client.get(f'/api/projects/{PROJECT_NAME}/glossary').get_json()
         assert [t['term'] for t in terms] == ['Alpha']
+
+
+class TestRound1Exact:
+    """Exact behaviour of the round 1 web code (mutation survivors)."""
+
+    def _task(self, projects_dir, state='running'):
+        task = TranslationTask(task_id='t', project_name=PROJECT_NAME,
+                               projects_dir=projects_dir, state=state)
+        task.pm = ProjectManager(os.path.join(projects_dir, PROJECT_NAME))
+        task.pm.load()
+        return task
+
+    def test_threads_alive_with_any_worker(self, project_with_translations):
+        task = self._task(project_with_translations)
+        assert task.threads_alive() is False
+        done = threading.Thread(target=lambda: None)
+        done.start()
+        done.join()
+        stop = threading.Event()
+        running = threading.Thread(target=stop.wait)
+        running.start()
+        task._threads = [done, running]
+        try:
+            assert task.threads_alive() is True
+        finally:
+            stop.set()
+            running.join()
+        assert task.threads_alive() is False
+
+    @pytest.mark.parametrize('state,owns', [('running', True), ('paused', True),
+                                            ('stopped', False), ('completed', False)])
+    def test_task_owns_state_by_state_alone(self, project_with_translations, state, owns):
+        TaskManager._instance = None
+        tm = TaskManager()
+        task = self._task(project_with_translations, state)
+        tm.tasks[PROJECT_NAME] = task
+        assert (tm.get_project_manager(PROJECT_NAME) is task.pm) is owns
+        assert (tm.get_or_load_pm(PROJECT_NAME, project_with_translations) is task.pm) is owns
+        assert tm.task_active(PROJECT_NAME) is owns
+        TaskManager._instance = None
+
+    def test_auth_error_event(self, project_with_translations):
+        task, patcher = _start(project_with_translations,
+                               lambda r: (_ for _ in ()).throw(AuthError('expired')))
+        _wait(lambda: task.state == 'paused')
+        TaskManager().stop_translation(PROJECT_NAME)
+        _finish(task, patcher)
+        events = [e for e in task.progress.get_all() if e['event'] == 'auth_error']
+        assert [e['data']['error'] for e in events] == ['expired']
+
+    def test_exact_messages_and_registration(self, project_with_translations, monkeypatch):
+        monkeypatch.setattr('src.web.tasks.STOP_WAIT_SECONDS', 0.1)
+        in_flight, release = threading.Event(), threading.Event()
+
+        def respond(request):
+            in_flight.set()
+            assert release.wait(10)
+            return '<p>譯</p>'
+
+        task, patcher = _start(project_with_translations, respond)
+        assert task._coordinator.daemon is True
+        assert in_flight.wait(10)
+        TaskManager().stop_translation(PROJECT_NAME)
+        with pytest.raises(ValueError) as info:
+            TaskManager().start_translation(PROJECT_NAME, project_with_translations)
+        assert str(info.value) == '上一個翻譯任務仍在結束中（等待進行中的段落），請稍後再試'
+        release.set()
+        _finish(task, patcher)
+        TaskManager._instance = None
+        empty = TaskManager().start_translation(PROJECT_NAME, project_with_translations,
+                                                segment_ids=[])
+        assert TaskManager().get_task(PROJECT_NAME) is empty
+        TaskManager._instance = None
+
+    def test_failure_report_exact(self, project_with_translations, caplog):
+        import logging
+        caplog.set_level(logging.INFO, logger='src.web.tasks')
+        TaskManager._instance = None
+        with patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
+            task, patcher = _start(project_with_translations, lambda r: '<p>譯</p>',
+                                   segment_ids=['ch1_seg0003'])
+            _finish(task, patcher)
+        message = 'disk full（1 個段落的結果未儲存：ch1_seg0003）'
+        assert task.error == message
+        assert [e for e in task.progress.get_all() if e['event'] == 'error'] == [
+            {'event': 'error', 'data': {'error': message, 'unsaved': ['ch1_seg0003']}}]
+        assert f'Translation task failed: {message}' in [r.getMessage() for r in caplog.records]
+
+    def test_skip_logged(self, client, project_with_translations, caplog):
+        import logging
+        caplog.set_level(logging.INFO, logger='src.web.tasks')
+        in_flight, release = threading.Event(), threading.Event()
+
+        def respond(request):
+            in_flight.set()
+            assert release.wait(10)
+            return '<p>譯</p>'
+
+        task, patcher = _start(project_with_translations, respond,
+                               segment_ids=['ch1_seg0003', 'ch2_seg0001'])
+        assert in_flight.wait(10)
+        client.post(f'/api/projects/{PROJECT_NAME}/segments/ch2_seg0001', json={'text': '人工'})
+        release.set()
+        _finish(task, patcher)
+        assert '段落已在排隊期間被編輯，略過: ch2_seg0001' in [r.getMessage() for r in caplog.records]
+
+    def test_worker_goes_on_after_a_skip(self, client, project_with_translations):
+        in_flight, release = threading.Event(), threading.Event()
+
+        def respond(request):
+            if '>Second paragraph.<' in request.messages[-1].content:
+                in_flight.set()
+                assert release.wait(10)
+            return '<p>機器譯文</p>'
+
+        task, patcher = _start(project_with_translations, respond,
+                               segment_ids=['ch1_seg0003', 'ch2_seg0001', 'ch2_seg0002'])
+        assert in_flight.wait(10)
+        client.post(f'/api/projects/{PROJECT_NAME}/segments/ch2_seg0001', json={'text': '人工'})
+        release.set()
+        _finish(task, patcher)
+        assert _load(project_with_translations)['ch2_seg0002'].translated_text == '<p>機器譯文</p>'
+
+    def test_unexpected_exception_logged(self, project_with_translations, caplog):
+        import logging
+        caplog.set_level(logging.ERROR, logger='src.web.tasks')
+        task, patcher = _start(project_with_translations,
+                               lambda r: (_ for _ in ()).throw(KeyError('surprise')),
+                               segment_ids=['ch1_seg0003'])
+        _finish(task, patcher)
+        assert '[W0] 未預期的錯誤: ch1_seg0003' in [r.getMessage() for r in caplog.records]
+
+    def test_review_responses_exact(self, client):
+        url = f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002'
+        assert client.post(url, json={'text': '改'}).get_json() == \
+            {'status': 'ok', 'segment_id': 'ch1_seg0002'}
+        assert client.post(url + '/approve', json={}).get_json() == \
+            {'status': 'ok', 'segment_id': 'ch1_seg0002'}
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/nope/retranslate')
+        assert response.status_code == 404
+        assert response.get_json() == {'error': 'Segment nope not found'}
+
+    def test_retranslate_sends_its_own_segment(self, client):
+        fake = FakeBackend(['<p>新譯文</p>'])
+        with use_fake_backend(fake):
+            client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
+        assert '>Second paragraph.<' in fake.prompts[0]
+
+    def test_backend_unavailable_retranslate_exact(self, client, caplog):
+        import logging
+        caplog.set_level(logging.WARNING, logger='src.web.blueprints.review')
+        with use_fake_backend(FakeBackend([BackendUnavailableError('gone')])):
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
+        assert response.get_json() == {'error': 'gone'}
+        assert 'Backend unavailable during retranslation: gone' in \
+            [r.getMessage() for r in caplog.records]
+
+    def test_delete_refused_message_exact(self, client, project_with_translations):
+        TaskManager._instance = None
+        task = self._task(project_with_translations)
+        TaskManager().tasks[PROJECT_NAME] = task
+        response = client.delete(f'/api/projects/{PROJECT_NAME}')
+        TaskManager._instance = None
+        assert response.status_code == 409
+        assert response.get_json() == {'error': '專案正在翻譯中，請先停止翻譯再刪除'}
+
+    def test_extraction_status_exact(self, client, project_with_translations, monkeypatch):
+        from src.web.blueprints.glossary import _extraction_tasks
+        _extraction_tasks.pop(PROJECT_NAME, None)
+        with use_fake_backend(FakeBackend(responder=lambda r: '[]')):
+            client.post(f'/api/projects/{PROJECT_NAME}/glossary/extract')
+            _wait(lambda: not _extraction_tasks[PROJECT_NAME]['running'])
+        assert client.get(f'/api/projects/{PROJECT_NAME}/glossary/extract/status').get_json() \
+            == {'status': 'completed', 'extracted_count': 0}
+        monkeypatch.setattr('src.glossary.term_extractor.MAX_CHARS_PER_BATCH', 20)
+        _extraction_tasks.pop(PROJECT_NAME, None)
+        fake = FakeBackend(['[{"term": "Alpha", "translation": "甲", "category": "term"}]',
+                            RateLimitError('limit')])
+        with use_fake_backend(fake):
+            client.post(f'/api/projects/{PROJECT_NAME}/glossary/extract')
+            _wait(lambda: not _extraction_tasks[PROJECT_NAME]['running'])
+        status = client.get(f'/api/projects/{PROJECT_NAME}/glossary/extract/status').get_json()
+        _extraction_tasks.pop(PROJECT_NAME, None)
+        assert status == {'status': 'error', 'error': '提取中斷：limit（已加入先前批次的 1 個術語）'}
+
+    def test_failure_report_lists_several_ids(self, project_with_translations):
+        TaskManager._instance = None
+        both = threading.Barrier(2)
+
+        def respond(request):
+            both.wait(10)
+            return '<p>譯</p>'
+
+        with patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
+            task, patcher = _start(project_with_translations, respond, num_workers=2,
+                                   segment_ids=['ch1_seg0003', 'ch2_seg0001'])
+            _finish(task, patcher)
+        assert task.error in (
+            'disk full（2 個段落的結果未儲存：ch1_seg0003, ch2_seg0001）',
+            'disk full（2 個段落的結果未儲存：ch2_seg0001, ch1_seg0003）')
