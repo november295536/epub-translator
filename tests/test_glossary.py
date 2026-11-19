@@ -145,6 +145,61 @@ class TestGlossaryManager:
         assert found('Renderman, deployx, cachet, debugx.') == []
         assert found('A cacheing typo.') == []
 
+    def test_four_letter_terms_take_inflections(self, gm):
+        gm.add_term('load', '載入')
+        for word in ('loading', 'loaded', 'loader', 'loaders'):
+            assert [e.term for e in gm.find_terms_in_text(f'The {word}.')] == ['load'], word
+
+    def test_suffix_lists_are_complete(self, gm):
+        gm.add_term('cache', '快取')
+        gm.add_term('manage', '管理')
+        gm.add_term('deploy', '部署')
+
+        def found(text):
+            return [e.term for e in gm.find_terms_in_text(text)]
+
+        assert found('Two cachers.') == ['cache']
+        assert found('Two managements.') == ['manage']
+        assert found('Two deployments.') == ['deploy']
+
+    def test_no_doubling_unless_vowel_then_consonant(self, gm):
+        gm.add_term('build', '建置')
+        gm.add_term('deploy', '部署')
+        gm.add_term('render', '算繪')
+
+        def found(text):
+            return [e.term for e in gm.find_terms_in_text(text)]
+
+        assert found('A buildding step.') == []   # consonant before final consonant
+        assert found('A deployying step.') == []  # final y is never doubled
+        gm.add_term('debug', '除錯')
+        assert found('A debugging step.') == ['debug']
+
+    def test_terms_not_ending_in_a_letter(self, gm):
+        gm.add_term('Web3', 'Web3')
+        gm.add_term('C', 'C')
+
+        def found(text):
+            return [e.term for e in gm.find_terms_in_text(text)]
+
+        assert found('Web3 apps and C code.') == ['C', 'Web3']
+        assert found('Some Web3s.') == []
+
+    def test_y_terms_by_length(self, gm):
+        gm.add_term('y', 'y')
+        gm.add_term('xy', 'xy')
+
+        def found(text):
+            return [e.term for e in gm.find_terms_in_text(text)]
+
+        assert found('An ies file.') == []
+        assert found('Several xies.') == ['xy']
+
+    def test_all_caps_multi_word_term(self, gm):
+        gm.add_term('ABC DEF', 'ABC DEF')
+        assert [e.term for e in gm.find_terms_in_text('the ABC\nDEF unit')] == ['ABC DEF']
+        assert gm.find_terms_in_text('the abc def unit') == []
+
     def test_short_terms_take_plurals_only(self, gm):
         gm.add_term('Go', 'Go')
         gm.add_term('tag', '標籤')
@@ -352,6 +407,33 @@ class TestTermExtractor:
         assert chunks[0].endswith(' ')
         assert _split_text('short', 100) == ['short']
         assert _split_text('', 100) == []
+
+    def test_split_text_boundaries(self):
+        from src.glossary.term_extractor import _split_text
+        assert _split_text('ab cd', 5) == ['ab cd']                 # exactly at the limit
+        assert _split_text('aaaa\nbbbb', 6) == ['aaaa\n', 'bbbb']  # newline as break
+        assert _split_text('aaaa\tbbbb', 6) == ['aaaa\t', 'bbbb']  # tab as break
+        assert _split_text(' abcdef', 4) == [' ', 'abcd', 'ef']     # break after index 0
+
+    def test_segment_without_text_sends_nothing(self):
+        with patch('src.glossary.term_extractor.subprocess.run') as mock_run:
+            assert TermExtractor().extract_from_segments([{}]) == []
+        mock_run.assert_not_called()
+
+    def test_batch_filled_exactly_to_limit_is_one_call(self):
+        from src.glossary.term_extractor import MAX_CHARS_PER_BATCH
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '[]'
+        half = (MAX_CHARS_PER_BATCH - 2) // 2
+        segments = [{'text': 'a' * half}, {'text': 'b' * half}]
+        assert len('\n\n'.join(s['text'] for s in segments)) == MAX_CHARS_PER_BATCH
+
+        with patch('src.glossary.term_extractor.subprocess.run',
+                   return_value=mock_result) as mock_run:
+            TermExtractor().extract_from_segments(segments)
+
+        assert mock_run.call_count == 1
 
     def test_extraction_error_propagates(self):
         """ExtractionError (e.g. auth error) should not be swallowed by broad except."""

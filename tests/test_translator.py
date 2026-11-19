@@ -529,6 +529,38 @@ class TestCodeResponseCleaning:
         assert TranslationEngine._clean_response(
             reply, code_mode=True, source='x = 1\ny = 2') == reply
 
+    def test_code_fence_body_leading_blank_lines_trimmed(self):
+        reply = '```python\n\n' + CODE_SAMPLE + '\n```'
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source=CODE_SAMPLE) == CODE_SAMPLE
+
+    def test_code_separator_line_is_not_a_preface(self):
+        # Only commentary lines count as a preface, not a '---' separator
+        reply = '---\n```\nx = 1\n```'
+        assert TranslationEngine._clean_response(
+            reply, code_mode=True, source='x = 1') == reply
+
+    def _translate(self, stdout, text='x', **kwargs):
+        engine = TranslationEngine()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = stdout
+        mock_result.stderr = ''
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            return engine.translate(text, **kwargs)
+
+    def test_text_without_html_gets_markdown_stripped(self):
+        assert self._translate('**粗體**與*斜體*') == '粗體與斜體'
+
+    def test_text_with_html_keeps_markdown_like_characters(self):
+        reply = '<p>*重要*與**強調**</p>'
+        assert self._translate(reply, html='<p>x</p>') == reply
+
+    def test_code_with_html_argument_still_code_mode(self):
+        assert self._translate('    **kwargs\n', text='    **kwargs',
+                               segment_type=SegmentType.CODE,
+                               html='<pre>x</pre>') == '    **kwargs'
+
     def test_code_translate_strips_preface_through_engine(self):
         engine = TranslationEngine()
         mock_result = MagicMock()
@@ -578,7 +610,8 @@ class TestContext:
 
         assert 'TAILMARK' in prompt
         assert 'HEADMARK' not in prompt
-        assert before[-200:] in prompt
+        assert '前文參考（不需翻譯）：\n' + before[-200:] + '\n' in prompt
+        assert before[-201:] not in prompt
 
     def test_prompt_uses_head_of_next_segment(self):
         engine = TranslationEngine()
@@ -589,6 +622,8 @@ class TestContext:
 
         assert 'HEADMARK' in prompt
         assert 'TAILMARK' not in prompt
+        assert '後文參考（不需翻譯）：\n' + after[:200] + '\n' in prompt
+        assert after[:201] not in prompt
 
     def test_neighbours_in_same_chapter_used(self):
         segments = [

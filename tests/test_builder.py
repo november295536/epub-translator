@@ -1216,3 +1216,80 @@ class TestWalkSelection:
         assert legacy is True and len(elements) == 2
         elements, legacy = builder._select_elements(body, new_states)
         assert legacy is False and len(elements) == 3
+
+
+class TestLegacySignatures:
+    """Each signature of legacy segment data is recognised, and nothing else is."""
+
+    @staticmethod
+    def _select(chapter, states):
+        builder = EPUBBuilder.__new__(EPUBBuilder)
+        body = BeautifulSoup(chapter, 'html.parser').body
+        return builder._select_elements(body, states)
+
+    def test_multi_word_comment_stored_as_text(self):
+        chapter = ('<html><body><p>Zero</p><!--  production   note here --><p>One</p>'
+                   '</body></html>')
+        states = [_seg_state('s1', '<p>Zero</p>\n production note here \n<p>One</p>',
+                             'x', 'y')]
+        elements, legacy = self._select(chapter, states)
+        assert legacy is True and len(elements) == 3
+
+    def test_comment_text_on_its_own_line_of_a_merged_text_node(self):
+        chapter = '<html><body>Some words.<!-- c --><p>One</p></body></html>'
+        states = [_seg_state('s1', 'Some words.\n c \n<p>One</p>', 'x', 'y')]
+        _, legacy = self._select(chapter, states)
+        assert legacy is True
+
+    def test_empty_comment_does_not_match_blank_text_nodes(self):
+        chapter = ('<html><body><!-- --><div><!-- note --><p>One</p><p>Two</p></div>'
+                   '</body></html>')
+        states = [_seg_state('s1', '<p>One</p>\n<p>Two</p>', 'x', 'y')]
+        elements, legacy = self._select(chapter, states)
+        assert legacy is False and len(elements) == 2
+
+    def test_code_segment_before_legacy_segment(self):
+        chapter = ('<html><body><pre>x = 1</pre><div><!-- c --><p>One</p></div>'
+                   '</body></html>')
+        states = [
+            _seg_state('s1', '<pre>x = 1</pre>', 'x = 1', 'x', SegmentType.CODE),
+            _seg_state('s2', '<div><!-- c --><p>One</p></div>', 'One', 'y'),
+        ]
+        _, legacy = self._select(chapter, states)
+        assert legacy is True
+
+    def test_code_segment_html_is_not_inspected(self):
+        chapter = '<html><body><!-- c --><pre>c</pre></body></html>'
+        states = [_seg_state('s1', 'c', 'c', 'x', SegmentType.CODE)]
+        _, legacy = self._select(chapter, states)
+        assert legacy is False
+
+    def test_stored_comment_before_legacy_div_is_skipped(self):
+        chapter = '<html><body><div><!-- c --><p>One</p></div></body></html>'
+        states = [_seg_state('s1', '<!-- c --><div><!-- c --><p>One</p></div>', 'One', 'y')]
+        _, legacy = self._select(chapter, states)
+        assert legacy is True
+
+    def test_stored_comment_is_not_a_text_node(self):
+        chapter = '<html><body><!-- c --><p>One</p></body></html>'
+        states = [_seg_state('s1', '<!-- c -->\n<p>One</p>', 'One', 'y')]
+        _, legacy = self._select(chapter, states)
+        assert legacy is False
+
+    @pytest.mark.parametrize('tag', ['div', 'section', 'article'])
+    def test_wrapper_tags(self, tag):
+        chapter = f'<html><body><{tag}><!-- c --><p>One</p></{tag}></body></html>'
+        states = [_seg_state('s1', f'<{tag}><!-- c --><p>One</p></{tag}>', 'One', 'y')]
+        _, legacy = self._select(chapter, states)
+        assert legacy is True
+
+    def test_other_wrapper_tag_is_not_a_signature(self):
+        chapter = '<html><body><aside><!-- c --><p>One</p></aside></body></html>'
+        states = [_seg_state('s1', '<aside><!-- c --><p>One</p></aside>', 'One', 'y')]
+        _, legacy = self._select(chapter, states)
+        assert legacy is False
+
+    def test_walk_skips_comments_by_default(self):
+        builder = EPUBBuilder.__new__(EPUBBuilder)
+        body = BeautifulSoup('<body><!-- c --><p>One</p></body>', 'html.parser').body
+        assert [e.name for e in builder._walk_content_elements(body)] == ['p']

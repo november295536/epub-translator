@@ -485,3 +485,14 @@ class TestCommentHandling:
         assert [s.segment_type for s in segments] == [
             SegmentType.TEXT, SegmentType.CODE, SegmentType.TEXT]
         assert all('note' not in s.html for s in segments)
+
+
+class TestCommentBeforeInlineContent:
+    """A comment does not end the container check: inline text after it still counts."""
+
+    def test_div_with_comment_then_inline_text_is_one_block(self, segmenter):
+        html = ('<html><body><div class="note"><!-- c -->Some <em>inline</em> text.'
+                '</div></body></html>')
+        segments = segmenter.segment_chapter('ch1', html)
+        assert len(segments) == 1
+        assert segments[0].html.startswith('<div class="note">')
