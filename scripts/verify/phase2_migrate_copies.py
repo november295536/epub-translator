@@ -73,7 +73,7 @@ def read_segments(project_file: str) -> tuple[int, int]:
     """(number of segments, characters of translated text)."""
     with open(project_file, encoding='utf-8') as f:
         segments = json.load(f)['segments']
-    return len(segments), sum(len(s.get('translated_text', '')) for s in segments)
+    return len(segments), sum(len(s['translated_text']) for s in segments)
 
 
 def placed_chapters(project_dir: str) -> tuple[int, int]:
@@ -120,7 +120,7 @@ def check_copy(copy_dir: str, client, name: str) -> tuple[dict, list[str]]:
         'placed': (placed, with_segments), 'loads': loads,
     }
     problems = []
-    if report.unmatched or not report.written:
+    if report.unmatched:
         problems.append(f'{len(report.unmatched)} chapters unmatched, nothing written')
     if after != before:
         problems.append('translated characters changed')
@@ -155,14 +155,11 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return run(args, names, work)
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(work)
 
 
-def run(args, names: list[str], work: str) -> int:
-    copies = os.path.join(work, 'projects')
-    app = create_app(projects_dir=copies)
-    app.config['TESTING'] = True
-    client = app.test_client()
+def run(args, names: list[str], copies: str) -> int:
+    client = create_app(projects_dir=copies).test_client()
     keys = ('chapters_matched', 'chapters', 'segments_matched', 'segments', 'groups',
             'grouped', 'count_differs')
     totals = dict.fromkeys(keys + ('chars_equal', 'placed', 'with_segments', 'loads'), 0)

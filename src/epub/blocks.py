@@ -75,7 +75,7 @@ def serialize(el) -> str:
     head = out[:end]
     for prefix, uri in parent.nsmap.items():
         name = 'xmlns' if prefix is None else f'xmlns:{prefix}'
-        head = head.replace(f' {name}="{uri}"', '', 1)
+        head = head.replace(f' {name}="{uri}"', '')
     return head + out[end:]
 
 

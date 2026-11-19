@@ -47,10 +47,10 @@ class MigrationError(Exception):
 
 @dataclass
 class MigrationReport:
-    chapters: int = 0
+    chapters: int
+    segments: int
     chapters_matched: int = 0
     chapters_with_comment_text: int = 0
-    segments: int = 0
     segments_matched: int = 0
     merged: list = field(default_factory=list)       # [legacy segment ids] per merge group
     notes: list = field(default_factory=list)        # groups not uniformly translated
@@ -165,7 +165,6 @@ def _match_chapter(chapter_id: str, segs: list[SegmentState], body, report: Migr
 
 def plan_migration(pm: ProjectManager, source: str):
     """(new segment list, report) for a loaded schema 1 project; reads only."""
-    report = MigrationReport()
     with open(source, 'rb') as f:
         zf = zipfile.ZipFile(io.BytesIO(f.read()))
     _, _, spine = read_package(zf)
@@ -174,8 +173,7 @@ def plan_migration(pm: ProjectManager, source: str):
     by_chapter: dict[str, list[SegmentState]] = {}
     for seg in pm.data.segments:
         by_chapter.setdefault(seg.chapter_id, []).append(seg)
-    report.chapters = len(by_chapter)
-    report.segments = len(pm.data.segments)
+    report = MigrationReport(chapters=len(by_chapter), segments=len(pm.data.segments))
 
     new_segments = []
     for chapter_id, segs in by_chapter.items():
@@ -195,12 +193,11 @@ def plan_migration(pm: ProjectManager, source: str):
             continue
         report.chapters_matched += 1
         report.segments_matched += len(segs)
+        report.count_differs += sum(
+            1 for s in new
+            if s.translated_text and s.segment_type == SegmentType.TEXT
+            and _top_level_count(s.translated_text) != _top_level_count(s.html))
         new_segments.extend(new)
-
-    report.count_differs = sum(
-        1 for s in new_segments
-        if s.translated_text and s.segment_type == SegmentType.TEXT
-        and _top_level_count(s.translated_text) != _top_level_count(s.html))
     return new_segments, report
 
 

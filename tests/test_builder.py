@@ -1413,3 +1413,19 @@ class TestSchema2Export:
         two = BeautifulSoup(book.get_item_with_id('two').get_content().decode('utf-8'),
                             'html.parser')
         assert two.find('h2').get_text() == '第二夜'
+
+    def test_run_with_inline_element_placed(self, tmp_path):
+        chapter = '<html><body>Bare <em>marked</em> words.<p>Para.</p></body></html>'
+        states = _schema2_states(chapter, ['裸<em>標</em>字。\n<p>段</p>'])
+        soup = self._export(tmp_path, chapter, states, 'chinese-only')
+        assert soup.find('em').get_text() == '標'
+        assert soup.find('p').get_text() == '段'
+        assert 'Bare' not in soup.get_text()
+
+    def test_content_div_placed_as_one_element(self, tmp_path):
+        chapter = ('<html><body><div class="note"><em>Note:</em> keep it.</div>'
+                   '</body></html>')
+        states = _schema2_states(chapter, ['<div class="note">譯</div>'])
+        soup = self._export(tmp_path, chapter, states, 'chinese-only')
+        note = soup.find('div', class_='note')
+        assert note.find('div') is None and note.get_text() == '譯'

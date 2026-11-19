@@ -115,7 +115,7 @@ class TestMigrate:
         project_dir = _legacy_project(tmp_path)
         before = _files(project_dir)
         report = migrate_project(project_dir, dry_run=True)
-        assert report.chapters_matched == 2 and not report.written
+        assert report.chapters_matched == 2 and report.written is False
         assert _files(project_dir) == before   # not even a lock file
 
     @pytest.mark.parametrize('statuses, merged', [
@@ -136,9 +136,10 @@ class TestMigrate:
         pm.load()
         assert [s.status for s in pm.data.segments] == [merged]
         if len(set(statuses)) > 1:
-            assert len(report.notes) == 1
-            assert report.notes[0].startswith('c2_seg0001：2 個段落的狀態為 '
-                                              f'{statuses[0]}, {statuses[1]}；合併後為 {merged}')
+            note = (f'c2_seg0001：2 個段落的狀態為 {statuses[0]}, {statuses[1]}；'
+                    f'合併後為 {merged}，譯文依序接合保留')
+            assert report.notes == [note]
+            assert f'  注意 {note}' in report.lines()
         else:
             assert report.notes == []
 
@@ -299,8 +300,9 @@ class TestMigrate:
     def test_missing_source_refused(self, tmp_path):
         project_dir = _legacy_project(tmp_path, source_inside=False,
                                       extra={'epub_path': str(tmp_path / 'gone.epub')})
-        with pytest.raises(MigrationError, match='找不到來源 EPUB'):
+        with pytest.raises(MigrationError) as e:
             migrate_project(project_dir)
+        assert str(e.value) == f'找不到來源 EPUB：{tmp_path / "gone.epub"}'
 
     def test_schema_2_refused(self, tmp_path):
         project_dir = _legacy_project(tmp_path)
@@ -401,3 +403,51 @@ class TestMigrateCLI:
         assert result.exit_code == 1
         expected = '專案已是 schema 2' if case == 'schema2' else '專案正由另一個程序使用'
         assert result.output.startswith(expected)
+
+
+class TestMigrateSurvivors:
+    """Mutation survivors of the migration."""
+
+    def test_top_level_count(self):
+        from src.core.migrate import _top_level_count
+        assert _top_level_count('<p>a</p>\n<p>b</p>') == 2
+        assert _top_level_count('text <em>x</em> more') == 3
+        assert _top_level_count('  ') == 0
+
+    def test_trailing_segment_joins_the_last_of_several_groups(self):
+        assert _groups(['a', 'b', 'c', ''], ['a', 'b', 'c']) == [
+            ([0], 0, 1), ([1], 1, 2), ([2, 3], 2, 3)]
+
+    def test_no_model_stays_empty(self, tmp_path):
+        segments = [_segment('c2', 1, '<p>Intro line.</p>\nFirst bare sentence.', '甲',
+                             'translated'),
+                    _segment('c2', 2, 'Second bare sentence.', '乙', 'translated')]
+        project_dir = _legacy_project(tmp_path, {'c2': CHAPTERS['c2']}, segments)
+        migrate_project(project_dir)
+        pm = ProjectManager(project_dir)
+        pm.load()
+        assert pm.data.segments[0].model == ''
+
+    @pytest.mark.parametrize('first, reason', [
+        ('<p>Other text.</p>', 'text differs'),
+        (None, 'not in the spine'),
+        ('<?xml version="1.0"?><html><body><p>x</div></html>', 'missing or not well-formed XML'),
+        ('<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"/>', 'no body'),
+    ])
+    def test_chapters_after_an_unmatched_one_are_still_checked(self, tmp_path, first, reason):
+        chapters = {'c1': CHAPTERS['c1']} if first is None else {'c0': first, 'c1': CHAPTERS['c1']}
+        segments = [_segment('c0', 1, '<p>Stored text.</p>')] + DEFAULT_SEGMENTS[:2]
+        project_dir = _legacy_project(tmp_path, chapters, segments)
+        report = migrate_project(project_dir, dry_run=True)
+        assert report.unmatched == [('c0', reason)]
+        assert (report.chapters_matched, report.segments_matched) == (1, 2)
+
+    def test_count_differs_summed_over_chapters(self, tmp_path):
+        segments = [_segment('c1', 1, '<h1>Harbour</h1>', '港', 'translated'),
+                    _segment('c1', 2, '<p>The boats came home.</p>\n<p>Nets were dried.</p>',
+                             '<p>一</p>', 'translated'),
+                    _segment('c2', 1, '<p>Intro line.</p>\nFirst bare sentence.', '<p>引</p>',
+                             'translated'),
+                    _segment('c2', 2, 'Second bare sentence.', '', 'pending')]
+        project_dir = _legacy_project(tmp_path, segments=segments)
+        assert migrate_project(project_dir, dry_run=True).count_differs == 2
