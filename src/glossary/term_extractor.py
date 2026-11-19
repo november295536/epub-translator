@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 import json
-import re
-import subprocess
 import logging
+import threading
+
+import src.llm as llm
+from src.llm import (
+    AuthError, BackendUnavailableError, LLMError, LLMRequest, Message, RateLimitError,
+)
 
 logger = logging.getLogger(__name__)
 
-_AUTH_ERROR_PATTERN = re.compile(
-    r'authentication_error|OAuth token has expired|please run /login',
-    re.IGNORECASE,
-)
-
 
 class ExtractionError(Exception):
-    """Raised when term extraction fails due to a non-recoverable error."""
-    pass
+    """Raised when term extraction stops on an error that every further
+    batch would hit too (rate limit, expired login, backend unavailable).
+    `terms` holds what the batches finished before it found."""
+
+    def __init__(self, message: str, terms: list[dict] | None = None):
+        super().__init__(message)
+        self.terms = terms if terms is not None else []
+
 
 EXTRACT_PROMPT = """你是一位專業的術語提取專家。請從以下英文文本中提取「需要統一翻譯」的核心術語。
 
@@ -66,10 +71,13 @@ def _split_text(text: str, limit: int) -> list[str]:
 
 
 class TermExtractor:
-    """Extracts technical terms from text using Claude CLI."""
+    """Extracts technical terms from text through an LLM backend."""
 
-    def __init__(self, timeout: int = 180):
+    def __init__(self, model: str = '', timeout: int = 180,
+                 backend: llm.LLMBackend | None = None):
+        self.model = model
         self.timeout = timeout
+        self.backend = backend if backend is not None else llm.default_backend()
 
     def extract_from_text(self, text: str) -> list[dict]:
         """Extract terms from a single text chunk.
@@ -77,30 +85,20 @@ class TermExtractor:
         Returns list of dicts with 'term', 'translation', 'category' keys.
         """
         prompt = EXTRACT_PROMPT.format(text=text[:MAX_CHARS_PER_BATCH])
+        request = LLMRequest(system='', messages=[Message('user', prompt)],
+                             model=self.model, timeout=self.timeout)
 
         try:
-            result = subprocess.run(
-                ['claude', '-p', prompt],
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
-
-            if result.returncode != 0:
-                combined = (result.stdout or '') + (result.stderr or '')
-                if _AUTH_ERROR_PATTERN.search(combined):
-                    raise ExtractionError('Claude CLI 認證已過期，請在終端執行 claude /login 重新登入')
-                logger.warning("Term extraction failed: %s", combined.strip())
-                return []
-
-            output = result.stdout.strip()
-            return self._parse_response(output)
-
-        except subprocess.TimeoutExpired:
-            logger.warning("Term extraction timed out")
+            response = self.backend.complete(request, threading.Event())
+        except (AuthError, RateLimitError, BackendUnavailableError) as e:
+            # Every further batch would fail the same way
+            raise ExtractionError(str(e))
+        except LLMError as e:
+            logger.warning("Term extraction failed: %s", e)
             return []
-        except ExtractionError:
-            raise
+
+        try:
+            return self._parse_response(response.text.strip())
         except Exception as e:
             logger.warning("Term extraction error: %s", e)
             return []
@@ -113,8 +111,14 @@ class TermExtractor:
 
         Returns:
             Deduplicated list of term dicts.
+
+        Raises:
+            ExtractionError: a rate limit, an expired login or an unusable
+                backend stopped the extraction; its `terms` are those of the
+                batches finished before.
         """
         all_terms = {}
+        batches = []
         current_batch = []
         current_len = 0
 
@@ -124,12 +128,7 @@ class TermExtractor:
                  for chunk in _split_text(seg.get('text', ''), MAX_CHARS_PER_BATCH))
         for text in texts:
             if current_len + len(text) > MAX_CHARS_PER_BATCH and current_batch:
-                batch_text = '\n\n'.join(current_batch)
-                terms = self.extract_from_text(batch_text)
-                for t in terms:
-                    key = t['term'].lower()
-                    if key not in all_terms:
-                        all_terms[key] = t
+                batches.append('\n\n'.join(current_batch))
                 current_batch = []
                 current_len = 0
 
@@ -137,14 +136,23 @@ class TermExtractor:
             current_len += len(text) + 2  # the '\n\n' separator counts too
 
         if current_batch:
-            batch_text = '\n\n'.join(current_batch)
-            terms = self.extract_from_text(batch_text)
+            batches.append('\n\n'.join(current_batch))
+
+        def found():
+            return sorted(all_terms.values(), key=lambda x: x['term'].lower())
+
+        for batch_text in batches:
+            try:
+                terms = self.extract_from_text(batch_text)
+            except ExtractionError as e:
+                # Stop, but keep the terms of the batches already done
+                raise ExtractionError(str(e), terms=found()) from e
             for t in terms:
                 key = t['term'].lower()
                 if key not in all_terms:
                     all_terms[key] = t
 
-        return sorted(all_terms.values(), key=lambda x: x['term'].lower())
+        return found()
 
     @staticmethod
     def _parse_response(output: str) -> list[dict]:

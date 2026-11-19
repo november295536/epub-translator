@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field, fields, asdict
@@ -11,8 +13,11 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import src.llm as llm
+
 if TYPE_CHECKING:
     from src.core.segmenter import Segment
+    from src.core.translator import TranslationOutcome
 
 
 class SegmentStatus(str, Enum):
@@ -20,6 +25,9 @@ class SegmentStatus(str, Enum):
     PENDING = 'pending'
     TRANSLATED = 'translated'
     REVIEWED = 'reviewed'
+    # Translation attempted and failed; not queued again unless asked for.
+    # A project holding this value cannot be loaded by v1.0.0.
+    FAILED = 'failed'
 
     def __str__(self):
         return self.value
@@ -27,6 +35,20 @@ class SegmentStatus(str, Enum):
 
 # Segmenter behaviour recorded on projects created now (see ProjectData)
 SEGMENTER_VERSION = 2
+
+
+@dataclass
+class Issue:
+    """A typed problem found with a segment's translation."""
+    kind: str        # structure | quality | glossary | backend
+    code: str        # e.g. empty_reply, transient, refusal
+    detail: str
+    blocking: bool
+
+
+# Per-segment fields written to project.json only when they differ from
+# these defaults, so an existing project round-trips without new keys
+_SEGMENT_DEFAULTS = {'issues': [], 'revision': 0, 'model': '', 'usage': None}
 
 
 @dataclass
@@ -41,6 +63,12 @@ class SegmentState:
     status: SegmentStatus = SegmentStatus.PENDING
     translated_text: str = ''
     translated_at: str = ''
+    issues: list[Issue] = field(default_factory=list)
+    # Incremented by every manual edit; a translation result computed for an
+    # older revision is dropped (see apply_outcome)
+    revision: int = 0
+    model: str = ''              # model that produced translated_text
+    usage: dict | None = None    # token usage of that call, when reported
 
 
 @dataclass
@@ -52,13 +80,34 @@ class ProjectData:
     author: str = ''
     created_at: str = ''
     updated_at: str = ''
-    model: str = 'sonnet'
+    # Filled with the backend's default model on create, and on load when
+    # the file has none (projects from before the field)
+    model: str = ''
     # 1: segmented before comments were skipped; never written to project.json,
     # so projects that existed before Phase 0 remain loadable by pre-Phase-0
     # code. 2: comments skipped; always written, so projects created after
     # Phase 0 are not. The builder walks chapters to match.
     segmenter_version: int = 1
     segments: list[SegmentState] = field(default_factory=list)
+
+
+# One mutex per project directory, shared by every ProjectManager of this
+# process: real project path -> RLock
+_project_mutexes: dict[str, threading.RLock] = {}
+_project_mutexes_guard = threading.Lock()
+
+
+def project_mutex(project_dir: str) -> threading.RLock:
+    """The in-process mutex of a project. Every in-memory change to a
+    project and every save hold it, so a save never sees a half-applied
+    change and two managers of one project never write at the same time.
+    Re-entrant: a caller holding it may call the manager's methods."""
+    key = os.path.realpath(project_dir)
+    with _project_mutexes_guard:
+        mutex = _project_mutexes.get(key)
+        if mutex is None:
+            mutex = _project_mutexes[key] = threading.RLock()
+        return mutex
 
 
 class ProjectManager:
@@ -70,7 +119,7 @@ class ProjectManager:
         self.project_dir = project_dir
         self.project_file = os.path.join(project_dir, self.PROJECT_FILE)
         self.data: ProjectData | None = None
-        self._save_lock = threading.Lock()
+        self.mutex = project_mutex(project_dir)
 
     def create(self, epub_path: str, title: str, author: str,
                segments: list[Segment], chapter_ids: dict[str, str] | None = None) -> ProjectData:
@@ -105,6 +154,7 @@ class ProjectManager:
             author=author,
             created_at=now,
             updated_at=now,
+            model=llm.default_backend().default_model,
             segmenter_version=SEGMENTER_VERSION,
             segments=segment_states,
         )
@@ -124,53 +174,119 @@ class ProjectManager:
                 s['segment_type'] = 'text'
             # Convert status string to enum
             s['status'] = SegmentStatus(s.get('status', 'pending'))
+            s['issues'] = [Issue(**i) for i in s.get('issues', [])]
             # Strip unknown fields from older/experimental schemas
             for key in list(s.keys()):
                 if key not in valid_fields:
                     del s[key]
         segments = [SegmentState(**s) for s in raw_segments]
+        if 'model' not in raw:
+            raw['model'] = llm.default_backend().default_model
         self.data = ProjectData(**raw, segments=segments)
         return self.data
+
+    def to_json(self) -> str:
+        """The text save() writes for the current data (writes nothing)."""
+        if not self.data:
+            raise RuntimeError("No project data to save.")
+        with self.mutex:
+            raw = asdict(self.data)
+        if raw['segmenter_version'] == 1:
+            # Leave the field out, so pre-Phase-0 code can still load it
+            del raw['segmenter_version']
+        for seg in raw['segments']:
+            for key, default in _SEGMENT_DEFAULTS.items():
+                if seg[key] == default:
+                    del seg[key]
+        return json.dumps(raw, ensure_ascii=False, indent=2)
 
     def save(self) -> None:
         """Save project to disk atomically via temp file + os.replace()."""
         if not self.data:
             raise RuntimeError("No project data to save.")
 
-        with self._save_lock:
+        with self.mutex, ProjectLock(self.project_dir):
             self.data.updated_at = time.strftime('%Y-%m-%d %H:%M:%S')
-            raw = asdict(self.data)
-            if raw['segmenter_version'] == 1:
-                # Leave the field out, so pre-Phase-0 code can still load it
-                del raw['segmenter_version']
-            tmp_file = self.project_file + '.tmp'
-            with open(tmp_file, 'w', encoding='utf-8') as f:
-                json.dump(raw, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_file, self.project_file)
+            text = self.to_json()
+            # A temporary file of its own for every save, removed on failure
+            fd, tmp_file = tempfile.mkstemp(
+                dir=self.project_dir, prefix=f'{self.PROJECT_FILE}.', suffix='.tmp')
+            try:
+                with open(fd, 'w', encoding='utf-8') as f:  # closes fd on any error
+                    # mkstemp creates the file 0600: keep the mode project.json had
+                    try:
+                        mode = os.stat(self.project_file).st_mode & 0o777
+                    except FileNotFoundError:
+                        mode = 0o644
+                    os.fchmod(fd, mode)
+                    f.write(text)
+                os.replace(tmp_file, self.project_file)
+            except BaseException:
+                try:
+                    os.remove(tmp_file)
+                except OSError:
+                    pass
+                raise
 
     def set_model(self, model: str) -> None:
         """Set the translation model (in-memory only; call save() to persist)."""
         if not self.data:
             raise RuntimeError("No project loaded.")
-        self.data.model = model
+        with self.mutex:
+            self.data.model = model
 
     def mark_translated(self, segment_id: str, translated_text: str) -> None:
         """Mark a segment as translated (in-memory only; call save() to persist)."""
         if not self.data:
             raise RuntimeError("No project loaded.")
-        for seg in self.data.segments:
-            if seg.segment_id == segment_id:
-                seg.status = SegmentStatus.TRANSLATED
-                seg.translated_text = translated_text
-                seg.translated_at = time.strftime('%Y-%m-%d %H:%M:%S')
-                return
-        raise ValueError(f"Segment not found: {segment_id}")
+        with self.mutex:
+            seg = self._find(segment_id)
+            seg.status = SegmentStatus.TRANSLATED
+            seg.translated_text = translated_text
+            seg.translated_at = time.strftime('%Y-%m-%d %H:%M:%S')
 
-    def get_pending_segments(self) -> list[SegmentState]:
-        """Get all segments that haven't been translated yet."""
+    def apply_outcome(self, segment_id: str, outcome: TranslationOutcome,
+                      revision: int | None = None) -> bool:
+        """Store a translation outcome (in-memory; call save() to persist).
+
+        Returns False, changing nothing, when `revision` is given and the
+        segment has been edited since (its revision differs). A failure
+        keeps the text and status of a translated or reviewed segment and
+        only attaches the issues; any other segment becomes FAILED.
+        """
+        with self.mutex:  # the check and the write are one step
+            seg = self._find(segment_id)
+            if revision is not None and seg.revision != revision:
+                return False
+            seg.issues = list(outcome.issues)
+            if outcome.status == SegmentStatus.FAILED:
+                if seg.status == SegmentStatus.PENDING:
+                    seg.status = SegmentStatus.FAILED
+                return True
+            seg.status = SegmentStatus.TRANSLATED
+            seg.translated_text = outcome.text
+            seg.translated_at = time.strftime('%Y-%m-%d %H:%M:%S')
+            seg.model = outcome.model
+            seg.usage = asdict(outcome.usage) if outcome.usage else None
+            return True
+
+    def _find(self, segment_id: str) -> SegmentState:
         if not self.data:
             raise RuntimeError("No project loaded.")
-        return [s for s in self.data.segments if s.status == SegmentStatus.PENDING]
+        for seg in self.data.segments:
+            if seg.segment_id == segment_id:
+                return seg
+        raise ValueError(f"Segment not found: {segment_id}")
+
+    def get_pending_segments(self, include_failed: bool = False) -> list[SegmentState]:
+        """Get all segments that haven't been translated yet, in order.
+        FAILED segments are included only when asked for."""
+        if not self.data:
+            raise RuntimeError("No project loaded.")
+        wanted = {SegmentStatus.PENDING}
+        if include_failed:
+            wanted.add(SegmentStatus.FAILED)
+        return [s for s in self.data.segments if s.status in wanted]
 
     def get_progress(self) -> dict:
         """Get translation progress statistics."""
@@ -181,36 +297,40 @@ class ProjectManager:
         translated = sum(1 for s in self.data.segments if s.status == SegmentStatus.TRANSLATED)
         reviewed = sum(1 for s in self.data.segments if s.status == SegmentStatus.REVIEWED)
         pending = sum(1 for s in self.data.segments if s.status == SegmentStatus.PENDING)
+        failed = sum(1 for s in self.data.segments if s.status == SegmentStatus.FAILED)
 
         return {
             'total': total,
             'translated': translated,
             'reviewed': reviewed,
             'pending': pending,
+            'failed': failed,
             'percent': round(((translated + reviewed) / total * 100) if total > 0 else 0, 1),
         }
 
     def mark_reviewed(self, segment_id: str, text: str = '') -> None:
-        """Mark a segment as reviewed (in-memory only; call save() to persist)."""
-        if not self.data:
-            raise RuntimeError("No project loaded.")
-        for seg in self.data.segments:
-            if seg.segment_id == segment_id:
-                if text:
-                    seg.translated_text = text
-                seg.status = SegmentStatus.REVIEWED
-                return
-        raise ValueError(f"Segment not found: {segment_id}")
+        """Mark a segment as reviewed (in-memory only; call save() to persist).
+        A manual decision: earlier issues are cleared."""
+        with self.mutex:
+            seg = self._find(segment_id)
+            if text:
+                seg.translated_text = text
+            seg.status = SegmentStatus.REVIEWED
+            seg.issues = []
+            seg.revision += 1
 
     def update_translation(self, segment_id: str, text: str) -> None:
-        """Update the translated text without changing status (in-memory; call save() to persist)."""
-        if not self.data:
-            raise RuntimeError("No project loaded.")
-        for seg in self.data.segments:
-            if seg.segment_id == segment_id:
-                seg.translated_text = text
-                return
-        raise ValueError(f"Segment not found: {segment_id}")
+        """Update the translated text (in-memory; call save() to persist).
+
+        The status is kept, except that a FAILED segment becomes TRANSLATED:
+        it now has a translation. Earlier issues are cleared."""
+        with self.mutex:
+            seg = self._find(segment_id)
+            seg.translated_text = text
+            if seg.status == SegmentStatus.FAILED:
+                seg.status = SegmentStatus.TRANSLATED
+            seg.issues = []
+            seg.revision += 1
 
     def get_segments_by_chapter(self, chapter_id: str) -> list[SegmentState]:
         """Get all segments belonging to a specific chapter."""
@@ -227,14 +347,88 @@ class ProjectManager:
         for seg in self.data.segments:
             cid = seg.chapter_id
             if cid not in chapters:
-                chapters[cid] = {'chapter_id': cid, 'total': 0, 'translated': 0, 'reviewed': 0}
+                chapters[cid] = {'chapter_id': cid, 'total': 0, 'translated': 0,
+                                 'reviewed': 0, 'failed': 0}
             chapters[cid]['total'] += 1
             if seg.status == SegmentStatus.TRANSLATED:
                 chapters[cid]['translated'] += 1
             elif seg.status == SegmentStatus.REVIEWED:
                 chapters[cid]['reviewed'] += 1
+            elif seg.status == SegmentStatus.FAILED:
+                chapters[cid]['failed'] += 1
         return list(chapters.values())
 
     def exists(self) -> bool:
         """Check if a project file exists in the project directory."""
         return os.path.isfile(self.project_file)
+
+
+class ProjectLockedError(Exception):
+    """Another process holds the project lock."""
+
+
+# Locks held by this process: lock path -> [file descriptor, hold count]
+_held_locks: dict[str, list] = {}
+_held_locks_guard = threading.Lock()
+
+
+class ProjectLock:
+    """One writer process per project, shared by the web server and the CLI.
+
+    An exclusive flock on `<project>/project.lock`. Threads of the holding
+    process share it (counted), other processes get ProjectLockedError. The
+    kernel drops the lock when the holder exits, however it exits, so a
+    lock left by a dead process never blocks. The file holds the holder's
+    PID for the error message and is left in place on release.
+    """
+
+    FILE = 'project.lock'
+
+    def __init__(self, project_dir: str):
+        self.path = os.path.realpath(os.path.join(project_dir, self.FILE))
+        self._held = False
+
+    def acquire(self) -> None:
+        if self._held:
+            return
+        with _held_locks_guard:
+            entry = _held_locks.get(self.path)
+            if entry is not None:
+                entry[1] += 1
+            else:
+                fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    try:
+                        holder = os.read(fd, 32).decode(errors='replace').strip()
+                    finally:
+                        os.close(fd)
+                    raise ProjectLockedError(
+                        f'專案正由另一個程序使用（PID {holder}）：{self.path}')
+                try:
+                    os.ftruncate(fd, 0)
+                    os.write(fd, str(os.getpid()).encode())
+                except BaseException:
+                    os.close(fd)  # drops the flock taken above
+                    raise
+                _held_locks[self.path] = [fd, 1]
+        self._held = True
+
+    def release(self) -> None:
+        if not self._held:
+            return
+        self._held = False
+        with _held_locks_guard:
+            entry = _held_locks[self.path]
+            entry[1] -= 1
+            if entry[1] == 0:
+                del _held_locks[self.path]
+                os.close(entry[0])  # closing the only descriptor drops the flock
+
+    def __enter__(self) -> ProjectLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()

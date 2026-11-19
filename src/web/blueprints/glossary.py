@@ -10,7 +10,7 @@ from flask import Blueprint, request, jsonify, current_app
 from src.core.project import ProjectManager
 from src.core.segmenter import SegmentType
 from src.glossary.glossary_manager import GlossaryManager
-from src.glossary.term_extractor import TermExtractor
+from src.glossary.term_extractor import ExtractionError, TermExtractor
 
 
 glossary_bp = Blueprint('glossary', __name__)
@@ -116,6 +116,7 @@ def extract_terms(project_name: str):
     # All text segments; TermExtractor splits them into bounded batches
     segments = [{'text': s.text} for s in pm.data.segments
                 if s.segment_type != SegmentType.CODE]
+    model = pm.data.model
 
     _extraction_tasks[project_name] = {
         'running': True,
@@ -130,8 +131,13 @@ def extract_terms(project_name: str):
 
     def run_extraction():
         try:
-            extractor = TermExtractor()
-            terms = extractor.extract_from_segments(segments)
+            extractor = TermExtractor(model=model)
+            stopped = None
+            try:
+                terms = extractor.extract_from_segments(segments)
+            except ExtractionError as e:
+                # Keep the terms of the batches finished before the stop
+                stopped, terms = e, e.terms
 
             # Add extracted terms to glossary
             glossary_path = os.path.join(projects_dir, project_name, 'glossary.json')
@@ -148,6 +154,9 @@ def extract_terms(project_name: str):
                     count += 1
 
             _extraction_tasks[project_name]['extracted_count'] = count
+            if stopped is not None:
+                _extraction_tasks[project_name]['error'] = (
+                    f'提取中斷：{stopped}（已加入先前批次的 {count} 個術語）')
         except Exception as e:
             _extraction_tasks[project_name]['error'] = str(e)
         finally:

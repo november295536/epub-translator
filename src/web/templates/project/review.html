@@ -24,7 +24,7 @@
             <div class="segment-header">
                 <span class="segment-id">{{ seg.segment_id }}</span>
                 {% if seg.segment_type == 'code' %}<span class="segment-type">code</span>{% endif %}
-                <span class="segment-status status-{{ seg.status }}">{{ seg.status }}</span>
+                <span class="segment-status status-{{ seg.status }}"{% if seg.issues %} title="{{ seg.issues | map(attribute='detail') | join('; ') }}"{% endif %}>{{ seg.status }}</span>
             </div>
             <div class="segment-body">
                 <div class="original" x-data="{ view: 'text' }">
@@ -54,7 +54,7 @@
                               data-id="{{ seg.segment_id }}">{{ seg.translated_text }}</textarea>
                     <div class="html-preview" x-show="tView === 'preview'" x-html="previewHtml"></div>
                     <div class="actions">
-                        <button class="btn-retranslate" onclick="retranslateSegment('{{ seg.segment_id }}')" title="使用 Claude 重新翻譯此段落">重新翻譯</button>
+                        <button class="btn-retranslate" onclick="retranslateSegment('{{ seg.segment_id }}')" title="重新翻譯此段落">重新翻譯</button>
                         <button class="btn-save" onclick="saveSegment('{{ seg.segment_id }}')">儲存</button>
                         <button class="btn-approve" onclick="approveSegment('{{ seg.segment_id }}')">通過審閱</button>
                     </div>
@@ -75,6 +75,16 @@
 <script>
 const projectName = '{{ project_name }}';
 
+// A save the server refused (e.g. 409: the project is locked): say so, and
+// keep the edit visibly unsaved
+function showSaveError(segId, r, data) {
+    const status = document.getElementById(`seg-${segId}`).querySelector('.segment-status');
+    status.textContent = '未儲存';
+    status.className = 'segment-status status-failed';
+    status.title = (data && data.error) || `HTTP ${r ? r.status : '?'}`;
+    alert('未儲存：' + status.title);
+}
+
 function saveSegment(segId) {
     const textarea = document.querySelector(`textarea[data-id="${segId}"]`);
     fetch(`/api/projects/${projectName}/segments/${segId}`, {
@@ -82,14 +92,16 @@ function saveSegment(segId) {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({text: textarea.value})
     })
-    .then(r => r.json())
-    .then(data => {
-        if (data.status === 'ok') {
+    .then(r => r.json().catch(() => ({})).then(data => {
+        if (r.ok && data.status === 'ok') {
             const el = document.getElementById(`seg-${segId}`);
             el.querySelector('.segment-status').textContent = 'saved';
             el.querySelector('.segment-status').className = 'segment-status status-translated';
+        } else {
+            showSaveError(segId, r, data);
         }
-    });
+    }))
+    .catch(err => showSaveError(segId, null, {error: err.message}));
 }
 
 function approveSegment(segId) {
@@ -99,14 +111,16 @@ function approveSegment(segId) {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({text: textarea.value})
     })
-    .then(r => r.json())
-    .then(data => {
-        if (data.status === 'ok') {
+    .then(r => r.json().catch(() => ({})).then(data => {
+        if (r.ok && data.status === 'ok') {
             const el = document.getElementById(`seg-${segId}`);
             el.querySelector('.segment-status').textContent = 'reviewed';
             el.querySelector('.segment-status').className = 'segment-status status-reviewed';
+        } else {
+            showSaveError(segId, r, data);
         }
-    });
+    }))
+    .catch(err => showSaveError(segId, null, {error: err.message}));
 }
 
 function retranslateSegment(segId) {
@@ -129,9 +143,8 @@ function retranslateSegment(segId) {
             el.querySelector('.segment-status').textContent = 'translated';
             el.querySelector('.segment-status').className = 'segment-status status-translated';
         } else {
-            const errMsg = data.auth_error
-                ? '認證已過期，請執行 claude /login 重新登入'
-                : (data.error || '翻譯失敗');
+            const errMsg = data.error
+                || (data.auth_error ? {{ auth_hint|tojson }} : '翻譯失敗');
             alert(errMsg);
         }
     })

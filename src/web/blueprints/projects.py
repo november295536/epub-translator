@@ -8,7 +8,7 @@ import shutil
 import uuid
 from flask import Blueprint, render_template, redirect, request, jsonify, current_app
 
-from src.core.project import ProjectManager
+from src.core.project import ProjectLock, ProjectLockedError, ProjectManager, project_mutex
 from src.core.segmenter import Segmenter
 from src.epub.extractor import EPUBExtractor
 from src.web.tasks import TaskManager
@@ -153,21 +153,42 @@ def create_project():
         project_name = sanitize_project_name(data.get('project_name') or original_name)
         project_dir = os.path.join(projects_dir, project_name)
 
-        # Copy EPUB to project directory
-        os.makedirs(project_dir, exist_ok=True)
-        final_epub_path = os.path.join(project_dir, 'source.epub')
-
-        import shutil
-        shutil.copy2(epub_path, final_epub_path)
-
-        # Create project
-        pm = ProjectManager(project_dir)
-        pm.create(
-            epub_path=final_epub_path,
-            title=metadata.get('title', '未知書名'),
-            author=metadata.get('author', '未知作者'),
-            segments=all_segments
-        )
+        # A project of the same name is replaced: as for a delete, no task,
+        # other process or request may use it meanwhile, and nothing of it
+        # is overwritten before that is known
+        with project_mutex(project_dir):
+            if TaskManager().task_active(project_name):
+                return jsonify({'error': '專案正在翻譯中，請先停止翻譯再重新建立'}), 409
+            # Under the mutex: a delete cannot remove it before the lock
+            os.makedirs(project_dir, exist_ok=True)
+            try:
+                lock = ProjectLock(project_dir)
+                lock.acquire()
+            except ProjectLockedError as e:
+                return jsonify({'error': str(e)}), 409
+            try:
+                final_epub_path = os.path.join(project_dir, 'source.epub')
+                # The new book takes the old one's place only once its
+                # project is saved: a failure leaves the old pair intact
+                tmp_epub_path = f'{final_epub_path}.{uuid.uuid4().hex}.tmp'
+                try:
+                    shutil.copy2(epub_path, tmp_epub_path)
+                    pm = ProjectManager(project_dir)
+                    pm.create(
+                        epub_path=final_epub_path,
+                        title=metadata.get('title', '未知書名'),
+                        author=metadata.get('author', '未知作者'),
+                        segments=all_segments
+                    )
+                    os.replace(tmp_epub_path, final_epub_path)
+                except BaseException:
+                    if os.path.exists(tmp_epub_path):
+                        os.remove(tmp_epub_path)
+                    raise
+                # The old book's failure diagnostics
+                shutil.rmtree(os.path.join(project_dir, 'log', 'failed'), ignore_errors=True)
+            finally:
+                lock.release()
 
         # Clean up uploaded file
         if epub_path.startswith(get_uploads_dir()):
@@ -281,7 +302,24 @@ def delete_project(project_name: str):
     if not os.path.isdir(project_dir):
         return jsonify({'error': '專案不存在'}), 404
 
-    shutil.rmtree(project_dir)
+    # Holding the mutex (under which a start registers its task) and the
+    # lock: no task, other process or request writes to the project while
+    # it is removed
+    with project_mutex(project_dir):
+        if TaskManager().task_active(project_name):
+            return jsonify({'error': '專案正在翻譯中，請先停止翻譯再刪除'}), 409
+        # Not a project (no project.json): no lock file is created in it
+        if not os.path.isfile(os.path.join(project_dir, ProjectManager.PROJECT_FILE)):
+            return jsonify({'error': '專案不存在'}), 404
+        try:
+            lock = ProjectLock(project_dir)
+            lock.acquire()
+        except ProjectLockedError as e:
+            return jsonify({'error': str(e)}), 409
+        try:
+            shutil.rmtree(project_dir)
+        finally:
+            lock.release()
     return jsonify({'status': 'ok'})
 
 
