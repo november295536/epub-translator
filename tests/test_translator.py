@@ -628,6 +628,56 @@ class TestCodeResponseCleaning:
             with pytest.raises(TranslationError, match='Empty translation'):
                 engine.translate('Some text.')
 
+    @pytest.mark.parametrize('reply', [
+        '```html\n```\n',
+        '```\n```',
+        '以下是翻譯結果：\n',
+        'Here is the translation:\n',
+    ])
+    @pytest.mark.parametrize('html', ['', '<p>Some text.</p>'])
+    def test_text_reply_only_fence_or_commentary_is_retried(self, reply, html):
+        engine = TranslationEngine(max_retries=2)
+        empty, good = MagicMock(), MagicMock()
+        empty.returncode = good.returncode = 0
+        empty.stderr = good.stderr = ''
+        empty.stdout = reply
+        good.stdout = '一些文字。\n'
+
+        with patch('src.core.translator.subprocess.run',
+                   side_effect=[empty, good]) as mock_run:
+            assert engine.translate('Some text.', html=html) == '一些文字。'
+        assert mock_run.call_count == 2
+
+    @pytest.mark.parametrize('reply', ['```html\n```\n', '以下是翻譯結果：\n'])
+    def test_text_reply_only_fence_or_commentary_exhausts(self, reply):
+        engine = TranslationEngine(max_retries=2)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = reply
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run',
+                   return_value=mock_result) as mock_run:
+            with pytest.raises(TranslationError, match='Empty translation'):
+                engine.translate('Some text.')
+        assert mock_run.call_count == 2
+
+    @pytest.mark.parametrize('source, reply', [
+        ('OK', '好的\n'),
+        ('Of course', '當然\n'),
+        ('Here are the steps:', '以下是步驟：\n'),
+        ('以下是：', '以下是：\n'),   # source left untranslated
+    ])
+    def test_short_text_reply_accepted(self, source, reply):
+        engine = TranslationEngine(max_retries=1)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = reply
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            assert engine.translate(source) == reply.strip()
+
     def test_code_whitespace_only_output_is_empty(self):
         engine = TranslationEngine(max_retries=1)
         mock_result = MagicMock()
