@@ -85,6 +85,42 @@ class TestGlossaryManager:
         assert 'machine learning' in terms or 'deep learning' in terms
         assert 'database' not in terms
 
+    def test_find_terms_whole_word_only(self, gm):
+        gm.add_term('AI', '人工智慧')
+        assert gm.find_terms_in_text('We maintain the main trail.') == []
+        assert [e.term for e in gm.find_terms_in_text('Modern AI, explained.')] == ['AI']
+        assert [e.term for e in gm.find_terms_in_text('the ai boom')] == ['AI']
+
+    def test_find_terms_plural_forms(self, gm):
+        gm.add_term('API', '應用程式介面')
+        gm.add_term('batch', '批次')
+        gm.add_term('dependency', '相依性')
+        gm.add_term('key', '鍵')
+
+        def found(text):
+            return [e.term for e in gm.find_terms_in_text(text)]
+
+        assert found('Public APIs change.') == ['API']
+        assert found('Two batches ran.') == ['batch']
+        assert found('Too many dependencies.') == ['dependency']
+        assert found('Rotate the keys.') == ['key']
+        assert found('One dependency.') == ['dependency']
+        assert found('A rapid keystroke.') == []
+
+    def test_find_terms_with_symbols(self, gm):
+        gm.add_term('C++', 'C++')
+        gm.add_term('C#', 'C#')
+        gm.add_term('.NET', '.NET')
+
+        def found(text):
+            return [e.term for e in gm.find_terms_in_text(text)]
+
+        assert found('Written in C++, mostly.') == ['C++']
+        assert found('Ported to C# later.') == ['C#']
+        assert found('Runs on .NET today.') == ['.NET']
+        assert found('The (.NET) runtime and (C++) code.') == ['.NET', 'C++']
+        assert found('Send a magnet or abc# tag.') == []
+
     def test_format_for_prompt(self, gm):
         gm.add_term('API', '應用程式介面', category='term')
         gm.add_term('cache', '快取')

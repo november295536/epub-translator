@@ -6,6 +6,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, asdict, field
+from functools import lru_cache
 
 
 CATEGORY_LABELS = {
@@ -17,6 +18,24 @@ CATEGORY_LABELS = {
     'expression': '慣用語',
     'other': '其他',
 }
+
+
+@lru_cache(maxsize=None)
+def _term_pattern(term: str) -> re.Pattern:
+    """Compile a whole-word, case-insensitive pattern for a glossary term.
+
+    Lookarounds are used instead of \\b so that terms starting or ending
+    with a non-word character (C++, C#, .NET) still match. A term ending in
+    a letter also matches its regular plurals (s, es, y -> ies).
+    """
+    term = term.strip()
+    body = re.escape(term)
+    if term and term[-1].isalpha():
+        if term[-1] in 'yY' and len(term) > 1:
+            body = re.escape(term[:-1]) + '(?:ys?|ies)'
+        else:
+            body += '(?:s|es)?'
+    return re.compile(r'(?<!\w)' + body + r'(?!\w)', re.IGNORECASE)
 
 
 @dataclass
@@ -103,10 +122,9 @@ class GlossaryManager:
 
     def find_terms_in_text(self, text: str) -> list[GlossaryEntry]:
         """Find all glossary terms that appear in the given text."""
-        text_lower = text.lower()
         found = []
         for entry in self.entries.values():
-            if entry.term.lower() in text_lower:
+            if _term_pattern(entry.term).search(text):
                 found.append(entry)
         return sorted(found, key=lambda e: e.term.lower())
 
