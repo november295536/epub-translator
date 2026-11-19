@@ -117,6 +117,14 @@ class TestCodeCheckMain:
         assert 'ERROR project-1: cannot read project' in out
         assert 'secret-name' not in out
 
+    def test_code_segment_without_text_is_unreadable(self, tmp_path, capsys):
+        seg = _code_seg('s', 'unused', 'XXXX')
+        del seg['text']
+        _write_project(str(tmp_path / 'p'), [seg])
+
+        assert code_check.main(['--projects-dir', str(tmp_path)]) == 1
+        assert 'ERROR p: cannot read project (KeyError)' in capsys.readouterr().out
+
     def test_missing_directory_path_not_printed_when_anonymized(self, tmp_path, capsys):
         missing = str(tmp_path / 'private-dir-name')
         code = code_check.main(['--projects-dir', missing, '--anonymize'])
@@ -371,6 +379,16 @@ class TestAlignmentOutput:
         _write_multi_chapter_project(str(tmp_path / 'projects' / 'old'), epub_path=elsewhere)
         assert align_check.main(['--projects-dir', str(tmp_path / 'projects')]) == 0
         assert 'chapters 2' in capsys.readouterr().out
+
+    def test_local_source_copy_preferred_over_epub_path(self, tmp_path, capsys):
+        _write_multi_chapter_project(str(tmp_path / 'p'))
+        with open(tmp_path / 'p' / 'project.json', encoding='utf-8') as f:
+            raw = json.load(f)
+        raw['epub_path'] = str(tmp_path / 'moved-away.epub')
+        with open(tmp_path / 'p' / 'project.json', 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+        assert align_check.main(['--projects-dir', str(tmp_path)]) == 0
+        assert 'PASS p: segmenter_version 1, chapters 2' in capsys.readouterr().out
 
     def test_missing_spine_item_is_skipped_not_the_rest(self, tmp_path, capsys):
         _write_multi_chapter_project(str(tmp_path / 'p'), segmenter_version=2,

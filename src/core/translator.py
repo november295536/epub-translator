@@ -108,10 +108,10 @@ _LEADING_BLANK_LINES = re.compile(r'\A(?:[ \t]*\r?\n)+')
 _CODE_FENCE_PATTERN = re.compile(r'\A```[^\n]*\n(?:(.*)\n)?```\Z', re.DOTALL)
 
 
-def _is_commentary_line(line: str) -> bool:
-    """True when a line matches the first two _START_PATTERNS
+def _starts_with_commentary(text: str) -> bool:
+    """True when the first line of text matches the first two _START_PATTERNS
     (e.g. "看起來…原樣輸出：" or "Here is…")."""
-    return any(re.match(p, line + '\n') for p in _START_PATTERNS[:2])
+    return any(re.match(p, text + '\n') for p in _START_PATTERNS[:2])
 
 
 # Number of characters of each neighbouring segment used as context
@@ -130,10 +130,10 @@ def get_context(segments, segment_id: str) -> tuple:
                   segment_id, chapter_id, segment_type and text).
         segment_id: ID of the segment about to be translated.
     """
-    idx = next((i for i, s in enumerate(segments)
-                if s.segment_id == segment_id), -1)
-    if idx < 0:
+    ids = [s.segment_id for s in segments]
+    if segment_id not in ids:
         return '', ''
+    idx = ids.index(segment_id)
     chapter_id = segments[idx].chapter_id
 
     def nearest_text(step: int) -> str:
@@ -332,10 +332,9 @@ class TranslationEngine:
         """
         if code_mode:
             cleaned = _LEADING_BLANK_LINES.sub('', text).rstrip()
-            first_line, _, rest = cleaned.partition('\n')
-            source_first_line = _LEADING_BLANK_LINES.sub('', source).partition('\n')[0]
-            if _is_commentary_line(first_line) and not _is_commentary_line(source_first_line):
-                cleaned = _LEADING_BLANK_LINES.sub('', rest)
+            if (_starts_with_commentary(cleaned)
+                    and not _starts_with_commentary(_LEADING_BLANK_LINES.sub('', source))):
+                cleaned = _LEADING_BLANK_LINES.sub('', cleaned.partition('\n')[2])
             if '```' not in source:
                 fenced = _CODE_FENCE_PATTERN.match(cleaned)
                 if fenced:
