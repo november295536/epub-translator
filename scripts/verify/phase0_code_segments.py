@@ -2,19 +2,34 @@
 """Phase 0 check: list translated code segments that may have been corrupted.
 
 Before the Phase 0 fix, the output of a code segment went through markdown
-cleanup, which could alter the code itself (Bug 3). This script finds the
-candidates for re-translation: already-translated CODE segments whose
-translation differs from the source once comment lines are removed.
+cleanup, which could alter the code itself (Bug 3). This script lists the
+candidates for re-translation, per project:
+
+- already-translated CODE segments whose translation differs from the
+  source once comment lines are removed;
+- CODE segments marked translated or reviewed whose translation is empty.
+
+It is a reporting script, not a pass/fail gate: the candidates still need a
+human look (a translated end-of-line comment also counts as a difference).
+
+A line is a comment line when its first non-blank characters are `//`, or
+`#` followed by whitespace, `!` or the end of the line. So `#define`,
+`#include` and `#[derive]` are code and are compared.
 
 Read-only. It opens each project's project.json, writes nothing, and never
-prints book text; only project names, counts and segment IDs.
+prints book text. Without --anonymize it prints project directory names and
+segment IDs. With --anonymize it prints project-N labels, where N is the
+alphabetical position of the directory among the directories of
+--projects-dir that contain a project.json, and no names, IDs or paths
+(also not in error messages).
 
 Usage:
     python3 scripts/verify/phase0_code_segments.py [--projects-dir projects]
                                                    [--anonymize]
 
 Exit code: 0 when every project could be read (whatever the counts),
-1 when at least one project.json could not be read.
+1 when at least one project.json could not be read, 2 when the projects
+directory cannot be listed.
 """
 
 from __future__ import annotations
@@ -22,24 +37,26 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 PROJECT_FILE = 'project.json'
-COMMENT_MARKERS = ('#', '//')
 TRANSLATED_STATUSES = ('translated', 'reviewed')
+COMMENT_LINE = re.compile(r'^\s*(?://|#(?:\s|!|$))')
+
+HEADER = ('Phase 0 code segment report (candidates for re-translation; '
+          'reporting only, not a pass/fail check)')
 
 
 def code_lines(text: str) -> list[str]:
     """Return the non-comment lines of a code block, normalised for comparison.
 
-    Comment lines (first non-blank characters are # or //) are dropped,
-    trailing whitespace is ignored, and blank lines at either end are
-    ignored. Leading indentation is kept: losing it is one of the defects
-    this check looks for.
+    Comment lines (see COMMENT_LINE) are dropped, trailing whitespace is
+    ignored, and blank lines at either end are ignored. Leading indentation
+    is kept: losing it is one of the defects this check looks for.
     """
     lines = [line.rstrip() for line in text.splitlines()]
-    lines = [line for line in lines
-             if not line.lstrip().startswith(COMMENT_MARKERS)]
+    lines = [line for line in lines if not COMMENT_LINE.match(line)]
     while lines and not lines[0]:
         lines.pop(0)
     while lines and not lines[-1]:
@@ -47,24 +64,27 @@ def code_lines(text: str) -> list[str]:
     return lines
 
 
-def check_project(project_file: str) -> tuple[int, list[str]]:
-    """Return (translated code segment count, IDs of segments that differ)."""
+def check_project(project_file: str) -> tuple[int, list[str], list[str]]:
+    """Return (translated code segment count, IDs that differ, IDs with an
+    empty translation) for one project.json."""
     with open(project_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
     translated = 0
     differing = []
+    empty = []
     for seg in data['segments']:
         if seg.get('segment_type') != 'code':
             continue
         if seg.get('status') not in TRANSLATED_STATUSES:
             continue
-        if not seg.get('translated_text'):
-            continue
         translated += 1
-        if code_lines(seg.get('text', '')) != code_lines(seg['translated_text']):
+        output = seg.get('translated_text') or ''
+        if not output.strip():
+            empty.append(seg['segment_id'])
+        elif code_lines(seg.get('text', '')) != code_lines(output):
             differing.append(seg['segment_id'])
-    return translated, differing
+    return translated, differing, empty
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -72,26 +92,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--projects-dir', default='projects',
                         help='Directory that holds the project folders (default: projects)')
     parser.add_argument('--anonymize', action='store_true',
-                        help='Print project-N labels instead of names and omit segment IDs')
+                        help='Print project-N labels; omit names, segment IDs and paths')
     args = parser.parse_args(argv)
 
-    if not os.path.isdir(args.projects_dir):
-        print(f'ERROR projects directory not found: {args.projects_dir}')
-        return 1
+    print(HEADER)
+    shown_dir = '<projects-dir>' if args.anonymize else args.projects_dir
+    try:
+        entries = os.listdir(args.projects_dir)
+    except OSError as e:
+        print(f'ERROR cannot list projects directory {shown_dir} ({type(e).__name__})')
+        return 2
 
-    names = sorted(
-        name for name in os.listdir(args.projects_dir)
-        if os.path.isfile(os.path.join(args.projects_dir, name, PROJECT_FILE))
-    )
+    names = sorted(name for name in entries
+                   if os.path.isfile(os.path.join(args.projects_dir, name, PROJECT_FILE)))
 
     total_translated = 0
     total_differing = 0
+    total_empty = 0
     unreadable = 0
 
     for index, name in enumerate(names, 1):
         label = f'project-{index}' if args.anonymize else name
         try:
-            translated, differing = check_project(
+            translated, differing, empty = check_project(
                 os.path.join(args.projects_dir, name, PROJECT_FILE))
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
             unreadable += 1
@@ -100,14 +123,20 @@ def main(argv: list[str] | None = None) -> int:
 
         total_translated += translated
         total_differing += len(differing)
+        total_empty += len(empty)
         line = (f'{label}: translated code segments {translated}, '
-                f'differ outside comment lines {len(differing)}')
-        if differing and not args.anonymize:
-            line += ': ' + ' '.join(differing)
+                f'differ outside comment lines {len(differing)}, '
+                f'empty translation {len(empty)}')
+        if not args.anonymize:
+            if differing:
+                line += '; differ: ' + ' '.join(differing)
+            if empty:
+                line += '; empty: ' + ' '.join(empty)
         print(line)
 
     print(f'TOTAL projects {len(names)}  translated code segments {total_translated}  '
-          f'differ outside comment lines {total_differing}  unreadable {unreadable}')
+          f'differ outside comment lines {total_differing}  '
+          f'empty translation {total_empty}  unreadable {unreadable}')
     return 1 if unreadable else 0
 
 
