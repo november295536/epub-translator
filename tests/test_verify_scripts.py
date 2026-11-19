@@ -126,6 +126,13 @@ class TestCodeCheckMain:
         assert code_check.main(['--projects-dir', str(tmp_path)]) == 1
         assert 'ERROR p: cannot read project (KeyError)' in capsys.readouterr().out
 
+    @pytest.mark.parametrize('translated', ['XXXX', ''])
+    def test_code_segment_with_null_text_is_unreadable(self, tmp_path, capsys, translated):
+        _write_project(str(tmp_path / 'p'), [_code_seg('s', None, translated)])
+
+        assert code_check.main(['--projects-dir', str(tmp_path)]) == 1
+        assert 'ERROR p: cannot read project (TypeError)' in capsys.readouterr().out
+
     def test_missing_directory_path_not_printed_when_anonymized(self, tmp_path, capsys):
         missing = str(tmp_path / 'private-dir-name')
         code = code_check.main(['--projects-dir', missing, '--anonymize'])

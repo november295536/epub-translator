@@ -80,8 +80,9 @@ whenever every project could be read, and its first output line says so. A line 
 comment when it starts with `//`, or with `#` followed by whitespace, `!` or the end of the line
 (`#define` and `#include` are code). A comment line's wording is ignored but its leading
 whitespace is compared (round 2). Translated or reviewed code segments with an empty
-translation are reported separately; a code segment without `text` makes the project
-unreadable, also when its translation is empty (round 3). `project-N` is the alphabetical position of the directory among the directories of
+translation are reported separately; a translated or reviewed code segment whose `text` is
+missing or not a string makes the project unreadable, whatever its translation (rounds 3
+and 4); pending segments are not checked. `project-N` is the alphabetical position of the directory among the directories of
 `--projects-dir` that contain a `project.json`; all 8 directories do, so the labels are the
 same as elsewhere in this log.
 
