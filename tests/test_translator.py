@@ -1391,7 +1391,7 @@ class TestRound3UnexpectedFailureLog:
         assert "error: 未預期的錯誤：KeyError: 'missing'" in content
         assert '=== request ===\n' + fake.prompts[0] + '\n' in content
         assert "=== attempt 1: KeyError: 'missing' ===" in content
-        assert 'Traceback (most recent call last):' in content
+        assert 'Traceback (most recent call last):\n  File ' in content
         assert content.rstrip().endswith("KeyError: 'missing'")
 
     def test_request_empty_when_not_built(self, tmp_path, monkeypatch):
