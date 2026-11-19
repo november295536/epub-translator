@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import logging
@@ -13,16 +14,21 @@ import src.llm as llm
 from src.core.project import Issue, SegmentStatus
 from src.core.segmenter import SegmentType
 from src.llm import (  # noqa: F401  (RateLimitError, AuthError re-exported)
-    AuthError, CancelledError, LLMError, LLMRequest, Message, RateLimitError,
-    RefusalError, TransientError, Usage,
+    AuthError, BackendUnavailableError, CancelledError, LLMError, LLMRequest,
+    Message, RateLimitError, RefusalError, TransientError, Usage,
 )
-from src.llm.claude_cli import MODELS
 
 logger = logging.getLogger(__name__)
 
-AVAILABLE_MODELS = [asdict(m) for m in MODELS]
 
-DEFAULT_MODEL = 'sonnet'
+def available_models() -> list[dict]:
+    """The models of the backend in use, as dicts (alias, label, description)."""
+    return [asdict(m) for m in llm.default_backend().list_models()]
+
+
+def default_model() -> str:
+    """The model of the backend in use for a project that names none."""
+    return llm.default_backend().default_model
 
 _SHARED_RULES = """1. 使用台灣慣用的繁體中文用語
 2. 專業術語請保留原文並用括號標註，例如：機器學習（machine learning）
@@ -199,15 +205,19 @@ class TranslationOutcome:
 # Characters of raw output kept per failed attempt in a diagnostics file
 DIAGNOSTIC_RAW_CHARS = 20000
 
+# Characters kept of an error message, in the diagnostics file and in the
+# segment's stored issue
+ERROR_MESSAGE_CHARS = 2000
+
 
 class TranslationEngine:
     """Translates text segments through an LLM backend."""
 
-    def __init__(self, max_retries: int = 3, model: str = DEFAULT_MODEL,
+    def __init__(self, max_retries: int = 3, model: str | None = None,
                  backend: llm.LLMBackend | None = None, timeout: float = 120):
         self.max_retries = max_retries
-        self.model = model
         self.backend = backend if backend is not None else llm.default_backend()
+        self.model = model if model is not None else self.backend.default_model
         self.timeout = timeout
 
     def translate(self, text: str, segment_type: SegmentType = SegmentType.TEXT,
@@ -241,7 +251,8 @@ class TranslationEngine:
         Raises:
             TranslationError: If every attempt failed (timeout, error exit,
                 empty reply) or the model refused.
-            RateLimitError, AuthError, CancelledError: at once, no retry.
+            RateLimitError, AuthError, BackendUnavailableError, CancelledError:
+                at once, no retry.
         """
         is_code = segment_type == SegmentType.CODE
         use_html_mode = bool(html) and not is_code
@@ -256,11 +267,11 @@ class TranslationEngine:
         for attempt in range(1, self.max_retries + 1):
             try:
                 response = self.backend.complete(request, cancel)
-            except (RateLimitError, AuthError, CancelledError):
+            except (RateLimitError, AuthError, BackendUnavailableError, CancelledError):
                 raise
             except TransientError as e:
                 logger.warning("Translation attempt %d/%d failed: %s",
-                               attempt, self.max_retries, e)
+                               attempt, self.max_retries, str(e)[:ERROR_MESSAGE_CHARS])
                 attempts.append((str(e), e.raw))
                 code = 'transient'
                 continue
@@ -399,8 +410,10 @@ def translate_segment(engine: TranslationEngine, seg, segments,
     segments), calls the engine and returns the outcome. A failed segment
     is an outcome with status FAILED and a backend issue, not an exception;
     when `log_dir` is given its raw request and replies are written there
-    (see write_failure_log). RateLimitError, AuthError and CancelledError
-    are raised: they concern the run, not the segment.
+    (see write_failure_log; a failure to write it is logged, the outcome
+    is returned all the same). RateLimitError, AuthError,
+    BackendUnavailableError and CancelledError are raised: they concern the
+    run, not the segment.
     """
     glossary_text = ''
     if glossary is not None and glossary.entries:
@@ -422,44 +435,66 @@ def translate_segment(engine: TranslationEngine, seg, segments,
         )
     except TranslationError as e:
         if log_dir:
-            write_failure_log(log_dir, seg.segment_id, model, e)
+            try:
+                write_failure_log(log_dir, seg.segment_id, model, e)
+            except OSError as log_error:
+                logger.error("無法寫入失敗紀錄 %s: %s", seg.segment_id, log_error)
         return TranslationOutcome(
             text=None, status=SegmentStatus.FAILED, model=model, usage=None,
-            issues=[Issue(kind='backend', code=e.code, detail=str(e), blocking=True)])
+            issues=[Issue(kind='backend', code=e.code,
+                          detail=str(e)[:ERROR_MESSAGE_CHARS], blocking=True)])
     if log_dir:
-        _remove_failure_log(log_dir, seg.segment_id)
+        remove_failure_log(log_dir, seg.segment_id)
     return TranslationOutcome(text=reply.text, status=SegmentStatus.TRANSLATED,
                               issues=[], model=model, usage=reply.usage)
 
 
+def unexpected_error_outcome(model: str, error: BaseException) -> TranslationOutcome:
+    """The outcome a worker reports when translating a segment raised an
+    exception nobody expected: the segment fails, the run goes on."""
+    detail = f'未預期的錯誤：{type(error).__name__}: {error}'[:ERROR_MESSAGE_CHARS]
+    return TranslationOutcome(
+        text=None, status=SegmentStatus.FAILED, model=model, usage=None,
+        issues=[Issue(kind='backend', code='unexpected', detail=detail, blocking=True)])
+
+
 def failure_log_path(log_dir: str, segment_id: str) -> str:
-    """One file per segment, replaced by each failed run of that segment."""
-    safe_id = re.sub(r'[^\w.-]', '_', segment_id)
-    return os.path.join(log_dir, 'failed', f'{safe_id}.txt')
+    """One file per segment, replaced by each failed run of that segment.
+    The name is the id with unsafe characters replaced (at most 100 of
+    them) and a digest of the exact id, so distinct ids never share a file."""
+    safe_id = re.sub(r'[^\w.-]', '_', segment_id)[:100]
+    digest = hashlib.sha256(segment_id.encode('utf-8')).hexdigest()[:10]
+    return os.path.join(log_dir, 'failed', f'{safe_id}-{digest}.txt')
 
 
 def write_failure_log(log_dir: str, segment_id: str, model: str,
                       error: TranslationError) -> None:
-    """Keep the raw request and the raw output of each failed attempt."""
+    """Keep the raw request and the raw output of each failed attempt.
+    Every field that comes from a reply is bounded."""
     path = failure_log_path(log_dir, segment_id)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     parts = [
         f'segment: {segment_id}',
         f'model: {model}',
         f'time: {time.strftime("%Y-%m-%d %H:%M:%S")}',
-        f'error: {error}',
+        f'error: {str(error)[:ERROR_MESSAGE_CHARS]}',
         '',
         '=== request ===',
         error.prompt,
     ]
     for i, (message, raw) in enumerate(error.attempts, 1):
-        parts += ['', f'=== attempt {i}: {message} ===', raw[:DIAGNOSTIC_RAW_CHARS]]
+        parts += ['', f'=== attempt {i}: {message[:ERROR_MESSAGE_CHARS]} ===',
+                  raw[:DIAGNOSTIC_RAW_CHARS]]
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(parts) + '\n')
 
 
-def _remove_failure_log(log_dir: str, segment_id: str) -> None:
+def remove_failure_log(log_dir: str, segment_id: str) -> None:
+    """Remove a segment's failure diagnostics (it translated, or a person
+    edited or approved it). A failure to remove is logged, not raised."""
     try:
         os.remove(failure_log_path(log_dir, segment_id))
     except FileNotFoundError:
         pass
+    except OSError as e:
+        logger.error("無法移除失敗紀錄 %s: %s", segment_id, e)
