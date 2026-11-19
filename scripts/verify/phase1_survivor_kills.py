@@ -89,6 +89,10 @@ M = [
  ('web181','src/web/blueprints/review.py',"f'Segment {segment_id} not found'","f'XXSegment {segment_id} not foundXX'",'tests/test_web.py::TestRound1Exact'),
  ('web30','src/web/tasks.py',"(task.state in ('running', 'paused')\n                                     or","(task.state in ('XXrunningXX', 'paused')\n                                     or",'tests/test_web.py::TestRound1Exact'),
  ('web87','src/web/tasks.py',"message += f'（{len(unsaved)}","message += f'XX（{len(unsaved)}",'tests/test_web.py::TestRound1Exact'),
+ ('web173','src/web/blueprints/review.py',"    remove_failure_log(_log_dir(pm), segment_id)\n    return jsonify({'status': 'ok', 'segment_id': segment_id})\n\n\n@review_bp.route('/api/projects/<project_name>/segments/<segment_id>/approve'","    remove_failure_log(_log_dir(pm), segment_id)\n    return jsonify({'status': 'ok', 'XXsegment_idXX': segment_id})\n\n\n@review_bp.route('/api/projects/<project_name>/segments/<segment_id>/approve'",'tests/test_web.py::TestRound1Exact'),
+ ('web174','src/web/blueprints/review.py',"    remove_failure_log(_log_dir(pm), segment_id)\n    return jsonify({'status': 'ok', 'segment_id': segment_id})\n\n\n@review_bp.route('/api/projects/<project_name>/segments/<segment_id>/retranslate'","    remove_failure_log(_log_dir(pm), segment_id)\n    return jsonify({'XXstatusXX': 'ok', 'segment_id': segment_id})\n\n\n@review_bp.route('/api/projects/<project_name>/segments/<segment_id>/retranslate'",'tests/test_web.py::TestRound1Exact'),
+ ('web180','src/web/blueprints/review.py',"return jsonify({'error': f'Segment {segment_id} not found'}), 404","return jsonify({'XXerrorXX': f'Segment {segment_id} not found'}), 404",'tests/test_web.py::TestRound1Exact'),
+ ('web31','src/web/tasks.py',"(task.state in ('running', 'paused')\n                                     or","(task.state in ('running', 'XXpausedXX')\n                                     or",'tests/test_web.py::TestRound1Exact'),
 ]
 only = sys.argv[1:]
 bad = 0
