@@ -122,6 +122,7 @@ def retranslate_segment(project_name: str, segment_id: str):
         if not seg:
             return jsonify({'error': f'Segment {segment_id} not found'}), 404
         revision = seg.revision
+        source = (seg.html, seg.text)  # a replaced project has other text
         model = pm.data.model
         segments = copy.deepcopy(pm.data.segments)
         seg = next(s for s in segments if s.segment_id == segment_id)
@@ -138,6 +139,9 @@ def retranslate_segment(project_name: str, segment_id: str):
         logger.info("重新翻譯段落: %s (模型: %s)", segment_id, engine.model)
         outcome = translate_segment(engine, seg, segments, gm)
         with transaction(project_name) as pm:
+            current = next((s for s in pm.data.segments if s.segment_id == segment_id), None)
+            if current is None or (current.html, current.text) != source:
+                return jsonify({'error': '專案已在翻譯期間被重新建立，未套用新譯文'}), 409
             if not pm.apply_outcome(segment_id, outcome, revision=revision):
                 return jsonify({'error': '段落已在翻譯期間被編輯，未套用新譯文'}), 409
             pm.save()
