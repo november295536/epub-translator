@@ -6,7 +6,7 @@ cleanup, which could alter the code itself (Bug 3). This script lists the
 candidates for re-translation, per project:
 
 - already-translated CODE segments whose translation differs from the
-  source once comment lines are removed;
+  source outside the wording of comment lines;
 - CODE segments marked translated or reviewed whose translation is empty.
 
 It is a reporting script, not a pass/fail gate: the candidates still need a
@@ -14,7 +14,8 @@ human look (a translated end-of-line comment also counts as a difference).
 
 A line is a comment line when its first non-blank characters are `//`, or
 `#` followed by whitespace, `!` or the end of the line. So `#define`,
-`#include` and `#[derive]` are code and are compared.
+`#include` and `#[derive]` are code and are compared. Only a comment line's
+wording is ignored; its leading whitespace is compared.
 
 Read-only. It opens each project's project.json, writes nothing, and never
 prints book text. Without --anonymize it prints project directory names and
@@ -42,21 +43,22 @@ import sys
 
 PROJECT_FILE = 'project.json'
 TRANSLATED_STATUSES = ('translated', 'reviewed')
-COMMENT_LINE = re.compile(r'^\s*(?://|#(?:\s|!|$))')
+COMMENT_LINE = re.compile(r'^(\s*)(?://|#(?:\s|!|$)).*')
 
 HEADER = ('Phase 0 code segment report (candidates for re-translation; '
           'reporting only, not a pass/fail check)')
 
 
 def code_lines(text: str) -> list[str]:
-    """Return the non-comment lines of a code block, normalised for comparison.
+    """Return the lines of a code block, normalised for comparison.
 
-    Comment lines (see COMMENT_LINE) are dropped, trailing whitespace is
-    ignored, and blank lines at either end are ignored. Leading indentation
-    is kept: losing it is one of the defects this check looks for.
+    A comment line (see COMMENT_LINE) becomes its leading whitespace plus
+    '#', so its wording is ignored but lost indentation is not. Trailing
+    whitespace and blank lines at either end are ignored. Leading
+    indentation is kept: losing it is one of the defects this check looks
+    for.
     """
-    lines = [line.rstrip() for line in text.splitlines()]
-    lines = [line for line in lines if not COMMENT_LINE.match(line)]
+    lines = [COMMENT_LINE.sub(r'\1#', line.rstrip()) for line in text.splitlines()]
     while lines and not lines[0]:
         lines.pop(0)
     while lines and not lines[-1]:

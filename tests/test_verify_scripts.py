@@ -37,9 +37,18 @@ def _write_project(directory, segments):
 
 class TestCodeLines:
 
-    def test_comment_lines_dropped(self):
+    def test_comment_wording_ignored(self):
         text = '# note\n#!/bin/sh\n#\n// note\n    # indented note\nx = 1'
-        assert code_check.code_lines(text) == ['x = 1']
+        assert code_check.code_lines(text) == ['#', '#', '#', '#', '    #', 'x = 1']
+
+    @pytest.mark.parametrize('source, translated', [
+        ('    // load config\n    value();', '// 載入設定\n    value();'),
+        ('    # init\n    x = 1', '# 初始化\n    x = 1'),
+    ])
+    def test_lost_comment_indentation_differs(self, source, translated):
+        assert code_check.code_lines(source) != code_check.code_lines(translated)
+        assert code_check.code_lines(source) == code_check.code_lines(
+            source.replace('load config', '載入設定').replace('init', '初始化'))
 
     def test_hash_directives_are_code(self):
         text = '#define FOO_H\n#include <x.h>\n#[derive(Debug)]'
