@@ -420,3 +420,31 @@ class TestTermExtractorRequest:
         caplog.set_level(logging.WARNING, logger='src.glossary.term_extractor')
         TermExtractor(backend=FakeBackend([TransientError('boom')])).extract_from_text('x')
         assert [r.getMessage() for r in caplog.records] == ['Term extraction failed: boom']
+
+
+# --- Review round 1 ---------------------------------------------------------------
+
+class TestExtractionStopKeepsTerms:
+    """Item 19: a stop keeps the terms of the batches already finished."""
+
+    def test_rate_limit_after_first_batch(self, monkeypatch):
+        from src.glossary.term_extractor import ExtractionError, TermExtractor
+        from src.llm import BackendUnavailableError, RateLimitError
+        from src.llm.fake import FakeBackend
+        monkeypatch.setattr('src.glossary.term_extractor.MAX_CHARS_PER_BATCH', 20)
+        for stop in (RateLimitError('limit'), BackendUnavailableError('missing')):
+            fake = FakeBackend(['[{"term": "Beta", "translation": "乙", "category": "term"},'
+                                ' {"term": "alpha", "translation": "甲", "category": "term"}]',
+                                stop])
+            extractor = TermExtractor(model='m', backend=fake)
+            with pytest.raises(ExtractionError) as info:
+                extractor.extract_from_segments([{'text': 'first batch text'},
+                                                 {'text': 'second batch text'},
+                                                 {'text': 'third batch text'}])
+            assert [t['term'] for t in info.value.terms] == ['alpha', 'Beta']
+            assert str(info.value) == str(stop)
+            assert len(fake.requests) == 2
+
+    def test_error_without_terms(self):
+        from src.glossary.term_extractor import ExtractionError
+        assert ExtractionError('x').terms == []

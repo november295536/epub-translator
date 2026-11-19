@@ -9,7 +9,7 @@ from src.core.translator import (
     TranslationEngine, TranslationError, RateLimitError,
     TRANSLATION_PROMPT, CODE_PROMPT,
     TEXT_HTML_PROMPT,
-    AVAILABLE_MODELS, DEFAULT_MODEL,
+    available_models, default_model,
 )
 from src.core.project import SegmentState
 
@@ -397,12 +397,12 @@ class TestHTMLMode:
 class TestModelSelection:
 
     def test_default_model_is_sonnet(self):
-        assert DEFAULT_MODEL == 'sonnet'
+        assert default_model() == 'sonnet'
         engine = TranslationEngine()
         assert engine.model == 'sonnet'
 
     def test_available_models_list(self):
-        aliases = [m['alias'] for m in AVAILABLE_MODELS]
+        aliases = [m['alias'] for m in available_models()]
         assert 'sonnet' in aliases
         assert 'opus' in aliases
         assert 'haiku' in aliases
@@ -988,8 +988,8 @@ class TestFailureDiagnostics:
         errors = [TransientError(f'exit {i}', raw=f'RAW-{i}') for i in (1, 2)]
         self._fail(tmp_path, errors + ['   '])
         files = os.listdir(tmp_path / 'failed')
-        assert files == ['c1_seg0001.txt']
-        content = (tmp_path / 'failed' / 'c1_seg0001.txt').read_text(encoding='utf-8')
+        assert files == ['c1_seg0001-1f098b794d.txt']
+        content = (tmp_path / 'failed' / 'c1_seg0001-1f098b794d.txt').read_text(encoding='utf-8')
         assert 'segment: c1_seg0001' in content
         assert 'model: haiku' in content
         assert '=== request ===' in content
@@ -1003,19 +1003,19 @@ class TestFailureDiagnostics:
         for _ in range(3):
             self._fail(tmp_path, [TransientError('x', raw='y' * 50000)] * 3)
         files = os.listdir(tmp_path / 'failed')
-        assert files == ['c1_seg0001.txt']
-        size = os.path.getsize(tmp_path / 'failed' / 'c1_seg0001.txt')
+        assert files == ['c1_seg0001-1f098b794d.txt']
+        size = os.path.getsize(tmp_path / 'failed' / 'c1_seg0001-1f098b794d.txt')
         assert size < 3 * 20000 + 5000
 
     def test_success_writes_nothing_and_removes_old_record(self, tmp_path):
         self._fail(tmp_path, [RefusalError('no')])
-        assert os.listdir(tmp_path / 'failed') == ['c1_seg0001.txt']
+        assert os.listdir(tmp_path / 'failed') == ['c1_seg0001-1f098b794d.txt']
         self._fail(tmp_path, ['譯文'])
         assert os.listdir(tmp_path / 'failed') == []
 
     def test_unsafe_characters_in_id(self, tmp_path):
         path = failure_log_path(str(tmp_path), 'OEBPS/ch 1.xhtml_seg0001')
-        assert path == os.path.join(str(tmp_path), 'failed', 'OEBPS_ch_1.xhtml_seg0001.txt')
+        assert path == os.path.join(str(tmp_path), 'failed', 'OEBPS_ch_1.xhtml_seg0001-b7bd8e88e1.txt')
 
     def test_nothing_written_without_log_dir(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -1086,9 +1086,106 @@ class TestFailureLogFormat:
         error = TranslationError('final message', code='transient', prompt='THE PROMPT',
                                  attempts=[('first', 'R1'), ('second', 'x' * 20001)])
         translator.write_failure_log(str(tmp_path), 'c1_seg0001', 'haiku', error)
-        content = (tmp_path / 'failed' / 'c1_seg0001.txt').read_text(encoding='utf-8')
+        content = (tmp_path / 'failed' / 'c1_seg0001-1f098b794d.txt').read_text(encoding='utf-8')
         assert content == (
             'segment: c1_seg0001\nmodel: haiku\ntime: STAMP\nerror: final message\n\n'
             '=== request ===\nTHE PROMPT\n\n'
             '=== attempt 1: first ===\nR1\n\n'
             '=== attempt 2: second ===\n' + 'x' * 20000 + '\n')
+
+
+# --- Review round 1 ---------------------------------------------------------------
+
+from src.core.translator import remove_failure_log
+from src.llm import BackendUnavailableError
+from src.llm.claude_cli import ClaudeCLI
+from src.llm.cli import ProcessResult
+
+
+class TestFailureLogNames:
+    """Item 21: distinct ids never share a failure log file."""
+
+    def test_ids_with_same_sanitized_form(self, tmp_path):
+        a = failure_log_path(str(tmp_path), 'a/b_seg0001')
+        b = failure_log_path(str(tmp_path), 'a_b_seg0001')
+        assert a != b
+        assert os.path.basename(a).startswith('a_b_seg0001-')
+
+    def test_success_of_one_keeps_the_other_log(self, tmp_path):
+        seg_a, seg_b = _seg('a/b_seg0001'), _seg('a_b_seg0001')
+        translate_segment(_engine(FakeBackend([RefusalError('no')])), seg_a, [seg_a],
+                          log_dir=str(tmp_path))
+        translate_segment(_engine(FakeBackend(['譯文'])), seg_b, [seg_b], log_dir=str(tmp_path))
+        assert os.path.exists(failure_log_path(str(tmp_path), 'a/b_seg0001'))
+
+    def test_long_id_bounded(self, tmp_path):
+        name = os.path.basename(failure_log_path(str(tmp_path), 'x' * 1000))
+        assert len(name) == 100 + 1 + 10 + 4
+
+
+class TestDiagnosticWriteFailure:
+    """Item 9: a failure log that cannot be written does not lose the outcome."""
+
+    def test_outcome_returned_and_error_logged(self, tmp_path, caplog):
+        (tmp_path / 'failed').write_text('a file where the directory should be')
+        seg = _seg()
+        with caplog.at_level('ERROR', logger='src.core.translator'):
+            outcome = translate_segment(_engine(FakeBackend([RefusalError('no')])), seg, [seg],
+                                        log_dir=str(tmp_path))
+        assert outcome.status == SegmentStatus.FAILED
+        assert any('無法寫入失敗紀錄 c1_seg0001' in r.getMessage() for r in caplog.records)
+
+    def test_removal_failure_logged(self, tmp_path, caplog):
+        os.makedirs(failure_log_path(str(tmp_path), 'c1_seg0001'))  # a directory: cannot remove
+        seg = _seg()
+        with caplog.at_level('ERROR', logger='src.core.translator'):
+            outcome = translate_segment(_engine(FakeBackend(['譯文'])), seg, [seg],
+                                        log_dir=str(tmp_path))
+        assert outcome.status == SegmentStatus.TRANSLATED
+        assert any('無法移除失敗紀錄 c1_seg0001' in r.getMessage() for r in caplog.records)
+
+    def test_remove_failure_log_missing_file(self, tmp_path):
+        remove_failure_log(str(tmp_path), 'c1_seg0001')  # nothing to remove: no error
+
+
+class TestBoundedErrorText:
+    """Item 13: response-derived text is bounded in the log and in the issue."""
+
+    def test_huge_stderr_through_claude_classification(self, tmp_path):
+        huge = 'E' * 3_000_000
+        seg = _seg()
+        engine = TranslationEngine(model='haiku', backend=ClaudeCLI())
+        with patch('src.llm.cli.run_process', return_value=ProcessResult(1, '', huge)):
+            outcome = translate_segment(engine, seg, [seg], log_dir=str(tmp_path))
+        assert outcome.status == SegmentStatus.FAILED
+        assert len(outcome.issues[0].detail) <= 2000
+        size = os.path.getsize(failure_log_path(str(tmp_path), 'c1_seg0001'))
+        assert size < 3 * (20000 + 2000) + 20000
+
+    def test_huge_error_message_from_any_backend(self, tmp_path):
+        seg = _seg()
+        errors = [TransientError('M' * 1_000_000, raw='R')] * 3
+        outcome = translate_segment(_engine(FakeBackend(errors)), seg, [seg],
+                                    log_dir=str(tmp_path))
+        assert len(outcome.issues[0].detail) == 2000
+        # the prompt plus 4 bounded messages
+        assert os.path.getsize(failure_log_path(str(tmp_path), 'c1_seg0001')) < 20000
+
+
+class TestRunLevelErrors:
+    """Item 15: BackendUnavailableError is raised, never a FAILED outcome."""
+
+    def test_raised(self, tmp_path):
+        seg = _seg()
+        fake = FakeBackend([BackendUnavailableError('could not be started')])
+        with pytest.raises(BackendUnavailableError):
+            translate_segment(_engine(fake), seg, [seg], log_dir=str(tmp_path))
+        assert len(fake.requests) == 1
+        assert not os.path.exists(tmp_path / 'failed')
+
+
+class TestEngineDefaultModel:
+    """Item 12: the engine's default model is the backend's."""
+
+    def test_backend_default(self):
+        assert TranslationEngine(backend=FakeBackend()).model == 'fake-model'
