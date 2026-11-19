@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Phase 1, review rounds 1 to 3: each fixed behaviour is guarded by a test.
+"""Phase 1, review rounds 1 to 4: each fixed behaviour is guarded by a test.
 
 Puts each old behaviour back, one at a time, into a copy of the committed
 code (git archive HEAD, in a temporary directory removed afterwards) and
 runs the tests that guard it. Every revert must make at least one of them
 fail. Prints OK/MISS per revert and the number not detected.
+
+Round 4 moved the code of R3-1 and R3-9 (web), whose reverts follow it,
+and adds the reverts "R4-<item>".
 
 Usage:
     python3 scripts/verify/phase1_reverts.py [name-prefix ...]
@@ -319,8 +322,8 @@ r('R2-21 rate-limit message cut from long stdout',
 
 FAKE = 'src/llm/fake.py'
 r('R3-1 project replaced before the lock is taken',
-  [(PR, "        with project_mutex(project_dir):\n            if TaskManager().task_active(project_name):\n                return jsonify({'error': '專案正在翻譯中，請先停止翻譯再重新建立'}), 409\n            try:\n                lock = ProjectLock(project_dir)\n                lock.acquire()\n            except ProjectLockedError as e:\n                return jsonify({'error': str(e)}), 409\n            try:",
-    "        if True:\n            lock = ProjectLock(project_dir)\n            try:")],
+  [(PR, "        with project_mutex(project_dir):\n            if TaskManager().task_active(project_name):\n                return jsonify({'error': '專案正在翻譯中，請先停止翻譯再重新建立'}), 409\n            # Under the mutex: a delete cannot remove it before the lock\n            os.makedirs(project_dir, exist_ok=True)\n            try:\n                lock = ProjectLock(project_dir)\n                lock.acquire()\n            except ProjectLockedError as e:\n                return jsonify({'error': str(e)}), 409\n            try:",
+    "        os.makedirs(project_dir, exist_ok=True)\n        if True:\n            lock = ProjectLock(project_dir)\n            try:")],
   ['tests/test_web.py::TestRound3ReplaceProjectUnderLock'])
 r('R3-2 no Start for a stopped task',
   [(TPL, " || state === 'failed' || state === 'stopped'\">", " || state === 'failed'\">")],
@@ -368,7 +371,7 @@ r('R3-8 stale result in the failure drain reported as unsaved',
     '                if res.outcome is not None:\n')],
   ['tests/test_web.py::TestRound3StaleResultInFailureDrain'])
 r('R3-9 web run goes on after five unexpected failures',
-  [(T, '                if stop:\n                    raise RuntimeError(stop)\n', '')],
+  [(T, '                if stop and streak_stop is None:\n', '                if False:\n')],
   ['tests/test_web.py::TestRound3UnexpectedStreakWeb'])
 r('R3-9 sequential CLI goes on after five unexpected failures',
   [(CLI, '        if stop:\n            _stop_run(stop)\n', '')],
@@ -401,6 +404,36 @@ r('R3-12 late finish keeps unbounded output',
 r('R3-12 timeout raw not bounded',
   [(LLM, 'raw=(_text(e.output) + _text(e.stderr))[:KEPT_OUTPUT_CHARS])', 'raw=_text(e.output) + _text(e.stderr))')],
   ['tests/test_llm.py::TestRound3TimeoutOutputBounded'])
+
+r('R4-1 re-translation applied to a replaced project',
+  [(REV, '            if current is None or (current.html, current.text) != source:\n',
+    '            if current is None:\n')],
+  ['tests/test_web.py::TestRound4RetranslateAcrossReplacement'])
+r('R4-2 worker added on resume listed and counted before its start',
+  [(T, "                            task.active_workers += 1\n                            try:\n                                t.start()\n                            except Exception as e:\n                                # Not started: neither listed nor counted; the\n                                # task stays paused with the workers it has\n                                task.active_workers -= 1\n                                task.error = f'無法增加 worker：{e}'\n                                return False\n                            task._threads.append(t)\n",
+    '                            task._threads.append(t)\n                            task.active_workers += 1\n                            t.start()\n')],
+  ['tests/test_web.py::TestRound4ResumeWorkerStartFailure'])
+r('R4-3 streak stop discards in-flight results',
+  [(T, '                    streak_stop = stop\n                    with task._lock:\n                        task.stop_event.set()\n                        task.pause_event.set()\n',
+    '                    raise RuntimeError(stop)\n')],
+  ['tests/test_web.py::TestRound4StreakKeepsInFlightResults'])
+r('R4-4 source.epub written before the project is saved',
+  [(PR, '                    shutil.copy2(epub_path, tmp_epub_path)\n',
+    '                    shutil.copy2(epub_path, final_epub_path)\n                    shutil.copy2(epub_path, tmp_epub_path)\n')],
+  ['tests/test_web.py::TestRound4ReplacementFiles'])
+r('R4-5 stream of an ended task waits for events',
+  [(TRL, "        if status['state'] in ('completed', 'failed', 'stopped'):\n            return  # ended before this stream opened: its last event is gone\n", '')],
+  ['tests/test_web.py::TestRound4StreamAfterEnd'])
+r('R4-5 page keeps the stream of an ended task',
+  [(TPL, '                if (ended) {\n                    this.currentSegment = null;\n                    this.refreshFailedCount();\n                    this.eventSource.close();\n                    this.eventSource = null;\n                }\n', '')],
+  ['tests/test_web.py::TestRound4StreamAfterEnd'])
+r('R4-6 project directory created before the mutex',
+  [(PR, '        # A project of the same name is replaced', '        os.makedirs(project_dir, exist_ok=True)\n        # A project of the same name is replaced'),
+   (PR, '            # Under the mutex: a delete cannot remove it before the lock\n            os.makedirs(project_dir, exist_ok=True)\n', '')],
+  ['tests/test_web.py::TestRound4ReplacementFiles'])
+r('R4-6 old failure logs kept after a replacement',
+  [(PR, "                shutil.rmtree(os.path.join(project_dir, 'log', 'failed'), ignore_errors=True)\n", '')],
+  ['tests/test_web.py::TestRound4ReplacementFiles'])
 
 undetected = 0
 for name, edits, tests in R:
