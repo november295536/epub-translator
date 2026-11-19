@@ -36,7 +36,7 @@ EXTRACT_PROMPT = """你是一位專業的術語提取專家。請從以下英文
 4. 直接輸出 JSON，不要加任何說明或 markdown 格式
 
 範例輸出：
-[{{"term": "Built to Last", "translation": "基業長青", "category": "work"}}, {{"term": "heuristics", "translation": "捷思法", "category": "term"}}]
+[{{"term": "The Quiet Ledger", "translation": "靜默帳本", "category": "work"}}, {{"term": "heuristics", "translation": "捷思法", "category": "term"}}]
 
 文本：
 {text}"""
