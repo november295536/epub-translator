@@ -18,6 +18,7 @@ from src.core.translator import (
     UnexpectedStreak, record_failure_log, translate_segment,
 )
 from src.glossary.glossary_manager import GlossaryManager
+from src.core.migrate import MigrationError, migrate_project
 from src.epub.builder import EPUBBuilder
 
 
@@ -413,6 +414,26 @@ def export(project, fmt):
     builder = EPUBBuilder(project_dir)
     result_path = builder.build(output_path, fmt=fmt)
     click.echo(f"已輸出：{result_path}")
+
+
+@cli.command()
+@click.argument('project_dir', type=click.Path(exists=True, file_okay=False))
+@click.option('--dry-run', is_flag=True, default=False, help='Only report; write nothing')
+def migrate(project_dir, dry_run):
+    """Migrate a project to the block model (schema 2), once.
+
+    Writes nothing unless every chapter matches; keeps the previous
+    project.json as project.schema1.json.
+    """
+    try:
+        report = migrate_project(project_dir, dry_run=dry_run)
+    except (MigrationError, ProjectLockedError) as e:
+        click.echo(str(e))
+        sys.exit(1)
+    for line in report.lines():
+        click.echo(line)
+    if report.unmatched:
+        sys.exit(1)
 
 
 # --- Glossary CLI commands ---
