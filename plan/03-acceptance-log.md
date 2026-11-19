@@ -482,3 +482,329 @@ counting test functions and cases it also arrived at 444):
   every text prompt was not measured against real translations.
 - Mutation testing ran on Python 3.12.7 (the interpreter mutmut is installed in), the normal
   test command on 3.9.6; the full suite passes on both (444), but mutants were not run on 3.9.
+
+---
+
+## Phase 1 — Foundations
+
+Date: 2026-11-19. Branch: `phase-1/foundations`, from `main` after Phase 0. No new runtime
+dependency. Commands run in `<repo>` with `source venv/bin/activate` (Python 3.9.6 for the
+suite, 3.12.7 for mutmut, as in Phase 0).
+
+### 1. What was built
+
+| Item | Where | Main names |
+|---|---|---|
+| Backend interface (4.4) | `src/llm/base.py` | `Message`, `LLMRequest`, `LLMResponse`, `Usage`, `Capabilities`, `ModelInfo`, `LLMBackend` (Protocol); errors `LLMError` > `RateLimitError(retry_after)`, `AuthError`, `TransientError`, `RefusalError`, `CancelledError` |
+| CLI base class | `src/llm/cli.py` | `run_process` (the only process start for model calls: `Popen` in a new session, stdin empty, polls every 0.1 s for cancel and deadline, kills the process group), `CLIBackend` (environment cleaning via `env_remove`, working directory `tempfile.gettempdir()`, timeout → `TransientError`, start failure → `LLMError`), `flatten_prompt` |
+| Claude CLI backend | `src/llm/claude_cli.py` | `ClaudeCLI`: `build_command`, `parse_output`, `classify_error`, `list_models`; `MODELS` (the former `AVAILABLE_MODELS` data) |
+| Fake backend | `src/llm/fake.py` | `FakeBackend(replies=… or responder=…)`, records `requests` |
+| Backend selection | `src/llm/__init__.py` | `default_backend()` (returns `ClaudeCLI()`; tests replace it) |
+| One entry point | `src/core/translator.py` | `translate_segment()`, `TranslationOutcome`, `TranslationEngine.translate_reply()` (`translate()` kept, returns the text), `TranslationError(code, prompt, attempts)`, `write_failure_log` |
+| Segment state (4.3) | `src/core/project.py` | `SegmentStatus.FAILED`, `Issue`, `SegmentState.issues/revision/model/usage`, `ProjectManager.apply_outcome()`, `get_pending_segments(include_failed=)`, `ProjectLock`, `ProjectLockedError` |
+| Call sites | `src/web/tasks.py`, `src/web/blueprints/review.py`, `translate.py` | web worker + coordinator `_apply_result`; re-translate endpoint; CLI `_start_sequential`, `_start_parallel` |
+| Term extraction | `src/glossary/term_extractor.py`, `src/web/blueprints/glossary.py`, `translate.py` | `TermExtractor(model=…, backend=…)`; both callers pass the project model |
+| FAILED in the UI | `search.py`, `translation.py`, `server.py`, templates, `style.css` | search includes FAILED; `retry_failed` on the start API and a button on the translation tab; failed count on the overview; issue detail as the status tooltip in review; 409 on a save while another process holds the lock |
+| Version | `src/__init__.py`, `translate.py` | `__version__ = "1.0.0"`, `--version` |
+| Check script | `scripts/verify/phase1_load_projects.py` | per project: counts by status, PASS/FAIL |
+
+Design choices where the plan left room:
+
+- **Lock.** An exclusive `fcntl.flock` on `<project>/project.lock` (the file holds the
+  holder's PID, for the message; it is left in place on release). Threads of one process
+  share the lock (a per-path count), other processes get `ProjectLockedError`. Taken by every
+  `save()` (briefly), by CLI `start` for the whole run, and by the web task from
+  `start_translation` until its coordinator ends. The kernel drops a flock when its holder
+  exits in any way, so a lock left by a dead process never blocks and no PID check is needed.
+  The file descriptor is not inherited by child processes. Not available on Windows (`fcntl`).
+- **Retry of FAILED.** A normal start (`get_pending_segments()`) skips FAILED segments. CLI:
+  `start --retry-failed`; web: `{"retry_failed": true}` on `/translate/start`, shown as a
+  "重試失敗段落（N）" button on the translation tab when N > 0. Selecting segments in the
+  search page (which now lists FAILED segments) and re-translating them also works.
+- **CLI exit code.** After a run in which some segments failed, the CLI prints the count and
+  the diagnostics directory and exits 1; all other segments are translated first. A rate
+  limit or an expired login still stops the run (exit 1), leaving the segment pending.
+- **CLI flags.** None added: `ClaudeCLI` runs `claude -p <prompt> --model <alias>` as before
+  (`-p/--print` and `--model` checked in `claude --help`, version 2.1.328). Plain-text output
+  has no usage, so `reports_usage` is false and usage is `None`. The system prompt and turns
+  are flattened by `flatten_prompt`; the translator sends one user message and no system
+  prompt, so the prompt text is byte-identical to before. Process changes: stdin is
+  `/dev/null` (before: inherited) and the process runs in its own session so cancel and
+  timeout kill its children too.
+- **Classification.** As before: "You've hit your limit" in stdout or stderr → rate limit;
+  `authentication_error|OAuth token has expired|please run /login` → auth (both whatever the
+  exit code); non-zero exit or timeout → transient (retried, 3 attempts); an empty reply after
+  cleanup → retried. New: the program missing (`OSError` on start) → `LLMError`, not retried
+  (before: an uncaught exception that killed the worker). Term extraction now also stops on a
+  rate limit (before: only on an auth error with a non-zero exit) and passes `--model`.
+- **Diagnostics.** `<project>/log/failed/<segment id>.txt` (characters outside `[\w.-]`
+  replaced by `_`): segment, model, time, error, the request, and per failed attempt its
+  message and raw output (stdout + stderr, at most 20 000 characters each). One file per
+  segment, replaced on each failed run: bounded by the number of segments. Removed when the
+  segment later translates; nothing is written for a success.
+- **Defaults omitted on save.** `issues` `[]`, `revision` 0, `model` `''`, `usage` `None` are
+  left out of each segment; `segmenter_version` 1 as in Phase 0. No new top-level field.
+  `load()` only reads.
+- **Revision.** `update_translation` and `mark_reviewed` (approve, with or without text)
+  increment it. The web worker records it when it takes a segment; the coordinator applies
+  the result only if it is unchanged (a dropped result is logged and counted as done). The
+  re-translate endpoint does the same around its own call and answers 409 if the segment was
+  edited meanwhile. The CLI holds the lock, so it passes no revision.
+- **Cancel.** `CLIBackend` honours the `threading.Event`; the callers pass none yet, so stop
+  and pause still wait for the in-flight call (terminating it is Phase 7).
+
+### 2. Test suite
+
+```
+$ python3 -m pytest tests/ -q
+622 passed, 32 warnings in 66.09s
+```
+
+444 before the phase; 578 at the first submission, 622 after the mutation work (section 6).
+New test file `tests/test_llm.py`; new classes in `test_project.py`,
+`test_translator.py`, `test_cli.py`, `test_web.py`, `test_glossary.py`,
+`test_verify_scripts.py`. An autouse fixture in `tests/conftest.py` stubs `run_process`, so no
+test can start the real `claude` (a call reaching it fails like an error exit); the tests of
+`run_process` itself start short Python child processes. No test was removed. Changed tests:
+
+- 46 + 9 tests patched `subprocess.run` in `src.core.translator` / `src.glossary.term_extractor`;
+  they now patch `src.llm.cli.run_process` (same arguments: command list, `timeout`, `cwd`,
+  `env`; same result object), unchanged otherwise.
+- `test_subprocess_called_with_timeout` no longer asserts `capture_output`/`text` keyword
+  arguments, which `run_process` does not take (it always captures text).
+- 10 web tests patched `TranslationEngine` in `src.web.tasks` / `src.web.blueprints.review`;
+  they now use `FakeBackend` through `default_backend()` with the same replies.
+  `test_retranslate_uses_project_model` asserts the model of the request instead of the
+  engine's constructor argument; `test_model_switch_during_translation` records the model of
+  each request instead of the engine's attribute.
+- `test_original_intact_if_write_fails` blocks the per-process temporary file name.
+
+Acceptance item → tests:
+
+| Item | Tests |
+|---|---|
+| failing segment, sequential and parallel CLI | `test_cli.py::TestCLIFailedSegments::test_failing_segment_recorded_and_rest_translated[1]`, `[3]` |
+| failing segment, web worker (1 and 3 workers) | `test_web.py::TestWorkerFailedSegment::test_failing_segment_recorded_and_rest_translated` |
+| FAILED retried only on request | `TestCLIFailedSegments::test_failed_not_retried_without_flag`, `TestWorkerFailedSegment::test_failed_queued_only_with_retry_failed`, `test_project.py::TestFailedStatus` |
+| stale-revision result dropped | `test_project.py::TestApplyOutcome` (5 tests), `test_web.py::TestEditDuringTranslation` (an edit through the review endpoint while the fake backend holds the call) |
+| second process cannot take the lock | `test_project.py::TestProjectLock::test_second_process_cannot_take_lock`, `test_save_refused_while_other_process_holds_lock`, `test_cli.py::TestCLILock::test_start_refused_while_other_process_holds_lock`, `test_web.py::TestWebProjectLock` (start and edit → 409) |
+| lock released on error / normal exit | `TestCLILock::test_lock_released_on_error[1]`, `[3]`, `test_lock_released_after_rate_limit_exit`, `test_lock_held_during_run_and_released_after`, `TestWebProjectLock::test_lock_released_when_loading_fails`, `…_when_coordinator_fails`, `…_when_nothing_to_translate`, `…_held_during_task_and_released_after` |
+| stale lock recoverable | `TestProjectLock::test_lock_of_killed_process_is_recoverable` (holder killed with SIGKILL) |
+| rate-limit / auth / transient classification | `test_llm.py::TestClaudeCLIClassification`, `TestCLIBackendComplete`, `test_translator.py::TestTranslateSegment::test_failure_is_an_outcome`, `test_run_level_errors_raised_without_retry`, and the existing `TestRateLimitDetection` through `run_process` |
+| cancel stops an in-flight call | `test_llm.py::TestRunProcess::test_cancel_stops_in_flight_call`, `test_cancel_kills_grandchildren` |
+| term extraction passes the project model | `test_web.py::TestTermExtractionModel`, `test_cli.py::TestCLIGlossaryExtract`, `test_glossary.py::TestTermExtractorBackend` |
+| failure diagnostics written and bounded | `test_translator.py::TestFailureDiagnostics` (3 failed runs with 50 000-character outputs → one file under 65 000 bytes) |
+| old project round-trips without new keys | `test_project.py::TestOldProjectCompatibility` (a `v1.0.0`-shaped `project.json`) |
+| `--version` | `test_cli.py::TestCLIVersion` |
+| usage recorded when reported | `TestApplyOutcome::test_success_records_text_model_and_usage`, `TestTranslateSegment::test_success` |
+
+### 3. New tests fail on the old code
+
+Running the branch's tests against `main`'s `src/`, `translate.py` and `scripts/` (in a copy
+under a temporary directory) stops at collection: the six changed test modules import
+`src.llm` or the new names, and the autouse fixture patches `src.llm.cli.run_process`.
+
+```
+$ python3 -m pytest tests/ -q        # tests from the branch, source from main
+ERROR tests/test_cli.py
+ERROR tests/test_llm.py
+ERROR tests/test_project.py
+ERROR tests/test_translator.py
+ERROR tests/test_verify_scripts.py - FileNotFoundError: …
+ERROR tests/test_web.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 6 errors during collection !!!!!!!!!!!!!!!!!!!!
+```
+
+That proves little, because the seams (`FakeBackend`, `run_process`) do not exist on `main`.
+So each old behaviour was also put back, one at a time, into a copy of the branch (after the
+mutation work), and the tests that guard it were run (a throw-away script in a temporary directory; each revert is a
+one-place text replacement):
+
+```
+OK   sequential CLI exits on a failed segment: 1 failed
+OK   parallel CLI stops all workers on a failed segment: 1 failed
+OK   web worker does not record a failed segment: 3 failed
+OK   result applied whatever the revision: 3 failed, 9 passed
+OK   manual edits do not change the revision: 3 failed, 9 passed
+OK   no project lock: 10 failed, 11 passed
+OK   new fields always written: 2 failed, 1 passed
+OK   FAILED queued by every start: 4 failed, 3 passed
+OK   failed re-translation attaches no issue: 1 failed
+OK   web term extraction without the project model: 1 failed
+OK   CLI term extraction without the project model: 1 failed
+OK   extraction continues after a rate limit: 1 failed
+OK   no failure diagnostics: 5 failed, 2 passed
+OK   cancel ignored: 1 failed
+OK   search skips FAILED: 1 failed
+OK   no --version: 1 failed
+reverts not detected: 0
+```
+
+("N passed" are tests in the same selection that guard something else, e.g. the lock tests
+that check the lock is free after release.) The mutation run (section 6) covers the rest.
+
+### 4. `subprocess` only in the backend module
+
+```
+$ grep -rn "subprocess" src/ translate.py | cut -d: -f1 | sort | uniq -c
+   9 src/llm/cli.py
+```
+
+### 5. Existing projects load unchanged
+
+```
+$ python3 scripts/verify/phase1_load_projects.py --projects-dir <repo>/projects --anonymize
+PASS project-1: segments 220, pending 0, translated 220, reviewed 0, failed 0
+PASS project-2: segments 291, pending 0, translated 291, reviewed 0, failed 0
+PASS project-3: segments 4385, pending 4349, translated 36, reviewed 0, failed 0
+PASS project-4: segments 2236, pending 903, translated 1333, reviewed 0, failed 0
+PASS project-5: segments 840, pending 7, translated 833, reviewed 0, failed 0
+PASS project-6: segments 581, pending 0, translated 581, reviewed 0, failed 0
+PASS project-7: segments 637, pending 74, translated 563, reviewed 0, failed 0
+PASS project-8: segments 331, pending 0, translated 331, reviewed 0, failed 0
+TOTAL projects 8  segments 9521  pending 5333  translated 4188  reviewed 0  failed 0  failed projects 0
+$ echo $?
+0
+```
+
+A project FAILs when loading raises, when `project.json`'s SHA-256 or modification time
+(nanoseconds) changed, or when the set of files in the project directory changed (so a
+created lock file would fail it). Size and modification time of every `project.json` and
+`project.lock` under `projects/` were also listed before and after the run: identical
+(no lock file exists there). Covered by `tests/test_verify_scripts.py::TestLoadCheck`.
+
+Round trip and `v1.0.0`, on copies of the 8 `project.json` files in a temporary directory
+(deleted afterwards): load and save with the branch, compare with the original, then load the
+saved file with `v1.0.0`'s `src/core/project.py`:
+
+```
+project-1: round-trip equal except updated_at True (top-level keys added: ['model']); v1.0.0 load ok
+project-2 … project-8: round-trip equal except updated_at True (top-level keys added: []); v1.0.0 load ok
+TOTAL 8/8
+```
+
+project-1 predates the `model` field; any save adds `model` there, as on `main` and in
+`v1.0.0` itself. And on synthetic projects saved by the branch: one with `model`, `revision`
+and `issues` on segments (no FAILED segment) loads with `v1.0.0` (its `load()` drops unknown
+segment keys); one with a FAILED segment does not (`ValueError: 'failed' is not a valid
+SegmentStatus`).
+
+### 6. Mutation testing
+
+`scripts/verify/mutation.sh` now has five groups: core (as in Phase 0), `llm` (`src/llm/*` with
+`test_llm.py`, `test_translator.py`, `test_glossary.py`), web (all changed blueprints and
+`server.py`, with the Phase 1 web test classes added to `-k`), cli, scripts (with
+`phase1_load_projects.py`). Only lines changed versus `main` are mutated.
+
+| run | mutants | killed | survived | timeout | suspicious |
+|---|---|---|---|---|---|
+| 1, first submission | 559 | 384 | 172 | 3 | 0 |
+| 2, after "test: kill surviving mutants of the Phase 1 code" | 532 | 509 | 18 | 5 | 0 |
+| 3, after "test: kill the remaining killable mutants…" | not finished when this entry was written | | | | |
+
+Run 1's survivors were mostly untested messages, event payloads, log lines, defaults and file
+formats. They were killed with exact tests, or the code was simplified so the mutant no longer
+exists (no defaults on internal dataclasses and arguments every caller passes; one issue per
+failed outcome; code segments pass their HTML, which code mode ignores; simpler coordinator
+loop; no fallbacks in the lock message).
+
+Run 2's 18 survivors and what was done:
+
+| location (run 2) | mutation | disposition |
+|---|---|---|
+| `project.py:374` | `flock(entry[0], LOCK_UN)` → `entry[1]` | code changed: the explicit unlock removed (closing the only descriptor drops the flock) |
+| `tasks.py:127` | `project_lock` default `None` → `""` | killed by `TestTaskWithoutLock` |
+| `translate.py:99` | `--retry-failed` help text wrapped in `XX` | killed: exact help test |
+| `phase1_load_projects.py:68`, `:70` | help texts wrapped in `XX` | killed: exact help test |
+| `project.py:68`, `tasks.py:127` | `X \| None` → `X & None` in an annotation | equivalent: annotations are strings under `from __future__ import annotations` and never evaluated |
+| `project.py:342`, `:368` | `self._held = False` → `None` | equivalent: `_held` is only tested for truth |
+| `project.py:356` | `os.read(fd, 32)` → `33` | equivalent while a PID has at most 32 digits (macOS/Linux PIDs have at most 7) |
+| `project.py:360` | `ftruncate(fd, 0)` → `1` | equivalent: the PID written next at offset 0 has at least one character and overwrites the kept byte |
+| `translator.py:405` | `glossary_text = ''` → `None` | equivalent: only its truth value is used (`if glossary_text`) |
+| `cli.py:23` | `POLL_SECONDS = 0.1` → `1.1` | performance-only: cancel and timeout are noticed up to 1.1 s later |
+| `cli.py:66` | `>= deadline` → `> deadline` | performance-only: differs only at exact float equality, by at most one more 0.1 s poll |
+| `tasks.py:386`, `:388` | post-batch exit check disabled (`workers_done = None`; `break` → `continue`) | performance-only: the loop then ends through the queue-timeout path, at most 1 s later |
+| `translate.py:248` | `get(timeout=0.5)` → `1.5` | performance-only: the result loop polls less often |
+| `phase1_load_projects.py:34` | `sys.path.insert(0, …)` → `insert(1, …)` | equivalent under the same condition as Phase 0's survivor 113 (default interpreter path settings) |
+
+The 5 timeouts of run 2 (`cli.py:23` `POLL_SECONDS = None`, `cli.py:54`
+`start_new_session=False`, `cli.py:63` `cancel is None`, `tasks.py` Empty path
+`workers_done = None` and `break` → `continue`) are detected: the tests do not finish.
+
+Expected for run 3: the 4 killed/changed rows above gone, the 11 equivalent or
+performance-only rows (13 mutants) left. Run 3 was started (`scripts/verify/mutation.sh`, about
+1 h) but had not finished when this entry was committed; its TOTAL line is not recorded here.
+
+### 7. One real call
+
+A synthetic project in a temporary directory with one invented sentence ("The small robot
+watered the tomato plants every morning before sunrise.", as `<p>` HTML), translated through
+the CLI (sequential path → `translate_segment` → `ClaudeCLI`) with the cheapest supported
+alias, from an export of the branch at the commit "chore: cover the Phase 1 modules and
+tests in the mutation run" (before the mutation work; the later commits do not change
+the command, the prompt of a text segment or how the outcome is stored, and the call was not
+repeated):
+
+```
+$ python3 translate.py start --project <tmp>/p --model haiku
+使用模型：haiku
+繼續翻譯：0/1 已完成 (0.0%)
+剩餘 1 個段落待翻譯
+
+[1/1] 翻譯段落 c1_seg0001...
+  ✓ 完成（11 字）
+
+全部翻譯完成！
+$ echo $?
+0
+```
+
+Stored segment (`html`/`text` omitted): `{'segment_id': 'c1_seg0001', 'chapter_id': 'c1',
+'word_count': 11, 'segment_type': 'text', 'status': 'translated', 'translated_text':
+'<p>小機器人每天日出前都會替番茄植株澆水。</p>', 'translated_at': '2026-11-19 18:10:40',
+'model': 'haiku'}`; project `model: haiku`. One call, first attempt, about 3 s wall time. The
+project directory held `project.json` and `project.lock` afterwards, and no `log/` directory
+(nothing is written for a success). Usage: not reported by this invocation, so not stored.
+
+### Known consequences
+
+- A project stops being loadable by `v1.0.0` (and by `main` before this phase) as soon as one
+  of its segments is saved with status `failed`: `v1.0.0`'s `load()` raises
+  `ValueError: 'failed' is not a valid SegmentStatus`. Retrying the segment successfully
+  makes it loadable again. The new per-segment fields (`issues`, `revision`, `model`, `usage`)
+  do not break `v1.0.0`, which drops unknown segment keys. A project with no failed segment
+  that existed before Phase 0 stays loadable (Phase 0's `segmenter_version` rule unchanged).
+- Each project directory gets a `project.lock` file at its first save (never on load). Saving
+  a project while another process holds its lock fails: CLI `start` exits 1 with the holder's
+  PID; web saves answer 409. Two web server processes on the same `projects/` exclude each
+  other in the same way.
+- The CLI exits 1 after a run with failed segments (it used to exit 1 at the first failure).
+- Term extraction now passes the project model (before: the CLI's default model) and stops
+  with an error on a rate limit.
+- The temporary file of `save()` is `project.json.<pid>.tmp` (was `project.json.tmp`).
+- A worker result for a segment edited mid-flight is dropped and counted as done in the
+  progress of that run.
+- The web coordinator ends only when all workers have exited *and* the result queue is empty.
+  Before, it ended on a queue timeout as soon as no worker was active, so a result put just
+  before the last worker exited could in principle be lost; it also had a separate final
+  drain, now removed.
+- Windows is not supported by the lock (`fcntl`).
+
+### Not done
+
+- The backend name is not stored in `project.json` (only one backend exists).
+- Stop/pause do not cancel the in-flight call: callers pass no cancel event yet (Phase 7).
+- Rate limiting is not owned by the backend instance (no queueing); workers still pause on
+  `RateLimitError` as before. `retry_after` is always `None` for the Claude CLI.
+- Validation on save/approve and at export (4.3) belongs to Phase 4.
+- Glossary writes (`glossary.json`) are not under the project lock.
+- `CLAUDE.md` is not updated (still describes `subprocess.run` in the translator).
+
+### Not verified
+
+- Only one real call was made (above). Rate-limit, auth and timeout handling against the real
+  CLI were not exercised; their patterns are those of the old code, tested with stubs.
+- Term extraction through the real CLI was not run.
+- The web UI changes (retry button, failed card, tooltip) were checked by rendering the
+  templates in tests, not in a browser.
+- Mutation testing ran on Python 3.12.7, the suite on 3.9.6 (both pass).
