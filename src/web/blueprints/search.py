@@ -37,7 +37,7 @@ def search_page(project_name: str):
 
 @search_bp.route('/api/projects/<project_name>/search-segments', methods=['POST'])
 def search_segments(project_name: str):
-    """Search translated/reviewed segments by text or translation content.
+    """Search translated, reviewed and failed segments by text or translation content.
 
     Request: { "query": "machine learning" }
     Response: { "segments": [...], "total": N, "truncated": bool }
@@ -52,7 +52,8 @@ def search_segments(project_name: str):
 
     results = []
     for seg in pm.data.segments:
-        if seg.status not in (SegmentStatus.TRANSLATED, SegmentStatus.REVIEWED):
+        # FAILED segments are included so they can be found and re-translated
+        if seg.status == SegmentStatus.PENDING:
             continue
 
         text_match = query_lower in seg.text.lower()

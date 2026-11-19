@@ -20,6 +20,12 @@
             <div class="stat-card-value text-orange">{{ progress.pending }}</div>
             <div class="stat-card-label">待處理</div>
         </div>
+        {% if progress.failed %}
+        <div class="stat-card">
+            <div class="stat-card-value">{{ progress.failed }}</div>
+            <div class="stat-card-label">翻譯失敗</div>
+        </div>
+        {% endif %}
     </div>
 
     <!-- Word count -->

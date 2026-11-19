@@ -392,3 +392,274 @@ class TestAtomicSave:
         assert seg2.status == SegmentStatus.PENDING
 
 
+
+
+# --- Phase 1: FAILED status, issues, revision, compatibility, lock -------------
+
+from src.core.project import Issue, ProjectLock, ProjectLockedError
+from src.core.translator import TranslationOutcome
+from src.llm import Usage
+from tests.conftest import hold_lock_in_child, lock_free_for_other_process
+
+
+def _ok(text='譯文', model='haiku', usage=None):
+    return TranslationOutcome(text=text, status=SegmentStatus.TRANSLATED,
+                              model=model, usage=usage)
+
+
+def _failed(detail='boom'):
+    return TranslationOutcome(text=None, status=SegmentStatus.FAILED, model='haiku',
+                              issues=[Issue('backend', 'transient', detail, True)])
+
+
+@pytest.fixture
+def pm(project_dir, sample_segments):
+    pm = ProjectManager(project_dir)
+    pm.create('/path/to/book.epub', 'Test', 'Author', sample_segments)
+    return pm
+
+
+class TestApplyOutcome:
+
+    def test_success_records_text_model_and_usage(self, pm):
+        assert pm.apply_outcome('ch1_seg0001', _ok(usage=Usage(10, 20))) is True
+        seg = pm.data.segments[0]
+        assert seg.status == SegmentStatus.TRANSLATED
+        assert seg.translated_text == '譯文'
+        assert seg.model == 'haiku'
+        assert seg.usage == {'input_tokens': 10, 'output_tokens': 20}
+        assert seg.translated_at
+        assert seg.issues == []
+
+    def test_failure_of_pending_segment_is_failed_with_issue(self, pm):
+        pm.apply_outcome('ch1_seg0001', _failed('timed out'))
+        seg = pm.data.segments[0]
+        assert seg.status == SegmentStatus.FAILED
+        assert seg.translated_text == ''
+        assert seg.issues == [Issue('backend', 'transient', 'timed out', True)]
+
+    @pytest.mark.parametrize('status', [SegmentStatus.TRANSLATED, SegmentStatus.REVIEWED])
+    def test_failed_retranslation_keeps_text_and_status(self, pm, status):
+        seg = pm.data.segments[0]
+        pm.apply_outcome('ch1_seg0001', _ok('舊譯文'))
+        seg.status = status
+        pm.apply_outcome('ch1_seg0001', _failed())
+        assert seg.status == status
+        assert seg.translated_text == '舊譯文'
+        assert seg.model == 'haiku'
+        assert [i.code for i in seg.issues] == ['transient']
+
+    def test_success_after_failure_clears_issues(self, pm):
+        pm.apply_outcome('ch1_seg0001', _failed())
+        pm.apply_outcome('ch1_seg0001', _ok())
+        seg = pm.data.segments[0]
+        assert seg.status == SegmentStatus.TRANSLATED
+        assert seg.issues == []
+
+    def test_result_for_older_revision_is_dropped(self, pm):
+        seg = pm.data.segments[0]
+        dispatched = seg.revision
+        pm.update_translation('ch1_seg0001', '人工譯文')  # edited mid-flight
+        assert pm.apply_outcome('ch1_seg0001', _ok('機器譯文'), revision=dispatched) is False
+        assert seg.translated_text == '人工譯文'
+        assert seg.status == SegmentStatus.PENDING
+
+    def test_failure_for_older_revision_is_dropped(self, pm):
+        seg = pm.data.segments[0]
+        dispatched = seg.revision
+        pm.mark_reviewed('ch1_seg0001', '人工譯文')
+        assert pm.apply_outcome('ch1_seg0001', _failed(), revision=dispatched) is False
+        assert seg.status == SegmentStatus.REVIEWED
+        assert seg.issues == []
+
+    def test_result_for_current_revision_is_applied(self, pm):
+        pm.update_translation('ch1_seg0001', '人工譯文')
+        seg = pm.data.segments[0]
+        assert pm.apply_outcome('ch1_seg0001', _ok(), revision=seg.revision) is True
+        assert seg.translated_text == '譯文'
+
+    def test_manual_edits_increment_revision(self, pm):
+        seg = pm.data.segments[0]
+        assert seg.revision == 0
+        pm.update_translation('ch1_seg0001', 'a')
+        pm.mark_reviewed('ch1_seg0001')
+        pm.mark_reviewed('ch1_seg0001', 'b')
+        assert seg.revision == 3
+        pm.apply_outcome('ch1_seg0001', _ok())
+        assert seg.revision == 3
+
+    def test_unknown_segment(self, pm):
+        with pytest.raises(ValueError):
+            pm.apply_outcome('nope', _ok())
+
+    def test_without_load(self, project_dir):
+        with pytest.raises(RuntimeError):
+            ProjectManager(project_dir).apply_outcome('x', _ok())
+
+
+class TestFailedStatus:
+
+    def test_failed_not_pending_unless_asked(self, pm):
+        pm.apply_outcome('ch1_seg0002', _failed())
+        ids = [s.segment_id for s in pm.get_pending_segments()]
+        assert ids == ['ch1_seg0001', 'ch1_seg0003']
+        ids = [s.segment_id for s in pm.get_pending_segments(include_failed=True)]
+        assert ids == ['ch1_seg0001', 'ch1_seg0002', 'ch1_seg0003']
+
+    def test_progress_and_chapters_count_failed(self, pm):
+        pm.apply_outcome('ch1_seg0002', _failed())
+        pm.apply_outcome('ch1_seg0001', _ok())
+        progress = pm.get_progress()
+        assert progress['failed'] == 1
+        assert progress['pending'] == 1
+        assert progress['translated'] == 1
+        assert progress['percent'] == 33.3
+        assert pm.get_chapters() == [{'chapter_id': 'ch1', 'total': 3, 'translated': 1,
+                                      'reviewed': 0, 'failed': 1}]
+
+    def test_failed_status_and_issues_persist(self, pm, project_dir):
+        pm.apply_outcome('ch1_seg0002', _failed('timed out'))
+        pm.save()
+        raw = json.load(open(os.path.join(project_dir, 'project.json')))
+        assert raw['segments'][1]['status'] == 'failed'
+        assert raw['segments'][1]['issues'] == [
+            {'kind': 'backend', 'code': 'transient', 'detail': 'timed out', 'blocking': True}]
+        pm2 = ProjectManager(project_dir)
+        pm2.load()
+        seg = pm2.data.segments[1]
+        assert seg.status == SegmentStatus.FAILED
+        assert seg.issues == [Issue('backend', 'transient', 'timed out', True)]
+
+
+# A project.json as written by the code at tag v1.0.0 (no Phase 0/1 fields)
+_V1_PROJECT = {
+    'epub_path': '/books/book.epub',
+    'project_dir': 'projects/book',
+    'title': 'Invented Title',
+    'author': 'Invented Author',
+    'created_at': '2026-01-01 10:00:00',
+    'updated_at': '2026-01-02 10:00:00',
+    'model': 'sonnet',
+    'segments': [
+        {'segment_id': 'c1_seg0001', 'chapter_id': 'c1', 'html': '<p>One.</p>',
+         'text': 'One.', 'word_count': 1, 'segment_type': 'text',
+         'status': 'reviewed', 'translated_text': '一。',
+         'translated_at': '2026-01-01 11:00:00'},
+        {'segment_id': 'c1_seg0002', 'chapter_id': 'c1', 'html': '<p>Two.</p>',
+         'text': 'Two.', 'word_count': 1, 'segment_type': 'text',
+         'status': 'translated', 'translated_text': '二。',
+         'translated_at': '2026-01-01 11:00:00'},
+        {'segment_id': 'c1_seg0003', 'chapter_id': 'c1', 'html': '<p>Three.</p>',
+         'text': 'Three.', 'word_count': 1, 'segment_type': 'text',
+         'status': 'pending', 'translated_text': '', 'translated_at': ''},
+    ],
+}
+
+
+class TestOldProjectCompatibility:
+
+    def _write(self, project_dir):
+        path = os.path.join(project_dir, 'project.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(_V1_PROJECT, f, ensure_ascii=False, indent=2)
+        return path
+
+    def test_round_trip_adds_no_keys(self, project_dir):
+        path = self._write(project_dir)
+        pm = ProjectManager(project_dir)
+        pm.load()
+        pm.save()
+        saved = json.load(open(path, encoding='utf-8'))
+        expected = dict(_V1_PROJECT, updated_at=saved['updated_at'])
+        assert saved == expected
+
+    def test_load_does_not_write(self, project_dir):
+        path = self._write(project_dir)
+        before = open(path, 'rb').read()
+        os.utime(path, (1_000_000, 1_000_000))
+        pm = ProjectManager(project_dir)
+        pm.load()
+        assert open(path, 'rb').read() == before
+        assert os.stat(path).st_mtime == 1_000_000
+        assert not os.path.exists(os.path.join(project_dir, ProjectLock.FILE))
+
+    def test_new_fields_written_only_when_not_default(self, project_dir):
+        path = self._write(project_dir)
+        pm = ProjectManager(project_dir)
+        pm.load()
+        pm.apply_outcome('c1_seg0003', _ok(model='haiku'))
+        pm.update_translation('c1_seg0001', '一！')
+        pm.save()
+        segs = json.load(open(path, encoding='utf-8'))['segments']
+        base = set(_V1_PROJECT['segments'][0])
+        assert set(segs[0]) == base | {'revision'}
+        assert set(segs[1]) == base
+        assert set(segs[2]) == base | {'model'}
+        assert segs[0]['revision'] == 1
+
+
+class TestProjectLock:
+
+    def test_second_process_cannot_take_lock(self, project_dir):
+        child = hold_lock_in_child(project_dir)
+        try:
+            with pytest.raises(ProjectLockedError, match=str(child.pid)):
+                ProjectLock(project_dir).acquire()
+        finally:
+            child.stdin.close()
+            child.wait(timeout=10)
+        # Released when the holder exits normally
+        with ProjectLock(project_dir):
+            pass
+
+    def test_save_refused_while_other_process_holds_lock(self, pm, project_dir):
+        child = hold_lock_in_child(project_dir)
+        try:
+            pm.mark_translated('ch1_seg0001', 'x')
+            with pytest.raises(ProjectLockedError):
+                pm.save()
+        finally:
+            child.stdin.close()
+            child.wait(timeout=10)
+        pm2 = ProjectManager(project_dir)
+        pm2.load()
+        assert pm2.data.segments[0].status == SegmentStatus.PENDING
+
+    def test_lock_of_killed_process_is_recoverable(self, project_dir):
+        child = hold_lock_in_child(project_dir)
+        child.kill()
+        child.wait(timeout=10)
+        assert os.path.exists(os.path.join(project_dir, ProjectLock.FILE))
+        with ProjectLock(project_dir):
+            assert not lock_free_for_other_process(project_dir)
+        assert lock_free_for_other_process(project_dir)
+
+    def test_same_process_shares_lock(self, project_dir):
+        outer = ProjectLock(project_dir)
+        outer.acquire()
+        try:
+            with ProjectLock(project_dir):
+                pass
+            # The inner release does not free the lock held by `outer`
+            assert not lock_free_for_other_process(project_dir)
+        finally:
+            outer.release()
+        assert lock_free_for_other_process(project_dir)
+
+    def test_acquire_and_release_are_idempotent(self, project_dir):
+        lock = ProjectLock(project_dir)
+        lock.acquire()
+        lock.acquire()
+        lock.release()
+        assert lock_free_for_other_process(project_dir)
+        lock.release()
+        assert lock_free_for_other_process(project_dir)
+
+    def test_save_does_not_hold_lock_afterwards(self, pm, project_dir):
+        pm.save()
+        assert lock_free_for_other_process(project_dir)
+
+    def test_lock_file_records_holder_pid(self, project_dir):
+        with ProjectLock(project_dir):
+            content = open(os.path.join(project_dir, ProjectLock.FILE)).read()
+        assert content == str(os.getpid())

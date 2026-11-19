@@ -6,9 +6,8 @@ import logging
 import os
 from flask import Blueprint, render_template, request, jsonify, current_app
 
-from src.core.project import ProjectManager
-from src.core.segmenter import SegmentType
-from src.core.translator import TranslationEngine, TranslationError, AuthError, get_context
+from src.core.project import ProjectManager, SegmentStatus
+from src.core.translator import AuthError, RateLimitError, TranslationEngine, translate_segment
 from src.glossary.glossary_manager import GlossaryManager
 from src.web.tasks import TaskManager, setup_project_logging, teardown_project_logging
 
@@ -104,42 +103,31 @@ def retranslate_segment(project_name: str, segment_id: str):
     gm = GlossaryManager(glossary_path)
     gm.load()
 
-    # Find glossary terms
-    glossary_text = ''
-    if gm.entries:
-        found = gm.terms_for_prompt(seg.text)
-        if found:
-            glossary_text = gm.format_for_prompt(found)
-
-    # Get context (previous and next segments)
-    context_before, context_after = get_context(pm.data.segments, segment_id)
-
     handler = setup_project_logging(project_dir)
     try:
         engine = TranslationEngine(model=pm.data.model)
-        html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
         logger.info("重新翻譯段落: %s (模型: %s)", segment_id, engine.model)
-        translated = engine.translate(
-            seg.text,
-            segment_type=seg.segment_type,
-            glossary_text=glossary_text,
-            context_before=context_before,
-            context_after=context_after,
-            html=html_arg,
-        )
-        pm.mark_translated(segment_id, translated)
+        revision = seg.revision
+        outcome = translate_segment(engine, seg, pm.data.segments, gm,
+                                    log_dir=os.path.join(project_dir, 'log'))
+        if not pm.apply_outcome(segment_id, outcome, revision=revision):
+            return jsonify({'error': '段落已在翻譯期間被編輯，未套用新譯文'}), 409
         pm.save()
+        if outcome.status == SegmentStatus.FAILED:
+            detail = '; '.join(i.detail for i in outcome.issues)
+            logger.warning("Translation error for %s: %s", segment_id, detail)
+            return jsonify({'error': detail}), 500
         logger.info("重新翻譯完成: %s (%s)", segment_id, engine.model)
         return jsonify({
             'status': 'ok',
             'segment_id': segment_id,
-            'translated_text': translated,
+            'translated_text': outcome.text,
         })
     except AuthError as e:
         logger.warning("Auth error during retranslation: %s", e)
         return jsonify({'error': str(e), 'auth_error': True}), 401
-    except TranslationError as e:
-        logger.warning("Translation error for %s: %s", segment_id, e)
+    except RateLimitError as e:
+        logger.warning("Rate limit during retranslation: %s", e)
         return jsonify({'error': str(e)}), 500
     finally:
         teardown_project_logging(handler)

@@ -22,7 +22,7 @@ class TestTranslationEngine:
         mock_result.returncode = 0
         mock_result.stdout = '這是翻譯結果。'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             result = engine.translate('This is the source text.')
 
         assert result == '這是翻譯結果。'
@@ -43,7 +43,7 @@ class TestTranslationEngine:
         mock_result.returncode = 0
         mock_result.stdout = '翻譯'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('test')
 
         prompt = mock_run.call_args[0][0][2]
@@ -62,7 +62,7 @@ class TestTranslationEngine:
         success_result.returncode = 0
         success_result.stdout = '翻譯結果'
 
-        with patch('src.core.translator.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    side_effect=[fail_result, success_result]) as mock_run:
             result = engine.translate('test')
 
@@ -76,7 +76,7 @@ class TestTranslationEngine:
         fail_result.returncode = 1
         fail_result.stderr = 'persistent error'
 
-        with patch('src.core.translator.subprocess.run', return_value=fail_result):
+        with patch('src.llm.cli.run_process', return_value=fail_result):
             with pytest.raises(TranslationError, match="failed after 2 attempts"):
                 engine.translate('test')
 
@@ -91,7 +91,7 @@ class TestTranslationEngine:
         success_result.returncode = 0
         success_result.stdout = '翻譯結果'
 
-        with patch('src.core.translator.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    side_effect=[empty_result, success_result]):
             result = engine.translate('test')
 
@@ -104,14 +104,14 @@ class TestTranslationEngine:
         empty_result.returncode = 0
         empty_result.stdout = '   '
 
-        with patch('src.core.translator.subprocess.run', return_value=empty_result):
+        with patch('src.llm.cli.run_process', return_value=empty_result):
             with pytest.raises(TranslationError, match="Empty translation"):
                 engine.translate('test')
 
     def test_timeout_handling(self):
         engine = TranslationEngine(max_retries=2)
 
-        with patch('src.core.translator.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    side_effect=subprocess.TimeoutExpired(cmd='claude', timeout=120)):
             with pytest.raises(TranslationError, match="timed out"):
                 engine.translate('test')
@@ -123,7 +123,7 @@ class TestTranslationEngine:
         success_result.returncode = 0
         success_result.stdout = '成功'
 
-        with patch('src.core.translator.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    side_effect=[
                        subprocess.TimeoutExpired(cmd='claude', timeout=120),
                        success_result,
@@ -138,13 +138,12 @@ class TestTranslationEngine:
         mock_result.returncode = 0
         mock_result.stdout = '翻譯'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('test')
 
+        # run_process always captures text output; only the timeout is passed
         call_kwargs = mock_run.call_args[1]
         assert call_kwargs['timeout'] == 120
-        assert call_kwargs['capture_output'] is True
-        assert call_kwargs['text'] is True
 
 
 class TestSubprocessIsolation:
@@ -158,7 +157,7 @@ class TestSubprocessIsolation:
         mock_result.returncode = 0
         mock_result.stdout = '翻譯'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('test')
 
         call_kwargs = mock_run.call_args[1]
@@ -175,7 +174,7 @@ class TestRateLimitDetection:
         mock_result.stdout = "You've hit your limit · resets 8pm (Asia/Taipei)"
         mock_result.stderr = ''
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             with pytest.raises(RateLimitError):
                 engine.translate('test')
 
@@ -187,7 +186,7 @@ class TestRateLimitDetection:
         mock_result.stdout = ''
         mock_result.stderr = "You've hit your limit · resets 8pm (Asia/Taipei)"
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             with pytest.raises(RateLimitError):
                 engine.translate('test')
 
@@ -200,7 +199,7 @@ class TestRateLimitDetection:
         mock_result.stdout = "You've hit your limit · resets 8pm (Asia/Taipei)"
         mock_result.stderr = ''
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             with pytest.raises(RateLimitError):
                 engine.translate('test')
 
@@ -264,7 +263,7 @@ class TestSegmentTypePrompts:
         mock_result.returncode = 0
         mock_result.stdout = 'def hello():\n    # 這是註解\n    print("Hello")'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('def hello():\n    # This is a comment\n    print("Hello")',
                            segment_type=SegmentType.CODE)
 
@@ -279,7 +278,7 @@ class TestSegmentTypePrompts:
         mock_result.stdout = '<h1>標題</h1>'
 
         html = '<h1>Introduction</h1>'
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('Introduction', segment_type=SegmentType.TEXT, html=html)
 
         prompt = mock_run.call_args[0][0][2]
@@ -293,7 +292,7 @@ class TestSegmentTypePrompts:
         mock_result.stdout = '翻譯'
 
         glossary = 'machine learning → 機器學習\ndeep learning → 深度學習'
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('test', glossary_text=glossary)
 
         prompt = mock_run.call_args[0][0][2]
@@ -306,7 +305,7 @@ class TestSegmentTypePrompts:
         mock_result.returncode = 0
         mock_result.stdout = '翻譯'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('current text',
                            context_before='previous text',
                            context_after='next text')
@@ -327,7 +326,7 @@ class TestHTMLMode:
         mock_result.stdout = '<p>翻譯結果</p>'
 
         html = '<p>Source text</p>'
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             result = engine.translate('Source text', segment_type=SegmentType.TEXT, html=html)
 
         prompt = mock_run.call_args[0][0][2]
@@ -342,7 +341,7 @@ class TestHTMLMode:
         mock_result.returncode = 0
         mock_result.stdout = '翻譯結果'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('Source text', segment_type=SegmentType.TEXT)
 
         prompt = mock_run.call_args[0][0][2]
@@ -354,7 +353,7 @@ class TestHTMLMode:
         mock_result.returncode = 0
         mock_result.stdout = 'code'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('code', segment_type=SegmentType.CODE, html='<pre><code>code</code></pre>')
 
         prompt = mock_run.call_args[0][0][2]
@@ -385,7 +384,7 @@ class TestHTMLMode:
 
         glossary = 'machine learning → 機器學習'
         html = '<p>Machine learning is important.</p>'
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('Machine learning is important.',
                            segment_type=SegmentType.TEXT, html=html, glossary_text=glossary)
 
@@ -414,7 +413,7 @@ class TestModelSelection:
         mock_result.returncode = 0
         mock_result.stdout = '翻譯'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('test')
 
         cmd = mock_run.call_args[0][0]
@@ -427,7 +426,7 @@ class TestModelSelection:
         mock_result.returncode = 0
         mock_result.stdout = '翻譯'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('test')
 
         cmd = mock_run.call_args[0][0]
@@ -439,7 +438,7 @@ class TestModelSelection:
         mock_result.returncode = 0
         mock_result.stdout = '翻譯'
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('test')
             assert mock_run.call_args[0][0][4] == 'sonnet'
 
@@ -475,7 +474,7 @@ class TestCodeResponseCleaning:
         mock_result.stdout = CODE_SAMPLE + '\n'
         mock_result.stderr = ''
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             result = engine.translate(CODE_SAMPLE, segment_type=SegmentType.CODE)
 
         assert result == CODE_SAMPLE
@@ -575,7 +574,7 @@ class TestCodeResponseCleaning:
         mock_result.returncode = 0
         mock_result.stdout = stdout
         mock_result.stderr = ''
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             return engine.translate(text, **kwargs)
 
     def test_text_without_html_gets_markdown_stripped(self):
@@ -597,7 +596,7 @@ class TestCodeResponseCleaning:
         mock_result.stdout = '看起來沒有註解需要翻譯：\n```python\n' + CODE_SAMPLE + '\n```\n'
         mock_result.stderr = ''
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             result = engine.translate(CODE_SAMPLE, segment_type=SegmentType.CODE)
 
         assert result == CODE_SAMPLE
@@ -616,7 +615,7 @@ class TestCodeResponseCleaning:
         empty.stdout = reply
         good.stdout = 'x = 1\n'
 
-        with patch('src.core.translator.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    side_effect=[empty, good]) as mock_run:
             assert engine.translate('x = 1', segment_type=SegmentType.CODE) == 'x = 1'
         assert mock_run.call_count == 2
@@ -631,7 +630,7 @@ class TestCodeResponseCleaning:
         empty.stdout = '```\n```'
         good.stdout = 'print("```")\n'
 
-        with patch('src.core.translator.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    side_effect=[empty, good]) as mock_run:
             assert engine.translate('print("```")',
                                     segment_type=SegmentType.CODE) == 'print("```")'
@@ -649,7 +648,7 @@ class TestCodeResponseCleaning:
         mock_result.stdout = source
         mock_result.stderr = ''
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             assert engine.translate(source, segment_type=segment_type) == source
 
     def test_text_reply_empty_after_cleanup_raises(self):
@@ -659,7 +658,7 @@ class TestCodeResponseCleaning:
         mock_result.stdout = '** **\n'   # markdown cleanup leaves only a space
         mock_result.stderr = ''
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             with pytest.raises(TranslationError, match='Empty translation'):
                 engine.translate('Some text.')
 
@@ -673,7 +672,7 @@ class TestCodeResponseCleaning:
         empty.stdout = reply
         good.stdout = '一些文字。\n'
 
-        with patch('src.core.translator.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    side_effect=[empty, good]) as mock_run:
             assert engine.translate('Some text.', html=html) == '一些文字。'
         assert mock_run.call_count == 2
@@ -685,7 +684,7 @@ class TestCodeResponseCleaning:
         mock_result.stdout = '```html\n```\n'
         mock_result.stderr = ''
 
-        with patch('src.core.translator.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    return_value=mock_result) as mock_run:
             with pytest.raises(TranslationError, match='Empty translation'):
                 engine.translate('Some text.')
@@ -701,7 +700,7 @@ class TestCodeResponseCleaning:
         mock_result.stdout = '以下是翻譯結果：\n'
         mock_result.stderr = ''
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             assert engine.translate(LONG_SOURCE, html=html) == '以下是翻譯結果：'
 
     def test_long_one_line_translation_starting_with_commentary_word_accepted(self):
@@ -712,7 +711,7 @@ class TestCodeResponseCleaning:
         mock_result.stdout = reply + '\n'
         mock_result.stderr = ''
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             assert engine.translate(
                 'Of course, there are exceptions to this rule, and we will discuss '
                 'them in more detail in the next chapter.') == reply
@@ -732,7 +731,7 @@ class TestCodeResponseCleaning:
         mock_result.stdout = reply
         mock_result.stderr = ''
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             assert engine.translate(source) == reply.strip()
 
     def test_code_whitespace_only_output_is_empty(self):
@@ -742,7 +741,7 @@ class TestCodeResponseCleaning:
         mock_result.stdout = '  \n\n'
         mock_result.stderr = ''
 
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             with pytest.raises(TranslationError, match='Empty translation'):
                 engine.translate('x = 1', segment_type=SegmentType.CODE)
 
@@ -837,3 +836,190 @@ class TestContext:
         assert get_context(segments, 'a_1') == ('', 'Two.')
         assert get_context(segments, 'a_2') == ('One.', '')
         assert get_context(segments, 'missing') == ('', '')
+
+
+# --- Phase 1: translate_segment, outcome, diagnostics --------------------------
+
+import os
+import threading
+
+from src.core.project import SegmentStatus
+from src.core.translator import (
+    TranslationOutcome, failure_log_path, translate_segment,
+)
+from src.llm import (
+    AuthError, CancelledError, LLMError, LLMResponse, RefusalError, TransientError, Usage,
+)
+from src.llm.fake import FakeBackend
+
+
+def _seg(seg_id='c1_seg0001', text='One sentence.', seg_type='text'):
+    return SegmentState(segment_id=seg_id, chapter_id='c1', html=f'<p>{text}</p>',
+                        text=text, word_count=2, segment_type=seg_type)
+
+
+def _engine(fake, model='haiku', max_retries=3):
+    return TranslationEngine(model=model, backend=fake, max_retries=max_retries)
+
+
+class TestTranslateSegment:
+
+    def test_success(self, tmp_path):
+        fake = FakeBackend([LLMResponse('<p>一句話。</p>', 'complete', Usage(5, 7), 'haiku')])
+        seg = _seg()
+        outcome = translate_segment(_engine(fake), seg, [seg], log_dir=str(tmp_path))
+        assert outcome == TranslationOutcome(text='<p>一句話。</p>',
+                                             status=SegmentStatus.TRANSLATED, issues=[],
+                                             model='haiku', usage=Usage(5, 7))
+        assert fake.requests[0].model == 'haiku'
+        assert fake.requests[0].timeout == 120
+        assert '<p>One sentence.</p>' in fake.prompts[0]
+        assert not os.path.exists(tmp_path / 'failed')
+
+    def test_usage_none_when_backend_reports_none(self):
+        seg = _seg()
+        outcome = translate_segment(_engine(FakeBackend(['譯文'])), seg, [seg])
+        assert outcome.usage is None
+
+    def test_glossary_and_context(self):
+        class Glossary:
+            entries = {'x': 1}
+
+            def terms_for_prompt(self, text):
+                return ['GLOSSMARK'] if 'One' in text else []
+
+            def format_for_prompt(self, found):
+                return 'GLOSSMARK → 詞彙'
+
+        segs = [_seg('c1_seg0001', 'Before it.'), _seg('c1_seg0002', 'One here.'),
+                _seg('c1_seg0003', 'After it.')]
+        fake = FakeBackend(['譯文'])
+        translate_segment(_engine(fake), segs[1], segs, Glossary())
+        prompt = fake.prompts[0]
+        assert 'GLOSSMARK → 詞彙' in prompt
+        assert 'Before it.' in prompt and 'After it.' in prompt
+
+    def test_code_segment_sent_as_code(self):
+        seg = _seg(text='x = 1  # set', seg_type='code')
+        fake = FakeBackend(['x = 1  # 設定'])
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert outcome.text == 'x = 1  # 設定'
+        assert '<p>' not in fake.prompts[0]
+
+    @pytest.mark.parametrize('replies,code,calls', [
+        ([TransientError('exit 1')] * 3, 'transient', 3),
+        (['', '  ', '```\n```'], 'empty_reply', 3),
+        ([RefusalError('no')], 'refusal', 1),
+        ([LLMError('could not be started')], 'error', 1),
+        ([TransientError('exit 1'), TransientError('exit 1'), '  '], 'empty_reply', 3),
+    ])
+    def test_failure_is_an_outcome(self, replies, code, calls):
+        fake = FakeBackend(list(replies))
+        seg = _seg()
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert outcome.status == SegmentStatus.FAILED
+        assert outcome.text is None
+        assert outcome.model == 'haiku'
+        assert len(outcome.issues) == 1
+        issue = outcome.issues[0]
+        assert (issue.kind, issue.code, issue.blocking) == ('backend', code, True)
+        assert len(fake.requests) == calls
+
+    def test_transient_then_success_retries(self):
+        fake = FakeBackend([TransientError('exit 1'), '譯文'])
+        seg = _seg()
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert outcome.status == SegmentStatus.TRANSLATED
+        assert len(fake.requests) == 2
+
+    @pytest.mark.parametrize('error', [RateLimitError('limit'), AuthError('login'),
+                                       CancelledError('cancelled')])
+    def test_run_level_errors_raised_without_retry(self, error, tmp_path):
+        fake = FakeBackend([error, '譯文'])
+        seg = _seg()
+        with pytest.raises(type(error)):
+            translate_segment(_engine(fake), seg, [seg], log_dir=str(tmp_path))
+        assert len(fake.requests) == 1
+        assert not os.path.exists(tmp_path / 'failed')
+
+    def test_cancel_event_reaches_backend(self):
+        seen = []
+
+        def responder(request):
+            return '譯文'
+
+        class Recording(FakeBackend):
+            def complete(self, request, cancel):
+                seen.append(cancel)
+                return super().complete(request, cancel)
+
+        cancel = threading.Event()
+        seg = _seg()
+        translate_segment(_engine(Recording(responder=responder)), seg, [seg], cancel=cancel)
+        assert seen == [cancel]
+
+    def test_engine_without_cancel_gets_an_unset_event(self):
+        seen = []
+
+        class Recording(FakeBackend):
+            def complete(self, request, cancel):
+                seen.append(cancel)
+                return super().complete(request, cancel)
+
+        _engine(Recording(['譯文'])).translate('x')
+        assert isinstance(seen[0], threading.Event) and not seen[0].is_set()
+
+    def test_engine_uses_default_backend(self):
+        from tests.conftest import use_fake_backend
+        fake = FakeBackend(['譯文'])
+        with use_fake_backend(fake):
+            engine = TranslationEngine(model='opus')
+        assert engine.backend is fake
+
+
+class TestFailureDiagnostics:
+
+    def _fail(self, tmp_path, replies, seg_id='c1_seg0001'):
+        seg = _seg(seg_id)
+        return translate_segment(_engine(FakeBackend(replies)), seg, [seg],
+                                 log_dir=str(tmp_path))
+
+    def test_request_and_raw_replies_written(self, tmp_path):
+        errors = [TransientError(f'exit {i}', raw=f'RAW-{i}') for i in (1, 2)]
+        self._fail(tmp_path, errors + ['   '])
+        files = os.listdir(tmp_path / 'failed')
+        assert files == ['c1_seg0001.txt']
+        content = (tmp_path / 'failed' / 'c1_seg0001.txt').read_text(encoding='utf-8')
+        assert 'segment: c1_seg0001' in content
+        assert 'model: haiku' in content
+        assert '=== request ===' in content
+        assert '<p>One sentence.</p>' in content          # the prompt sent
+        assert '=== attempt 1: exit 1 ===\nRAW-1' in content
+        assert '=== attempt 2: exit 2 ===\nRAW-2' in content
+        assert '=== attempt 3: empty reply ===\n   ' in content
+        assert 'error: Empty translation after 3 attempts' in content
+
+    def test_bounded_one_file_per_segment(self, tmp_path):
+        for _ in range(3):
+            self._fail(tmp_path, [TransientError('x', raw='y' * 50000)] * 3)
+        files = os.listdir(tmp_path / 'failed')
+        assert files == ['c1_seg0001.txt']
+        size = os.path.getsize(tmp_path / 'failed' / 'c1_seg0001.txt')
+        assert size < 3 * 20000 + 5000
+
+    def test_success_writes_nothing_and_removes_old_record(self, tmp_path):
+        self._fail(tmp_path, [RefusalError('no')])
+        assert os.listdir(tmp_path / 'failed') == ['c1_seg0001.txt']
+        self._fail(tmp_path, ['譯文'])
+        assert os.listdir(tmp_path / 'failed') == []
+
+    def test_unsafe_characters_in_id(self, tmp_path):
+        path = failure_log_path(str(tmp_path), 'OEBPS/ch 1.xhtml_seg0001')
+        assert path == os.path.join(str(tmp_path), 'failed', 'OEBPS_ch_1.xhtml_seg0001.txt')
+
+    def test_nothing_written_without_log_dir(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        seg = _seg()
+        outcome = translate_segment(_engine(FakeBackend([RefusalError('no')])), seg, [seg])
+        assert outcome.status == SegmentStatus.FAILED
+        assert os.listdir(tmp_path) == []

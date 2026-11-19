@@ -116,6 +116,7 @@ def extract_terms(project_name: str):
     # All text segments; TermExtractor splits them into bounded batches
     segments = [{'text': s.text} for s in pm.data.segments
                 if s.segment_type != SegmentType.CODE]
+    model = pm.data.model
 
     _extraction_tasks[project_name] = {
         'running': True,
@@ -130,7 +131,7 @@ def extract_terms(project_name: str):
 
     def run_extraction():
         try:
-            extractor = TermExtractor()
+            extractor = TermExtractor(model=model)
             terms = extractor.extract_from_segments(segments)
 
             # Add extracted terms to glossary

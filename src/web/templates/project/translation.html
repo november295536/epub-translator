@@ -15,6 +15,13 @@
                         開始翻譯
                     </button>
                 </template>
+                {% if progress.failed %}
+                <template x-if="state === 'idle' || state === 'completed' || state === 'failed'">
+                    <button class="btn btn-secondary" @click="startTranslation(true)" :disabled="starting">
+                        重試失敗段落（{{ progress.failed }}）
+                    </button>
+                </template>
+                {% endif %}
                 <template x-if="state === 'running'">
                     <button class="btn btn-secondary" @click="pauseTranslation()">
                         ⏸ 暫停
@@ -213,7 +220,7 @@ function translationController() {
             }
         },
 
-        async startTranslation() {
+        async startTranslation(retryFailed = false) {
             this.starting = true;
             this.error = null;
             this.logs = [];
@@ -221,7 +228,7 @@ function translationController() {
                 const res = await fetch('/api/projects/{{ project_name }}/translate/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ workers: parseInt(this.workers) }),
+                    body: JSON.stringify({ workers: parseInt(this.workers), retry_failed: retryFailed }),
                 });
                 const data = await res.json();
                 if (data.error) {

@@ -8,8 +8,8 @@ import click
 
 from src.epub.extractor import EPUBExtractor
 from src.core.segmenter import Segmenter, SegmentType
-from src.core.project import ProjectManager
-from src.core.translator import TranslationEngine, TranslationError, get_context
+from src.core.project import ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus
+from src.core.translator import AuthError, RateLimitError, TranslationEngine, translate_segment
 from src.glossary.glossary_manager import GlossaryManager
 from src.epub.builder import EPUBBuilder
 
@@ -93,13 +93,29 @@ def init(epub_file):
               default=None, help='Translation model (sonnet/opus/haiku)')
 @click.option('--workers', '-w', type=click.IntRange(1, 20), default=1,
               help='Number of parallel workers (1-20)')
-def start(project, model, workers):
+@click.option('--retry-failed', is_flag=True, default=False,
+              help='Also translate segments whose earlier translation failed')
+def start(project, model, workers, retry_failed):
     """Start or resume translation of pending segments."""
     project_dir = _find_project(project)
     if not project_dir:
         click.echo("找不到專案。請先執行 init 指令，或用 --project 指定專案目錄。")
         sys.exit(1)
 
+    # One writer per project: held for the whole run, released on any exit
+    lock = ProjectLock(project_dir)
+    try:
+        lock.acquire()
+    except ProjectLockedError as e:
+        click.echo(str(e))
+        sys.exit(1)
+    try:
+        _start(project_dir, model, workers, retry_failed)
+    finally:
+        lock.release()
+
+
+def _start(project_dir, model, workers, retry_failed):
     pm = ProjectManager(project_dir)
     pm.load()
 
@@ -107,9 +123,12 @@ def start(project, model, workers):
         pm.set_model(model)
         pm.save()
 
-    pending = pm.get_pending_segments()
+    pending = pm.get_pending_segments(include_failed=retry_failed)
     if not pending:
         click.echo("所有段落已翻譯完成！")
+        failed = pm.get_progress()['failed']
+        if failed:
+            click.echo(f"{failed} 個段落先前翻譯失敗，可用 start --retry-failed 重試。")
         return
 
     progress = pm.get_progress()
@@ -126,51 +145,50 @@ def start(project, model, workers):
 
     all_segments = pm.data.segments
 
+    log_dir = os.path.join(project_dir, 'log')
     if workers > 1:
-        _start_parallel(pm, gm, pending, all_segments, progress, workers)
+        failed = _start_parallel(pm, gm, pending, all_segments, progress, workers, log_dir)
     else:
-        _start_sequential(pm, gm, pending, all_segments, progress)
+        failed = _start_sequential(pm, gm, pending, all_segments, progress, log_dir)
 
     click.echo()
+    if failed:
+        click.echo(f"翻譯結束：{failed} 個段落翻譯失敗，其餘已完成。"
+                   f"失敗紀錄在 {os.path.join(log_dir, 'failed')}，可用 start --retry-failed 重試。")
+        sys.exit(1)
     click.echo("全部翻譯完成！")
 
 
-def _start_sequential(pm, gm, pending, all_segments, progress):
-    """Single-worker sequential translation (original path)."""
+def _stop_run(e):
+    """A rate limit or an expired login stops the whole run."""
+    click.echo(f"  ✗ {e}")
+    click.echo("翻譯中斷。已完成的進度已儲存，可用 start 繼續。")
+    sys.exit(1)
+
+
+def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
+    """Single-worker sequential translation. Returns the number of failed segments."""
     engine = TranslationEngine(model=pm.data.model)
+    failed = 0
 
     for i, seg in enumerate(pending, 1):
         click.echo(f"[{progress['translated'] + i}/{progress['total']}] 翻譯段落 {seg.segment_id}...")
-
-        glossary_text = ''
-        if gm.entries:
-            found = gm.terms_for_prompt(seg.text)
-            if found:
-                glossary_text = gm.format_for_prompt(found)
-
-        context_before, context_after = get_context(all_segments, seg.segment_id)
-
         try:
-            html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
-            translated = engine.translate(
-                seg.text,
-                segment_type=seg.segment_type,
-                glossary_text=glossary_text,
-                context_before=context_before,
-                context_after=context_after,
-                html=html_arg,
-            )
-            pm.mark_translated(seg.segment_id, translated)
-            pm.save()
+            outcome = translate_segment(engine, seg, all_segments, gm, log_dir=log_dir)
+        except (RateLimitError, AuthError) as e:
+            _stop_run(e)
+        pm.apply_outcome(seg.segment_id, outcome)
+        pm.save()
+        if outcome.status == SegmentStatus.FAILED:
+            failed += 1
+            click.echo(f"  ✗ 翻譯失敗：{outcome.issues[0].detail}")
+        else:
             click.echo(f"  ✓ 完成（{seg.word_count} 字）")
-        except TranslationError as e:
-            click.echo(f"  ✗ 翻譯失敗：{e}")
-            click.echo("翻譯中斷。已完成的進度已儲存，可用 start 繼續。")
-            sys.exit(1)
+    return failed
 
 
-def _start_parallel(pm, gm, pending, all_segments, progress, num_workers):
-    """Multi-worker parallel translation."""
+def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_dir):
+    """Multi-worker parallel translation. Returns the number of failed segments."""
     import threading
     import queue as queue_mod
 
@@ -179,7 +197,8 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers):
         seg_queue.put(seg)
 
     result_queue = queue_mod.Queue()
-    error_event = threading.Event()
+    error_event = threading.Event()  # rate limit or auth error: stop the run
+    stop_errors = []
     total = progress['total']
     base_translated = progress['translated']
 
@@ -193,29 +212,13 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers):
             except queue_mod.Empty:
                 break
 
-            glossary_text = ''
-            if gm.entries:
-                found = gm.terms_for_prompt(seg.text)
-                if found:
-                    glossary_text = gm.format_for_prompt(found)
-
-            context_before, context_after = get_context(all_segments, seg.segment_id)
-
             try:
-                html_arg = seg.html if seg.segment_type != SegmentType.CODE else ''
-                translated = engine.translate(
-                    seg.text,
-                    segment_type=seg.segment_type,
-                    glossary_text=glossary_text,
-                    context_before=context_before,
-                    context_after=context_after,
-                    html=html_arg,
-                )
-                result_queue.put((seg.segment_id, translated, seg.word_count, tag))
-            except TranslationError as e:
-                click.echo(f"  [{tag}] ✗ {seg.segment_id} 翻譯失敗：{e}")
+                outcome = translate_segment(engine, seg, all_segments, gm, log_dir=log_dir)
+            except (RateLimitError, AuthError) as e:
+                stop_errors.append(e)
                 error_event.set()
                 break
+            result_queue.put((seg.segment_id, outcome, seg.word_count, tag))
 
     actual_workers = min(num_workers, len(pending))
     threads = []
@@ -226,24 +229,28 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers):
 
     # Process results in main thread
     completed = 0
+    failed = 0
+
+    def apply(seg_id, outcome, word_count, tag):
+        nonlocal completed, failed
+        pm.apply_outcome(seg_id, outcome)
+        if outcome.status == SegmentStatus.FAILED:
+            failed += 1
+            click.echo(f"  [{tag}] ✗ {seg_id} 翻譯失敗：{outcome.issues[0].detail}")
+        else:
+            completed += 1
+            click.echo(f"  [{tag}] [{base_translated + completed}/{total}] ✓ {seg_id}（{word_count} 字）")
+
     while any(t.is_alive() for t in threads) or not result_queue.empty():
         try:
-            seg_id, translated, word_count, tag = result_queue.get(timeout=0.5)
+            apply(*result_queue.get(timeout=0.5))
         except queue_mod.Empty:
             continue
-        pm.mark_translated(seg_id, translated)
-        completed += 1
-        click.echo(f"  [{tag}] [{base_translated + completed}/{total}] ✓ {seg_id}（{word_count} 字）")
 
         # Batch: drain any immediately available results
-        batch_count = 0
         while True:
             try:
-                seg_id, translated, word_count, tag = result_queue.get_nowait()
-                pm.mark_translated(seg_id, translated)
-                completed += 1
-                batch_count += 1
-                click.echo(f"  [{tag}] [{base_translated + completed}/{total}] ✓ {seg_id}（{word_count} 字）")
+                apply(*result_queue.get_nowait())
             except queue_mod.Empty:
                 break
         pm.save()
@@ -252,8 +259,8 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers):
         t.join()
 
     if error_event.is_set():
-        click.echo("翻譯中斷。已完成的進度已儲存，可用 start 繼續。")
-        sys.exit(1)
+        _stop_run(stop_errors[0])
+    return failed
 
 
 @cli.command()
@@ -277,6 +284,7 @@ def status(project):
     click.echo(f"已翻譯：  {progress['translated']}")
     click.echo(f"已審閱：  {progress['reviewed']}")
     click.echo(f"待翻譯：  {progress['pending']}")
+    click.echo(f"失敗：    {progress['failed']}")
     click.echo(f"進度：    {progress['percent']}%")
 
 
@@ -400,7 +408,7 @@ def glossary_extract(project):
     pm.load()
 
     from src.glossary.term_extractor import TermExtractor
-    extractor = TermExtractor()
+    extractor = TermExtractor(model=pm.data.model)
 
     segments = [{'text': s.text} for s in pm.data.segments if s.segment_type == SegmentType.TEXT]
     click.echo(f"正在從 {len(segments)} 個文字段落中提取術語...")
