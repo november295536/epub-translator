@@ -448,6 +448,10 @@ class TestModelSelection:
             assert mock_run.call_args[0][0][4] == 'haiku'
 
 
+# A one-line source of more than 15 words that ends in a colon
+LONG_SOURCE = ('After the configuration file has been loaded and checked, '
+               'the output of the first run looks like this:')
+
 CODE_SAMPLE = (
     '    # load config\n'
     '    def __init__(self, *args, **kwargs):\n'
@@ -664,6 +668,7 @@ class TestCodeResponseCleaning:
         '```\n```',
         '以下是翻譯結果：\n',
         'Here is the translation:\n',
+        'Here is the translation\n',
     ])
     @pytest.mark.parametrize('html', ['', '<p>Some text.</p>'])
     def test_text_reply_only_fence_or_commentary_is_retried(self, reply, html):
@@ -676,11 +681,16 @@ class TestCodeResponseCleaning:
 
         with patch('src.core.translator.subprocess.run',
                    side_effect=[empty, good]) as mock_run:
-            assert engine.translate('Some text.', html=html) == '一些文字。'
+            assert engine.translate(LONG_SOURCE, html=html) == '一些文字。'
         assert mock_run.call_count == 2
 
+    @pytest.mark.parametrize('source', [
+        LONG_SOURCE,
+        'Some text.\nMore text.',
+        ' '.join(['word'] * 15) + ' this:',   # 16 words, ends in a colon
+    ])
     @pytest.mark.parametrize('reply', ['```html\n```\n', '以下是翻譯結果：\n'])
-    def test_text_reply_only_fence_or_commentary_exhausts(self, reply):
+    def test_text_reply_only_fence_or_commentary_exhausts(self, reply, source):
         engine = TranslationEngine(max_retries=2)
         mock_result = MagicMock()
         mock_result.returncode = 0
@@ -690,13 +700,16 @@ class TestCodeResponseCleaning:
         with patch('src.core.translator.subprocess.run',
                    return_value=mock_result) as mock_run:
             with pytest.raises(TranslationError, match='Empty translation'):
-                engine.translate('Some text.')
+                engine.translate(source)
         assert mock_run.call_count == 2
 
     @pytest.mark.parametrize('source, reply', [
         ('OK', '好的\n'),
         ('Of course', '當然\n'),
         ('Here are the steps:', '以下是步驟：\n'),
+        ("Here's an example.", '以下是一個範例：\n'),
+        ('Here is the translation', 'Here is the translation\n'),
+        (' '.join(['word'] * 14) + ' end.', '以下是翻譯結果：\n'),   # 15 words
         ('以下是：', '以下是：\n'),   # source left untranslated
         ('X', 'X\n'),
     ])

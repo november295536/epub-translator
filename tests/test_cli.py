@@ -127,7 +127,7 @@ class TestCLIStart:
 
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = '翻譯結果'
+        mock_result.stdout = '譯文'
 
         with patch('src.core.translator.subprocess.run', return_value=mock_result):
             result = runner.invoke(cli, ['start', '--project', full_path])
@@ -197,7 +197,7 @@ class TestCLIModelOption:
 
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = '翻譯結果'
+        mock_result.stdout = '譯文'
 
         with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
             result = runner.invoke(cli, ['start', '--project', full_path, '--model', 'opus'])
@@ -235,7 +235,7 @@ class TestCLIModelOption:
 
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = '翻譯結果'
+        mock_result.stdout = '譯文'
 
         with patch('src.core.translator.subprocess.run', return_value=mock_result) as mock_run:
             result = runner.invoke(cli, ['start', '--project', full_path])
@@ -260,7 +260,7 @@ class TestCLIWorkersOption:
 
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = '翻譯結果'
+        mock_result.stdout = '譯文'
 
         with patch('src.core.translator.subprocess.run', return_value=mock_result):
             result = runner.invoke(cli, ['start', '--project', full_path, '--workers', '3'])
@@ -278,7 +278,7 @@ class TestCLIWorkersOption:
 
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = '翻譯結果'
+        mock_result.stdout = '譯文'
 
         with patch('src.core.translator.subprocess.run', return_value=mock_result):
             result = runner.invoke(cli, ['start', '--project', full_path])
