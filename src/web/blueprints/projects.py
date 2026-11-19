@@ -153,21 +153,31 @@ def create_project():
         project_name = sanitize_project_name(data.get('project_name') or original_name)
         project_dir = os.path.join(projects_dir, project_name)
 
-        # Copy EPUB to project directory
         os.makedirs(project_dir, exist_ok=True)
-        final_epub_path = os.path.join(project_dir, 'source.epub')
+        # A project of the same name is replaced: as for a delete, no task,
+        # other process or request may use it meanwhile, and nothing of it
+        # is overwritten before that is known
+        with project_mutex(project_dir):
+            if TaskManager().task_active(project_name):
+                return jsonify({'error': '專案正在翻譯中，請先停止翻譯再重新建立'}), 409
+            try:
+                lock = ProjectLock(project_dir)
+                lock.acquire()
+            except ProjectLockedError as e:
+                return jsonify({'error': str(e)}), 409
+            try:
+                final_epub_path = os.path.join(project_dir, 'source.epub')
+                shutil.copy2(epub_path, final_epub_path)
 
-        import shutil
-        shutil.copy2(epub_path, final_epub_path)
-
-        # Create project
-        pm = ProjectManager(project_dir)
-        pm.create(
-            epub_path=final_epub_path,
-            title=metadata.get('title', '未知書名'),
-            author=metadata.get('author', '未知作者'),
-            segments=all_segments
-        )
+                pm = ProjectManager(project_dir)
+                pm.create(
+                    epub_path=final_epub_path,
+                    title=metadata.get('title', '未知書名'),
+                    author=metadata.get('author', '未知作者'),
+                    segments=all_segments
+                )
+            finally:
+                lock.release()
 
         # Clean up uploaded file
         if epub_path.startswith(get_uploads_dir()):
@@ -287,6 +297,9 @@ def delete_project(project_name: str):
     with project_mutex(project_dir):
         if TaskManager().task_active(project_name):
             return jsonify({'error': '專案正在翻譯中，請先停止翻譯再刪除'}), 409
+        # Not a project (no project.json): no lock file is created in it
+        if not os.path.isfile(os.path.join(project_dir, ProjectManager.PROJECT_FILE)):
+            return jsonify({'error': '專案不存在'}), 404
         try:
             lock = ProjectLock(project_dir)
             lock.acquire()

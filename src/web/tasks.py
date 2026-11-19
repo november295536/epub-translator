@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from src.core.project import ProjectLock, ProjectManager, SegmentStatus, project_mutex
 from src.core.translator import (
     AuthError, BackendUnavailableError, RateLimitError, TranslationEngine,
-    TranslationOutcome, record_failure_log, translate_segment,
+    TranslationOutcome, UnexpectedStreak, record_failure_log, translate_segment,
 )
 from src.glossary.glossary_manager import GlossaryManager
 
@@ -204,10 +204,14 @@ class TaskManager:
         mutex and its file lock (other processes; ProjectLockedError when
         another process has it) and yields the authoritative manager (the
         task's, otherwise a fresh load from disk). The caller saves inside
-        the block."""
+        the block. FileNotFoundError, before any lock file is created, when
+        the project does not exist."""
         project_dir = os.path.join(projects_dir, project_name)
-        with project_mutex(project_dir), ProjectLock(project_dir):
-            yield self.get_or_load_pm(project_name, projects_dir)
+        with project_mutex(project_dir):
+            if not os.path.isfile(os.path.join(project_dir, ProjectManager.PROJECT_FILE)):
+                raise FileNotFoundError('專案不存在')
+            with ProjectLock(project_dir):
+                yield self.get_or_load_pm(project_name, projects_dir)
 
     def task_active(self, project_name: str) -> bool:
         """True while a task of the project runs, is paused or is ending."""
@@ -407,22 +411,24 @@ class TaskManager:
             logger.info("翻譯開始: %s (共 %d 段待翻譯, %d workers, 模型: %s)",
                         task.project_name, task.total, num_workers, pm.data.model)
 
-            # Start worker threads
-            workers = []
+            # Start worker threads; _threads lists only those that started
+            with task._lock:
+                task.active_workers = num_workers
             for i in range(num_workers):
                 t = threading.Thread(
                     target=self._worker_loop,
                     args=(task, i),
                     daemon=True,
                 )
-                workers.append(t)
-            task._threads = workers
+                try:
+                    t.start()
+                except BaseException:
+                    with task._lock:
+                        task.active_workers -= num_workers - i  # never started
+                    raise
+                task._threads.append(t)
 
-            with task._lock:
-                task.active_workers = num_workers
-
-            for t in workers:
-                t.start()
+            streak = UnexpectedStreak()
 
             # Result processing loop
             while True:
@@ -456,6 +462,13 @@ class TaskManager:
                     unsaved.clear()
                     for res in accepted:
                         record_failure_log(log_dir, res.segment_id, res.outcome)
+
+                # Too many unexpected failures in a row: a run-level error
+                stop = None
+                for res in batch:
+                    stop = streak.add(res.outcome) or stop
+                if stop:
+                    raise RuntimeError(stop)
 
                 # Results that arrived meanwhile are taken by the next round
                 with task._lock:
@@ -495,13 +508,17 @@ class TaskManager:
             task.pause_event.set()
         for t in list(task._threads):
             t.join()
-        while True:
-            try:
-                res = task.result_queue.get_nowait()
-            except queue.Empty:
-                break
-            if res.outcome is not None:  # a skipped segment had nothing to save
-                unsaved.append(res.segment_id)
+        with task.pm.mutex:
+            while True:
+                try:
+                    res = task.result_queue.get_nowait()
+                except queue.Empty:
+                    break
+                # A skipped segment had nothing to save; a stale result
+                # (edited meanwhile) would have been dropped
+                if (res.outcome is not None
+                        and task.pm._find(res.segment_id).revision == res.revision):
+                    unsaved.append(res.segment_id)
         message = str(error)
         if unsaved:
             message += f'（{len(unsaved)} 個段落的結果未儲存：{", ".join(unsaved)}）'

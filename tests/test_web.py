@@ -2878,8 +2878,10 @@ class TestRound2UnsavedReport:
         error = [e for e in task.progress.get_all() if e['event'] == 'error'][0]
         assert error['data'] == {'error': 'disk full', 'unsaved': []}
 
-    def test_skipped_result_in_queue_not_reported(self):
-        task = TranslationTask(task_id='t', project_name=PROJECT_NAME, projects_dir='.')
+    def test_skipped_result_in_queue_not_reported(self, project_with_translations):
+        task = TranslationTask(task_id='t', project_name=PROJECT_NAME,
+                               projects_dir=project_with_translations)
+        _setup_task_pm(task, project_with_translations)  # a coordinator's task has one
         task.result_queue.put(TranslationResult('ch1_seg0002', None, 0))
         outcome = TranslationOutcome(text='x', status=SegmentStatus.TRANSLATED, issues=[],
                                      model='m', usage=None)
@@ -2976,3 +2978,335 @@ class TestRound2StartChecks:
             task, patcher = _start(project_with_translations, lambda r: '<p>譯</p>')
             _finish(task, patcher)
         assert owned and owned[0] is True
+
+
+# --- Review round 3 ---------------------------------------------------------------
+
+from src.core.translator import MAX_CONSECUTIVE_UNEXPECTED
+
+
+def _dir_snapshot(path):
+    """Name, size and modification time of every file under path."""
+    out = {}
+    for root, _, files in os.walk(path):
+        for name in files:
+            st = os.stat(os.path.join(root, name))
+            out[os.path.relpath(os.path.join(root, name), path)] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+class TestRound3ReplaceProjectUnderLock:
+    """Item 1: replacing a project of the same name takes the mutex and the
+    lock first; a refused request leaves its files untouched."""
+
+    NAME = 'replaceme'
+
+    def _create(self, client, sample_epub):
+        response = client.post('/api/projects', json={
+            'epub_path': sample_epub, 'project_name': self.NAME})
+        assert response.status_code == 200, response.get_json()
+        return response
+
+    def test_refused_while_other_process_holds_lock(self, client, project_with_translations,
+                                                    sample_epub):
+        TaskManager._instance = None
+        self._create(client, sample_epub)
+        project_dir = os.path.join(project_with_translations, self.NAME)
+        before = _dir_snapshot(project_dir)
+        child = hold_lock_in_child(project_dir)
+        try:
+            response = client.post('/api/projects', json={
+                'epub_path': sample_epub, 'project_name': self.NAME})
+        finally:
+            child.stdin.close()
+            child.wait(timeout=10)
+        assert response.status_code == 409
+        assert '另一個程序' in response.get_json()['error']
+        after = _dir_snapshot(project_dir)
+        # The child wrote its PID into the lock file; nothing else changed
+        before.pop('project.lock'), after.pop('project.lock')
+        assert after == before
+
+    def test_refused_while_task_active(self, client, project_with_translations, sample_epub):
+        TaskManager._instance = None
+        self._create(client, sample_epub)
+        project_dir = os.path.join(project_with_translations, self.NAME)
+        before = _dir_snapshot(project_dir)
+        in_flight, release = threading.Event(), threading.Event()
+
+        def respond(request):
+            in_flight.set()
+            assert release.wait(10)
+            return '<p>譯</p>'
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            task = TaskManager().start_translation(self.NAME, project_with_translations)
+            try:
+                assert in_flight.wait(10)
+                response = client.post('/api/projects', json={
+                    'epub_path': sample_epub, 'project_name': self.NAME})
+                during = _dir_snapshot(project_dir)
+            finally:
+                TaskManager().stop_translation(self.NAME)
+                release.set()
+                task._coordinator.join(20)
+        TaskManager._instance = None
+        assert response.status_code == 409
+        assert response.get_json() == {'error': '專案正在翻譯中，請先停止翻譯再重新建立'}
+        # The task's log and lock file aside, nothing changed
+        kept = ('log', 'project.lock')
+        assert {k: v for k, v in during.items() if not k.startswith(kept)} == \
+            {k: v for k, v in before.items() if not k.startswith(kept)}
+
+    def test_lock_held_while_files_are_written(self, client, project_with_translations,
+                                               sample_epub):
+        TaskManager._instance = None
+        self._create(client, sample_epub)
+        project_dir = os.path.join(project_with_translations, self.NAME)
+        seen = []
+        import shutil as _shutil
+        real_copy = _shutil.copy2
+
+        def copy(src, dst):
+            seen.append((project_mutex(project_dir)._is_owned(),
+                         lock_free_for_other_process(project_dir)))
+            return real_copy(src, dst)
+
+        with patch('src.web.blueprints.projects.shutil.copy2', copy):
+            self._create(client, sample_epub)
+        assert seen == [(True, False)]
+        assert lock_free_for_other_process(project_dir)
+
+
+class TestRound3StoppedTaskRestartable:
+    """Item 2: a stopped task offers Start; the page reacts to `stopped`."""
+
+    def test_start_after_stopped(self, client, project_with_translations):
+        in_flight, release = threading.Event(), threading.Event()
+
+        def respond(request):
+            in_flight.set()
+            assert release.wait(10)
+            return '<p>譯</p>'
+
+        task, patcher = _start(project_with_translations, respond)
+        assert in_flight.wait(10)
+        TaskManager().stop_translation(PROJECT_NAME)
+        release.set()
+        task._coordinator.join(20)
+        assert task.state == 'stopped'
+        tm = TaskManager()
+        response = client.post(f'/api/projects/{PROJECT_NAME}/translate/start', json={})
+        assert response.status_code == 200
+        tm.get_task(PROJECT_NAME)._coordinator.join(20)
+        patcher.stop()
+        TaskManager._instance = None
+
+    def test_page_offers_start_when_stopped(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
+        assert ("<template x-if=\"state === 'idle' || state === 'completed' "
+                "|| state === 'failed' || state === 'stopped'\">") in html
+        assert "'stopped': '已停止'," in html
+
+    def test_page_handles_stopped_event(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
+        start = html.index("addEventListener('stopped'")
+        handler = html[start:html.index('});', start)]
+        assert "this.state = 'stopped';" in handler
+        assert 'this.eventSource.close();' in handler
+        assert 'this.eventSource = null;' in handler
+
+
+class TestRound3WorkerStartFailure:
+    """Item 5: a failing worker start joins only the started workers."""
+
+    def test_second_worker_start_fails(self, project_with_translations):
+        real_start = threading.Thread.start
+        calls = []
+
+        def start(self):
+            calls.append(self)
+            if len(calls) == 3:  # coordinator, first worker, then this one
+                raise RuntimeError('no more threads')
+            return real_start(self)
+
+        hold = threading.Event()
+
+        def respond(request):
+            assert hold.wait(10)
+            return '<p>譯</p>'
+
+        with patch.object(threading.Thread, 'start', start):
+            task, patcher = _start(project_with_translations, respond, num_workers=3)
+            hold.set()
+            _finish(task, patcher)
+        assert task.state == 'failed'
+        assert task.error.startswith('no more threads')
+        assert task.active_workers == 0
+        assert len(task._threads) == 1 and not task._threads[0].is_alive()
+        assert lock_free_for_other_process(os.path.join(project_with_translations,
+                                                        PROJECT_NAME))
+
+
+class TestRound3InitialStatusError:
+    """Item 6: the initial SSE status carries the retained error, and no event
+    sent after the snapshot is lost."""
+
+    def _task(self, projects_dir, **kwargs):
+        TaskManager._instance = None
+        task = TranslationTask(task_id='t', project_name=PROJECT_NAME,
+                               projects_dir=projects_dir, total=3, **kwargs)
+        TaskManager().tasks[PROJECT_NAME] = task
+        return task
+
+    def test_status_includes_error(self, client, project_with_translations):
+        task = self._task(project_with_translations, state='paused',
+                          error='找不到程式')
+        response = client.get(f'/api/projects/{PROJECT_NAME}/translate/stream',
+                              buffered=False)
+        first = next(iter(response.response)).decode('utf-8')
+        response.close()
+        assert first == ('event: status\ndata: {"state": "paused", "completed": 0, '
+                         '"total": 3, "error": "找不到程式"}\n\n')
+        TaskManager._instance = None
+
+    def test_event_after_snapshot_delivered(self, client, project_with_translations):
+        task = self._task(project_with_translations, state='running')
+        response = client.get(f'/api/projects/{PROJECT_NAME}/translate/stream',
+                              buffered=False)
+        chunks = iter(response.response)
+        assert next(chunks).startswith(b'event: status')
+        task.state = 'completed'
+        task.progress.put({'event': 'complete', 'data': {'total_translated': 3}})
+        rest = b''.join(chunks).decode('utf-8')
+        assert 'event: complete' in rest
+        TaskManager._instance = None
+
+    def test_page_shows_initial_error(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
+        start = html.index("addEventListener('status'")
+        handler = html[start:html.index('});', start)]
+        assert 'if (data.error) this.error = data.error;' in handler
+
+
+class TestRound3StaleResultInFailureDrain:
+    """Item 8: a stale result drained after a coordinator failure is not
+    reported as unsaved."""
+
+    def test_edited_in_flight_segment_not_unsaved(self, project_with_translations):
+        in_flight, release = threading.Event(), threading.Event()
+
+        def respond(request):
+            if '>Chapter 2<' in request.messages[-1].content:
+                in_flight.set()
+                assert release.wait(10)
+            return '<p>譯</p>'
+
+        TaskManager._instance = None
+        with patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
+            task, patcher = _start(project_with_translations, respond,
+                                   segment_ids=['ch1_seg0003', 'ch2_seg0001'],
+                                   num_workers=2)
+            assert in_flight.wait(10)
+            task.pm.update_translation('ch2_seg0001', '人工')  # edited while in flight
+            release.set()
+            _finish(task, patcher)
+        assert task.state == 'failed'
+        error = [e for e in task.progress.get_all() if e['event'] == 'error'][0]
+        assert error['data'] == {'error': 'disk full（1 個段落的結果未儲存：ch1_seg0003）',
+                                 'unsaved': ['ch1_seg0003']}
+
+
+class TestRound3UnexpectedStreakWeb:
+    """Item 9: five unexpected failures in a row end the web run."""
+
+    def _project(self, projects_dir, n):
+        project_dir = os.path.join(projects_dir, PROJECT_NAME)
+        pm = ProjectManager(project_dir)
+        pm.create('/path/to/book.epub', 'Test Book', 'Author', [
+            Segment(id=f'ch1_seg{i:04d}', html=f'<p>Line {i}.</p>', text=f'Line {i}.',
+                    word_count=2, segment_type=SegmentType.TEXT) for i in range(1, n + 1)])
+
+    def test_run_stops_after_five(self, project_with_translations):
+        self._project(project_with_translations, 8)
+        holder, calls = {}, []
+
+        def respond(request):
+            calls.append(1)
+            if len(calls) > MAX_CONSECUTIVE_UNEXPECTED:
+                # The sixth call ends only once the run has been stopped
+                _wait(lambda: 'task' in holder and holder['task'].stop_event.is_set())
+            return {}['missing']
+
+        task, patcher = _start(project_with_translations, respond)
+        holder['task'] = task
+        _finish(task, patcher)
+        assert len(calls) == 6
+        assert task.state == 'failed'
+        assert task.error == ("連續 5 個段落發生未預期的錯誤，翻譯已停止"
+                              "（最後一個：未預期的錯誤：KeyError: 'missing'）"
+                              "（1 個段落的結果未儲存：ch1_seg0006）")
+        segs = _load(project_with_translations)
+        statuses = [segs[f'ch1_seg{i:04d}'].status for i in range(1, 9)]
+        assert statuses[:5] == [SegmentStatus.FAILED] * 5
+        assert statuses[5:] == [SegmentStatus.PENDING] * 3
+        error = [e for e in task.progress.get_all() if e['event'] == 'error'][0]
+        assert error['data'] == {'error': task.error, 'unsaved': ['ch1_seg0006']}
+
+    def test_success_resets_the_count(self, project_with_translations):
+        self._project(project_with_translations, 9)
+
+        def respond(request):
+            if '>Line 5.<' in request.messages[-1].content:
+                return '<p>譯</p>'
+            return {}['missing']
+
+        task, patcher = _start(project_with_translations, respond)
+        _finish(task, patcher)
+        assert task.state == 'completed'
+        segs = _load(project_with_translations)
+        assert [s.status for s in segs.values()].count(SegmentStatus.FAILED) == 8
+
+
+class TestRound3MissingProject:
+    """Third reviewer: no lock file and 404 for a directory without
+    project.json, also when it is deleted during a re-translation."""
+
+    @pytest.mark.parametrize('method,path,body', [
+        ('post', '/segments/ch1_seg0001', {'text': 'x'}),
+        ('post', '/segments/ch1_seg0001/approve', {}),
+        ('post', '/segments/ch1_seg0001/retranslate', None),
+        ('delete', '', None),
+    ])
+    def test_directory_without_project_file(self, client, project_with_translations,
+                                            method, path, body):
+        TaskManager._instance = None
+        os.makedirs(os.path.join(project_with_translations, 'empty'))
+        response = getattr(client, method)(f'/api/projects/empty{path}', json=body)
+        assert response.status_code == 404
+        assert response.get_json() == {'error': '專案不存在'}
+        assert os.listdir(os.path.join(project_with_translations, 'empty')) == []
+
+    def test_set_model_creates_no_lock_file(self, client, project_with_translations):
+        TaskManager._instance = None
+        os.makedirs(os.path.join(project_with_translations, 'empty'))
+        response = client.put('/api/projects/empty/model', json={'model': 'sonnet'})
+        assert response.status_code == 404
+        assert os.listdir(os.path.join(project_with_translations, 'empty')) == []
+
+    def test_deleted_during_retranslation(self, client, project_with_translations):
+        import shutil as _shutil
+        TaskManager._instance = None
+        project_dir = os.path.join(project_with_translations, PROJECT_NAME)
+
+        def respond(request):
+            _shutil.rmtree(project_dir)
+            return '<p>譯</p>'
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/retranslate')
+        assert response.status_code == 404
+        assert response.get_json() == {'error': '專案不存在'}
+        assert not os.path.exists(os.path.join(project_dir, 'project.json'))
+        assert not os.path.exists(os.path.join(project_dir, 'project.lock'))

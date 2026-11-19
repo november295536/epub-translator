@@ -127,10 +127,15 @@ def translation_stream(project_name: str):
             yield f"event: error\ndata: {json.dumps({'error': '沒有翻譯任務'})}\n\n"
             return
 
-        # Send initial status
-        yield f"event: status\ndata: {json.dumps({'state': task.state, 'completed': task.completed, 'total': task.total})}\n\n"
-
+        # The cursor before the snapshot: an event sent in between is
+        # delivered (possibly repeating what the snapshot shows), not lost
         cursor = task.progress.cursor_end
+        # Initial status, with a run-level error that paused the task before
+        # this page connected
+        status = {'state': task.state, 'completed': task.completed,
+                  'total': task.total, 'error': task.error}
+        yield f"event: status\ndata: {json.dumps(status, ensure_ascii=False)}\n\n"
+
         while True:
             events, cursor = task.progress.iter_from(cursor, timeout=30)
 
