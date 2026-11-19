@@ -96,7 +96,10 @@ class TestCLIInit:
         result = runner.invoke(cli, ['init', epub_path])
 
         assert result.exit_code == 0, result.output
-        assert '無法解析的章節（不分段）：b：not well-formed XML' in result.output
+        unparsed = [line for line in result.output.splitlines() if 'not well-formed' in line]
+        assert len(unparsed) == 1
+        assert unparsed[0].startswith('無法解析的章節（不分段）：b：not well-formed XML')
+        assert unparsed[0].endswith(')')  # the parser's message, nothing appended
         assert '分段完成：共 1 個段落' in result.output
 
     def test_init_duplicate_project(self, runner, sample_epub, tmp_path, monkeypatch):
@@ -892,3 +895,40 @@ class TestCLIRound3UnexpectedStreak:
         statuses = _statuses(path)
         assert list(statuses.values()).count(SegmentStatus.FAILED) >= 5
         assert statuses['c1_seg0008'] == SegmentStatus.PENDING
+
+
+class TestCLIPhase2:
+    """Phase 2: init into an existing directory, export file name, migrate options."""
+
+    def test_init_into_existing_empty_directory(self, runner, sample_epub, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        os.makedirs(_get_project_dir(sample_epub))
+        result = runner.invoke(cli, ['init', sample_epub])
+        assert result.exit_code == 0, result.output
+        assert os.path.isfile(os.path.join(_get_project_dir(sample_epub), 'project.json'))
+
+    def test_export_named_after_the_project(self, runner, sample_epub, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        runner.invoke(cli, ['init', sample_epub])
+        project_dir = _get_project_dir(sample_epub)
+        pm = ProjectManager(project_dir)
+        pm.load()
+        pm.mark_translated(pm.data.segments[0].segment_id, '<h1>譯</h1>')
+        pm.save()
+        result = runner.invoke(cli, ['export', '-p', project_dir, '-f', 'chinese-only'])
+        assert result.exit_code == 0, result.output
+        name = os.path.basename(project_dir)
+        assert os.listdir(os.path.join(project_dir, 'output')) == [f'{name}-chinese-only.epub']
+
+    @pytest.mark.parametrize('make', ['missing', 'file'])
+    def test_migrate_needs_a_directory(self, runner, tmp_path, make):
+        path = tmp_path / 'p'
+        if make == 'file':
+            path.write_text('x')
+        result = runner.invoke(cli, ['migrate', str(path)])
+        assert result.exit_code == 2
+        assert ('does not exist' if make == 'missing' else 'is a file') in result.output
+
+    def test_migrate_help(self, runner):
+        result = runner.invoke(cli, ['migrate', '--help'])
+        assert '--dry-run  Only report; write nothing' in result.output
