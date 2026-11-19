@@ -14,6 +14,8 @@ class FakeBackend:
     Every request is recorded in `requests`."""
 
     name = 'fake'
+    default_model = 'fake-model'
+    auth_hint = 'fake: sign in again'
     capabilities = Capabilities(
         separate_system=True, multi_turn=True, reports_usage=True,
         sampling_params=True, suggested_concurrency=4,

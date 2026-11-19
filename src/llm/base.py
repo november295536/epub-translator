@@ -84,6 +84,11 @@ class TransientError(LLMError):
     """A failure worth retrying: timeout, non-zero exit, connection error."""
 
 
+class BackendUnavailableError(LLMError):
+    """The backend cannot be used at all (e.g. its program is missing):
+    concerns the run, not one request."""
+
+
 class RefusalError(LLMError):
     """The model declined to answer."""
 
@@ -95,6 +100,8 @@ class CancelledError(LLMError):
 class LLMBackend(Protocol):
     name: str
     capabilities: Capabilities
+    default_model: str     # alias used when a project names none
+    auth_hint: str         # what the user should do after an AuthError
 
     def list_models(self) -> List[ModelInfo]: ...
 

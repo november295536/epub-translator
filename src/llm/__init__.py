@@ -2,7 +2,7 @@
 use comes from default_backend()."""
 
 from src.llm.base import (  # noqa: F401
-    AuthError, CancelledError, Capabilities, LLMBackend, LLMError, LLMRequest,
+    AuthError, BackendUnavailableError, CancelledError, Capabilities, LLMBackend, LLMError, LLMRequest,
     LLMResponse, Message, ModelInfo, RateLimitError, RefusalError,
     TransientError, Usage,
 )

@@ -131,10 +131,12 @@ class TestCLIBackendComplete:
                 ClaudeCLI().complete(_request(timeout=5), threading.Event())
 
     def test_missing_program_is_not_transient(self):
+        from src.llm import BackendUnavailableError
         with patch('src.llm.cli.run_process', side_effect=FileNotFoundError('claude')):
             with pytest.raises(LLMError) as info:
                 ClaudeCLI().complete(_request(), threading.Event())
-        assert type(info.value) is LLMError
+        # Review round 1, item 15: a run-level error, not a per-segment one
+        assert type(info.value) is BackendUnavailableError
         assert 'could not be started' in str(info.value)
 
     def test_base_class_methods_must_be_supplied(self):
@@ -331,3 +333,237 @@ class TestInterfaceDetails:
     def test_fake_string_reply_is_complete(self):
         response = FakeBackend(['x']).complete(_request(model='m'), threading.Event())
         assert response == LLMResponse(text='x', stop_reason='complete', usage=None, model='m')
+
+
+# --- Review round 1 ---------------------------------------------------------------
+
+import subprocess as _subprocess
+
+import src.llm.cli as cli_module
+from src.llm import BackendUnavailableError
+
+
+def _sleeper(pid_file, seconds=60, before=''):
+    """A child that records its PID, runs `before`, then sleeps."""
+    return [sys.executable, '-c',
+            f'import os,sys,time; open({str(pid_file)!r},"w").write(str(os.getpid())); '
+            f'{before}time.sleep({seconds})']
+
+
+def _gone(pid, wait=5):
+    """True when pid is no process (killed and reaped) within `wait` s."""
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+class TestRunProcessExceptionalExit:
+    """Item 8: any exception after the start kills and reaps the process."""
+
+    def test_keyboard_interrupt_kills_child(self, tmp_path):
+        pid_file = tmp_path / 'pid'
+
+        class InterruptOnceStarted:
+            def is_set(self):
+                if pid_file.exists() and pid_file.read_text():
+                    raise KeyboardInterrupt
+                return False
+
+        with pytest.raises(KeyboardInterrupt):
+            run_process(_sleeper(pid_file), timeout=60, cwd=str(tmp_path),
+                        env=dict(os.environ), cancel=InterruptOnceStarted())
+        pid = int(pid_file.read_text())
+        with pytest.raises(ProcessLookupError):  # killed and reaped, not a zombie
+            os.kill(pid, 0)
+        assert cli_module._live_groups == set()
+
+    def test_kill_wait_is_bounded_when_a_descendant_keeps_the_pipes(self, tmp_path,
+                                                                    monkeypatch):
+        monkeypatch.setattr(cli_module, 'KILL_WAIT_SECONDS', 0.5)
+        pid_file = tmp_path / 'pid'
+        # The grandchild leaves the process group (setsid) and inherits stdout
+        grandchild = (f'import os,time; os.setsid(); '
+                      f'open({str(pid_file)!r},"w").write(str(os.getpid())); time.sleep(60)')
+        cmd = [sys.executable, '-c',
+               f'import subprocess,sys,time; subprocess.Popen([sys.executable,"-c",{grandchild!r}]); '
+               'time.sleep(60)']
+        cancel = threading.Event()
+        outcome = []
+
+        def call():
+            try:
+                run_process(cmd, timeout=60, cwd=str(tmp_path), env=dict(os.environ),
+                            cancel=cancel)
+            except CancelledError:
+                outcome.append('cancelled')
+
+        t = threading.Thread(target=call)
+        t.start()
+        deadline = time.monotonic() + 10
+        while not (pid_file.exists() and pid_file.read_text()):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        cancel.set()
+        t.join(timeout=20)
+        grandchild_pid = int(pid_file.read_text())
+        os.kill(grandchild_pid, 9)
+        assert not t.is_alive()
+        assert outcome == ['cancelled']
+
+    def test_atexit_hook_kills_live_groups(self, tmp_path):
+        pid_file = tmp_path / 'pid'
+        errors = []
+
+        def call():
+            try:
+                run_process(_sleeper(pid_file), timeout=60, cwd=str(tmp_path),
+                            env=dict(os.environ))
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        t = threading.Thread(target=call)
+        t.start()
+        deadline = time.monotonic() + 10
+        while not (pid_file.exists() and pid_file.read_text()):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        assert len(cli_module._live_groups) == 1
+        cli_module._kill_live_groups()
+        t.join(timeout=10)
+        assert not t.is_alive()
+        assert _gone(int(pid_file.read_text()))
+        assert cli_module._live_groups == set()
+
+    def test_children_killed_when_interpreter_exits(self, tmp_path):
+        """A call left running in a daemon thread is killed by the exit hook."""
+        pid_file = tmp_path / 'pid'
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = (
+            'import os, sys, threading, time\n'
+            f'sys.path.insert(0, {repo!r})\n'
+            'from src.llm.cli import run_process\n'
+            f'cmd = {_sleeper(pid_file)!r}\n'
+            'threading.Thread(target=run_process, args=(cmd,), daemon=True,\n'
+            '                 kwargs=dict(timeout=60, cwd=".", env=dict(os.environ))).start()\n'
+            f'while not os.path.exists({str(pid_file)!r}) or not open({str(pid_file)!r}).read():\n'
+            '    time.sleep(0.05)\n'
+        )
+        _subprocess.run([sys.executable, '-c', script], cwd=str(tmp_path), timeout=30,
+                        check=True)
+        assert _gone(int(pid_file.read_text()))
+
+
+class TestRunProcessCancelAndDeadline:
+    """Item 10: cancel before start; the deadline bounds every wait."""
+
+    def test_cancelled_before_start_starts_nothing(self, tmp_path):
+        cancel = threading.Event()
+        cancel.set()
+        with patch('src.llm.cli.subprocess.Popen', side_effect=AssertionError('started')):
+            with pytest.raises(CancelledError):
+                run_process(['true'], timeout=30, cwd=str(tmp_path), env=dict(os.environ),
+                            cancel=cancel)
+
+    def test_deadline_not_stretched_by_poll_interval(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli_module, 'POLL_SECONDS', 5)
+        cmd = [sys.executable, '-c', 'import time; time.sleep(1.5); print("late")']
+        with pytest.raises(_subprocess.TimeoutExpired):
+            run_process(cmd, timeout=0.5, cwd=str(tmp_path), env=dict(os.environ))
+
+    def test_output_of_call_cancelled_meanwhile_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli_module, 'POLL_SECONDS', 5)
+        cmd = [sys.executable, '-c', 'import time; time.sleep(1); print("done")']
+        cancel = threading.Event()
+        timer = threading.Timer(0.2, cancel.set)
+        timer.start()
+        with pytest.raises(CancelledError):
+            run_process(cmd, timeout=30, cwd=str(tmp_path), env=dict(os.environ),
+                        cancel=cancel)
+        timer.join()
+
+
+class TestTimeoutKeepsOutput:
+    """Item 14: output written before a timeout reaches the diagnostics."""
+
+    def test_timeout_expired_carries_output(self, tmp_path):
+        cmd = [sys.executable, '-c',
+               'import sys,time; print("partial reply", flush=True); '
+               'print("an error line", file=sys.stderr, flush=True); time.sleep(60)']
+        with pytest.raises(_subprocess.TimeoutExpired) as info:
+            run_process(cmd, timeout=1, cwd=str(tmp_path), env=dict(os.environ))
+        assert 'partial reply' in info.value.output
+        assert 'an error line' in info.value.stderr
+
+    def test_transient_error_raw(self):
+        expired = _subprocess.TimeoutExpired(['claude'], 5, output='partial reply',
+                                             stderr='an error line')
+        with patch('src.llm.cli.run_process', side_effect=expired):
+            with pytest.raises(TransientError) as info:
+                ClaudeCLI().complete(_request(), threading.Event())
+        assert info.value.raw == 'partial replyan error line'
+
+    def test_output_kept_is_bounded(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli_module, 'KEPT_OUTPUT_CHARS', 10)
+        cmd = [sys.executable, '-c',
+               'import time; print("x" * 1000, flush=True); time.sleep(60)']
+        with pytest.raises(_subprocess.TimeoutExpired) as info:
+            run_process(cmd, timeout=1, cwd=str(tmp_path), env=dict(os.environ))
+        assert info.value.output == 'x' * 10
+
+
+class TestBackendUnavailable:
+    """Item 15: a program that cannot start is a run-level error."""
+
+    @pytest.mark.parametrize('error', [FileNotFoundError('claude'), PermissionError('denied')])
+    def test_start_failure(self, error):
+        with patch('src.llm.cli.run_process', side_effect=error):
+            with pytest.raises(BackendUnavailableError):
+                ClaudeCLI().complete(_request(), threading.Event())
+
+
+class TestClassificationOfReplies:
+    """Item 19: ordinary text that quotes an error phrase is not an error."""
+
+    LONG = '譯文' * 200
+
+    @pytest.mark.parametrize('phrase', ['authentication_error', 'please run /login',
+                                        "You've hit your limit"])
+    def test_long_successful_reply_quoting_a_phrase(self, phrase):
+        result = _result(0, f'{self.LONG} {phrase} {self.LONG}')
+        assert ClaudeCLI().classify_error(result) is None
+
+    def test_short_successful_reply_still_detected(self):
+        assert isinstance(ClaudeCLI().classify_error(_result(0, 'Please run /login')),
+                          AuthError)
+
+    def test_stderr_and_failed_runs_always_searched(self):
+        assert isinstance(ClaudeCLI().classify_error(
+            _result(0, self.LONG, 'OAuth token has expired')), AuthError)
+        assert isinstance(ClaudeCLI().classify_error(
+            _result(1, self.LONG + "You've hit your limit")), RateLimitError)
+
+    def test_error_messages_bounded(self):
+        error = ClaudeCLI().classify_error(_result(1, '', 'e' * 100000))
+        assert isinstance(error, TransientError)
+        assert len(str(error)) < 1000
+        error = ClaudeCLI().classify_error(_result(1, '', "You've hit your limit" + 'x' * 100000))
+        assert len(str(error)) <= 500
+
+
+class TestBackendDefaults:
+    """Item 12: backends name their default model and auth hint."""
+
+    def test_claude(self):
+        backend = ClaudeCLI()
+        assert backend.default_model in [m.alias for m in backend.list_models()]
+        assert 'claude /login' in backend.auth_hint
+
+    def test_fake(self):
+        backend = FakeBackend()
+        assert backend.default_model == 'fake-model'
+        assert [m.alias for m in backend.list_models()] == ['fake-model']

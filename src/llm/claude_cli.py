@@ -9,7 +9,7 @@ from src.llm.base import (
     AuthError, Capabilities, LLMError, LLMRequest, LLMResponse, ModelInfo,
     RateLimitError, TransientError,
 )
-from src.llm.cli import CLIBackend, ProcessResult, _text
+from src.llm.cli import ERROR_CHARS, CLIBackend, ProcessResult, _text
 
 MODELS = [
     ModelInfo('sonnet', 'Sonnet', '快速且高品質，適合大多數翻譯'),
@@ -23,11 +23,22 @@ _AUTH_ERROR_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-AUTH_MESSAGE = 'Claude CLI 認證已過期，請在終端執行 claude /login 重新登入'
+AUTH_HINT = '請在終端執行 claude /login 重新登入'
+AUTH_MESSAGE = f'Claude CLI 認證已過期，{AUTH_HINT}'
+
+# A successful run (exit 0) is searched for the limit and login patterns
+# only when its stdout is at most this long. main searched stdout + stderr
+# whatever the exit code, because the CLI can print these errors as a short
+# reply with exit code 0; that is kept. But a translation can contain the
+# same words, so a longer reply is not searched. Accepted risk: a reply this
+# short that quotes one of the phrases is still taken for an error.
+SHORT_REPLY_CHARS = 300
 
 
 class ClaudeCLI(CLIBackend):
     name = 'claude-cli'
+    default_model = 'sonnet'
+    auth_hint = AUTH_HINT
     # Set inside a Claude Code session; the CLI refuses to start nested
     env_remove = ('CLAUDECODE',)
     # Plain-text output: no usage report, system prompt and turns flattened
@@ -50,15 +61,20 @@ class ClaudeCLI(CLIBackend):
                            usage=None, model=request.model)
 
     def classify_error(self, result: ProcessResult) -> Optional[LLMError]:
-        # The CLI may report a limit or an expired login on stdout with
-        # exit code 0, so both streams are checked whatever the exit code.
-        combined = _text(result.stdout) + _text(result.stderr)
-        if _RATE_LIMIT_PATTERN.search(combined):
-            return RateLimitError(combined.strip())
-        if _AUTH_ERROR_PATTERN.search(combined):
+        stdout, stderr = _text(result.stdout), _text(result.stderr)
+        # stderr and any failed run: both streams. A successful run: only a
+        # short reply (see SHORT_REPLY_CHARS), so translated text that
+        # mentions e.g. "authentication_error" is not taken for an error.
+        if result.returncode != 0 or len(stdout) <= SHORT_REPLY_CHARS:
+            searched = stdout + stderr
+        else:
+            searched = stderr
+        if _RATE_LIMIT_PATTERN.search(searched):
+            return RateLimitError(searched.strip()[:ERROR_CHARS])
+        if _AUTH_ERROR_PATTERN.search(searched):
             return AuthError(AUTH_MESSAGE)
         if result.returncode != 0:
             return TransientError(
                 f'claude CLI exited with code {result.returncode}: '
-                f'{_text(result.stderr).strip()}')
+                f'{stderr.strip()[:ERROR_CHARS]}')
         return None
