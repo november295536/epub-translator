@@ -271,3 +271,86 @@ class TestRawPackage:
         with zipfile.ZipFile(raw_epub) as z:
             assert z.namelist()[0] == 'mimetype'
             assert z.read('OEBPS/Text/one.xhtml').decode().count('<link rel="stylesheet"') == 1
+
+
+# --- Mutation survivors: every rule spelled out --------------------------------
+
+ALL_BLOCK_TAGS = [
+    'address', 'article', 'aside', 'blockquote', 'details', 'dialog', 'dd', 'div', 'dl', 'dt',
+    'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'header', 'hgroup', 'hr', 'li', 'main', 'nav', 'ol', 'p', 'pre', 'section', 'summary',
+    'table', 'ul']
+
+
+class TestRules:
+
+    @pytest.mark.parametrize('tag', ALL_BLOCK_TAGS)
+    def test_block_tag_ends_a_run(self, tag):
+        assert _htmls(f'a<{tag}>b</{tag}>c') == ['a', f'<{tag}>b</{tag}>', 'c']
+
+    @pytest.mark.parametrize('tag', ['span', 'em', 'a', 'code', 'sup', 'small'])
+    def test_inline_tag_stays_in_the_run(self, tag):
+        assert _htmls(f'a<{tag}>b</{tag}>c') == [f'a<{tag}>b</{tag}>c']
+
+    @pytest.mark.parametrize('tag', ['div', 'section', 'article'])
+    def test_descended_tags(self, tag):
+        assert _htmls(f'<{tag}><p>a</p><p>b</p></{tag}>') == ['<p>a</p>', '<p>b</p>']
+
+    def test_greater_than_escaped(self):
+        assert _htmls('a &gt; b') == ['a &gt; b']
+
+    def test_empty_comment_is_no_comment_run(self):
+        blocks = walk_blocks(body_of('<div><!----><p>x</p></div>'), with_comment_runs=True)
+        assert [b.index for b in blocks] == [0]
+
+    @pytest.mark.parametrize('tag', ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table'])
+    def test_standalone_tags(self, tag):
+        segs = Segmenter().segment_chapter('ch', body_of(f'<p>a</p><{tag}>b</{tag}><p>c</p>'))
+        assert [(s.block_start, s.standalone) for s in segs] == [(0, False), (1, True),
+                                                                  (2, False)]
+
+    @staticmethod
+    def _words(n, mark):
+        return ' '.join(f'{mark}{i}' for i in range(n))
+
+    def test_block_that_would_pass_max_starts_a_new_segment(self):
+        html = f'<p>{self._words(250, "a")}</p><p>{self._words(260, "b")}</p>'
+        segs = Segmenter().segment_chapter('ch', body_of(html))
+        assert [s.word_count for s in segs] == [250, 260]
+
+    def test_block_reaching_exactly_max_joins(self):
+        html = f'<p>{self._words(250, "a")}</p><p>{self._words(250, "b")}</p>'
+        segs = Segmenter().segment_chapter('ch', body_of(html))
+        assert [s.word_count for s in segs] == [MAX_WORDS]
+
+    def test_entities_not_expanded(self):
+        doc = parse_xml(b'<?xml version="1.0"?><!DOCTYPE html [<!ENTITY x "EXPANDED">]>'
+                        b'<html><body><p>a &x; b</p></body></html>')
+        assert [b.text for b in walk_blocks(find_body(doc))] == ['a  b']
+
+    def test_text_content_and_title(self, tmp_path):
+        items = [('a', 'a.xhtml', 'application/xhtml+xml', None)]
+        body = '<h3>A\n  small   title</h3><p>One  two</p>Three<!-- x -->'
+        path = write_raw_epub(tmp_path / 'b.epub', items, ['a'],
+                              {'OEBPS/a.xhtml': xhtml(body)})
+        ex = EPUBExtractor(path)
+        ex.load()
+        chapter = ex.extract_chapters()[0]
+        assert chapter.title == 'A small title'
+        assert chapter.text_content == 'A small title One two Three'
+
+    def test_spine_entries_after_skipped_ones_kept(self, tmp_path):
+        items = [('a', 'a.xhtml', 'application/xhtml+xml', None),
+                 ('img', 'i.png', 'image/png', None),
+                 ('b', 'b.xhtml', 'application/xhtml+xml', None)]
+        members = {'OEBPS/a.xhtml': xhtml('<p>A.</p>'), 'OEBPS/b.xhtml': xhtml('<p>B.</p>'),
+                   'OEBPS/i.png': b'png'}
+        path = write_raw_epub(tmp_path / 'b.epub', items, ['a', 'a', 'unknown', 'img', 'b'],
+                              members)
+        ex = EPUBExtractor(path)
+        ex.load()
+        assert [s.id for s in ex.spine] == ['a', 'b']
+
+    def test_fresh_extractor(self):
+        ex = EPUBExtractor('unused.epub')
+        assert (ex.spine, ex.failed) == ([], [])

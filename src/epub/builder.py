@@ -162,9 +162,7 @@ class EPUBBuilder:
         elements = self._walk_content_elements(body, legacy=self._legacy_walk())
         placed = []
         elem_idx = 0
-        for seg in segments:
-            if elem_idx >= len(elements):
-                break
+        for seg in segments:  # past the last element a segment gets none
             end_idx = min(elem_idx + self._count_segment_blocks(seg), len(elements))
             placed.append((seg, elements[elem_idx:end_idx]))
             elem_idx = end_idx

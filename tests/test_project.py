@@ -1028,3 +1028,30 @@ class TestRound2DescriptorLeaks:
             child.stdin.close()
             child.wait(timeout=10)
         assert '（PID �12）' in str(info.value)
+
+
+class TestPhase2ProjectFields:
+    """Mutation survivors of the Phase 2 project fields."""
+
+    def test_sha256_file_of_a_large_file(self, tmp_path):
+        import hashlib
+        from src.core.project import sha256_file
+        data = os.urandom(3 * (1 << 20) + 17)
+        path = tmp_path / 'big.bin'
+        path.write_bytes(data)
+        assert sha256_file(str(path)) == hashlib.sha256(data).hexdigest()
+
+    def test_schema_1_project_has_no_source_hash(self, project_dir):
+        with open(os.path.join(project_dir, 'project.json'), 'w', encoding='utf-8') as f:
+            json.dump({'epub_path': '/b.epub', 'project_dir': project_dir, 'segments': []}, f)
+        pm = ProjectManager(project_dir)
+        pm.load()
+        assert (pm.data.schema, pm.data.source_sha256) == (1, '')
+
+    def test_create_without_hash_or_ranges(self, project_dir, sample_segments):
+        ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments)
+        with open(os.path.join(project_dir, 'project.json'), encoding='utf-8') as f:
+            raw = json.load(f)
+        assert raw['source_sha256'] == ''
+        assert all(not ({'block_start', 'block_end', 'fingerprints'} & set(s))
+                   for s in raw['segments'])

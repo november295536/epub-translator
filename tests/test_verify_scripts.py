@@ -693,11 +693,12 @@ def _roundtrip_project(directory, members=None, inside=True):
     spine, a chapter with an XHTML 1.0 DOCTYPE and a stylesheet."""
     from tests.conftest import RAW_NAV, write_raw_epub, xhtml
     os.makedirs(directory)
-    items = [('nav', 'nav.xhtml', 'application/xhtml+xml', 'nav'),
-             ('a', 'a.xhtml', 'application/xhtml+xml', None),
-             ('old', 'old.xhtml', 'application/xhtml+xml', None),
+    # items after a non-XHTML item and after a broken one are still checked
+    items = [('css', 's.css', 'text/css', None),
+             ('nav', 'nav.xhtml', 'application/xhtml+xml', 'nav'),
              ('extra', 'extra.xhtml', 'application/xhtml+xml', None),
-             ('css', 's.css', 'text/css', None)]
+             ('a', 'a.xhtml', 'application/xhtml+xml', None),
+             ('old', 'old.xhtml', 'application/xhtml+xml', None)]
     content = {'OEBPS/nav.xhtml': RAW_NAV, 'OEBPS/a.xhtml': xhtml('<p>A tide.</p>'),
                'OEBPS/old.xhtml': XHTML10, 'OEBPS/extra.xhtml': xhtml('<p>Extra.</p>'),
                'OEBPS/s.css': 'p {}'}
@@ -945,7 +946,7 @@ class TestMigrateCopiesCheck:
 
         def read_epub(path):
             book = real(path)
-            book.items = [i for i in book.items if i.get_id() != 'c2']
+            book.items = [i for i in book.items if i.get_id() != 'c1']
             return book
         monkeypatch.setattr(migrate_check.epub, 'read_epub', read_epub)
         assert migrate_check.placed_chapters(directory) == (2, 1)
@@ -1039,3 +1040,85 @@ class TestMigrateCopiesCheck:
         _assert_help(result.stdout,
                      'Phase 2 check: the migration succeeds on copies of the existing '
                      'projects.', 'Print project-N labels; omit names and paths')
+
+
+
+class TestPhase2ScriptSurvivors:
+    """Mutation survivors of the Phase 2 check scripts."""
+
+    def test_canonical_keeps_comments(self):
+        assert roundtrip_check.canonical(b'<a><!--c--><b/></a>') == '<a><!--c--><b></b></a>'
+
+    def test_own_copy_preferred(self, tmp_path, capsys):
+        directory = str(tmp_path / 'p')
+        _roundtrip_project(directory)
+        with open(os.path.join(directory, 'project.json'), 'w') as f:
+            json.dump({'epub_path': '/moved/away.epub'}, f)
+        assert roundtrip_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 0
+
+    @pytest.mark.parametrize('check', ['roundtrip', 'migrate'])
+    def test_default_projects_dir(self, tmp_path, capsys, monkeypatch, check):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / 'projects').mkdir()
+        if check == 'roundtrip':
+            _roundtrip_project(str(tmp_path / 'projects' / 'alpha'))
+            assert roundtrip_check.main([]) == 0
+        else:
+            _migratable(tmp_path / 'projects', 'alpha')
+            assert migrate_check.main([]) == 0
+        assert capsys.readouterr().out.startswith('PASS alpha')
+
+    def test_roundtrip_counts_every_failure(self, tmp_path, capsys):
+        directory = tmp_path / 'aaa'
+        directory.mkdir()
+        (directory / 'project.json').write_text(json.dumps({'epub_path': '/gone.epub'}))
+        _roundtrip_project(str(tmp_path / 'bbb'), {'OEBPS/extra.xhtml': None})
+        _roundtrip_project(str(tmp_path / 'ccc'), {'OEBPS/extra.xhtml': None})
+        _roundtrip_project(str(tmp_path / 'ddd'))
+        assert roundtrip_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[0] == 'FAIL project-1: cannot read the source (FileNotFoundError)'
+        assert out[3].startswith('PASS project-4')
+        assert out[4].endswith('failed projects 3')
+
+    def test_roundtrip_two_problems_joined(self, tmp_path, capsys, monkeypatch):
+        directory = str(tmp_path / 'p')
+        _roundtrip_project(directory, {'OEBPS/extra.xhtml': None})
+        real = roundtrip_check.check_epub
+
+        def check_epub(path):
+            with open(os.path.join(directory, 'project.json'), 'a') as f:
+                f.write(' ')
+            return real(path)
+        monkeypatch.setattr(roundtrip_check, 'check_epub', check_epub)
+        roundtrip_check.main(['--projects-dir', str(tmp_path), '--anonymize'])
+        assert capsys.readouterr().out.splitlines()[0].endswith(
+            '; 1 chapters missing, unparseable or changed; files in the project directory changed')
+
+    def test_migrate_counts_every_failure(self, tmp_path, capsys, monkeypatch):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        for name in ('a', 'b', 'c', 'd'):
+            _migratable(root, name, unmatched=name in ('c', 'd'))
+        real = migrate_check.migrate_project
+
+        def migrate(copy_dir):
+            if os.path.basename(copy_dir) in ('a', 'b'):
+                raise RuntimeError('boom')
+            return real(copy_dir)
+        monkeypatch.setattr(migrate_check, 'migrate_project', migrate)
+        assert migrate_check.main(['--projects-dir', str(root), '--anonymize']) == 1
+        assert capsys.readouterr().out.splitlines()[-1].endswith('failed projects 4')
+
+    def test_partly_placed_count(self, tmp_path, capsys, monkeypatch):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        _migratable(root, 'alpha')
+        real = migrate_check.EPUBBuilder._place_by_blocks
+
+        def place(body, segments):
+            return None if segments[0].chapter_id == 'c1' else real(body, segments)
+        monkeypatch.setattr(migrate_check.EPUBBuilder, '_place_by_blocks', staticmethod(place))
+        assert migrate_check.main(['--projects-dir', str(root), '--anonymize']) == 1
+        assert capsys.readouterr().out.splitlines()[0].endswith(
+            'export places 1/2, web load ok; 1 chapters not placed by the export')
