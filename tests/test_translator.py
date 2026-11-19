@@ -663,15 +663,9 @@ class TestCodeResponseCleaning:
             with pytest.raises(TranslationError, match='Empty translation'):
                 engine.translate('Some text.')
 
-    @pytest.mark.parametrize('reply', [
-        '```html\n```\n',
-        '```\n```',
-        '以下是翻譯結果：\n',
-        'Here is the translation:\n',
-        'Here is the translation\n',
-    ])
+    @pytest.mark.parametrize('reply', ['```html\n```\n', '```\n```', '```\n  \n```'])
     @pytest.mark.parametrize('html', ['', '<p>Some text.</p>'])
-    def test_text_reply_only_fence_or_commentary_is_retried(self, reply, html):
+    def test_text_reply_only_fence_is_retried(self, reply, html):
         engine = TranslationEngine(max_retries=2)
         empty, good = MagicMock(), MagicMock()
         empty.returncode = good.returncode = 0
@@ -681,35 +675,53 @@ class TestCodeResponseCleaning:
 
         with patch('src.core.translator.subprocess.run',
                    side_effect=[empty, good]) as mock_run:
-            assert engine.translate(LONG_SOURCE, html=html) == '一些文字。'
+            assert engine.translate('Some text.', html=html) == '一些文字。'
         assert mock_run.call_count == 2
 
-    @pytest.mark.parametrize('source', [
-        LONG_SOURCE,
-        'Some text.\nMore text.',
-        ' '.join(['word'] * 15) + ' this:',   # 16 words, ends in a colon
-    ])
-    @pytest.mark.parametrize('reply', ['```html\n```\n', '以下是翻譯結果：\n'])
-    def test_text_reply_only_fence_or_commentary_exhausts(self, reply, source):
+    def test_text_reply_only_fence_exhausts(self):
         engine = TranslationEngine(max_retries=2)
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = reply
+        mock_result.stdout = '```html\n```\n'
         mock_result.stderr = ''
 
         with patch('src.core.translator.subprocess.run',
                    return_value=mock_result) as mock_run:
             with pytest.raises(TranslationError, match='Empty translation'):
-                engine.translate(source)
+                engine.translate('Some text.')
         assert mock_run.call_count == 2
+
+    @pytest.mark.parametrize('html', ['', '<p>x</p>'])
+    def test_text_commentary_only_reply_is_stored(self, html):
+        # Accepted limitation: a reply that is only a commentary line is not
+        # treated as empty (as on main); validating replies is left to Phase 4
+        engine = TranslationEngine(max_retries=1)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '以下是翻譯結果：\n'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            assert engine.translate(LONG_SOURCE, html=html) == '以下是翻譯結果：'
+
+    def test_long_one_line_translation_starting_with_commentary_word_accepted(self):
+        engine = TranslationEngine(max_retries=1)
+        reply = '當然，這條規則也有例外，我們會在下一章更詳細地討論這些例外情況。'
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = reply + '\n'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run', return_value=mock_result):
+            assert engine.translate(
+                'Of course, there are exceptions to this rule, and we will discuss '
+                'them in more detail in the next chapter.') == reply
 
     @pytest.mark.parametrize('source, reply', [
         ('OK', '好的\n'),
         ('Of course', '當然\n'),
         ('Here are the steps:', '以下是步驟：\n'),
         ("Here's an example.", '以下是一個範例：\n'),
-        ('Here is the translation', 'Here is the translation\n'),
-        (' '.join(['word'] * 14) + ' end.', '以下是翻譯結果：\n'),   # 15 words
         ('以下是：', '以下是：\n'),   # source left untranslated
         ('X', 'X\n'),
     ])
@@ -722,18 +734,6 @@ class TestCodeResponseCleaning:
 
         with patch('src.core.translator.subprocess.run', return_value=mock_result):
             assert engine.translate(source) == reply.strip()
-
-    def test_multi_line_reply_ending_in_colon_accepted(self):
-        # Only a single commentary line counts as empty; here the first line
-        # is removed by the start pattern and two lines remain
-        engine = TranslationEngine(max_retries=1)
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '當然。\n以下是項目清單\n例如：\n'
-        mock_result.stderr = ''
-
-        with patch('src.core.translator.subprocess.run', return_value=mock_result):
-            assert engine.translate('Sure.\nHere is a list\nfor example') == '以下是項目清單\n例如：'
 
     def test_code_whitespace_only_output_is_empty(self):
         engine = TranslationEngine(max_retries=1)
