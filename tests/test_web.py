@@ -3256,14 +3256,14 @@ class TestRound3UnexpectedStreakWeb:
         assert len(calls) == 6
         assert task.state == 'failed'
         assert task.error == ("連續 5 個段落發生未預期的錯誤，翻譯已停止"
-                              "（最後一個：未預期的錯誤：KeyError: 'missing'）"
-                              "（1 個段落的結果未儲存：ch1_seg0006）")
+                              "（最後一個：未預期的錯誤：KeyError: 'missing'）")
         segs = _load(project_with_translations)
         statuses = [segs[f'ch1_seg{i:04d}'].status for i in range(1, 9)]
-        assert statuses[:5] == [SegmentStatus.FAILED] * 5
-        assert statuses[5:] == [SegmentStatus.PENDING] * 3
+        # The sixth call was in flight: its result is saved too (round 4)
+        assert statuses[:6] == [SegmentStatus.FAILED] * 6
+        assert statuses[6:] == [SegmentStatus.PENDING] * 2
         error = [e for e in task.progress.get_all() if e['event'] == 'error'][0]
-        assert error['data'] == {'error': task.error, 'unsaved': ['ch1_seg0006']}
+        assert error['data'] == {'error': task.error, 'unsaved': []}
 
     def test_success_resets_the_count(self, project_with_translations):
         self._project(project_with_translations, 9)
@@ -3426,3 +3426,35 @@ class TestRound4ResumeWorkerStartFailure:
                                                         PROJECT_NAME))
         segs = _load(project_with_translations)
         assert all(s.status == SegmentStatus.TRANSLATED for s in segs.values())
+
+
+class TestRound4StreakKeepsInFlightResults:
+    """Item 3: after five unexpected failures in a row the calls in flight
+    are awaited and their results saved, then the task fails."""
+
+    def test_good_result_after_streak_saved(self, project_with_translations):
+        TestRound3UnexpectedStreakWeb()._project(project_with_translations, 8)
+        holder, calls = {}, []
+
+        def respond(request):
+            calls.append(1)
+            if len(calls) > MAX_CONSECUTIVE_UNEXPECTED:
+                # The sixth call ends only once the run has been stopped
+                _wait(lambda: 'task' in holder and holder['task'].stop_event.is_set())
+                return '<p>第六段</p>'
+            return {}['missing']
+
+        task, patcher = _start(project_with_translations, respond)
+        holder['task'] = task
+        _finish(task, patcher)
+        assert len(calls) == 6
+        assert task.state == 'failed'
+        assert task.error == ("連續 5 個段落發生未預期的錯誤，翻譯已停止"
+                              "（最後一個：未預期的錯誤：KeyError: 'missing'）")
+        segs = _load(project_with_translations)
+        statuses = [segs[f'ch1_seg{i:04d}'].status for i in range(1, 9)]
+        assert statuses == [SegmentStatus.FAILED] * 5 + [SegmentStatus.TRANSLATED] \
+            + [SegmentStatus.PENDING] * 2
+        assert segs['ch1_seg0006'].translated_text == '<p>第六段</p>'
+        error = [e for e in task.progress.get_all() if e['event'] == 'error'][0]
+        assert error['data'] == {'error': task.error, 'unsaved': []}
