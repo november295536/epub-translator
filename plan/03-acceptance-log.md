@@ -514,8 +514,9 @@ Design choices where the plan left room:
   holder's PID, for the message; it is left in place on release). Threads of one process
   share the lock (a per-path count), other processes get `ProjectLockedError`; within the
   process, one mutex per project serializes changes and saves (review round 1). Taken by every
-  `save()` (briefly), by CLI `start` for the whole run, and by the web task from
-  `start_translation` until its coordinator ends. The kernel drops a flock when its holder
+  `save()` (briefly), by every web transaction from before its load until after its save
+  (review round 2), by CLI `start` for the whole run, and by the web task from
+  `start_translation` until its coordinator ends. Order everywhere: the mutex, then the lock. The kernel drops a flock when its holder
   exits in any way, so a lock left by a dead process never blocks and no PID check is needed.
   The file descriptor is not inherited by child processes. Not available on Windows (`fcntl`).
 - **Retry of FAILED.** A normal start (`get_pending_segments()`) skips FAILED segments. CLI:
@@ -535,14 +536,21 @@ Design choices where the plan left room:
 - **Classification.** As before: "You've hit your limit" in stdout or stderr → rate limit;
   `authentication_error|OAuth token has expired|please run /login` → auth (both whatever the
   exit code); non-zero exit or timeout → transient (retried, 3 attempts); an empty reply after
-  cleanup → retried. New: the program missing (`OSError` on start) → `BackendUnavailableError`, a run-level error (review round 1, item 15), not retried
-  (before: an uncaught exception that killed the worker). Term extraction now also stops on a
+  cleanup → retried. New: the program missing or not executable (`FileNotFoundError`,
+  `PermissionError`, `ENOEXEC` on start) → `BackendUnavailableError`, a run-level error
+  (review round 1, item 15; narrowed in review round 2, item 4), not retried (before: an
+  uncaught exception that killed the worker); any other start error (e.g. `E2BIG`) fails that
+  segment only. An exit-0 reply is not taken for an error when the matched phrase also occurs
+  in the request (review round 2, item 15). Term extraction now also stops on a
   rate limit (before: only on an auth error with a non-zero exit) and passes `--model`.
-- **Diagnostics.** `<project>/log/failed/<segment id>-<digest>.txt` (characters outside `[\w.-]`
-  replaced by `_`, at most 100, then the first 10 hex digits of the id's SHA-256; review round 1): segment, model, time, error, the request, and per failed attempt its
+- **Diagnostics.** `<project>/log/failed/<segment id>-<digest>.txt` (characters outside
+  `[A-Za-z0-9_.-]` replaced by `_`, at most 100, then the first 10 hex digits of the id's
+  SHA-256; review rounds 1 and 2): segment, model, time, error, the request, and per failed attempt its
   message and raw output (stdout + stderr, at most 20 000 characters each). One file per
-  segment, replaced on each failed run: bounded by the number of segments. Removed when the
-  segment later translates; nothing is written for a success.
+  segment, replaced on each failed run: bounded by the number of segments. Written, replaced
+  or removed only where an outcome is accepted and saved (`record_failure_log`), or by an
+  edit or approval inside its transaction (review round 2, items 10 and 17): a stale result
+  leaves the file alone; nothing is written for a success.
 - **Defaults omitted on save.** `issues` `[]`, `revision` 0, `model` `''`, `usage` `None` are
   left out of each segment; `segmenter_version` 1 as in Phase 0. No new top-level field.
   `load()` only reads.
@@ -558,12 +566,12 @@ Design choices where the plan left room:
 
 ```
 $ python3 -m pytest tests/ -q
-749 passed, 32 warnings in 113.50s
+816 passed, 32 warnings in 127.22s
 ```
 
 444 before the phase; 578 at the first submission, 622 after the mutation work (section 6),
 708 after the review round 1 fixes (section 8), 749 after the tests that kill that round's
-mutation survivors (section 10).
+mutation survivors (section 10), 816 after review round 2 (section 11).
 New test file `tests/test_llm.py`; new classes in `test_project.py`,
 `test_translator.py`, `test_cli.py`, `test_web.py`, `test_glossary.py`,
 `test_verify_scripts.py`. An autouse fixture in `tests/conftest.py` stubs `run_process`, so no
@@ -978,7 +986,6 @@ mutants by hand to a copy of the committed code and checks a test fails: all 77 
 | core 138 | `ftruncate(fd, 0)` → `1` | the PID written next at offset 0 overwrites the kept byte |
 | core 203 | `glossary_text = ''` → `None` | only its truth value is used |
 | llm 26 | `stdout = stderr = ''` → `None` (after giving up on the pipes) | the value goes through `_text()`, which maps `None` to `''` |
-| llm 51 | `time.monotonic() > deadline` → `>=` after the process ended | differs only when the clock equals the deadline exactly |
 | web 10 | `queued` field `repr=False` → `True` | the task's `repr` is never used |
 | web 60 | `project_lock is None or …` → `is not None or …` in `start_translation`'s cleanup | in that branch the coordinator is never alive (nothing after `coordinator.start()` can raise), so both conditions are true |
 | web 63, 64 | `task.state = 'failed'` → other value, same branch | the task is not registered yet and is unreachable after the exception |
@@ -993,7 +1000,6 @@ mutants by hand to a copy of the committed code and checks a test fails: all 77 
 | mutant | mutation | effect |
 |---|---|---|
 | llm 14 | `POLL_SECONDS = 0.1` → `1.1` | cancel noticed up to 1.1 s later; each wait is also bounded by the deadline and late or cancelled output is refused |
-| llm 16 | `KILL_WAIT_SECONDS = 2` → `3` | gives up on held pipes 1 s later |
 | llm 37, 38 | the wait's lower bound `0.0` → `1.0`; `deadline - now` → `deadline + now` | waits up to one poll (0.1 s) past the deadline; the output is still refused by the check after the process ends |
 | llm 45 | `>= deadline` → `> deadline` in the poll loop | at exact equality, one more zero-length wait |
 | web 75, 77 | post-batch exit check disabled | the coordinator ends through its 1 s queue-timeout path instead |
@@ -1001,6 +1007,161 @@ mutants by hand to a copy of the committed code and checks a test fails: all 77 
 | cli 76 | batch drain `while True` → `while False` | results are applied one per loop round, with a save each, instead of in a batch |
 
 No timing assertion was added for any of them.
+
+Corrected in review round 2 (G9, G14): llm 51 is not equivalent (at a clock reading equal to
+the deadline `>` accepts the reply and `>=` refuses it); it is killed by
+`test_llm.py::TestRound2DeadlineBoundary::test_finished_exactly_at_deadline` (mocked clock).
+llm 16 is not performance-only (output written by an escaped descendant between 2 and 3 s
+reaches the diagnostics or not); it is killed by
+`TestRound2PartialOutputAfterKill::test_captured_output_kept` (mocked process: the post-kill
+wait is 2 s). Both kills confirmed with `phase1_survivor_kills.py llm16 llm51` (section 12).
+So the counts above become 78 killed by a new test, 17 equivalent, 8 performance-only.
+Also corrected (third reviewer): the web group of `mutation.sh` did not select
+`TestRound1Exact`, so the 33 web kills in the table were shown by `phase1_survivor_kills.py`
+only, not by the single-command run; the group now selects it (section 13).
+
+### 11. Review round 2
+
+Static reviews by G, O and a third reviewer (items 16–21, added by the orchestrator after
+checking them against the code). Every item got a test that fails on the code before the
+fix; `scripts/verify/phase1_reverts.py` now also puts back each round 2 behaviour (rows
+`R2-…`, section 12). No finding was rejected as not reproducible.
+
+| # | finding | ruling | what was done | tests |
+|---|---|---|---|---|
+| 1 | G1, O5: a web transaction excludes other threads but not other processes (load, edit, save of two processes: the second save drops the first edit) | accepted | `TaskManager.transaction()` holds the project mutex and then the `ProjectLock` from before the load until after the save (ProjectLockedError → 409 as before). `load()` stays lock-free. Re-translate is now refused (409) before the model call when another process holds the lock | `test_web.py::TestRound2TransactionAcrossProcesses` (3: a second process's save inside a transaction is refused; entering is refused; re-translate makes no call) |
+| 2 | G2, O4: delete checks for a running task outside the mutex under which a start registers it | accepted | the `task_active` check is inside `with project_mutex(project_dir)`, together with the lock and the removal | `TestRound2DeleteGuardInsideMutex::test_task_registered_while_delete_waits` (a task registered while the delete waits for the mutex → 409, project kept) |
+| 3 | G3: parallel CLI starts its workers outside the supervisor's protected block | accepted | the start loop is inside the `try`; `threads` lists only started workers, which the `except` joins | `test_cli.py::TestRound2WorkerStartup` (`RuntimeError`, `KeyboardInterrupt` from the second `Thread.start()`) |
+| 4 | G4, O2: every `OSError` at start is `BackendUnavailableError` | accepted | only `FileNotFoundError`, `PermissionError` and `ENOEXEC` are; any other start error (e.g. `E2BIG`) is a plain `LLMError`, not retried: the segment is FAILED (code `error`) and the run goes on | `test_llm.py::TestRound2StartErrors` (6), `test_translator.py::TestRound2StartErrorFailsSegment` |
+| 5 | G5, O1: an unexpected exception aborts the sequential CLI run | accepted | `translate_segment` turns any exception other than the run-level ones into the `unexpected` FAILED outcome (logged); the now unreachable handlers in the web and CLI workers were removed | `test_translator.py::TestRound2UnexpectedErrorInEntryPoint` (6, incl. undecodable output), `test_cli.py::TestCLIUnexpectedErrors::test_unexpected_worker_exception[1]`, `[3]` (parametrized); `TestCLILock::test_lock_released_on_error[1]` now expects FAILED |
+| 6 | G6: the group is not killed when the parent has already exited | accepted | the `except BaseException` of `run_process` kills the group whatever the parent's return code (once: the in-loop timeout path no longer kills, it raises and the `except` adds the output); the group leaves exit tracking only afterwards (`finally`) | `test_llm.py::TestRound2GroupKilledAfterParentExit` (the parent exits, its child with redirected pipes is killed after a cancel noticed late) |
+| 7 | G7: the exit hook takes one snapshot and does not stop new starts | accepted | `_kill_live_groups` sets `_shutting_down` under `_live_groups_guard`; `Popen` and the registration run under the same guard, and after the flag a call raises `CancelledError('shutting down')` (run-level, not retried) | `TestRound2ExitHook` (3) |
+| 8 | G8, O7: the survivor-kill script counts any non-zero exit as a kill | accepted | see section 12: named tests, baseline on the unmutated copy, kill only on exit 1 with failed tests, `try/finally` removal, no shell; `phase1_reverts.py` without shell too | the scripts' runs (section 12) |
+| 9 | G9: output captured before giving up on held pipes is dropped | accepted | `_kill_group` keeps `TimeoutExpired.output/stderr` (bytes even in text mode), decoded with replacement, bounded by `KEPT_OUTPUT_CHARS` | `TestRound2PartialOutputAfterKill` (4, mocks only); `test_kill_wait_is_bounded_when_a_descendant_keeps_the_pipes[timeout]` now expects `('partial\n', '')` |
+| 10 | G10, O6: the failure log is removed inside the model call path, before acceptance | accepted, with 17 | see 17 | see 17 |
+| 11 | G11: a run-level pause before the page connects is unexplained | accepted | the worker that pauses the task stores the message in `task.error` (cleared on resume); the status endpoint already returns `error` and the page already shows it on load (`fetchStatus`) | `test_web.py::TestRound2RunErrorVisible` (3) |
+| 12 | G12: a stored model the backend does not list is not shown | accepted | `fetchModel` prepends the stored model as an option labelled "目前設定，後端未列出" when the list lacks it; nothing is saved until another model is picked | `TestRound2StoredModelOption` (2, rendered text) |
+| 13 | G13: the failure-log name can exceed 255 bytes | accepted | the readable prefix keeps only `[A-Za-z0-9_.-]` | `test_translator.py::TestRound2FailureLogNameBytes` (3) |
+| 14 | G14: survivor llm 51 (`>` → `>=` after the process ended) is not equivalent | accepted | mocked-clock test: a call that ends at a reading exactly equal to the deadline is accepted, one after it is refused | `test_llm.py::TestRound2DeadlineBoundary` (2); llm 51 now killed (section 10, corrected) |
+| 15 | O3: an exit-0 reply that echoes a phrase of the request is taken for an auth/limit error | accepted | `classify_error(result, prompt)`: on exit 0 a match whose text (case-insensitive) occurs in the request is ignored; `CLIBackend.complete` passes the flattened prompt | `test_llm.py::TestRound2RequestEcho` (6), `test_translator.py::TestRound2CodeEchoingAnErrorPhrase` (a code segment through `translate_segment` ends TRANSLATED) |
+| 16 | third reviewer: start takes the file lock before the mutex; a start for a missing project creates or fails on `project.lock` | accepted | `_start_locked` takes the mutex, checks `project.json` exists (else `FileNotFoundError` → 404 "專案不存在", no lock file), then the lock | `TestRound2StartChecks` (3) |
+| 17 | third reviewer (extends 10): a stale FAILED outcome leaves a log; edit/approve remove the log outside the transaction | accepted | a failure log is written or removed only where an outcome is accepted and saved or an edit is saved: `translate_segment` writes no file (the outcome carries the error, `failure`, not compared or shown); `record_failure_log` is called by the web coordinator (apply, save and logs under the mutex), the CLI after each save, re-translate inside its second transaction; edit and approve remove inside their transaction | `test_web.py::TestRound2FailureLogAtAcceptance` (7: stale success keeps a newer failure's log; stale failure writes none; accepted outcomes write and remove; refused save keeps the log; stale re-translation writes none; edit/approve remove under the mutex and lock), `test_translator.py::TestRound2EntryPointWritesNoFile` (4) |
+| 18 | third reviewer: the web group of `mutation.sh` never selects `TestRound1Exact` | accepted | `Round1Exact or Round2` added to the web group's `-k`; every round 1 and round 2 class that targets web code is selected; the other groups run whole files | the run in section 13 |
+| 19 | third reviewer: descriptor leaks in `save()` and `ProjectLock.acquire()` | accepted | `save()` hands the descriptor to `open()` first; `acquire()` closes it in a `finally` when reading the holder fails and decodes with replacement | `test_project.py::TestRound2DescriptorLeaks` (4) |
+| 20 | third reviewer: `unsaved` lists skipped and stale results | accepted | `_apply_result` returns whether the outcome was accepted; only accepted results go to `unsaved`; on a coordinator failure, queued skipped results are not listed | `test_web.py::TestRound2UnsavedReport` (2) |
+| 21 | third reviewer: the rate-limit message is cut from long stdout | accepted | quoted from stderr when the phrase is there, else from stdout | `test_llm.py::TestRound2RateLimitMessage` (2) |
+
+Changed existing tests: the translator tests that passed `log_dir` to `translate_segment` call
+it and then `record_failure_log` (helper `_translated`, what a caller does); three
+`TestDiagnosticWriteFailure`/`TestRound1Exact` checks of the removal log line call
+`remove_failure_log` directly; `test_atexit_hook_kills_live_groups` restores `_shutting_down`;
+the three tests named in items 5 and 9 above; `TestRound1Exact::test_unexpected_exception_logged`
+(web) expects the line from `src.core.translator`. No test was removed.
+
+Beyond the list: none.
+
+### 12. Review round 2: evidence scripts
+
+Both scripts were changed (item 8): they take the copy with `git archive HEAD` piped to
+`tar` through argument lists (no shell), run pytest without bytecode, and remove the copy in
+a `finally`. `phase1_survivor_kills.py` runs the tests the table of section 10 names (node
+ids), requires them to pass on the unmutated copy, counts a kill only on pytest exit 1 with
+"failed" in the summary, and restores the copy after each mutant. Round 1 entries whose code
+round 2 changed follow the new text (llm 44, web 171–176); llm 25 and web 144 are dropped,
+their lines no longer exist (the empty output after giving up on the pipes; the worker's own
+unexpected-error handler, now in `translate_segment`).
+
+Run on the commit "fix: failure logs at acceptance, transactions under the file lock (review
+round 2)" (all round 2 source and test changes):
+
+```
+$ python3 scripts/verify/phase1_survivor_kills.py
+KILLED core18 1 failed …                  (75 lines, all KILLED)
+not killed 0
+$ python3 scripts/verify/phase1_survivor_kills.py llm16 llm51     # after the mutation run
+KILLED llm16 1 failed
+KILLED llm51 1 failed
+not killed 0
+```
+
+`phase1_reverts.py`: the round 1 reverts of items 5, 8, 9 and 24 now put the old behaviour
+back at the place round 2 moved the code to; round 2 reverts added. All 74 detected (50
+round 1 rows, all OK, not repeated here; round 2 rows below; durations and warning counts
+trimmed):
+
+```
+$ python3 scripts/verify/phase1_reverts.py
+…
+OK   R2-1 transaction without the file lock: 3 failed
+OK   R2-2 delete checks the task outside the mutex: 1 failed
+OK   R2-3 CLI workers started outside the protected block: 2 failed
+OK   R2-4 every start error stops the run: 4 failed, 3 passed
+OK   R2-5 unexpected exception escapes the entry point: 5 failed, 3 passed
+OK   R2-6 group left alone when the parent has exited: 1 failed
+OK   R2-7 start not refused after the exit hook: 2 failed, 1 passed
+OK   R2-7 exit hook sets no flag: 3 failed
+OK   R2-9 output dropped when the pipes are given up: 3 failed, 3 passed
+OK   R2-10 web success removes the log before acceptance: 1 failed
+OK   R2-10 re-translate records the log before acceptance and save: 2 failed
+OK   R2-17 web failure log written before acceptance: 1 failed
+OK   R2-17 edit removes the log outside the transaction: 1 failed, 1 passed
+OK   R2-11 run-level error not kept on the task: 2 failed, 1 passed
+OK   R2-11 resume keeps the old error: 1 failed
+OK   R2-12 stored model not shown: 1 failed, 1 passed
+OK   R2-13 Unicode in the file name: 1 failed, 2 passed
+OK   R2-15 echoed phrase taken for an error: 4 failed, 3 passed
+OK   R2-16 no project check before the lock: 1 failed, 2 passed
+OK   R2-16 file lock before the mutex: 1 failed
+OK   R2-19 temporary descriptor leaked by save: 1 failed, 3 passed
+OK   R2-19 lock descriptor leaked when the holder cannot be read: 2 failed, 2 passed
+OK   R2-20 stale and skipped results reported as unsaved: 2 failed
+OK   R2-21 rate-limit message cut from long stdout: 2 failed
+reverts not detected: 0
+```
+
+Item 14 is a mutant kill (section 10, corrected); item 18 is the mutation run itself.
+
+### 13. Mutation testing after review round 2
+
+Only this round's changes: `scripts/verify/mutation.sh <BASE>` with BASE the commit "docs:
+record review round 1 of Phase 1 in the acceptance log" (passed on the command line), on the
+code of the commit "chore: harden the evidence scripts and select the exact-value web tests"
+(no source file changed afterwards). The web group now selects `TestRound1Exact` and the
+`TestRound2…` classes. Afterwards `git status` was clean and no `.bak` file was left.
+
+```
+$ scripts/verify/mutation.sh <BASE>
+...
+== scripts: no changed lines
+TOTAL mutants 93  killed 81  survived 11  timeout 0  suspicious 1  untested 0
+$ echo $?
+1
+```
+
+| group | survived | timeout | suspicious |
+|---|---|---|---|
+| core | 3 | 0 | 0 |
+| llm | 4 | 0 | 1 |
+| web | 4 | 0 | 0 |
+| cli | 0 | 0 | 0 |
+| scripts | no changed lines | | |
+
+The suspicious mutant (llm 10, `start_new_session=False`) is detected: the tests fail or
+never finish, as llm 34 in section 10.
+
+Every survivor is equivalent; no new test was added for them:
+
+| mutant | mutation | condition |
+|---|---|---|
+| core 8 | `os.read(fd, 32)` → `33` (moved into a `try`) | as core 135 of section 10: a PID has at most 32 digits |
+| core 11 | `TranslationError \| None` → `& None` in an annotation | annotations are strings, never evaluated |
+| core 16 | `glossary_text = ''` → `None` (moved into the `try`) | as core 203: only its truth value is used |
+| llm 2 | `_shutting_down = False` → `None` | only its truth value is used |
+| llm 23 | default `prompt=''` → `'XXXX'` in `CLIBackend.classify_error` | the base method only raises `NotImplementedError` |
+| llm 24 | default `prompt=''` → `'XXXX'` in `ClaudeCLI.classify_error` | used only when no prompt is passed (`complete` always passes it); no error phrase is contained in `xxxx` |
+| llm 27 | `echoed = … else ''` → `else 'XXXX'` (non-zero exit) | no error phrase is contained in `xxxx`, so every match still counts |
+| web 3 | `FileNotFoundError('專案不存在')` → `'XX…XX'` | the only caller (the start endpoint) answers its own fixed message for this exception |
+| web 4, 7, 8 | cleanup condition `is None` → `is not None`; `task.state = 'failed'` → other value | as web 60, 63, 64 of section 10 (the same lines, re-indented by item 16) |
 
 ### Known consequences
 
@@ -1013,7 +1174,12 @@ No timing assertion was added for any of them.
 - Each project directory gets a `project.lock` file at its first save (never on load). Saving
   a project while another process holds its lock fails: CLI `start` exits 1 with the holder's
   PID; web saves answer 409. Two web server processes on the same `projects/` exclude each
-  other in the same way.
+  other in the same way: a web change (edit, approve, set model, re-translate) holds the
+  lock from its load to its save (review round 2), and re-translate is refused before the
+  model call while another process holds it.
+- Starting a task for a directory without `project.json` answers 404 and creates no lock file.
+- A run-level error that paused a web task stays in the task's `error` (status endpoint)
+  until the task resumes.
 - The CLI exits 1 after a run with failed segments (it used to exit 1 at the first failure).
 - Term extraction now passes the project model (before: the CLI's default model) and stops
   with an error on a rate limit.
@@ -1064,3 +1230,11 @@ No timing assertion was added for any of them.
 - Concurrency tests that need an edit to land between a check and a write use a 0.3–0.5 s
   wait for the other thread; on a heavily loaded machine the "fails without the fix" side of
   those tests could pass by accident (the tests never fail on the fixed code because of it).
+  Review round 2 adds one more such wait (`TestRound2DeleteGuardInsideMutex`, 0.5 s for the
+  delete request to reach the mutex).
+- Review round 2: no real `claude` call; `E2BIG`, `ENOEXEC`, undecodable output and the
+  exit-0 echo were produced with stubs of `run_process`, the partial output after the kill
+  and the deadline boundary with mocked processes and clocks. The cross-process transaction
+  was tested with a second Python process saving through `ProjectManager`, not with two web
+  servers. The model-selector option (item 12) was checked as rendered text, not in a
+  browser. The exit hook's shutdown flag was tested by calling the hook directly.
