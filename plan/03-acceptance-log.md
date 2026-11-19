@@ -540,8 +540,12 @@ Design choices where the plan left room:
   `PermissionError`, `ENOEXEC` on start) → `BackendUnavailableError`, a run-level error
   (review round 1, item 15; narrowed in review round 2, item 4), not retried (before: an
   uncaught exception that killed the worker); any other start error (e.g. `E2BIG`) fails that
-  segment only. An exit-0 reply is not taken for an error when the matched phrase also occurs
-  in the request (review round 2, item 15). Term extraction now also stops on a
+  segment only; `EAGAIN`, `ENOMEM`, `EMFILE`, `ENFILE` at start are transient (retried;
+  review round 3, item 4). An exit-0 reply is not taken for an error when the matched phrase
+  on stdout also occurs in the request (review round 2, item 15); a phrase on stderr always
+  counts (review round 3, item 3). Output is decoded as UTF-8 with replacement (review round 3,
+  item 7). Five `unexpected` failures in a row stop a run (`MAX_CONSECUTIVE_UNEXPECTED`,
+  review round 3, item 9). Term extraction now also stops on a
   rate limit (before: only on an auth error with a non-zero exit) and passes `--model`.
 - **Diagnostics.** `<project>/log/failed/<segment id>-<digest>.txt` (characters outside
   `[A-Za-z0-9_.-]` replaced by `_`, at most 100, then the first 10 hex digits of the id's
@@ -550,7 +554,9 @@ Design choices where the plan left room:
   segment, replaced on each failed run: bounded by the number of segments. Written, replaced
   or removed only where an outcome is accepted and saved (`record_failure_log`), or by an
   edit or approval inside its transaction (review round 2, items 10 and 17): a stale result
-  leaves the file alone; nothing is written for a success.
+  leaves the file alone; nothing is written for a success. An `unexpected` failure writes a
+  short log too: error, the request when it can be rebuilt, and the traceback (review round 3,
+  item 7).
 - **Defaults omitted on save.** `issues` `[]`, `revision` 0, `model` `''`, `usage` `None` are
   left out of each segment; `segmenter_version` 1 as in Phase 0. No new top-level field.
   `load()` only reads.
@@ -566,12 +572,13 @@ Design choices where the plan left room:
 
 ```
 $ python3 -m pytest tests/ -q
-816 passed, 32 warnings in 127.22s
+858 passed, 36 warnings in 127.44s
 ```
 
 444 before the phase; 578 at the first submission, 622 after the mutation work (section 6),
 708 after the review round 1 fixes (section 8), 749 after the tests that kill that round's
-mutation survivors (section 10), 816 after review round 2 (section 11).
+mutation survivors (section 10), 816 after review round 2 (section 11), 858 after review
+round 3 (section 14) and the tests that kill its mutation survivors (section 16).
 New test file `tests/test_llm.py`; new classes in `test_project.py`,
 `test_translator.py`, `test_cli.py`, `test_web.py`, `test_glossary.py`,
 `test_verify_scripts.py`. An autouse fixture in `tests/conftest.py` stubs `run_process`, so no
@@ -1163,6 +1170,133 @@ Every survivor is equivalent; no new test was added for them:
 | web 3 | `FileNotFoundError('專案不存在')` → `'XX…XX'` | the only caller (the start endpoint) answers its own fixed message for this exception |
 | web 4, 7, 8 | cleanup condition `is None` → `is not None`; `task.state = 'failed'` → other value | as web 60, 63, 64 of section 10 (the same lines, re-indented by item 16) |
 
+### 14. Review round 3
+
+Static reviews by G (changes requested), O (approved with minor findings) and a third reviewer
+(approved with minor findings; its items 1 and 3 are G7 and G3, its items 4 and 5 became
+items 11 and 12). Every accepted item got a test that fails on the code before the fix;
+`scripts/verify/phase1_reverts.py` puts each round 3 behaviour back (rows `R3-…`, section 15).
+No finding was rejected as not reproducible.
+
+| # | finding | ruling | what was done | tests |
+|---|---|---|---|---|
+| 1 | G1: replacing a project of the same name overwrites `source.epub` before the lock is taken (a CLI holding the lock: request fails, files already changed) | accepted | `create_project` takes the project mutex, refuses (409) while a task of the project is active, takes the file lock (409 with the holder's PID), and only then copies the EPUB and creates the project; the lock is held until the project is saved | `test_web.py::TestRound3ReplaceProjectUnderLock` (4: other process → 409, files unchanged; active task → 409, files unchanged; mutex and lock held while the EPUB is copied; replacement written) |
+| 2 | G2: a task ending `stopped` leaves the tab without Start | accepted | the Start button is shown for `stopped` too (label "已停止"); the `stopped` event sets the state, clears the current segment and closes the stream. The overlap guard is unchanged (409 while the old threads live) | `TestRound3StoppedTaskRestartable` (3: a start after a stopped task → 200; rendered button condition; the `stopped` handler) |
+| 3 | G3, part of O4: the exit-0 echo rule also hides an error phrase on stderr | accepted | the echo rule applies to stdout only; a phrase on stderr is always classified | `test_llm.py::TestRound3StderrNotEchoSuppressed` (3) |
+| 4 | G4, O2: `EAGAIN`/`ENOMEM` at process start fail the segment for good | accepted | `EAGAIN`, `ENOMEM`, `EMFILE`, `ENFILE` (`RESOURCE_ERRNOS`) → `TransientError`, retried like other transient failures (after 3 attempts the segment is FAILED `transient`); `E2BIG` stays a per-request `LLMError` | `TestRound3ResourceErrors` (5); `TestRound2StartErrors::test_other_start_failure_concerns_the_request` now covers `E2BIG` only |
+| 5 | G5: a failing worker start joins unstarted threads and loses the error | accepted | `_threads` lists only started workers; a failed start subtracts the workers never started from `active_workers` and re-raises, so `_fail_task` records the original error | `test_web.py::TestRound3WorkerStartFailure` (the second worker's start fails: state `failed`, error kept, `active_workers` 0, lock free) |
+| 6 | G6: the initiating page misses a run-level error that paused the task before it connected | accepted | the stream takes its cursor before the snapshot and the initial `status` event carries `task.error`; the page shows it on the first status | `TestRound3InitialStatusError` (3: error in the first event; an event sent after the snapshot is delivered; page handler) |
+| 7 | G7, O3: an accepted `unexpected` failure writes no diagnostics and leaves an older log; undecodable output raises | accepted | `unexpected_error_outcome(model, error, prompt)` carries a failure record (error type and message, the request when it can be rebuilt from the call's arguments, the traceback as the attempt's raw output), so `record_failure_log` writes it and replaces an older log; the process is started with `encoding='utf-8', errors='replace'` | `test_translator.py::TestRound3UnexpectedFailureLog` (4), `test_llm.py::TestRound3UndecodableOutput`; `TestRound2EntryPointWritesNoFile::test_record_unexpected_failure_keeps_older_log` renamed `…_replaces_older_log` and inverted |
+| 8 | G8: the failure-path drain reports stale results as unsaved | accepted | under the project mutex, a drained result is listed only when the segment's revision still equals the result's | `test_web.py::TestRound3StaleResultInFailureDrain` |
+| 9 | O1: repeated unexpected failures never stop a run | accepted | `UnexpectedStreak` in `translator.py` counts `unexpected` failures in a row in the order the coordinator or CLI loop receives results; any other result (also a skipped one) resets it; at `MAX_CONSECUTIVE_UNEXPECTED` (5) the run stops: web: the coordinator saves the batch and fails the task with "連續 5 個段落發生未預期的錯誤，翻譯已停止（最後一個：…）" (state `failed`, `error` event, in-flight results reported as unsaved); CLI sequential and parallel: the message, then exit 1. Segments already FAILED stay FAILED; the rest stay pending | `test_translator.py::TestRound3UnexpectedStreak` (4), `test_web.py::TestRound3UnexpectedStreakWeb` (2), `test_cli.py::TestCLIRound3UnexpectedStreak` (3) |
+| 10 | O5: an exhausted `FakeBackend` is swallowed by the catch-all | accepted | `FakeBackendExhausted(BaseException)`; each over-call is also recorded in `FakeBackend.overcalls`, which an autouse fixture asserts empty after every test (an exception in a worker thread only ends the thread). Whole suite run afterwards: no test newly failed through an over-call; only the two tests that exhaust the fake on purpose changed | `test_llm.py::TestRound3FakeOverCall` (2); `TestFakeBackend::test_scripted_replies_and_errors`, `TestInterfaceDetails::test_fake_identity` expect the new type |
+| 11 | third reviewer, item 4: transaction and delete take the file lock in a directory without `project.json` (creates `project.lock`), review endpoints answer 500 | accepted | `transaction()` checks `project.json` inside the mutex before the lock (`FileNotFoundError('專案不存在')`); delete answers 404 for such a directory; a blueprint handler makes edit, approve and re-translate answer 404 "專案不存在", also when the project is deleted between re-translate's two transactions | `test_web.py::TestRound3MissingProject` (6) |
+| 12 | third reviewer, item 5: output kept on a late finish and the timeout's raw output are unbounded | accepted | both sliced to `KEPT_OUTPUT_CHARS` | `test_llm.py::TestRound3TimeoutOutputBounded` (2) |
+| — | O4 extra rule: on exit 0 also an error when the reply's first line starts with the matched phrase | rejected | recorded as a known limitation (below) | — |
+| — | treating `MemoryError` specially (G4) | rejected | not done | — |
+| — | third reviewer, item 2, scenario 1: re-translate persists FAILED for an unexpected exception | rejected | consistent with how every other failure is persisted; item 9 covers the batch case | — |
+| — | third reviewer: match the echo rule against the segment's source text only | rejected | the backend receives one flattened prompt; covered by the known limitation | — |
+
+Known limitation (from the rejected O4 rule): a request that itself contains a login or limit
+phrase, combined with a real error reply on stdout with exit code 0, is stored as a
+translation. Output validation (Phase 4) is to catch it.
+
+Changed existing tests: the five named in items 4, 7 and 10 above;
+`TestRound1Exact::test_unexpected_error_outcome` passes the new `prompt` argument;
+`TestRound2UnsavedReport::test_skipped_result_in_queue_not_reported` gives its task a project
+manager (the drain now reads revisions). No test was removed.
+
+Beyond the list: the state label "已停止"; the initial `status` event is encoded with
+`ensure_ascii=False` like the other events; deleting a directory without `project.json` now
+answers 404 instead of removing it; the web group of `mutation.sh` selects `Round3`. The first
+version of `TestRound3StaleResultInFailureDrain` could pass without the fix (both results in
+one batch); it now waits for the coordinator failure before releasing the held call (found by
+the revert check).
+
+### 15. Review round 3: evidence scripts
+
+Round 1 and 2 reverts whose code round 3 moved (rows 9, 10, 14, 18, 22, R2-1, R2-5, R2-16,
+R2-20) follow it; `phase1_survivor_kills.py` entry web162 is re-anchored (a second 409
+message with the same start now exists). Run on the commit "chore: re-anchor the evidence
+scripts after round 3, list its mutant kills" (durations and warning counts trimmed):
+
+```
+$ python3 scripts/verify/phase1_reverts.py
+…                                   (74 round 1 and 2 rows, all OK)
+OK   R3-1 project replaced before the lock is taken: 3 failed, 1 passed
+OK   R3-2 no Start for a stopped task: 1 failed, 2 passed
+OK   R3-2 stopped event leaves state and stream: 1 failed, 2 passed
+OK   R3-3 echo rule hides stderr: 2 failed, 1 passed
+OK   R3-4 resource errors at start fail the segment: 5 failed
+OK   R3-5 unstarted workers joined: 1 failed
+OK   R3-6 initial status without the error: 1 failed, 2 passed
+OK   R3-6 cursor taken after the snapshot: 1 failed
+OK   R3-6 page ignores the initial error: 1 failed, 2 passed
+OK   R3-7 strict decoding of the output: 2 failed, 3 passed
+OK   R3-7 unexpected failure without diagnostics: 4 failed, 4 passed
+OK   R3-7 request not in the unexpected-failure log: 1 failed, 3 passed
+OK   R3-8 stale result in the failure drain reported as unsaved: 1 failed
+OK   R3-9 web run goes on after five unexpected failures: 1 failed, 1 passed
+OK   R3-9 sequential CLI goes on after five unexpected failures: 1 failed, 2 passed
+OK   R3-9 parallel CLI goes on after five unexpected failures: 1 failed
+OK   R3-9 streak not reset by another result: 5 failed, 4 passed
+OK   R3-10 fake over-call is an ordinary exception: 2 failed, 2 errors
+OK   R3-11 transaction takes the lock of a missing project: 4 failed, 2 passed
+OK   R3-11 delete takes the lock of a directory without project.json: 1 failed, 5 passed
+OK   R3-11 review endpoints answer 500 for a missing project: 4 failed, 2 passed
+OK   R3-12 late finish keeps unbounded output: 1 failed, 1 passed
+OK   R3-12 timeout raw not bounded: 1 failed, 1 passed
+reverts not detected: 0
+$ python3 scripts/verify/phase1_survivor_kills.py
+KILLED core18 …                     (82 lines, all KILLED)
+not killed 0
+```
+
+### 16. Mutation testing after review round 3
+
+Only this round's changes: `scripts/verify/mutation.sh <BASE>` with BASE the commit "docs:
+record review round 2 of Phase 1 in the acceptance log" (passed on the command line), on the
+code of the commit "chore: revert checks for review round 3, select its web tests in the
+mutation run" (the later commits change tests and the evidence scripts only). Afterwards `git
+status` showed only two evidence scripts edited during the run (not in any mutated group; see
+"Not verified") and no `.bak` file was left.
+
+```
+$ scripts/verify/mutation.sh <BASE>
+...
+== scripts: no changed lines
+TOTAL mutants 94  killed 82  survived 10  timeout 1  suspicious 1  untested 0
+$ echo $?
+1
+```
+
+| group | survived | timeout | suspicious |
+|---|---|---|---|
+| core | 2 | 0 | 0 |
+| llm | 1 | 0 | 0 |
+| web | 7 | 1 | 0 |
+| cli | 0 | 0 | 1 |
+| scripts | no changed lines | | |
+
+The timeout (web 3, `active_workers = None` before the workers start) and the suspicious
+mutant (cli 5, the parallel CLI's streak result replaced by `None`: the test's held calls
+wait their 10 s and the test fails) are detected.
+
+| mutant | mutation | disposition |
+|---|---|---|
+| core 6 | `''.join(traceback…)` → `'XXXX'.join` | killed: `TestRound3UnexpectedFailureLog::test_log_has_type_message_traceback_and_request` |
+| web 23 | `'source.epub'` → `'XXsource.epubXX'` (line moved under the lock) | killed: `TestRound3ReplaceProjectUnderLock::test_replacement_written` |
+| web 26, 28 | metadata keys `'title'`, `'author'` | killed: same test |
+| web 2 | `FileNotFoundError('專案不存在')` message in `transaction()` | killed: `TestRound3MissingProject::test_set_model_creates_no_lock_file` (set-model answers the message) |
+| core 1 | `context = None` → `""` | equivalent: only its truth value is used, and it becomes a non-empty tuple once known |
+| llm 7 | `searched = ''` → `'XXXX'` | equivalent: no error pattern matches `XXXX` |
+| web 27, 29 | defaults `'未知書名'`, `'未知作者'` | equivalent: `EPUBExtractor.get_metadata()` always returns both keys (`'Unknown'` when absent), so the defaults are never used |
+| web 8 | `stop = None` → `""` before the streak loop | equivalent: only its truth value is used, and `x or ""` is falsy exactly when `x or None` is |
+
+The five kills were confirmed with `phase1_survivor_kills.py r3-core6 r3-web23 r3-web26
+r3-web28 r3-web2` (all KILLED, `not killed 0`) and are in the full run of section 15.
+No timing assertion was added.
+
 ### Known consequences
 
 - A project stops being loadable by `v1.0.0` (and by `main` before this phase) as soon as one
@@ -1200,6 +1334,16 @@ Every survivor is equivalent; no new test was added for them:
   before the last worker exited could in principle be lost; it also had a separate final
   drain, now removed.
 - Windows is not supported by the lock (`fcntl`).
+- Review round 3: replacing a project through the web while a task of it is active or another
+  process holds its lock answers 409 and changes none of its files; deleting a directory
+  without `project.json` answers 404 (it used to be removed); edit, approve and re-translate
+  of a missing project answer 404. A web task ending `stopped` can be started again from the
+  translation tab. Five `unexpected` failures in a row end a web run as `failed` and a CLI run
+  with exit 1; the segments already FAILED stay FAILED. A shortage of processes, memory or file
+  descriptors at process start is retried, then fails the segment as `transient`.
+- Known limitation (review round 3): a request that itself contains a login or limit phrase,
+  combined with a real error reply on stdout with exit code 0, is stored as a translation;
+  output validation in Phase 4 is to catch it.
 
 ### Not done
 
@@ -1238,3 +1382,12 @@ Every survivor is equivalent; no new test was added for them:
   was tested with a second Python process saving through `ProjectManager`, not with two web
   servers. The model-selector option (item 12) was checked as rendered text, not in a
   browser. The exit hook's shutdown flag was tested by calling the hook directly.
+- Review round 3: no real `claude` call. Resource errors at start were raised from a stub of
+  `run_process`, not produced by exhausting the system; undecodable output came from a short
+  Python child process. The template changes (Start for `stopped`, the `stopped` handler, the
+  initial error) were checked as rendered text, not in a browser. The worker-start failure was
+  made by patching `Thread.start`. During the mutation run (section 16) the two evidence
+  scripts were edited (re-anchored; neither is in a mutated group) and the load check was run
+  once while files were mutated in place; it was run again afterwards on the unmutated code
+  (same TOTAL line as section 5:
+  `TOTAL projects 8  segments 9521  pending 5333  translated 4188  reviewed 0  failed 0  round trip equal 7  model added 1  differs 0  failed projects 0`, exit 0).
