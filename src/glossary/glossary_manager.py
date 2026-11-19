@@ -20,22 +20,77 @@ CATEGORY_LABELS = {
 }
 
 
+# Suffixes accepted after a term that ends in a letter and whose last word
+# has at least INFLECTION_MIN_LETTERS letters.
+INFLECTION_MIN_LETTERS = 4
+_VOWELS = 'aeiou'
+_NO_DOUBLING = _VOWELS + 'wxy'
+
+
+def _escape_words(text: str) -> str:
+    """Escape text for a regex; any run of whitespace matches \\s+."""
+    return r'\s+'.join(re.escape(part) for part in text.split())
+
+
+def _term_forms(term: str) -> list[tuple[str, tuple[str, ...]]]:
+    """Return (stem, suffixes) pairs; a match is a stem followed by one suffix."""
+    if not term[-1].isalpha():
+        return [(term, ('',))]
+
+    last = term[-1].lower()
+    if last == 'y' and len(term) > 1:
+        forms = [(term, ('', 's')), (term[:-1], ('ies',))]
+    else:
+        forms = [(term, ('', 's', 'es'))]
+
+    last_word = re.search(r'[^\W\d_]+$', term).group()
+    if len(last_word) < INFLECTION_MIN_LETTERS:
+        return forms
+
+    if last == 'e':
+        # cache -> cached, cacher(s), caching; manage -> management(s)
+        forms.append((term, ('d', 'r', 'rs', 'ment', 'ments')))
+        forms.append((term[:-1], ('ing',)))
+    else:
+        forms.append((term, ('ed', 'ing', 'er', 'ers', 'ment', 'ments')))
+        if last not in _NO_DOUBLING and term[-2].lower() in _VOWELS:
+            # debug -> debugged, debugging, debugger(s)
+            forms.append((term + term[-1], ('ed', 'ing', 'er', 'ers')))
+    return forms
+
+
 @lru_cache(maxsize=None)
 def _term_pattern(term: str) -> re.Pattern:
-    """Compile a whole-word, case-insensitive pattern for a glossary term.
+    """Compile a whole-word pattern for a glossary term.
 
     Lookarounds are used instead of \\b so that terms starting or ending
-    with a non-word character (C++, C#, .NET) still match. A term ending in
-    a letter also matches its regular plurals (s, es, y -> ies).
+    with a non-word character (C++, C#, .NET) still match. Because of the
+    leading (?<!\\w), '.NET' does not match inside 'ASP.NET'.
+
+    - A term ending in a letter also matches its plurals (s, es, y -> ies).
+    - If its last word has at least INFLECTION_MIN_LETTERS letters, it also
+      matches ed/d, ing (with e-drop and a doubled final consonant), er/ers
+      and ment/ments.
+    - All-caps terms (API, IT, US) are case-sensitive, so IT does not match
+      "its"; the suffix itself may be in any case. Other terms are
+      case-insensitive.
+    - Whitespace inside a multi-word term matches any whitespace run
+      (newline, NBSP).
     """
     term = term.strip()
-    body = re.escape(term)
-    if term and term[-1].isalpha():
-        if term[-1] in 'yY' and len(term) > 1:
-            body = re.escape(term[:-1]) + '(?:ys?|ies)'
-        else:
-            body += '(?:s|es)?'
-    return re.compile(r'(?<!\w)' + body + r'(?!\w)', re.IGNORECASE)
+    if not term:
+        return re.compile(r'(?!)')
+    case_sensitive = any(c.isalpha() for c in term) and term == term.upper()
+
+    alternatives = []
+    for stem, suffixes in _term_forms(term):
+        suffix_group = '|'.join(suffixes)
+        if case_sensitive:
+            suffix_group = '(?i:' + suffix_group + ')'
+        alternatives.append(_escape_words(stem) + '(?:' + suffix_group + ')')
+
+    flags = 0 if case_sensitive else re.IGNORECASE
+    return re.compile(r'(?<!\w)(?:' + '|'.join(alternatives) + r')(?!\w)', flags)
 
 
 @dataclass
