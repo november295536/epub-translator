@@ -438,3 +438,109 @@ class TestAlignmentOutput:
         _assert_help(result.stdout,
                      "Phase 0 check: existing projects resolve to the builder's legacy walk.",
                      'Print project-N labels; omit names, chapter IDs and paths')
+
+
+# --- Phase 1: every project loads, untouched -----------------------------------
+
+load_check = _load('phase1_load_projects')
+
+
+def _write_loadable(directory, statuses, extra=None):
+    os.makedirs(directory, exist_ok=True)
+    segments = [{'segment_id': f'c1_seg{i:04d}', 'chapter_id': 'c1', 'html': '<p>x</p>',
+                 'text': 'x', 'word_count': 1, 'segment_type': 'text', 'status': status,
+                 'translated_text': '', 'translated_at': ''}
+                for i, status in enumerate(statuses)]
+    data = {'epub_path': '/b.epub', 'project_dir': directory, 'title': 'T',
+            'author': 'A', 'created_at': '', 'updated_at': '', 'model': 'sonnet',
+            'segments': segments}
+    data.update(extra or {})
+    with open(os.path.join(directory, 'project.json'), 'w') as f:
+        json.dump(data, f)
+
+
+class TestLoadCheck:
+
+    def test_counts_and_pass(self, tmp_path, capsys):
+        _write_loadable(str(tmp_path / 'zeta'), ['pending', 'translated', 'reviewed'])
+        _write_loadable(str(tmp_path / 'alpha'), ['failed', 'failed'])
+        (tmp_path / 'not-a-project').mkdir()
+        assert load_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert out == [
+            'PASS project-1: segments 2, pending 0, translated 0, reviewed 0, failed 2',
+            'PASS project-2: segments 3, pending 1, translated 1, reviewed 1, failed 0',
+            'TOTAL projects 2  segments 5  pending 1  translated 1  reviewed 1  failed 2'
+            '  failed projects 0',
+        ]
+
+    def test_names_without_anonymize(self, tmp_path, capsys):
+        _write_loadable(str(tmp_path / 'alpha'), ['pending'])
+        assert load_check.main(['--projects-dir', str(tmp_path)]) == 0
+        assert capsys.readouterr().out.startswith('PASS alpha: segments 1')
+
+    def test_load_error_fails(self, tmp_path, capsys):
+        _write_loadable(str(tmp_path / 'alpha'), ['pending'], extra={'unknown_field': 1})
+        _write_loadable(str(tmp_path / 'beta'), ['pending'])
+        assert load_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
+        out = capsys.readouterr().out
+        assert 'FAIL project-1: cannot load (TypeError)' in out
+        assert 'PASS project-2' in out
+        assert 'failed projects 1' in out
+        assert str(tmp_path) not in out
+
+    def test_write_during_load_fails(self, tmp_path, capsys, monkeypatch):
+        directory = str(tmp_path / 'alpha')
+        _write_loadable(directory, ['pending'])
+        original = load_check.ProjectManager.load
+
+        def load_and_save(self):
+            data = original(self)
+            self.save()
+            return data
+
+        monkeypatch.setattr(load_check.ProjectManager, 'load', load_and_save)
+        assert load_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
+        out = capsys.readouterr().out
+        assert out.startswith('FAIL project-1: segments 1')
+        assert 'project.json content changed' in out
+        assert 'files in the project directory changed' in out  # the lock file
+
+    def test_touch_during_load_fails(self, tmp_path, capsys, monkeypatch):
+        directory = str(tmp_path / 'alpha')
+        _write_loadable(directory, ['pending'])
+        original = load_check.ProjectManager.load
+
+        def load_and_touch(self):
+            data = original(self)
+            os.utime(self.project_file, ns=(1, 1))
+            return data
+
+        monkeypatch.setattr(load_check.ProjectManager, 'load', load_and_touch)
+        assert load_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
+        out = capsys.readouterr().out
+        assert 'project.json modification time changed' in out
+        assert 'content changed' not in out
+
+    def test_loading_leaves_files_untouched(self, tmp_path):
+        directory = str(tmp_path / 'alpha')
+        _write_loadable(directory, ['pending', 'failed'])
+        path = os.path.join(directory, 'project.json')
+        before = (open(path, 'rb').read(), os.stat(path).st_mtime_ns)
+        load_check.main(['--projects-dir', str(tmp_path)])
+        assert (open(path, 'rb').read(), os.stat(path).st_mtime_ns) == before
+        assert os.listdir(directory) == ['project.json']
+
+    def test_missing_directory(self, tmp_path, capsys):
+        missing = str(tmp_path / 'nope')
+        assert load_check.main(['--projects-dir', missing, '--anonymize']) == 2
+        out = capsys.readouterr().out
+        assert out == 'ERROR cannot list projects directory <projects-dir> (FileNotFoundError)\n'
+
+    def test_runs_as_script(self, tmp_path):
+        _write_loadable(str(tmp_path / 'alpha'), ['pending'])
+        script = os.path.join(ROOT, 'scripts', 'verify', 'phase1_load_projects.py')
+        result = subprocess.run([sys.executable, script, '--projects-dir', str(tmp_path)],
+                                capture_output=True, text=True, cwd=str(tmp_path))
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.startswith('PASS alpha')
