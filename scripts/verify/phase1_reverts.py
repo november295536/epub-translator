@@ -6,7 +6,7 @@ code (git archive HEAD, in a temporary directory removed afterwards) and
 runs the tests that guard it. Every revert must make at least one of them
 fail. Prints OK/MISS per revert and the number not detected.
 
-Round 4 moved the code of R3-1 and R3-9 (web), whose reverts follow it,
+Round 4 moved the code of 2, R3-1 and R3-9 (web), whose reverts follow it,
 and adds the reverts "R4-<item>".
 
 Usage:
@@ -49,8 +49,8 @@ r('1 temp file left after a failed save',
     '')],
   ['tests/test_project.py::TestAtomicSave'])
 r('2 re-translate applies to its stale snapshot',
-  [(REV, '        with transaction(project_name) as pm:\n            if not pm.apply_outcome',
-    '        with pm.mutex:\n            if not pm.apply_outcome')],
+  [(REV, '        with transaction(project_name) as pm:\n            current = next(',
+    '        with pm.mutex:\n            current = next(')],
   ['tests/test_web.py::TestRetranslateTransaction', 'tests/test_web.py::TestRetranslateDetails'])
 r('2 stopped task still ending does not own the state',
   [(T, "if task.state in ('running', 'paused') or task.threads_alive():\n            return task.pm",
