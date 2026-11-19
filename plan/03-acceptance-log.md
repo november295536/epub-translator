@@ -213,7 +213,7 @@ until a `<file>.bak` exists (both times `src/core/project.py.bak`, with `git sta
   while it runs; that they landed inside the cleanup is inferred from this timing, not
   observed directly): exit 130, `restored src/core/project.py`, and the same clean state, and
   the run's private `mktemp -d` directory was gone. The same procedure with the round-2
-  script (`f47a5ad`) left `src/core/project.py` mutated, `project.py.bak`, `.mutmut-cache`
+  script (`7cbc050`) left `src/core/project.py` mutated, `project.py.bak`, `.mutmut-cache`
   and the private directory behind (restored by hand afterwards), so the procedure does
   exercise the second-signal path.
 
@@ -222,10 +222,10 @@ Results:
 | | mutants | killed | survived | timeout | suspicious |
 |---|---|---|---|---|---|
 | round 1, final (old script, round-1 code) | 456 | 438 | 14 | 4 | 0 |
-| round 2, after the code changes, before the survivor work (commit `a0a4713`) | 356 | 345 | 7 | 4 | 0 |
-| round 2, final (commit `2ce86b2`) | 349 | 342 | 3 | 4 | 0 |
-| round 3, after the code changes (commit `bf0b008`) | 361 | 352 | 5 | 4 | 0 |
-| round 3, final (commit `db3c816`) | 361 | 354 | 3 | 4 | 0 |
+| round 2, after the code changes, before the survivor work (commit `8073ca2`) | 356 | 345 | 7 | 4 | 0 |
+| round 2, final (commit `124635a`) | 349 | 342 | 3 | 4 | 0 |
+| round 3, after the code changes (commit `7ef9b02`) | 361 | 352 | 5 | 4 | 0 |
+| round 3, final (commit `5fe6830`) | 361 | 354 | 3 | 4 | 0 |
 | round 4, after the code changes | 371 | 363 | 4 | 4 | 0 |
 | round 4, after the check-script fix | 370 | 363 | 3 | 4 | 0 |
 | round 4, final (commentary rule removed) | 362 | 355 | 3 | 4 | 0 |
@@ -309,10 +309,10 @@ commit before the fix.
 | B9 regex edges | partly: `IT`/`US` and whitespace confirmed and fixed; `.NET` in `ASP.NET` accepted and documented by a test; irregular plurals (indices, analyses) not handled (not in decision 5); matching cost measured in round 1 (the rules were removed in round 2) | `test_all_caps_terms_are_case_sensitive`, `test_multi_word_terms_match_any_whitespace` failed before | decision 5 (replaced in round 2; whitespace rule kept) |
 
 Check that the round-1 tests fail on the pre-review source (tests from the branch; `src/`,
-`translate.py` and `scripts/` from `9693ae2`, the last commit before round 1):
+`translate.py` and `scripts/` from `d22807f`, the last commit before round 1):
 
 ```
-$ git checkout 9693ae2 -- src translate.py scripts
+$ git checkout d22807f -- src translate.py scripts
 $ python3 -m pytest tests/ -q
 68 failed, 298 passed, 31 warnings in 40.05s
 $ git checkout HEAD -- src translate.py scripts
@@ -333,10 +333,10 @@ D2 replaced the content signatures and the glossary inflection rules by simpler 
 the items about them are "superseded" rather than patched.
 
 Check that the round-2 tests fail on the pre-round source (tests from the branch; `src/`,
-`translate.py` and the two check scripts from `093dcd4`, the last commit before round 2):
+`translate.py` and the two check scripts from `cd2ea1c`, the last commit before round 2):
 
 ```
-$ git checkout 093dcd4 -- src translate.py scripts/verify/phase0_code_segments.py scripts/verify/phase0_builder_alignment.py
+$ git checkout cd2ea1c -- src translate.py scripts/verify/phase0_code_segments.py scripts/verify/phase0_builder_alignment.py
 $ python3 -m pytest tests/ -q
 90 failed, 329 passed in 43.21s
 $ git checkout HEAD -- src translate.py scripts/verify
@@ -348,31 +348,31 @@ are listed per item below.
 
 | Item | Verdict | Evidence | Fix |
 |---|---|---|---|
-| A1 builder signatures misclassify both generations | confirmed | pre-round builder: a new project's `<!--note-->note<h1>Title</h1>` chapter selected the legacy walk; `TestVersion1ExportMatchesMain[comment_holds_markup-*-None]` (old extractor stored `<!--<p>Draft</p>-->` as a paragraph) and `[comment_equals_text-*-None]` differ from `main`'s output on the pre-round builder | `3cc2987`: `segmenter_version` marker (D1) |
-| A2 empty cleaned reply accepted | confirmed | `test_code_reply_empty_after_cleanup_is_retried` (4 shapes), `test_text_reply_empty_after_cleanup_raises` failed before | `57880dd` (D3) |
-| A3 groups share one mutmut baseline | confirmed by reading mutmut 2.5.1 (`time_test_suite` reuses the cached time when the tests-directory hash matches; the cache file is `.mutmut-cache` in the working directory) | — | `a0a4713`: empty cache per group |
-| A4 cancellation leaves the run alive | confirmed by reading (mutmut and pytest were not in a group the script controlled) | interrupt tests in section 5 | `a0a4713`: own process group, kill and restore on INT/TERM |
-| A5 writes outside the worktree | partly: patch, runner and pytest temp files were in the system temp tree; per the decision a private `mktemp -d` directory is enough | — | `a0a4713`: one private directory for patch, runner, `TMPDIR`, `--basetemp`; section 5 says what is written where |
-| A6 suffixes match unrelated words (`Go`→goes …) | superseded by simplification | — | `c9288ab` (D2); now accepted and documented: other words starting with the term match |
+| A1 builder signatures misclassify both generations | confirmed | pre-round builder: a new project's `<!--note-->note<h1>Title</h1>` chapter selected the legacy walk; `TestVersion1ExportMatchesMain[comment_holds_markup-*-None]` (old extractor stored `<!--<p>Draft</p>-->` as a paragraph) and `[comment_equals_text-*-None]` differ from `main`'s output on the pre-round builder | `5cf02bf`: `segmenter_version` marker (D1) |
+| A2 empty cleaned reply accepted | confirmed | `test_code_reply_empty_after_cleanup_is_retried` (4 shapes), `test_text_reply_empty_after_cleanup_raises` failed before | `1de8807` (D3) |
+| A3 groups share one mutmut baseline | confirmed by reading mutmut 2.5.1 (`time_test_suite` reuses the cached time when the tests-directory hash matches; the cache file is `.mutmut-cache` in the working directory) | — | `8073ca2`: empty cache per group |
+| A4 cancellation leaves the run alive | confirmed by reading (mutmut and pytest were not in a group the script controlled) | interrupt tests in section 5 | `8073ca2`: own process group, kill and restore on INT/TERM |
+| A5 writes outside the worktree | partly: patch, runner and pytest temp files were in the system temp tree; per the decision a private `mktemp -d` directory is enough | — | `8073ca2`: one private directory for patch, runner, `TMPDIR`, `--basetemp`; section 5 says what is written where |
+| A6 suffixes match unrelated words (`Go`→goes …) | superseded by simplification | — | `6d9a3ae` (D2); now accepted and documented: other words starting with the term match |
 | A7 survivors called equivalent although inputs distinguish them | confirmed for 271, 357, 371, 372 (and 379); 347 and 164 no longer exist | section 5 | survivors removed from code or killed by tests; remaining 3 justified |
 | A8 `C` matches inside `C++`/`C#` | superseded by simplification | — | accepted (documented in `_term_pattern`) |
 | A9 plural entries do not match singular | superseded by simplification | — | accepted (documented) |
-| A10 lost comment-line indentation not reported | confirmed | `TestCodeLines::test_lost_comment_indentation_differs` (2 cases), `test_comment_wording_ignored` failed before | `ff999f9` (D5) |
-| A11 backup guard misses a single `.bak` | confirmed by reading (`ls` of several paths fails when any is missing) | — | `a0a4713`: each path checked |
-| A12 stale bytecode can still be read | confirmed by reading; the same effect was hit by hand during this round (two same-size edits within one second, the second run used the first's bytecode from the macOS `pycache_prefix`) | — | `a0a4713`: private `PYTHONPYCACHEPREFIX` |
-| B1 legacy chapter with a comment holding markup or an entity uses the new walk | confirmed | `TestVersion1ExportMatchesMain[comment_holds_markup-*-None]`, `[comment_with_entity-*-None]` failed before | `3cc2987` (D1) |
-| B2 commentary line before unfenced code kept | confirmed | `test_code_preface_before_unfenced_code_removed` (3 cases) failed before; `test_code_preface_without_fence_not_removed`, which locked the old behaviour, replaced | `57880dd` (D4) |
-| B3 emptiness check before cleanup; single-newline empty fence not recognised | confirmed | as A2, plus `test_code_empty_fence_cleans_to_empty['```python\n```']` failed before | `57880dd` (D3) |
-| B4 suffix false matches; `C` in `C++`/`CS` | superseded by simplification | — | `c9288ab` (D2), accepted |
-| B5 plural entries; `C++11`, `Python3` no longer matched | superseded by simplification; `C++11`/`Python3` match again (no trailing boundary) | — | `c9288ab` (D2) |
-| B6 0-based line numbers | confirmed | — | `a0a4713`: 1-based; log locations corrected |
-| B7 survivors 371/372 reachable; 271 reason inexact | confirmed | spine tests (section 5) | `2ce86b2`, `3cc2987` |
-| B8 = A10 | confirmed | as A10 | `ff999f9` |
-| C1 `es`, doubling and `y` rules wrong | superseded by simplification | — | `c9288ab` (D2) |
+| A10 lost comment-line indentation not reported | confirmed | `TestCodeLines::test_lost_comment_indentation_differs` (2 cases), `test_comment_wording_ignored` failed before | `ece8470` (D5) |
+| A11 backup guard misses a single `.bak` | confirmed by reading (`ls` of several paths fails when any is missing) | — | `8073ca2`: each path checked |
+| A12 stale bytecode can still be read | confirmed by reading; the same effect was hit by hand during this round (two same-size edits within one second, the second run used the first's bytecode from the macOS `pycache_prefix`) | — | `8073ca2`: private `PYTHONPYCACHEPREFIX` |
+| B1 legacy chapter with a comment holding markup or an entity uses the new walk | confirmed | `TestVersion1ExportMatchesMain[comment_holds_markup-*-None]`, `[comment_with_entity-*-None]` failed before | `5cf02bf` (D1) |
+| B2 commentary line before unfenced code kept | confirmed | `test_code_preface_before_unfenced_code_removed` (3 cases) failed before; `test_code_preface_without_fence_not_removed`, which locked the old behaviour, replaced | `1de8807` (D4) |
+| B3 emptiness check before cleanup; single-newline empty fence not recognised | confirmed | as A2, plus `test_code_empty_fence_cleans_to_empty['```python\n```']` failed before | `1de8807` (D3) |
+| B4 suffix false matches; `C` in `C++`/`CS` | superseded by simplification | — | `6d9a3ae` (D2), accepted |
+| B5 plural entries; `C++11`, `Python3` no longer matched | superseded by simplification; `C++11`/`Python3` match again (no trailing boundary) | — | `6d9a3ae` (D2) |
+| B6 0-based line numbers | confirmed | — | `8073ca2`: 1-based; log locations corrected |
+| B7 survivors 371/372 reachable; 271 reason inexact | confirmed | spine tests (section 5) | `124635a`, `5cf02bf` |
+| B8 = A10 | confirmed | as A10 | `ece8470` |
+| C1 `es`, doubling and `y` rules wrong | superseded by simplification | — | `6d9a3ae` (D2) |
 | C2 plural entries | superseded by simplification | — | accepted (documented) |
-| C3 empty fenced / prefaced replies saved without retry | confirmed | as A2/B3; for code segments a commentary-only reply (`以下是翻譯結果：\n`) cleans to empty, since code cleanup removes the commentary line, and is retried; for text and HTML segments a commentary-only reply is stored (round 4, B2) | `57880dd` (D3) |
+| C3 empty fenced / prefaced replies saved without retry | confirmed | as A2/B3; for code segments a commentary-only reply (`以下是翻譯結果：\n`) cleans to empty, since code cleanup removes the commentary line, and is retried; for text and HTML segments a commentary-only reply is stored (round 4, B2) | `1de8807` (D3) |
 | C4 `C` matches inside `C++`/`C#` | superseded by simplification | — | accepted (documented) |
-| C5 = A10 | confirmed | as A10 | `ff999f9` |
+| C5 = A10 | confirmed | as A10 | `ece8470` |
 
 Accepted glossary limitations (decision D2): for a glossary of more than 150 entries, a term
 also matches other words that start with it (`Go` → "going", `C` in "C++"), `.NET` does not
@@ -391,15 +391,15 @@ with a failing test (or, for the shell script, a real run) before the fix.
 
 | Item | Verdict | Evidence | Fix |
 |---|---|---|---|
-| A1 `mutation.sh`: mutmut failing clears the PID, cleanup skips group kill and restore | confirmed | section 5, round 3: killing mutmut itself now restores the file; the failure path previously set `MUTPID=""` before `exit 2` | `82d3ba9`: restore and warning run on every exit; the PID is kept on failure so the group is stopped |
-| A2 text/HTML reply of only fences (`` ```html\n``` `` → `` ``` ``) or only a commentary line is saved | confirmed | `test_text_reply_only_fence_or_commentary_is_retried` (8 cases) and `…_exhausts` (2) failed before; `test_short_text_reply_accepted` (`好的`, `當然`, `以下是步驟：` for a source ending in a colon, `X`) passes before and after | `2e5b536`: `_is_empty_reply` — empty when only backticks remain, or a single commentary line (existing start patterns) ending in a colon when the source does not end in one. In round 4 the backtick rule became whitespace-aware (A1) and the commentary rule was removed: a commentary-only reply is deliberately not treated as empty, an accepted limitation left to Phase 4's reply validation (B2; section 9) |
+| A1 `mutation.sh`: mutmut failing clears the PID, cleanup skips group kill and restore | confirmed | section 5, round 3: killing mutmut itself now restores the file; the failure path previously set `MUTPID=""` before `exit 2` | `89dcd21`: restore and warning run on every exit; the PID is kept on failure so the group is stopped |
+| A2 text/HTML reply of only fences (`` ```html\n``` `` → `` ``` ``) or only a commentary line is saved | confirmed | `test_text_reply_only_fence_or_commentary_is_retried` (8 cases) and `…_exhausts` (2) failed before; `test_short_text_reply_accepted` (`好的`, `當然`, `以下是步驟：` for a source ending in a colon, `X`) passes before and after | `7b5fbe4`: `_is_empty_reply` — empty when only backticks remain, or a single commentary line (existing start patterns) ending in a colon when the source does not end in one. In round 4 the backtick rule became whitespace-aware (A1) and the commentary rule was removed: a commentary-only reply is deliberately not treated as empty, an accepted limitation left to Phase 4's reply validation (B2; section 9) |
 | A3 survivor 111 not unconditionally equivalent | confirmed (by reading; not run) | `sys.path[0]` is not the script's directory under `-P`/`PYTHONSAFEPATH` (3.11+) | disposition (section 5) and the script's comment state the condition; no subprocess test, per the round-3 decision |
-| A4 code segment without `text` but with an empty translation counted as empty, not unreadable | confirmed | `test_code_segment_without_text_is_unreadable['']` failed before | `a1f7413`: source read before classifying |
-| B1 = A1 | confirmed | as A1 | `82d3ba9` |
-| B2 cleanup not protected from a second INT/TERM | confirmed by a real run of the round-2 script (section 5) | file left mutated, `.bak`, cache and private directory left | `82d3ba9`: `trap '' INT TERM` at the start of `cleanup` |
-| B3 alignment check proves only that the legacy walk is chosen, not equality with `main` | confirmed | the check compares the chosen walk with `legacy=True` of the branch's builder | `bf0b008`: output "not on legacy walk", docstring and section 4 say what it shows; equality with `main` rests on `TestVersion1ExportMatchesMain` |
+| A4 code segment without `text` but with an empty translation counted as empty, not unreadable | confirmed | `test_code_segment_without_text_is_unreadable['']` failed before | `023c925`: source read before classifying |
+| B1 = A1 | confirmed | as A1 | `89dcd21` |
+| B2 cleanup not protected from a second INT/TERM | confirmed by a real run of the round-2 script (section 5) | file left mutated, `.bak`, cache and private directory left | `89dcd21`: `trap '' INT TERM` at the start of `cleanup` |
+| B3 alignment check proves only that the legacy walk is chosen, not equality with `main` | confirmed | the check compares the chosen walk with `legacy=True` of the branch's builder | `7ef9b02`: output "not on legacy walk", docstring and section 4 say what it shows; equality with `main` rests on `TestVersion1ExportMatchesMain` |
 | B4 C3 row: commentary-only reply retried only for code | confirmed | — | row reworded (and again in round 4: text/HTML commentary-only replies are stored) |
-| B5 header says the mutmut cache goes to the private directory | confirmed | `.mutmut-cache` is in the repository root | `82d3ba9`: header corrected |
+| B5 header says the mutmut cache goes to the private directory | confirmed | `.mutmut-cache` is in the repository root | `89dcd21`: header corrected |
 | B6 `main`/`v1.0.0` cannot load a project created on this branch | confirmed | `v1.0.0`'s `src/` on a project created by this branch: `TypeError` | cannot be fixed on the branch; "Known consequences" and the Phase 0 section of `plan/02-improvement-plan.md` |
 
 ### 9. Review round 4
