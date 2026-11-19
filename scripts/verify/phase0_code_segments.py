@@ -81,10 +81,11 @@ def check_project(project_file: str) -> tuple[int, list[str], list[str]]:
         if seg.get('status') not in TRANSLATED_STATUSES:
             continue
         translated += 1
+        source = seg['text']  # a missing source makes the project unreadable
         output = seg.get('translated_text') or ''
         if not output.strip():
             empty.append(seg['segment_id'])
-        elif code_lines(seg['text']) != code_lines(output):
+        elif code_lines(source) != code_lines(output):
             differing.append(seg['segment_id'])
     return translated, differing, empty
 
