@@ -491,7 +491,7 @@ class TaskManager:
                 # Find glossary terms
                 glossary_text = ''
                 if gm.entries:
-                    found = gm.find_terms_in_text(seg.text)
+                    found = gm.terms_for_prompt(seg.text)
                     if found:
                         glossary_text = gm.format_for_prompt(found)
 

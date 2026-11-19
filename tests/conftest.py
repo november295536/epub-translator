@@ -200,7 +200,8 @@ def make_context_project():
 
     Chapter B is pending: a long text segment, code, the target text, code,
     another text. Chapters A and C (one text segment each) are already
-    translated, so their text must never appear as context.
+    translated, so their text must never appear as context. The glossary
+    has one term that occurs in no segment.
     """
     from src.core.project import ProjectManager
 
@@ -210,6 +211,10 @@ def make_context_project():
         pm.mark_translated('chA_seg0001', '甲')
         pm.mark_translated('chC_seg0001', '丙')
         pm.save()
+        # A small glossary goes into every text prompt, matched or not
+        from src.glossary.glossary_manager import GlossaryManager
+        GlossaryManager(os.path.join(project_dir, 'glossary.json')).add_term(
+            'GLOSSMARK', '詞彙')
         return project_dir
 
     return make
@@ -236,6 +241,9 @@ def assert_context_prompts(prompts, project_dir):
         matches = [p for p in prompts if f'<p>{mark}' in p]
         assert len(matches) == 1, mark
         return matches[0]
+
+    for mark in ('HEADMARK', 'TARGETMARK', 'NEXTTEXTMARK'):
+        assert 'GLOSSMARK → 詞彙' in prompt_for(mark)   # small glossary: all entries
 
     first = prompt_for('HEADMARK')
     assert 'PREVCHAPTERMARK' not in first          # other chapter
