@@ -674,3 +674,368 @@ class TestLoadCheckRoundTripExact:
         pm = self._pm(tmp_path, drop_model=True)
         pm.data.title = 'changed'
         assert load_check.round_trip(pm) == ('differs', "top-level keys ['model', 'title'], segments 0")
+
+
+# --- Phase 2: round trip and migration of copies -------------------------------
+
+roundtrip_check = _load('phase2_roundtrip')
+migrate_check = _load('phase2_migrate_copies')
+
+XHTML10 = ('<?xml version="1.0" encoding="utf-8"?>\n'
+           '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" '
+           '"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">\n'
+           '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head>'
+           '<body><!-- kept --><p>Old doctype.</p></body></html>')
+
+
+def _roundtrip_project(directory, members=None, inside=True):
+    """A project whose EPUB has a nav document, an XHTML item outside the
+    spine, a chapter with an XHTML 1.0 DOCTYPE and a stylesheet."""
+    from tests.conftest import RAW_NAV, write_raw_epub, xhtml
+    os.makedirs(directory)
+    items = [('nav', 'nav.xhtml', 'application/xhtml+xml', 'nav'),
+             ('a', 'a.xhtml', 'application/xhtml+xml', None),
+             ('old', 'old.xhtml', 'application/xhtml+xml', None),
+             ('extra', 'extra.xhtml', 'application/xhtml+xml', None),
+             ('css', 's.css', 'text/css', None)]
+    content = {'OEBPS/nav.xhtml': RAW_NAV, 'OEBPS/a.xhtml': xhtml('<p>A tide.</p>'),
+               'OEBPS/old.xhtml': XHTML10, 'OEBPS/extra.xhtml': xhtml('<p>Extra.</p>'),
+               'OEBPS/s.css': 'p {}'}
+    content.update(members or {})
+    content = {k: v for k, v in content.items() if v is not None}
+    path = os.path.join(directory, 'source.epub' if inside else '../outside.epub')
+    write_raw_epub(path, items, ['nav', 'a', 'old'], content)
+    with open(os.path.join(directory, 'project.json'), 'w') as f:
+        json.dump({'epub_path': os.path.abspath(path), 'segments': []}, f)
+
+
+class TestRoundtripCheck:
+
+    def test_pass_counts_every_xhtml_item(self, tmp_path, capsys):
+        _roundtrip_project(str(tmp_path / 'zeta'))
+        _roundtrip_project(str(tmp_path / 'alpha'), inside=False)
+        (tmp_path / 'not-a-project').mkdir()
+        assert roundtrip_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 0
+        assert capsys.readouterr().out.splitlines() == [
+            'PASS project-1: chapters 4, round trip equal 4, whole-document equal 3',
+            'PASS project-2: chapters 4, round trip equal 4, whole-document equal 3',
+            'TOTAL projects 2  chapters 8  round trip equal 8  whole-document equal 6  '
+            'failed projects 0',
+        ]
+
+    def test_names_without_anonymize(self, tmp_path, capsys):
+        _roundtrip_project(str(tmp_path / 'alpha'))
+        roundtrip_check.main(['--projects-dir', str(tmp_path)])
+        assert capsys.readouterr().out.startswith('PASS alpha: chapters 4')
+
+    @pytest.mark.parametrize('members', [
+        {'OEBPS/extra.xhtml': '<html><body><p>open</body></html>'},
+        {'OEBPS/extra.xhtml': None},
+    ])
+    def test_unparseable_or_missing_item_fails(self, tmp_path, capsys, members):
+        _roundtrip_project(str(tmp_path / 'p'), members)
+        assert roundtrip_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
+        assert capsys.readouterr().out.splitlines() == [
+            'FAIL project-1: chapters 4, round trip equal 3, whole-document equal 2; '
+            '1 chapters missing, unparseable or changed',
+            'TOTAL projects 1  chapters 4  round trip equal 3  whole-document equal 2  '
+            'failed projects 1',
+        ]
+
+    def test_changed_serialization_fails(self, tmp_path, capsys, monkeypatch):
+        _roundtrip_project(str(tmp_path / 'p'))
+        real = roundtrip_check.canonical
+        calls = []
+
+        def canonical(data):
+            calls.append(data)
+            return real(data) + ('x' if len(calls) == 2 else '')
+        monkeypatch.setattr(roundtrip_check, 'canonical', canonical)
+        assert roundtrip_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
+        assert 'round trip equal 3, whole-document equal 3; 1 chapters' in capsys.readouterr().out
+
+    def test_unreadable_source_fails(self, tmp_path, capsys):
+        directory = tmp_path / 'secret-name'
+        directory.mkdir()
+        (directory / 'project.json').write_text(json.dumps(
+            {'epub_path': str(directory / 'gone.epub')}))
+        assert roundtrip_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
+        out = capsys.readouterr().out
+        assert out.splitlines() == [
+            'FAIL project-1: cannot read the source (FileNotFoundError)',
+            'TOTAL projects 1  chapters 0  round trip equal 0  whole-document equal 0  '
+            'failed projects 1']
+        assert 'secret-name' not in out
+
+    def test_changed_project_directory_fails(self, tmp_path, capsys, monkeypatch):
+        directory = str(tmp_path / 'p')
+        _roundtrip_project(directory)
+        real = roundtrip_check.check_epub
+
+        def check_epub(path):
+            with open(os.path.join(directory, 'project.json'), 'a') as f:
+                f.write(' ')
+            return real(path)
+        monkeypatch.setattr(roundtrip_check, 'check_epub', check_epub)
+        assert roundtrip_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
+        assert capsys.readouterr().out.startswith(
+            'FAIL project-1: chapters 4, round trip equal 4, whole-document equal 3; '
+            'files in the project directory changed\n')
+
+    def test_snapshot_sees_nested_files(self, tmp_path):
+        (tmp_path / 'log').mkdir()
+        (tmp_path / 'log' / 'b.txt').write_text('12')
+        (tmp_path / 'a.txt').write_text('1')
+        snap = roundtrip_check.snapshot(str(tmp_path))
+        assert [(name, size) for name, size, _ in snap] == [('a.txt', 1), ('log/b.txt', 2)]
+        assert snap[0][2] == os.stat(tmp_path / 'a.txt').st_mtime_ns
+
+    def test_read_only(self, tmp_path):
+        directory = str(tmp_path / 'p')
+        _roundtrip_project(directory)
+        before = roundtrip_check.snapshot(directory)
+        roundtrip_check.main(['--projects-dir', str(tmp_path)])
+        assert roundtrip_check.snapshot(directory) == before
+
+    def test_missing_directory(self, tmp_path, capsys):
+        assert roundtrip_check.main(['--projects-dir', str(tmp_path / 'nope'),
+                                     '--anonymize']) == 2
+        assert capsys.readouterr().out == (
+            'ERROR cannot list projects directory <projects-dir> (FileNotFoundError)\n')
+
+    def test_runs_as_script_with_help(self, tmp_path):
+        _roundtrip_project(str(tmp_path / 'alpha'))
+        result = _run_script('phase2_roundtrip', ['--projects-dir', str(tmp_path)],
+                             str(tmp_path))
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.startswith('PASS alpha')
+        result = _run_script('phase2_roundtrip', ['--help'], str(tmp_path))
+        _assert_help(result.stdout,
+                     'Phase 2 check: every chapter file parses as XML and re-serializes '
+                     'unchanged.', 'Print project-N labels; omit names and paths')
+
+
+def _migratable(root, name, unmatched=False):
+    from tests.test_migrate import DEFAULT_SEGMENTS, _legacy_project, _segment
+    segments = list(DEFAULT_SEGMENTS)
+    if unmatched:
+        segments[3] = _segment('c2', 2, 'Another sentence.', '另。', 'translated')
+    return _legacy_project(root, segments=segments, name=name)
+
+
+class TestMigrateCopiesCheck:
+
+    PASS_LINE = ('PASS project-1: chapters 2/2, segments 4/4, merge groups 1 (2 segments), '
+                 'count differs 0, translated chars 54 -> 54, export places 2/2, web load ok')
+
+    def _main(self, root, anonymize=True):
+        return migrate_check.main(['--projects-dir', str(root)]
+                                  + (['--anonymize'] if anonymize else []))
+
+    def test_pass_and_fail_lines(self, tmp_path, capsys):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        good = _migratable(root, 'alpha')
+        bad = _migratable(root, 'beta', unmatched=True)
+        (root / 'not-a-project').mkdir()
+        before = {d: roundtrip_check.snapshot(d) for d in (good, bad)}
+
+        assert self._main(root) == 1
+
+        assert capsys.readouterr().out.splitlines() == [
+            self.PASS_LINE,
+            'FAIL project-2: chapters 1/2, segments 2/4, merge groups 0 (0 segments), '
+            'count differs 0, translated chars 52 -> 52, export places 0/2, web load ok; '
+            '1 chapters unmatched, nothing written; 2 chapters not placed by the export',
+            'TOTAL projects 2  chapters 3/4  segments 6/8  merge groups 1 (2 segments)  '
+            'count differs 0  translated chars unchanged 2  export places 2/4  web loads 2  '
+            'failed projects 1',
+        ]
+        # the originals were only read
+        assert {d: roundtrip_check.snapshot(d) for d in (good, bad)} == before
+        assert sorted(os.listdir(good)) == ['project.json', 'source.epub']
+
+    def test_copies_removed_and_outside_repository(self, tmp_path, capsys, monkeypatch):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        _migratable(root, 'alpha')
+        made = []
+        real = migrate_check.tempfile.mkdtemp
+
+        def mkdtemp(**kwargs):
+            made.append(real(**kwargs))
+            return made[-1]
+        monkeypatch.setattr(migrate_check.tempfile, 'mkdtemp', mkdtemp)
+        assert self._main(root) == 0
+        assert len(made) == 1 and not os.path.exists(made[0])
+        assert os.path.basename(made[0]).startswith('phase2-migrate-')
+        assert not os.path.realpath(made[0]).startswith(ROOT)
+
+    def test_refuses_temporary_directory_inside_repository(self, tmp_path, capsys,
+                                                           monkeypatch):
+        import tempfile
+        root = tmp_path / 'projects'
+        root.mkdir()
+        _migratable(root, 'alpha')
+        inside = tempfile.mkdtemp(dir=ROOT, prefix='.phase2-test-')
+        monkeypatch.setattr(migrate_check.tempfile, 'mkdtemp', lambda **kwargs: inside)
+        assert self._main(root) == 2
+        assert capsys.readouterr().out == (
+            'ERROR the temporary directory is inside the repository\n')
+        assert not os.path.exists(inside)
+
+    def test_glossary_copied_and_names_shown(self, tmp_path, capsys, monkeypatch):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        directory = _migratable(root, 'alpha')
+        with open(os.path.join(directory, 'glossary.json'), 'w') as f:
+            f.write('{}')
+        seen = []
+        real = migrate_check.check_copy
+
+        def check_copy(copy_dir, client, name):
+            seen.append(sorted(os.listdir(copy_dir)))
+            return real(copy_dir, client, name)
+        monkeypatch.setattr(migrate_check, 'check_copy', check_copy)
+        assert self._main(root, anonymize=False) == 0
+        assert seen == [['glossary.json', 'project.json', 'source.epub']]
+        assert capsys.readouterr().out.startswith('PASS alpha: chapters 2/2')
+
+    def test_changed_translation_fails(self, tmp_path, capsys, monkeypatch):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        _migratable(root, 'alpha')
+        real = migrate_check.migrate_project
+
+        def migrate(copy_dir):
+            report = real(copy_dir)
+            path = os.path.join(copy_dir, 'project.json')
+            with open(path, encoding='utf-8') as f:
+                raw = json.load(f)
+            raw['segments'][0]['translated_text'] += '!'
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(raw, f)
+            return report
+        monkeypatch.setattr(migrate_check, 'migrate_project', migrate)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[0] == (self.PASS_LINE.replace('PASS', 'FAIL').replace('54 -> 54', '54 -> 55')
+                          + '; translated characters changed')
+        assert 'translated chars unchanged 0' in out[1]
+
+    def test_unplaced_chapter_fails(self, tmp_path, capsys, monkeypatch):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        _migratable(root, 'alpha')
+        monkeypatch.setattr(migrate_check.EPUBBuilder, '_place_by_blocks',
+                            staticmethod(lambda body, segments: None))
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[0] == (self.PASS_LINE.replace('PASS', 'FAIL')
+                          .replace('export places 2/2', 'export places 0/2')
+                          + '; 2 chapters not placed by the export')
+        assert 'export places 0/2' in out[1]
+
+    def test_chapter_missing_from_book_not_placed(self, tmp_path, monkeypatch):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        directory = _migratable(root, 'alpha')
+        migrate_check.migrate_project(directory)
+        real = migrate_check.epub.read_epub
+
+        def read_epub(path):
+            book = real(path)
+            book.items = [i for i in book.items if i.get_id() != 'c2']
+            return book
+        monkeypatch.setattr(migrate_check.epub, 'read_epub', read_epub)
+        assert migrate_check.placed_chapters(directory) == (2, 1)
+
+    def test_web_load_checked(self, tmp_path, capsys, monkeypatch):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        _migratable(root, 'alpha')
+        monkeypatch.setattr(migrate_check, 'web_loads', lambda client, name, segments: False)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[0] == (self.PASS_LINE.replace('PASS', 'FAIL').replace('web load ok',
+                                                                         'web load failed')
+                          + '; does not load in the web app')
+        assert 'web loads 0' in out[1]
+
+    @pytest.mark.parametrize('case', ['ok', 'count', 'missing', 'review', 'home'])
+    def test_web_loads(self, tmp_path, case, monkeypatch):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        directory = _migratable(root, 'alpha')
+        migrate_check.migrate_project(directory)
+        app = migrate_check.create_app(projects_dir=str(root))
+        app.config['TESTING'] = True
+        client = app.test_client()
+        name, count = 'alpha', 3
+        if case == 'count':
+            count = 4
+        elif case == 'missing':
+            name = 'nope'
+        elif case in ('review', 'home'):
+            real = client.get
+            path = '/project/alpha/review' if case == 'review' else '/'
+
+            def get(url, *a, **k):
+                response = real(url, *a, **k)
+                if url == path:
+                    response.status_code = 500
+                return response
+            monkeypatch.setattr(client, 'get', get)
+        assert migrate_check.web_loads(client, name, count) is (case == 'ok')
+
+    def test_exception_is_a_fail(self, tmp_path, capsys, monkeypatch):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        _migratable(root, 'alpha')
+        _migratable(root, 'beta')
+
+        def boom(copy_dir):
+            if copy_dir.endswith('alpha'):
+                raise RuntimeError('secret-name')
+            return real(copy_dir)
+        real = migrate_check.migrate_project
+        monkeypatch.setattr(migrate_check, 'migrate_project', boom)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[0] == 'FAIL project-1: migration check raised RuntimeError'
+        assert out[1].startswith('PASS project-2')
+        assert out[2].startswith('TOTAL projects 2  chapters 2/2  segments 4/4')
+        assert out[2].endswith('failed projects 1')
+
+    def test_changed_project_directory_fails(self, tmp_path, capsys, monkeypatch):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        directory = _migratable(root, 'alpha')
+        real = migrate_check.check_copy
+
+        def check_copy(copy_dir, client, name):
+            with open(os.path.join(directory, 'project.json'), 'a') as f:
+                f.write(' ')
+            return real(copy_dir, client, name)
+        monkeypatch.setattr(migrate_check, 'check_copy', check_copy)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[0] == (
+            self.PASS_LINE.replace('PASS', 'FAIL') + '; files in the project directory changed')
+
+    def test_missing_directory(self, tmp_path, capsys):
+        assert self._main(tmp_path / 'nope') == 2
+        assert capsys.readouterr().out == (
+            'ERROR cannot list projects directory <projects-dir> (FileNotFoundError)\n')
+
+    def test_runs_as_script_with_help(self, tmp_path):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        _migratable(root, 'alpha')
+        result = _run_script('phase2_migrate_copies', ['--projects-dir', str(root)],
+                             str(tmp_path))
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.startswith('PASS alpha')
+        result = _run_script('phase2_migrate_copies', ['--help'], str(tmp_path))
+        _assert_help(result.stdout,
+                     'Phase 2 check: the migration succeeds on copies of the existing '
+                     'projects.', 'Print project-N labels; omit names and paths')
