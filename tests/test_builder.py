@@ -1026,3 +1026,66 @@ class TestContentDivAlignment:
         h1 = soup.find('h1')
         assert h1 is not None, "h1 should exist after container div recurse"
         assert '前言' in h1.get_text()
+
+
+class _FakeItem:
+    """Minimal stand-in for an ebooklib document item."""
+
+    def __init__(self, html: str):
+        self.content = html.encode('utf-8')
+
+    def get_content(self):
+        return self.content
+
+    def set_content(self, content):
+        self.content = content
+
+
+def _seg_state(segment_id, html, text, translated,
+               segment_type=SegmentType.TEXT):
+    from src.core.project import SegmentState
+    return SegmentState(segment_id=segment_id, chapter_id='ch1', html=html,
+                        text=text, word_count=len(text.split()),
+                        segment_type=segment_type, translated_text=translated)
+
+
+class TestCommentAlignment:
+    """The builder must line up with segments made with or without comment skipping."""
+
+    CHAPTER = ('<html><body><h1>Title</h1><!-- note -->'
+               '<p>Para one.</p><pre>x = 1</pre></body></html>')
+
+    def _transform(self, tmp_path, segments):
+        builder = EPUBBuilder(str(tmp_path))
+        item = _FakeItem(self.CHAPTER)
+        builder._transform_chapter(item, segments, 'chinese-only')
+        return BeautifulSoup(item.get_content().decode('utf-8'), 'html.parser')
+
+    def test_segments_without_comment_block(self, tmp_path):
+        """Segments from the current segmenter (comment skipped)."""
+        from src.core.segmenter import Segmenter
+        segs = Segmenter().segment_chapter('ch1', self.CHAPTER)
+        assert len(segs) == 3
+        states = [_seg_state(s.id, s.html, s.text, f'T{i}', s.segment_type)
+                  for i, s in enumerate(segs)]
+
+        soup = self._transform(tmp_path, states)
+
+        assert soup.find('h1').get_text() == 'T0'
+        assert soup.find('p').get_text() == 'T1'
+        assert soup.find('pre').get_text() == 'T2'
+
+    def test_legacy_segments_with_comment_block(self, tmp_path):
+        """Segments stored by the old segmenter, which kept the comment as text."""
+        states = [
+            _seg_state('ch1_seg0001', '<h1>Title</h1>', 'Title', 'T0'),
+            _seg_state('ch1_seg0002', ' note \n<p>Para one.</p>',
+                       'note\nPara one.', '<p>T1</p>'),
+            _seg_state('ch1_seg0003', '<pre>x = 1</pre>', 'x = 1', 'T2',
+                       SegmentType.CODE),
+        ]
+
+        soup = self._transform(tmp_path, states)
+
+        assert soup.find('h1').get_text() == 'T0'
+        assert soup.find('pre').get_text() == 'T2'
