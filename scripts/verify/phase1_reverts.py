@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 1, review round 1: each fixed behaviour is guarded by a test.
+"""Phase 1, review rounds 1 and 2: each fixed behaviour is guarded by a test.
 
 Puts each old behaviour back, one at a time, into a copy of the committed
 code (git archive HEAD, in a temporary directory removed afterwards) and
@@ -8,6 +8,10 @@ fail. Prints OK/MISS per revert and the number not detected.
 
 Usage:
     python3 scripts/verify/phase1_reverts.py [name-prefix ...]
+
+Round 1 reverts whose code review round 2 moved put back the same old
+behaviour at the new place (items 8, 9, 24); the round 2 reverts are named
+"R2-<item>".
 
 Exit code: 0 when every revert is detected, 1 otherwise.
 """
@@ -67,8 +71,8 @@ r('5 logging set up outside the try',
    (T, '            handler = setup_project_logging(project_dir)\n            pm = task.pm', '            pm = task.pm')],
   ['tests/test_web.py::TestStartFailures::test_logging_setup_failure'])
 r('5 coordinator start failure keeps the lock',
-  [(T, '            if task.project_lock is None or not task.threads_alive():\n                # Nothing started that would release it\n                task.state = \'failed\'\n                lock.release()',
-    '            if task.project_lock is None:\n                lock.release()')],
+  [(T, '                if task.project_lock is None or not task.threads_alive():\n                    # Nothing started that would release it\n                    task.state = \'failed\'\n                    lock.release()',
+    '                if task.project_lock is None:\n                    lock.release()')],
   ['tests/test_web.py::TestStartFailures::test_coordinator_start_failure'])
 r('5 lock descriptor leaked after flock',
   [(P, '                except BaseException:\n                    os.close(fd)  # drops the flock taken above\n                    raise',
@@ -90,8 +94,8 @@ r('7 late run error after stop pauses the task',
     '                        # Only first')],
   ['tests/test_web.py::TestStopThenLateRunError'])
 r('8 KeyboardInterrupt leaves the child running',
-  [(LLM, '    except BaseException:\n        if proc.returncode is None:\n            _kill_group(proc)\n        raise\n',
-    '    except BaseException:\n        raise\n')],
+  [(LLM, '        # Also when the program itself has ended: what it started may still run\n        stdout, stderr = _kill_group(proc)\n',
+    '        stdout = stderr = None\n')],
   ['tests/test_llm.py::TestRunProcessExceptionalExit::test_keyboard_interrupt_kills_child'])
 r('8 unbounded wait after the kill',
   [(LLM, 'proc.communicate(timeout=KILL_WAIT_SECONDS)', 'proc.communicate()')],
@@ -100,16 +104,15 @@ r('8 no exit hook',
   [(LLM, 'atexit.register(_kill_live_groups)', '')],
   ['tests/test_llm.py::TestRunProcessExceptionalExit::test_children_killed_when_interpreter_exits'])
 r('9 failure log write error propagates',
-  [(TR, '            try:\n                write_failure_log(log_dir, seg.segment_id, model, e)\n            except OSError as log_error:\n                logger.error("無法寫入失敗紀錄 %s: %s", seg.segment_id, log_error)',
-    '            write_failure_log(log_dir, seg.segment_id, model, e)')],
+  [(TR, '        try:\n            write_failure_log(log_dir, segment_id, outcome.model, outcome.failure)\n        except OSError as e:\n            logger.error("無法寫入失敗紀錄 %s: %s", segment_id, e)',
+    '        write_failure_log(log_dir, segment_id, outcome.model, outcome.failure)')],
   ['tests/test_translator.py::TestDiagnosticWriteFailure', 'tests/test_web.py::TestWorkerUnexpectedErrors',
    'tests/test_cli.py::TestCLIUnexpectedErrors'])
 r('9 web worker dies on an unexpected exception',
-  [(T, '                    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n                        logger.exception("[%s] 未預期的錯誤: %s", tag, seg.segment_id)\n                        outcome = unexpected_error_outcome(engine.model, e)\n',
-    '')],
+  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        return unexpected_error_outcome(model, e)\n', '')],
   ['tests/test_web.py::TestWorkerUnexpectedErrors::test_unexpected_exception'])
 r('9 CLI worker dies on an unexpected exception',
-  [(CLI, '            except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n                outcome = unexpected_error_outcome(engine.model, e)\n', '')],
+  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        return unexpected_error_outcome(model, e)\n', '')],
   ['tests/test_cli.py::TestCLIUnexpectedErrors::test_unexpected_worker_exception',
    'tests/test_cli.py::TestCLILock::test_lock_released_on_error'])
 r('10 no cancel check before the start',
@@ -202,11 +205,11 @@ r('21 file name without digest',
   [(TR, "f'{safe_id}-{digest}.txt'", "f'{safe_id}.txt'")],
   ['tests/test_translator.py::TestFailureLogNames'])
 r('24 edit leaves the failure log',
-  [(REV, '    # A person\'s version replaces the failed one: its diagnostics go too\n    remove_failure_log(_log_dir(pm), segment_id)\n', '')],
+  [(REV, "            # A person's version replaces the failed one: its diagnostics go too\n            remove_failure_log(_log_dir(pm), segment_id)\n", '')],
   ['tests/test_web.py::TestEditRemovesFailureLog'])
 r('24 approve leaves the failure log',
-  [(REV, "        return jsonify({'error': str(e)}), 404\n    remove_failure_log(_log_dir(pm), segment_id)\n    return jsonify({'status': 'ok', 'segment_id': segment_id})\n\n\n@review_bp.route('/api/projects/<project_name>/segments/<segment_id>/retranslate'",
-    "        return jsonify({'error': str(e)}), 404\n    return jsonify({'status': 'ok', 'segment_id': segment_id})\n\n\n@review_bp.route('/api/projects/<project_name>/segments/<segment_id>/retranslate'")],
+  [(REV, '            pm.mark_reviewed(segment_id, text=text)\n            pm.save()\n            remove_failure_log(_log_dir(pm), segment_id)\n',
+    '            pm.mark_reviewed(segment_id, text=text)\n            pm.save()\n')],
   ['tests/test_web.py::TestEditRemovesFailureLog'])
 r('25 call spent on a segment edited after queueing',
   [(T, '                if skip:\n', '                if False:\n')],
@@ -216,13 +219,112 @@ r('25 explicitly queued reviewed segment skipped',
     "                        seg.status == SegmentStatus.REVIEWED)")],
   ['tests/test_web.py::TestQueuedEdits::test_queued_reviewed_segment_is_translated_when_asked'])
 
+
+# --- Review round 2 ---------------------------------------------------------------
+
+CL, PR, TRL, TPL = ('src/llm/claude_cli.py', 'src/web/blueprints/projects.py',
+                    'src/web/blueprints/translation.py', 'src/web/templates/project/translation.html')
+
+r('R2-1 transaction without the file lock',
+  [(T, '        with project_mutex(project_dir), ProjectLock(project_dir):\n            yield',
+    '        with project_mutex(project_dir):\n            yield')],
+  ['tests/test_web.py::TestRound2TransactionAcrossProcesses'])
+r('R2-2 delete checks the task outside the mutex',
+  [(PR, "    with project_mutex(project_dir):\n        if TaskManager().task_active(project_name):\n            return jsonify({'error': '專案正在翻譯中，請先停止翻譯再刪除'}), 409\n",
+    "    if TaskManager().task_active(project_name):\n        return jsonify({'error': '專案正在翻譯中，請先停止翻譯再刪除'}), 409\n    with project_mutex(project_dir):\n")],
+  ['tests/test_web.py::TestRound2DeleteGuardInsideMutex'])
+r('R2-3 CLI workers started outside the protected block',
+  [(CLI, '    try:\n        # Started inside the try: if a later start fails or is interrupted,\n        # the workers already running are stopped and joined below\n        for i in range(actual_workers):\n            # Daemon: a second Ctrl-C ends the process without waiting for them\n            t = threading.Thread(target=worker, args=(i,), daemon=True)\n            t.start()\n            threads.append(t)\n\n        while',
+    '    for i in range(actual_workers):\n        t = threading.Thread(target=worker, args=(i,), daemon=True)\n        t.start()\n        threads.append(t)\n    try:\n        while')],
+  ['tests/test_cli.py::TestRound2WorkerStartup'])
+r('R2-4 every start error stops the run',
+  [(LLM, "            if isinstance(e, (FileNotFoundError, PermissionError)) or e.errno == errno.ENOEXEC:",
+    '            if True:')],
+  ['tests/test_llm.py::TestRound2StartErrors', 'tests/test_translator.py::TestRound2StartErrorFailsSegment'])
+r('R2-5 unexpected exception escapes the entry point',
+  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        return unexpected_error_outcome(model, e)\n', '')],
+  ['tests/test_translator.py::TestRound2UnexpectedErrorInEntryPoint',
+   'tests/test_cli.py::TestCLIUnexpectedErrors::test_unexpected_worker_exception'])
+r('R2-6 group left alone when the parent has exited',
+  [(LLM, '        stdout, stderr = _kill_group(proc)\n        if isinstance(e',
+    "        stdout = stderr = ''\n        if proc.returncode is None:\n            stdout, stderr = _kill_group(proc)\n        if isinstance(e")],
+  ['tests/test_llm.py::TestRound2GroupKilledAfterParentExit'])
+r('R2-7 start not refused after the exit hook',
+  [(LLM, "        if _shutting_down:\n            raise CancelledError('shutting down')\n", '')],
+  ['tests/test_llm.py::TestRound2ExitHook'])
+r('R2-7 exit hook sets no flag',
+  [(LLM, '        _shutting_down = True\n        groups', '        groups')],
+  ['tests/test_llm.py::TestRound2ExitHook'])
+r('R2-9 output dropped when the pipes are given up',
+  [(LLM, '        stdout, stderr = _decoded(e.output), _decoded(e.stderr)', "        stdout = stderr = ''")],
+  ['tests/test_llm.py::TestRound2PartialOutputAfterKill',
+   'tests/test_llm.py::TestRunProcessExceptionalExit::test_kill_wait_is_bounded_when_a_descendant_keeps_the_pipes'])
+r('R2-10 web success removes the log before acceptance',
+  [(T, '        outcome = res.outcome\n        if outcome is None:',
+    "        outcome = res.outcome\n        if outcome is not None and outcome.status == SegmentStatus.TRANSLATED:\n            record_failure_log(os.path.join(pm.project_dir, 'log'), res.segment_id, outcome)\n        if outcome is None:")],
+  ['tests/test_web.py::TestRound2FailureLogAtAcceptance::test_stale_success_keeps_newer_failure_log'])
+r('R2-10 re-translate records the log before acceptance and save',
+  [(REV, '        outcome = translate_segment(engine, seg, segments, gm)\n',
+    "        outcome = translate_segment(engine, seg, segments, gm)\n        record_failure_log(os.path.join(project_dir, 'log'), segment_id, outcome)\n")],
+  ['tests/test_web.py::TestRound2FailureLogAtAcceptance::test_success_whose_save_is_refused_keeps_the_log',
+   'tests/test_web.py::TestRound2FailureLogAtAcceptance::test_stale_retranslation_writes_no_log'])
+r('R2-17 web failure log written before acceptance',
+  [(T, '        outcome = res.outcome\n        if outcome is None:',
+    "        outcome = res.outcome\n        if outcome is not None:\n            record_failure_log(os.path.join(pm.project_dir, 'log'), res.segment_id, outcome)\n        if outcome is None:")],
+  ['tests/test_web.py::TestRound2FailureLogAtAcceptance::test_stale_failure_writes_no_log'])
+r('R2-17 edit removes the log outside the transaction',
+  [(REV, "            pm.save()\n            # A person's version replaces the failed one: its diagnostics go too\n            remove_failure_log(_log_dir(pm), segment_id)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 404\n",
+    "            pm.save()\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 404\n    remove_failure_log(_log_dir(pm), segment_id)\n")],
+  ['tests/test_web.py::TestRound2FailureLogAtAcceptance::test_edit_removes_the_log_inside_the_transaction'])
+r('R2-11 run-level error not kept on the task',
+  [(T, '                            task.error = str(e)  # for a page opened later\n', '')],
+  ['tests/test_web.py::TestRound2RunErrorVisible'])
+r('R2-11 resume keeps the old error',
+  [(T, '            task.error = None  # the run-level error that paused it\n', '')],
+  ['tests/test_web.py::TestRound2RunErrorVisible::test_resume_clears_it'])
+r('R2-12 stored model not shown',
+  [(TPL, "                if (!this.availableModels.some(m => m.alias === this.model)) {", '                if (false) {')],
+  ['tests/test_web.py::TestRound2StoredModelOption'])
+r('R2-13 Unicode in the file name',
+  [(TR, "re.sub(r'[^A-Za-z0-9_.-]', '_', segment_id)", "re.sub(r'[^\\w.-]', '_', segment_id)")],
+  ['tests/test_translator.py::TestRound2FailureLogNameBytes'])
+r('R2-15 echoed phrase taken for an error',
+  [(CL, "        echoed = prompt.lower() if result.returncode == 0 else ''", "        echoed = ''")],
+  ['tests/test_llm.py::TestRound2RequestEcho', 'tests/test_translator.py::TestRound2CodeEchoingAnErrorPhrase'])
+r('R2-16 no project check before the lock',
+  [(T, "            if not os.path.isfile(os.path.join(project_dir, ProjectManager.PROJECT_FILE)):\n                raise FileNotFoundError('專案不存在')\n", '')],
+  ['tests/test_web.py::TestRound2StartChecks'])
+r('R2-16 file lock before the mutex',
+  [(T, '        with project_mutex(project_dir):\n            # No lock file', '        lock.acquire()\n        with project_mutex(project_dir):\n            # No lock file'),
+   (T, '            lock.acquire()  # raises ProjectLockedError\n', '')],
+  ['tests/test_web.py::TestRound2StartChecks::test_lock_taken_under_the_mutex'])
+r('R2-19 temporary descriptor leaked by save',
+  [(P, "                with open(fd, 'w', encoding='utf-8') as f:  # closes fd on any error\n                    # mkstemp creates the file 0600: keep the mode project.json had\n                    try:\n                        mode = os.stat(self.project_file).st_mode & 0o777\n                    except FileNotFoundError:\n                        mode = 0o644\n                    os.fchmod(fd, mode)\n                    f.write(text)",
+    "                try:\n                    mode = os.stat(self.project_file).st_mode & 0o777\n                except FileNotFoundError:\n                    mode = 0o644\n                os.fchmod(fd, mode)\n                with open(fd, 'w', encoding='utf-8') as f:\n                    f.write(text)")],
+  ['tests/test_project.py::TestRound2DescriptorLeaks'])
+r('R2-19 lock descriptor leaked when the holder cannot be read',
+  [(P, "                    try:\n                        holder = os.read(fd, 32).decode(errors='replace').strip()\n                    finally:\n                        os.close(fd)\n",
+    '                    holder = os.read(fd, 32).decode().strip()\n                    os.close(fd)\n')],
+  ['tests/test_project.py::TestRound2DescriptorLeaks'])
+r('R2-20 stale and skipped results reported as unsaved',
+  [(T, '                    unsaved.extend(res.segment_id for res in accepted)',
+    '                    unsaved.extend(res.segment_id for res in batch)'),
+   (T, '            if res.outcome is not None:  # a skipped segment had nothing to save\n', '            if True:\n')],
+  ['tests/test_web.py::TestRound2UnsavedReport'])
+r('R2-21 rate-limit message cut from long stdout',
+  [(CL, '            source = stderr if _RATE_LIMIT_PATTERN.search(stderr) else stdout\n            return RateLimitError(source.strip()[:ERROR_CHARS])',
+    '            return RateLimitError(searched.strip()[:ERROR_CHARS])')],
+  ['tests/test_llm.py::TestRound2RateLimitMessage'])
+
 undetected = 0
 for name, edits, tests in R:
     if only and not any(name.startswith(o) for o in only):
         continue
     d = tempfile.mkdtemp()
     try:
-        subprocess.run(f'git -C {REPO} archive HEAD | tar -x -C {d}', shell=True, check=True)
+        archive = subprocess.run(['git', '-C', REPO, 'archive', 'HEAD'], capture_output=True,
+                                 check=True).stdout
+        subprocess.run(['tar', '-x', '-C', d], input=archive, check=True)
         for f, old, new in edits:
             path = os.path.join(d, f)
             text = open(path, encoding='utf-8').read()
@@ -234,12 +336,13 @@ for name, edits, tests in R:
             open(path, 'w', encoding='utf-8').write(text.replace(old, new))
         else:
             p = subprocess.run([PY, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', *tests],
-                               cwd=d, capture_output=True, text=True, timeout=600)
+                               cwd=d, capture_output=True, text=True, timeout=600,
+                               env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
             last = p.stdout.strip().splitlines()[-1] if p.stdout.strip() else p.stderr[-200:]
             ok = p.returncode == 1 and ' failed' in last
             undetected += not ok
             print(f'{"OK  " if ok else "MISS"} {name}: {last}', flush=True)
     finally:
-        shutil.rmtree(d)
+        shutil.rmtree(d, ignore_errors=True)
 print(f'reverts not detected: {undetected}')
 sys.exit(1 if undetected else 0)
