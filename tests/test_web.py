@@ -3458,3 +3458,89 @@ class TestRound4StreakKeepsInFlightResults:
         assert segs['ch1_seg0006'].translated_text == '<p>第六段</p>'
         error = [e for e in task.progress.get_all() if e['event'] == 'error'][0]
         assert error['data'] == {'error': task.error, 'unsaved': []}
+
+
+class TestRound4ReplacementFiles:
+    """Items 4 and 6: a same-name replacement moves the new EPUB into place
+    only after the project is saved, creates the directory under the
+    mutex, and removes the old book's failure logs."""
+
+    NAME = 'replaceme'
+
+    def _create(self, client, epub_path):
+        return client.post('/api/projects', json={
+            'epub_path': epub_path, 'project_name': self.NAME})
+
+    def _read(self, path):
+        with open(path, 'rb') as f:
+            return f.read()
+
+    def test_failed_save_leaves_old_files(self, client, project_with_translations,
+                                          sample_epub, rich_sample_epub):
+        TaskManager._instance = None
+        assert self._create(client, sample_epub).status_code == 200
+        project_dir = os.path.join(project_with_translations, self.NAME)
+        source = os.path.join(project_dir, 'source.epub')
+        before = {name: self._read(os.path.join(project_dir, name))
+                  for name in ('source.epub', 'project.json')}
+        names = sorted(os.listdir(project_dir))
+        with patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
+            response = self._create(client, rich_sample_epub)
+        assert response.status_code == 500
+        assert 'disk full' in response.get_json()['error']
+        assert {name: self._read(os.path.join(project_dir, name))
+                for name in ('source.epub', 'project.json')} == before
+        assert sorted(os.listdir(project_dir)) == names
+        assert self._read(source) == self._read(sample_epub)
+
+    def test_new_epub_in_place_after_save(self, client, project_with_translations,
+                                          sample_epub, rich_sample_epub):
+        TaskManager._instance = None
+        assert self._create(client, sample_epub).status_code == 200
+        project_dir = os.path.join(project_with_translations, self.NAME)
+        source = os.path.join(project_dir, 'source.epub')
+        seen = []
+        real_save = ProjectManager.save
+
+        def save(pm):
+            seen.append(self._read(source))
+            return real_save(pm)
+
+        with patch.object(ProjectManager, 'save', save):
+            assert self._create(client, rich_sample_epub).status_code == 200
+        assert seen == [self._read(sample_epub)]  # still the old book while saving
+        assert self._read(source) == self._read(rich_sample_epub)
+        assert not [n for n in os.listdir(project_dir) if n.endswith('.tmp')]
+
+    def test_directory_created_under_mutex(self, client, project_with_translations,
+                                           sample_epub):
+        """A delete that takes the mutex just before the create removes the
+        directory; the create then makes it again."""
+        TaskManager._instance = None
+        import src.web.blueprints.projects as projects_module
+        real_mutex = projects_module.project_mutex
+
+        def mutex(project_dir):
+            _shutil.rmtree(project_dir, ignore_errors=True)  # the delete ran first
+            return real_mutex(project_dir)
+
+        with patch.object(projects_module, 'project_mutex', mutex):
+            response = self._create(client, sample_epub)
+        assert response.status_code == 200, response.get_json()
+        assert os.path.isfile(os.path.join(project_with_translations, self.NAME,
+                                           'project.json'))
+
+    def test_old_failure_logs_removed(self, client, project_with_translations,
+                                      sample_epub):
+        TaskManager._instance = None
+        assert self._create(client, sample_epub).status_code == 200
+        project_dir = os.path.join(project_with_translations, self.NAME)
+        failed_dir = os.path.join(project_dir, 'log', 'failed')
+        os.makedirs(failed_dir)
+        with open(os.path.join(failed_dir, 'ch1_seg0001-abc.txt'), 'w') as f:
+            f.write('old book diagnostics')
+        with open(os.path.join(project_dir, 'log', 'translation_x.log'), 'w') as f:
+            f.write('run log')
+        assert self._create(client, sample_epub).status_code == 200
+        assert not os.path.exists(failed_dir)
+        assert os.path.isfile(os.path.join(project_dir, 'log', 'translation_x.log'))

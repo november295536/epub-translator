@@ -153,13 +153,14 @@ def create_project():
         project_name = sanitize_project_name(data.get('project_name') or original_name)
         project_dir = os.path.join(projects_dir, project_name)
 
-        os.makedirs(project_dir, exist_ok=True)
         # A project of the same name is replaced: as for a delete, no task,
         # other process or request may use it meanwhile, and nothing of it
         # is overwritten before that is known
         with project_mutex(project_dir):
             if TaskManager().task_active(project_name):
                 return jsonify({'error': '專案正在翻譯中，請先停止翻譯再重新建立'}), 409
+            # Under the mutex: a delete cannot remove it before the lock
+            os.makedirs(project_dir, exist_ok=True)
             try:
                 lock = ProjectLock(project_dir)
                 lock.acquire()
@@ -167,15 +168,25 @@ def create_project():
                 return jsonify({'error': str(e)}), 409
             try:
                 final_epub_path = os.path.join(project_dir, 'source.epub')
-                shutil.copy2(epub_path, final_epub_path)
-
-                pm = ProjectManager(project_dir)
-                pm.create(
-                    epub_path=final_epub_path,
-                    title=metadata.get('title', '未知書名'),
-                    author=metadata.get('author', '未知作者'),
-                    segments=all_segments
-                )
+                # The new book takes the old one's place only once its
+                # project is saved: a failure leaves the old pair intact
+                tmp_epub_path = f'{final_epub_path}.{uuid.uuid4().hex}.tmp'
+                try:
+                    shutil.copy2(epub_path, tmp_epub_path)
+                    pm = ProjectManager(project_dir)
+                    pm.create(
+                        epub_path=final_epub_path,
+                        title=metadata.get('title', '未知書名'),
+                        author=metadata.get('author', '未知作者'),
+                        segments=all_segments
+                    )
+                    os.replace(tmp_epub_path, final_epub_path)
+                except BaseException:
+                    if os.path.exists(tmp_epub_path):
+                        os.remove(tmp_epub_path)
+                    raise
+                # The old book's failure diagnostics
+                shutil.rmtree(os.path.join(project_dir, 'log', 'failed'), ignore_errors=True)
             finally:
                 lock.release()
 
