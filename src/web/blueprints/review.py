@@ -8,7 +8,7 @@ from flask import Blueprint, render_template, request, jsonify, current_app
 
 from src.core.project import ProjectManager
 from src.core.segmenter import SegmentType
-from src.core.translator import TranslationEngine, TranslationError, AuthError
+from src.core.translator import TranslationEngine, TranslationError, AuthError, get_context
 from src.glossary.glossary_manager import GlossaryManager
 from src.web.tasks import TaskManager, setup_project_logging, teardown_project_logging
 
@@ -112,10 +112,7 @@ def retranslate_segment(project_name: str, segment_id: str):
             glossary_text = gm.format_for_prompt(found)
 
     # Get context (previous and next segments)
-    all_segments = pm.data.segments
-    seg_idx = next((j for j, s in enumerate(all_segments) if s.segment_id == segment_id), -1)
-    context_before = all_segments[seg_idx - 1].text if seg_idx > 0 else ''
-    context_after = all_segments[seg_idx + 1].text if seg_idx < len(all_segments) - 1 else ''
+    context_before, context_after = get_context(pm.data.segments, segment_id)
 
     handler = setup_project_logging(project_dir)
     try:

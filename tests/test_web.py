@@ -1378,3 +1378,23 @@ class TestTermExtractionCoverage:
         sent = '\n'.join(c[0][0][2] for c in mock_run.call_args_list)
         assert 'zorblatt' in sent
         assert 'CODEONLYMARK' not in sent
+
+
+class TestRetranslateContext:
+    """Retranslation takes context from the same chapter only."""
+
+    def test_previous_chapter_not_used_as_context(self, client):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '<h2>第二章</h2>'
+        mock_result.stderr = ''
+
+        with patch('src.core.translator.subprocess.run',
+                   return_value=mock_result) as mock_run:
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch2_seg0001/retranslate')
+
+        assert response.status_code == 200
+        prompt = mock_run.call_args[0][0][2]
+        assert 'Second paragraph.' not in prompt   # last segment of chapter 1
+        assert 'Chapter 2 content.' in prompt      # next segment, same chapter

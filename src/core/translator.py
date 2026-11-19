@@ -100,6 +100,47 @@ _MD_BOLD_PATTERN = re.compile(r'\*\*(.+?)\*\*|__(.+?)__')
 # Markdown italic: *text* or _text_ (but not inside ASCII words like 3*5 or foo_bar)
 _MD_ITALIC_PATTERN = re.compile(r'(?<![0-9a-zA-Z])\*(.+?)\*(?![0-9a-zA-Z])|(?<![0-9a-zA-Z])_(.+?)_(?![0-9a-zA-Z])')
 
+# Blank lines at the very start of a response (indentation of the first
+# non-blank line is not part of the match)
+_LEADING_BLANK_LINES = re.compile(r'\A(?:[ \t]*\r?\n)+')
+
+# A response that is entirely wrapped in one code fence
+_CODE_FENCE_PATTERN = re.compile(r'\A```[^\n]*\n(.*)\n```\Z', re.DOTALL)
+
+# Number of characters of each neighbouring segment used as context
+CONTEXT_CHARS = 200
+
+
+def get_context(segments, segment_id: str) -> tuple:
+    """Return (context_before, context_after) source texts for a segment.
+
+    Only the immediate neighbours are considered. A neighbour is used only
+    if it belongs to the same chapter and is not a code segment; otherwise
+    that side is an empty string.
+
+    Args:
+        segments: All project segments in reading order (objects with
+                  segment_id, chapter_id, segment_type and text).
+        segment_id: ID of the segment about to be translated.
+    """
+    idx = next((i for i, s in enumerate(segments)
+                if s.segment_id == segment_id), -1)
+    if idx < 0:
+        return '', ''
+    current = segments[idx]
+
+    def usable(i: int) -> str:
+        if i < 0 or i >= len(segments):
+            return ''
+        neighbour = segments[i]
+        if neighbour.chapter_id != current.chapter_id:
+            return ''
+        if neighbour.segment_type == SegmentType.CODE:
+            return ''
+        return neighbour.text
+
+    return usable(idx - 1), usable(idx + 1)
+
 
 class TranslationError(Exception):
     """Raised when translation fails."""
@@ -151,7 +192,8 @@ class TranslationEngine:
         Raises:
             TranslationError: If translation fails after all retries.
         """
-        use_html_mode = bool(html) and segment_type != SegmentType.CODE
+        is_code = segment_type == SegmentType.CODE
+        use_html_mode = bool(html) and not is_code
         prompt = self._build_prompt(text, segment_type, glossary_text,
                                     context_before, context_after, html=html)
 
@@ -189,8 +231,9 @@ class TranslationEngine:
                         )
                     continue
 
-                translated = result.stdout.strip()
-                if not translated:
+                # Code keeps its leading whitespace (first-line indentation)
+                translated = result.stdout if is_code else result.stdout.strip()
+                if not translated.strip():
                     logger.warning(
                         "Empty translation result (attempt %d/%d)",
                         attempt, self.max_retries,
@@ -201,7 +244,8 @@ class TranslationEngine:
                         )
                     continue
 
-                return self._clean_response(translated, html_mode=use_html_mode)
+                return self._clean_response(translated, html_mode=use_html_mode,
+                                            code_mode=is_code)
 
             except subprocess.TimeoutExpired:
                 logger.warning(
@@ -239,9 +283,9 @@ class TranslationEngine:
         if context_before or context_after:
             parts = []
             if context_before:
-                parts.append(f'前文參考（不需翻譯）：\n{context_before[:200]}')
+                parts.append(f'前文參考（不需翻譯）：\n{context_before[-CONTEXT_CHARS:]}')
             if context_after:
-                parts.append(f'後文參考（不需翻譯）：\n{context_after[:200]}')
+                parts.append(f'後文參考（不需翻譯）：\n{context_after[:CONTEXT_CHARS]}')
             context_section = '\n'.join(parts) + '\n'
 
         if segment_type == SegmentType.CODE:
@@ -260,14 +304,26 @@ class TranslationEngine:
             )
 
     @staticmethod
-    def _clean_response(text: str, html_mode: bool = False) -> str:
+    def _clean_response(text: str, html_mode: bool = False,
+                        code_mode: bool = False) -> str:
         """Remove common Claude response prefixes, formatting artifacts, and markdown syntax.
 
         Args:
             text: The raw response from Claude.
             html_mode: If True, only strip prefix/suffix commentary but preserve
                        all HTML tags and structure (no markdown stripping).
+            code_mode: If True, the response is source code: only a wrapping
+                       code fence, surrounding blank lines and trailing
+                       whitespace are removed. Indentation and characters
+                       that look like markdown (#, *, _) are kept.
         """
+        if code_mode:
+            cleaned = _LEADING_BLANK_LINES.sub('', text).rstrip()
+            fenced = _CODE_FENCE_PATTERN.match(cleaned)
+            if fenced:
+                cleaned = _LEADING_BLANK_LINES.sub('', fenced.group(1)).rstrip()
+            return cleaned
+
         cleaned = text
         for pattern in _START_PATTERNS:
             cleaned = re.sub(pattern, '', cleaned)
