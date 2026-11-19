@@ -212,13 +212,13 @@ class ProjectManager:
             fd, tmp_file = tempfile.mkstemp(
                 dir=self.project_dir, prefix=f'{self.PROJECT_FILE}.', suffix='.tmp')
             try:
-                # mkstemp creates the file 0600: keep the mode project.json had
-                try:
-                    mode = os.stat(self.project_file).st_mode & 0o777
-                except FileNotFoundError:
-                    mode = 0o644
-                os.fchmod(fd, mode)
-                with open(fd, 'w', encoding='utf-8') as f:
+                with open(fd, 'w', encoding='utf-8') as f:  # closes fd on any error
+                    # mkstemp creates the file 0600: keep the mode project.json had
+                    try:
+                        mode = os.stat(self.project_file).st_mode & 0o777
+                    except FileNotFoundError:
+                        mode = 0o644
+                    os.fchmod(fd, mode)
                     f.write(text)
                 os.replace(tmp_file, self.project_file)
             except BaseException:
@@ -400,8 +400,10 @@ class ProjectLock:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except OSError:
-                    holder = os.read(fd, 32).decode().strip()
-                    os.close(fd)
+                    try:
+                        holder = os.read(fd, 32).decode(errors='replace').strip()
+                    finally:
+                        os.close(fd)
                     raise ProjectLockedError(
                         f'專案正由另一個程序使用（PID {holder}）：{self.path}')
                 try:
