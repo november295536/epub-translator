@@ -180,7 +180,7 @@ class TestAlignmentCheck:
         out = capsys.readouterr().out
         assert code == 0
         assert ('PASS project-1: segmenter_version 1, chapters 1, '
-                'with comment-dependent walk 1, walk changed vs main 0') in out
+                'with comment-dependent walk 1, not on legacy walk 0') in out
         assert (tmp_path / 'old' / 'project.json').read_bytes() == before
 
     @pytest.mark.parametrize('version, code', [(1, 0), (2, 1)])
@@ -191,7 +191,7 @@ class TestAlignmentCheck:
 
         out = capsys.readouterr().out
         assert f'segmenter_version {version}, chapters 1' in out
-        assert f'walk changed vs main {code}' in out
+        assert f'not on legacy walk {code}' in out
 
     def test_unreadable_source_fails_without_path(self, tmp_path, capsys):
         _write_full_project(str(tmp_path / 'secret-name'), [{'chapter_id': 'c'}],
@@ -348,12 +348,12 @@ class TestAlignmentOutput:
         assert capsys.readouterr().out.splitlines() == [
             'FAIL a-broken: cannot read project or source (FileNotFoundError)',
             'PASS b-old: segmenter_version 1, chapters 2, with comment-dependent walk 2, '
-            'walk changed vs main 0',
+            'not on legacy walk 0',
             'FAIL c-new: segmenter_version 2, chapters 2, with comment-dependent walk 2, '
-            'walk changed vs main 2: c1 c2',
+            'not on legacy walk 2: c1 c2',
             'FAIL d-new: segmenter_version 2, chapters 2, with comment-dependent walk 2, '
-            'walk changed vs main 2: c1 c2',
-            'TOTAL projects 4  chapters 6  comment-dependent 6  changed vs main 4  '
+            'not on legacy walk 2: c1 c2',
+            'TOTAL projects 4  chapters 6  comment-dependent 6  not on legacy walk 4  '
             'failed projects 3',
         ]
 
@@ -362,7 +362,7 @@ class TestAlignmentOutput:
         assert align_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
         lines = capsys.readouterr().out.splitlines()
         assert lines[2] == ('FAIL project-3: segmenter_version 2, chapters 2, '
-                            'with comment-dependent walk 2, walk changed vs main 2')
+                            'with comment-dependent walk 2, not on legacy walk 2')
 
     def test_two_unreadable_projects_counted(self, tmp_path, capsys):
         _write_project(str(tmp_path / 'p1'), [])
@@ -429,5 +429,5 @@ class TestAlignmentOutput:
     def test_help(self, tmp_path):
         result = _run_script('phase0_builder_alignment', ['--help'], str(tmp_path))
         _assert_help(result.stdout,
-                     'Phase 0 check: existing projects keep the builder walk they had on main.',
+                     "Phase 0 check: existing projects resolve to the builder's legacy walk.",
                      'Print project-N labels; omit names, chapter IDs and paths')

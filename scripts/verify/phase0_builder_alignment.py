@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0 check: existing projects keep the builder walk they had on main.
+"""Phase 0 check: existing projects resolve to the builder's legacy walk.
 
 Before Phase 0 the builder always walked a chapter body treating comments
 (and other non-text strings) as text, matching the segmenter of that time.
@@ -8,11 +8,14 @@ segmenter_version 2; the builder walks chapters of a project without the
 field (segmenter_version 1) as main did (EPUBBuilder._legacy_walk).
 
 For each chapter that has stored segments, the script compares the element
-list the builder chooses for the project with the element list main would
-use. A project PASSes when no chapter differs. A project created after
-Phase 0 (segmenter_version 2) whose source has comments is expected to FAIL:
-for it the new walk is the correct one, and this check is meant for projects
-created before Phase 0.
+list the builder chooses for the project with the element list of the
+branch's legacy walk. A project PASSes when no chapter differs, which shows
+that the project resolves to the legacy walk. It does not compare with
+main's code: that the legacy walk gives main's output rests on the golden
+tests (tests/test_builder.py::TestVersion1ExportMatchesMain). A project
+created after Phase 0 (segmenter_version 2) whose source has comments is
+expected to FAIL: for it the new walk is the correct one, and this check is
+meant for projects created before Phase 0.
 
 Read-only. It loads each project's project.json and its source EPUB, writes
 nothing, and never prints book text. Without --anonymize it prints project
@@ -35,6 +38,9 @@ import os
 import sys
 import warnings
 
+# At index 0, ahead of everything; with default interpreter path settings
+# sys.path[0] is this script's directory (no src package), so index 1 would
+# import the same src.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 warnings.filterwarnings('ignore')
@@ -59,7 +65,7 @@ def _source_path(project_dir: str, epub_path: str) -> str:
 def check_project(project_dir: str) -> tuple[int, int, int, list[str]]:
     """Return (segmenter_version, chapters checked, chapters whose walk
     differs between the two rules at all, IDs of chapters whose chosen walk
-    differs from main's)."""
+    differs from the legacy walk)."""
     builder = EPUBBuilder(project_dir)
     data = builder.pm.load()  # reads project.json; never saves
     legacy = builder._legacy_walk()
@@ -81,12 +87,12 @@ def check_project(project_dir: str) -> tuple[int, int, int, list[str]]:
             continue
         checked += 1
 
-        main_walk = builder._walk_content_elements(body, legacy=True)
+        legacy_walk = builder._walk_content_elements(body, legacy=True)
         new_walk = builder._walk_content_elements(body, legacy=False)
-        chosen = main_walk if legacy else new_walk
-        if [id(e) for e in main_walk] != [id(e) for e in new_walk]:
+        chosen = legacy_walk if legacy else new_walk
+        if [id(e) for e in legacy_walk] != [id(e) for e in new_walk]:
             affected += 1
-        if [id(e) for e in chosen] != [id(e) for e in main_walk]:
+        if [id(e) for e in chosen] != [id(e) for e in legacy_walk]:
             changed.append(item_id)
     return data.segmenter_version, checked, affected, changed
 
@@ -131,13 +137,13 @@ def main(argv: list[str] | None = None) -> int:
             failed += 1
         line = (f'{status} {label}: segmenter_version {version}, chapters {checked}, '
                 f'with comment-dependent walk '
-                f'{affected}, walk changed vs main {len(changed)}')
+                f'{affected}, not on legacy walk {len(changed)}')
         if changed and not args.anonymize:
             line += ': ' + ' '.join(changed)
         print(line)
 
     print(f'TOTAL projects {len(names)}  chapters {total_checked}  '
-          f'comment-dependent {total_affected}  changed vs main {total_changed}  '
+          f'comment-dependent {total_affected}  not on legacy walk {total_changed}  '
           f'failed projects {failed}')
     return 1 if failed else 0
 
