@@ -1398,3 +1398,32 @@ class TestRetranslateContext:
         prompt = mock_run.call_args[0][0][2]
         assert 'Second paragraph.' not in prompt   # last segment of chapter 1
         assert 'Chapter 2 content.' in prompt      # next segment, same chapter
+
+
+class TestWorkerContext:
+    """The prompts built by the web worker use same-chapter, non-code context."""
+
+    @pytest.mark.parametrize('num_workers', [1, 3])
+    def test_worker_prompts(self, tmp_path, make_context_project, num_workers):
+        from tests.conftest import fake_claude_run, assert_context_prompts
+        projects_dir = str(tmp_path)
+        project_dir = make_context_project(os.path.join(projects_dir, PROJECT_NAME))
+
+        TaskManager._instance = None
+        tm = TaskManager()
+        task = TranslationTask(task_id='ctx', project_name=PROJECT_NAME,
+                               projects_dir=projects_dir, state='running',
+                               total=5, num_workers=num_workers)
+        _setup_task_pm(task, projects_dir)
+
+        with patch('src.core.translator.subprocess.run',
+                   side_effect=fake_claude_run) as mock_run:
+            thread = threading.Thread(target=tm._run_translation, args=(task,))
+            thread.start()
+            thread.join(timeout=20)
+
+        assert task.state == 'completed'
+        prompts = [c[0][0][2] for c in mock_run.call_args_list]
+        assert len(prompts) == 5
+        assert_context_prompts(prompts, project_dir)
+        TaskManager._instance = None
