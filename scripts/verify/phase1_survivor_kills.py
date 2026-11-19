@@ -106,6 +106,9 @@ M = [  # (name, file, old text, mutated text, tests)
  ('web174','src/web/blueprints/review.py',"        return jsonify({'error': str(e)}), 404\n    return jsonify({'status': 'ok', 'segment_id': segment_id})\n\n\n@review_bp.route('/api/projects/<project_name>/segments/<segment_id>/retranslate'","        return jsonify({'error': str(e)}), 404\n    return jsonify({'XXstatusXX': 'ok', 'segment_id': segment_id})\n\n\n@review_bp.route('/api/projects/<project_name>/segments/<segment_id>/retranslate'",['tests/test_web.py::TestRound1Exact::test_review_responses_exact']),
  ('web180','src/web/blueprints/review.py',"return jsonify({'error': f'Segment {segment_id} not found'}), 404","return jsonify({'XXerrorXX': f'Segment {segment_id} not found'}), 404",['tests/test_web.py::TestRound1Exact::test_review_responses_exact']),
  ('web31','src/web/tasks.py',"(task.state in ('running', 'paused')\n                                     or","(task.state in ('running', 'XXpausedXX')\n                                     or",['tests/test_web.py::TestRound1Exact::test_task_owns_state_by_state_alone']),
+ # Round 1 survivors whose disposition review round 2 corrected (G9, G14)
+ ('llm16','src/llm/cli.py','KILL_WAIT_SECONDS = 2','KILL_WAIT_SECONDS = 3',['tests/test_llm.py::TestRound2PartialOutputAfterKill::test_captured_output_kept']),
+ ('llm51','src/llm/cli.py','            if time.monotonic() > deadline:','            if time.monotonic() >= deadline:',['tests/test_llm.py::TestRound2DeadlineBoundary::test_finished_exactly_at_deadline']),
 ]
 
 
