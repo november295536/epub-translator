@@ -31,6 +31,10 @@ if [[ -z "$VENV" || ! -x "$VENV/bin/mutmut" ]]; then
     exit 2
 fi
 PY="$VENV/bin/python"
+# A mutant and the restored file can have the same size and mtime second, so
+# bytecode cached for one can be loaded for the other (on macOS the cache is
+# under sys.pycache_prefix, not __pycache__). Never write bytecode in this run.
+export PYTHONDONTWRITEBYTECODE=1
 MUTMUT="$VENV/bin/mutmut"
 
 cd "$(git rev-parse --show-toplevel)"
@@ -76,6 +80,9 @@ for group in "${MUT_GROUPS[@]}"; do
     else
         runner="$PY -m pytest -x -q -p no:cacheprovider $tests"
     fi
+    # mutmut 2.x counts only exit code 1 as killed; a mutant that breaks test
+    # collection (pytest exit 2-5) would be reported as survived
+    runner="$runner || exit 1"
     echo "== $name: mutating changed lines of $files"
     # mutmut exits non-zero when mutants survive; totals are read from the cache below
     "$MUTMUT" run --paths-to-mutate "$files" --use-patch-file "$PATCH" \
