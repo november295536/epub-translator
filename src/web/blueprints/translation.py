@@ -135,6 +135,8 @@ def translation_stream(project_name: str):
         status = {'state': task.state, 'completed': task.completed,
                   'total': task.total, 'error': task.error}
         yield f"event: status\ndata: {json.dumps(status, ensure_ascii=False)}\n\n"
+        if status['state'] in ('completed', 'failed', 'stopped'):
+            return  # ended before this stream opened: its last event is gone
 
         while True:
             events, cursor = task.progress.iter_from(cursor, timeout=30)

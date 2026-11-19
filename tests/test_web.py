@@ -650,15 +650,18 @@ class TestStoppedStateSSE:
             task_id='test_sse_stopped',
             project_name=PROJECT_NAME,
             projects_dir=project_with_translations,
-            state='stopped',
+            state='running',
             total=3,
         )
         tm.tasks[PROJECT_NAME] = task
 
         # Push stopped event after a short delay so it arrives after SSE connects
+        # (the state first, then the event, as the coordinator does; a stream
+        # opened on an ended task ends after its status, round 4 item 5)
         def push_stopped():
             import time
             time.sleep(0.3)
+            task.state = 'stopped'
             task.progress.put({'event': 'stopped', 'data': {
                 'completed': 1, 'remaining': 2
             }})
@@ -2393,7 +2396,8 @@ class TestTemplatesHandleErrors:
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
         assert 'failedCount: 0,' in html
         assert 'x-show="failedCount > 0' in html
-        assert html.count('this.refreshFailedCount();') == 3  # complete, stopped, error
+        # complete, stopped, error, and a first status of an ended task
+        assert html.count('this.refreshFailedCount();') == 4
 
     def test_backend_error_event_handled(self, client):
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
@@ -3544,3 +3548,39 @@ class TestRound4ReplacementFiles:
         assert self._create(client, sample_epub).status_code == 200
         assert not os.path.exists(failed_dir)
         assert os.path.isfile(os.path.join(project_dir, 'log', 'translation_x.log'))
+
+
+class TestRound4StreamAfterEnd:
+    """Item 5: a stream opened after the task ended ends after the initial
+    status; the page closes it and refreshes the failed count."""
+
+    @pytest.mark.parametrize('state', ['completed', 'failed', 'stopped'])
+    def test_stream_ends_after_status(self, client, project_with_translations, state):
+        TaskManager._instance = None
+        task = TranslationTask(task_id='t', project_name=PROJECT_NAME,
+                               projects_dir=project_with_translations, total=3,
+                               state=state)
+        TaskManager().tasks[PROJECT_NAME] = task
+
+        def iter_from(*args, **kwargs):
+            raise AssertionError('the stream waited for events')
+
+        task.progress.iter_from = iter_from
+        response = client.get(f'/api/projects/{PROJECT_NAME}/translate/stream',
+                              buffered=False)
+        body = b''.join(response.response).decode('utf-8')
+        response.close()
+        assert body == (f'event: status\ndata: {{"state": "{state}", "completed": 0, '
+                        '"total": 3, "error": null}\n\n')
+        TaskManager._instance = None
+
+    def test_page_closes_stream_on_ended_first_status(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
+        start = html.index("addEventListener('status'")
+        handler = html[start:html.index('});', start)]
+        assert ("const ended = this._isFirstStatus "
+                "&& ['completed', 'failed', 'stopped'].includes(data.state);") in handler
+        block = handler[handler.index('if (ended) {'):]
+        for line in ('this.currentSegment = null;', 'this.refreshFailedCount();',
+                     'this.eventSource.close();', 'this.eventSource = null;'):
+            assert line in block
