@@ -10,7 +10,10 @@ from src import __version__
 from src.epub.extractor import EPUBExtractor
 from src.core.segmenter import Segmenter, SegmentType
 from src.core.project import ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus
-from src.core.translator import AuthError, RateLimitError, TranslationEngine, translate_segment
+from src.core.translator import (
+    AuthError, BackendUnavailableError, RateLimitError, TranslationEngine, available_models,
+    translate_segment, unexpected_error_outcome,
+)
 from src.glossary.glossary_manager import GlossaryManager
 from src.epub.builder import EPUBBuilder
 
@@ -89,10 +92,20 @@ def init(epub_file):
     click.echo("使用 'python translate.py start' 開始翻譯")
 
 
+def _check_model(ctx, param, value):
+    """--model must be one of the backend's models (asked when used)."""
+    if value is None:
+        return value
+    aliases = [m['alias'] for m in available_models()]
+    if value not in aliases:
+        raise click.BadParameter(f"'{value}' is not one of {', '.join(aliases)}")
+    return value
+
+
 @cli.command()
 @click.option('--project', '-p', default=None, help='Project directory path')
-@click.option('--model', '-m', type=click.Choice(['sonnet', 'opus', 'haiku']),
-              default=None, help='Translation model (sonnet/opus/haiku)')
+@click.option('--model', '-m', default=None, callback=_check_model,
+              help="Translation model: one of the backend's models")
 @click.option('--workers', '-w', type=click.IntRange(1, 20), default=1,
               help='Number of parallel workers (1-20)')
 @click.option('--retry-failed', is_flag=True, default=False,
@@ -161,8 +174,13 @@ def _start(project_dir, model, workers, retry_failed):
     click.echo("全部翻譯完成！")
 
 
+# Errors that stop a whole run, leaving the segment pending
+RUN_ERRORS = (RateLimitError, AuthError, BackendUnavailableError)
+
+
 def _stop_run(e):
-    """A rate limit or an expired login stops the whole run."""
+    """A rate limit, an expired login or a backend that cannot be started
+    stops the whole run."""
     click.echo(f"  ✗ {e}")
     click.echo("翻譯中斷。已完成的進度已儲存，可用 start 繼續。")
     sys.exit(1)
@@ -177,7 +195,7 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
         click.echo(f"[{progress['translated'] + i}/{progress['total']}] 翻譯段落 {seg.segment_id}...")
         try:
             outcome = translate_segment(engine, seg, all_segments, gm, log_dir=log_dir)
-        except (RateLimitError, AuthError) as e:
+        except RUN_ERRORS as e:
             _stop_run(e)
         pm.apply_outcome(seg.segment_id, outcome)
         pm.save()
@@ -216,26 +234,31 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
 
             try:
                 outcome = translate_segment(engine, seg, all_segments, gm, log_dir=log_dir)
-            except (RateLimitError, AuthError) as e:
+            except RUN_ERRORS as e:
                 stop_errors.append(e)
                 error_event.set()
                 break
+            except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on
+                outcome = unexpected_error_outcome(engine.model, e)
             result_queue.put((seg.segment_id, outcome, seg.word_count, tag))
 
     actual_workers = min(num_workers, len(pending))
     threads = []
     for i in range(actual_workers):
-        t = threading.Thread(target=worker, args=(i,))
+        # Daemon: a second Ctrl-C ends the process without waiting for them
+        t = threading.Thread(target=worker, args=(i,), daemon=True)
         threads.append(t)
         t.start()
 
     # Process results in main thread
     completed = 0
     failed = 0
+    unsaved = []  # applied in memory since the last successful save
 
     def apply(seg_id, outcome, word_count, tag):
         nonlocal completed, failed
         pm.apply_outcome(seg_id, outcome)
+        unsaved.append(seg_id)
         if outcome.status == SegmentStatus.FAILED:
             failed += 1
             click.echo(f"  [{tag}] ✗ {seg_id} 翻譯失敗：{outcome.issues[0].detail}")
@@ -243,19 +266,38 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
             completed += 1
             click.echo(f"  [{tag}] [{base_translated + completed}/{total}] ✓ {seg_id}（{word_count} 字）")
 
-    while any(t.is_alive() for t in threads) or not result_queue.empty():
-        try:
-            apply(*result_queue.get(timeout=0.5))
-        except queue_mod.Empty:
-            continue
+    try:
+        while any(t.is_alive() for t in threads) or not result_queue.empty():
+            try:
+                apply(*result_queue.get(timeout=0.5))
+            except queue_mod.Empty:
+                continue
 
-        # Batch: drain any immediately available results
+            # Batch: drain any immediately available results
+            while True:
+                try:
+                    apply(*result_queue.get_nowait())
+                except queue_mod.Empty:
+                    break
+            pm.save()
+            unsaved.clear()
+    except BaseException:
+        # The supervisor failed (a save raised, Ctrl-C): stop dispatching,
+        # wait for the calls in flight, then report what was not saved
+        # before the caller releases the lock
+        error_event.set()
+        click.echo("翻譯中斷，等待進行中的段落結束……")
+        for t in threads:
+            t.join()
         while True:
             try:
-                apply(*result_queue.get_nowait())
+                unsaved.append(result_queue.get_nowait()[0])
             except queue_mod.Empty:
                 break
-        pm.save()
+        if unsaved:
+            click.echo(f"未儲存的結果（{len(unsaved)} 個段落，下次 start 會重新翻譯）："
+                       + ', '.join(unsaved))
+        raise
 
     for t in threads:
         t.join()
@@ -409,13 +451,19 @@ def glossary_extract(project):
     pm = ProjectManager(project_dir)
     pm.load()
 
-    from src.glossary.term_extractor import TermExtractor
+    from src.glossary.term_extractor import ExtractionError, TermExtractor
     extractor = TermExtractor(model=pm.data.model)
 
     segments = [{'text': s.text} for s in pm.data.segments if s.segment_type == SegmentType.TEXT]
     click.echo(f"正在從 {len(segments)} 個文字段落中提取術語...")
 
-    terms = extractor.extract_from_segments(segments)
+    stopped = None
+    try:
+        terms = extractor.extract_from_segments(segments)
+    except ExtractionError as e:
+        # Keep what the finished batches found
+        stopped, terms = e, e.terms
+        click.echo(f"提取中斷：{e}")
     click.echo(f"提取到 {len(terms)} 個術語")
 
     if terms:
@@ -424,6 +472,8 @@ def glossary_extract(project):
         for t in terms:
             gm.add_term(t['term'], t['translation'], category=t.get('category', ''))
         click.echo(f"已儲存到 {_get_glossary_path(project_dir)}")
+    if stopped is not None:
+        sys.exit(1)
 
 
 @glossary.command('import')

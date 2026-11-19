@@ -378,7 +378,7 @@ class TestCLIFailedSegments:
         assert [i.code for i in failed.issues] == ['transient']
         assert pm.data.segments[0].model == 'sonnet'
         # Diagnostics for the failed segment only
-        assert os.listdir(os.path.join(path, 'log', 'failed')) == ['c1_seg0002.txt']
+        assert os.listdir(os.path.join(path, 'log', 'failed')) == ['c1_seg0002-dbf96005d5.txt']
         # 3 attempts for the failing segment, 1 for each other
         assert len(fake.requests) == 6
 
@@ -454,14 +454,17 @@ class TestCLILock:
         assert seen == [False]
         assert lock_free_for_other_process(path)
 
-    # A worker thread dies on the unexpected error (as before this phase)
-    @pytest.mark.filterwarnings('ignore::pytest.PytestUnhandledThreadExceptionWarning')
     @pytest.mark.parametrize('workers', ['1', '3'])
     def test_lock_released_on_error(self, runner, tmp_path, workers):
         path = _make_project(str(tmp_path / 'p'), n=1)
         with use_fake_backend(FakeBackend([RuntimeError('unexpected')])):
-            runner.invoke(cli, ['start', '--project', path, '--workers', workers])
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', workers])
         assert lock_free_for_other_process(path)
+        # Review round 1, item 9: sequential stops on it; a parallel worker
+        # turns it into a failed segment
+        assert result.exit_code == 1
+        expected = SegmentStatus.PENDING if workers == '1' else SegmentStatus.FAILED
+        assert _statuses(path) == {'c1_seg0001': expected}
 
     def test_lock_released_after_rate_limit_exit(self, runner, tmp_path):
         path = _make_project(str(tmp_path / 'p'), n=1)
@@ -575,3 +578,118 @@ class TestCLIMessages:
             '  ✗ limit reached',
             '翻譯中斷。已完成的進度已儲存，可用 start 繼續。',
         ]
+
+
+# --- Review round 1 ---------------------------------------------------------------
+
+import threading
+import time as _time
+from src.llm import BackendUnavailableError
+
+
+class TestCLISupervisorFailure:
+    """Item 6: the parallel supervisor joins its workers before the lock goes."""
+
+    @pytest.mark.parametrize('error', [OSError('disk full'), KeyboardInterrupt()])
+    def test_save_failure(self, runner, tmp_path, error):
+        path = _make_project(str(tmp_path / 'p'), n=4)
+        threads = []
+
+        def respond(request):
+            threads.append(threading.current_thread())
+            if '<p>Sentence MARK4.</p>' in request.messages[-1].content:
+                _time.sleep(1)  # still in flight when the save fails
+            return '<p>譯文</p>'
+
+        # Without --model the run's first save is the supervisor's
+        with use_fake_backend(FakeBackend(responder=respond)), \
+                patch.object(ProjectManager, 'save', side_effect=error):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', '3'])
+        assert result.exit_code != 0
+        assert threads and not any(t.is_alive() for t in threads)
+        assert '未儲存的結果' in result.output
+        assert lock_free_for_other_process(path)
+        # Nothing was saved: every segment is still pending
+        assert set(_statuses(path).values()) == {SegmentStatus.PENDING}
+
+
+class TestCLIUnexpectedErrors:
+    """Item 9: diagnostic I/O errors and unexpected worker errors."""
+
+    @pytest.mark.parametrize('workers', ['1', '3'])
+    def test_unwritable_failure_log(self, runner, tmp_path, workers):
+        path = _make_project(str(tmp_path / 'p'))
+        os.makedirs(os.path.join(path, 'log'))
+        with open(os.path.join(path, 'log', 'failed'), 'w') as f:
+            f.write('a file where the directory should be')
+        with use_fake_backend(FakeBackend(responder=_responder(['MARK2']))):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', workers])
+        assert result.exit_code == 1, result.output
+        assert '1 個段落翻譯失敗' in result.output
+        statuses = _statuses(path)
+        assert statuses['c1_seg0002'] == SegmentStatus.FAILED
+        assert statuses['c1_seg0004'] == SegmentStatus.TRANSLATED
+
+    def test_unexpected_worker_exception(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'))
+        with use_fake_backend(FakeBackend(responder=_responder(['MARK2'],
+                                                               error=KeyError('surprise')))):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', '3'])
+        assert result.exit_code == 1, result.output
+        assert '1 個段落翻譯失敗' in result.output
+        pm = ProjectManager(path)
+        pm.load()
+        seg = pm.data.segments[1]
+        assert seg.status == SegmentStatus.FAILED
+        assert seg.issues[0].code == 'unexpected' and 'surprise' in seg.issues[0].detail
+        assert pm.data.segments[3].status == SegmentStatus.TRANSLATED
+
+
+class TestCLIBackendModels:
+    """Item 12: --model is checked against the backend's models."""
+
+    def test_backend_model_accepted_and_claude_alias_rejected(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        fake = FakeBackend(responder=_responder())
+        with use_fake_backend(fake):
+            result = runner.invoke(cli, ['start', '--project', path, '--model', 'sonnet'])
+            assert result.exit_code == 2
+            assert "'sonnet' is not one of fake-model" in result.output
+            result = runner.invoke(cli, ['start', '--project', path, '--model', 'fake-model'])
+        assert result.exit_code == 0, result.output
+        assert [r.model for r in fake.requests] == ['fake-model']
+
+
+class TestCLIBackendUnavailable:
+    """Item 15: a missing program stops the run; no segment becomes FAILED."""
+
+    @pytest.mark.parametrize('workers', ['1', '3'])
+    def test_stops_run(self, runner, tmp_path, workers):
+        path = _make_project(str(tmp_path / 'p'), n=3)
+        error = BackendUnavailableError('claude-cli could not be started: not found')
+        with use_fake_backend(FakeBackend(responder=lambda r: (_ for _ in ()).throw(error))):
+            result = runner.invoke(cli, ['start', '--project', path, '--workers', workers])
+        assert result.exit_code == 1
+        assert 'could not be started' in result.output and '翻譯中斷' in result.output
+        assert set(_statuses(path).values()) == {SegmentStatus.PENDING}
+        assert not os.path.exists(os.path.join(path, 'log', 'failed'))
+
+
+class TestCLIGlossaryExtractStop:
+    """Item 19: a rate limit keeps the terms found so far, without a traceback."""
+
+    def test_partial_terms_saved(self, runner, tmp_path, monkeypatch):
+        monkeypatch.setattr('src.glossary.term_extractor.MAX_CHARS_PER_BATCH', 20)
+        path = _make_project(str(tmp_path / 'p'), n=3)
+        fake = FakeBackend(['[{"term": "Alpha", "translation": "甲", "category": "term"}]',
+                            RateLimitError("You've hit your limit")])
+        with use_fake_backend(fake):
+            result = runner.invoke(cli, ['glossary', 'extract', '--project', path])
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert "提取中斷：You've hit your limit" in result.output
+        assert '提取到 1 個術語' in result.output
+        from src.glossary.glossary_manager import GlossaryManager
+        gm = GlossaryManager(os.path.join(path, 'glossary.json'))
+        gm.load()
+        assert [e.term for e in gm.get_all_terms()] == ['Alpha']
