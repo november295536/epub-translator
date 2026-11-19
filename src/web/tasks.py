@@ -7,17 +7,31 @@ import queue
 import threading
 import time
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
-from src.core.project import ProjectLock, ProjectManager, SegmentStatus
+from src.core.project import ProjectLock, ProjectManager, SegmentStatus, project_mutex
 from src.core.translator import (
-    AuthError, RateLimitError, TranslationEngine, TranslationOutcome, translate_segment,
+    AuthError, BackendUnavailableError, RateLimitError, TranslationEngine,
+    TranslationOutcome, translate_segment, unexpected_error_outcome,
 )
 from src.glossary.glossary_manager import GlossaryManager
 
 logger = logging.getLogger(__name__)
 
 MAX_WORKERS = 20
+
+# How long a new start waits for the threads of a stopped task to end
+STOP_WAIT_SECONDS = 5
+
+# Errors that stop (pause) a whole run, leaving the segment pending, and the
+# event each one sends
+RUN_ERROR_EVENTS = (
+    (AuthError, 'auth_error'),
+    (RateLimitError, 'rate_limit'),
+    (BackendUnavailableError, 'backend_error'),
+)
+RUN_ERRORS = tuple(cls for cls, _ in RUN_ERROR_EVENTS)
 
 
 def setup_project_logging(project_dir: str) -> logging.Handler:
@@ -91,8 +105,8 @@ class EventBroadcaster:
 class TranslationResult:
     """Result from a worker thread."""
     segment_id: str
-    outcome: TranslationOutcome
-    revision: int  # segment revision when the segment was dispatched
+    outcome: TranslationOutcome | None  # None: skipped, edited since queued
+    revision: int  # segment revision when the segment was queued
 
 
 @dataclass
@@ -128,6 +142,13 @@ class TranslationTask:
     _gm: GlossaryManager | None = field(default=None, repr=False)
     _threads: list = field(default_factory=list, repr=False)
     _coordinator: threading.Thread | None = field(default=None, repr=False)
+    # segment id -> (revision, status) when the segment was queued
+    queued: dict = field(default_factory=dict, repr=False)
+
+    def threads_alive(self) -> bool:
+        """True while the coordinator or any worker of this task runs."""
+        return ((self._coordinator is not None and self._coordinator.is_alive())
+                or any(t.is_alive() for t in self._threads))
 
     def __post_init__(self):
         # Running by default — cleared to pause
@@ -146,27 +167,50 @@ class TaskManager:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
                     cls._instance.tasks: dict[str, TranslationTask] = {}
+                    # Serializes starting tasks (check, load, register)
+                    cls._instance._start_lock = threading.Lock()
         return cls._instance
 
     def get_task(self, project_name: str) -> TranslationTask | None:
         """Get the current task for a project."""
         return self.tasks.get(project_name)
 
-    def get_project_manager(self, project_name: str) -> ProjectManager | None:
-        """Return the running task's ProjectManager, or None if no active task."""
-        task = self.tasks.get(project_name)
-        if task and task.state in ('running', 'paused') and task.pm is not None:
+    @staticmethod
+    def _owning_pm(task: TranslationTask | None) -> ProjectManager | None:
+        """The task's in-memory manager while the task may still save it
+        (running, paused, or stopped with its coordinator still ending)."""
+        if task is None or task.pm is None:
+            return None
+        if task.state in ('running', 'paused') or task.threads_alive():
             return task.pm
         return None
 
+    def get_project_manager(self, project_name: str) -> ProjectManager | None:
+        """Return the running task's ProjectManager, or None if no active task."""
+        return self._owning_pm(self.tasks.get(project_name))
+
     def get_or_load_pm(self, project_name: str, projects_dir: str) -> ProjectManager:
         """Return running task's PM (in-memory, latest) or load from disk."""
-        task = self.tasks.get(project_name)
-        if task and task.state in ('running', 'paused') and task.pm:
-            return task.pm
+        pm = self._owning_pm(self.tasks.get(project_name))
+        if pm is not None:
+            return pm
         pm = ProjectManager(os.path.join(projects_dir, project_name))
         pm.load()
         return pm
+
+    @contextmanager
+    def transaction(self, project_name: str, projects_dir: str):
+        """Load, change and save a project as one step: holds the project's
+        mutex and yields the authoritative manager (the task's, otherwise a
+        fresh load from disk). The caller saves inside the block."""
+        with project_mutex(os.path.join(projects_dir, project_name)):
+            yield self.get_or_load_pm(project_name, projects_dir)
+
+    def task_active(self, project_name: str) -> bool:
+        """True while a task of the project runs, is paused or is ending."""
+        task = self.tasks.get(project_name)
+        return task is not None and (task.state in ('running', 'paused')
+                                     or task.threads_alive())
 
     def stop_translation(self, project_name: str):
         """Stop a running or paused translation task."""
@@ -196,15 +240,24 @@ class TaskManager:
             ProjectLockedError: another process holds the project lock
                 (this task holds it until it ends).
         """
+        with self._start_lock:
+            return self._start_locked(project_name, projects_dir, num_workers,
+                                      segment_ids, retry_failed)
+
+    def _start_locked(self, project_name, projects_dir, num_workers,
+                      segment_ids, retry_failed) -> TranslationTask:
         existing = self.tasks.get(project_name)
         if existing and existing.state == 'running':
             raise ValueError('翻譯任務已在執行中')
         # Stop any lingering paused task before creating a new one
         if existing and existing.state == 'paused':
             self.stop_translation(project_name)
-        # Wait for old coordinator thread to finish before starting a new one
-        if existing and existing._coordinator is not None:
-            existing._coordinator.join(timeout=5)
+        # The old task's threads must have ended: a timed-out wait is not an end
+        if existing is not None:
+            if existing._coordinator is not None:
+                existing._coordinator.join(timeout=STOP_WAIT_SECONDS)
+            if existing.threads_alive():
+                raise ValueError('上一個翻譯任務仍在結束中（等待進行中的段落），請稍後再試')
 
         num_workers = max(1, min(num_workers, MAX_WORKERS))
 
@@ -220,44 +273,49 @@ class TaskManager:
         lock = ProjectLock(project_dir)
         lock.acquire()  # raises ProjectLockedError
         try:
-            pm = ProjectManager(project_dir)
-            pm.load()
+            # Under the project mutex until the task is registered: an edit
+            # either lands before the load or goes to the task's manager
+            with project_mutex(project_dir):
+                pm = ProjectManager(project_dir)
+                pm.load()
 
-            if segment_ids is not None:
-                # Retranslate mode: queue specified segments regardless of status
-                id_set = set(segment_ids)
-                to_translate = [s for s in pm.data.segments if s.segment_id in id_set]
-            else:
-                to_translate = pm.get_pending_segments(include_failed=retry_failed)
+                if segment_ids is not None:
+                    # Retranslate mode: queue specified segments regardless of status
+                    id_set = set(segment_ids)
+                    to_translate = [s for s in pm.data.segments if s.segment_id in id_set]
+                else:
+                    to_translate = pm.get_pending_segments(include_failed=retry_failed)
+
+                task.total = len(to_translate)
+                if task.total == 0:
+                    lock.release()
+                    task.state = 'completed'
+                    self.tasks[project_name] = task
+                    return task
+
+                task.state = 'running'
+                task.pm = pm
+                task.project_lock = lock  # released by the coordinator when it ends
+
+                # Fill segment queue; a later edit of a queued segment wins
+                for seg in to_translate:
+                    task.queued[seg.segment_id] = (seg.revision, seg.status)
+                    task.segment_queue.put(seg)
+
+                coordinator = threading.Thread(
+                    target=self._run_translation,
+                    args=(task,),
+                    daemon=True,
+                )
+                task._coordinator = coordinator
+                coordinator.start()
+                self.tasks[project_name] = task
         except BaseException:
-            lock.release()
+            if task.project_lock is None or not task.threads_alive():
+                # Nothing started that would release it
+                task.state = 'failed'
+                lock.release()
             raise
-
-        task.total = len(to_translate)
-
-        if task.total == 0:
-            lock.release()
-            task.state = 'completed'
-            self.tasks[project_name] = task
-            return task
-
-        task.state = 'running'
-        task.pm = pm
-        task.project_lock = lock  # released by the coordinator when it ends
-
-        # Fill segment queue
-        for seg in to_translate:
-            task.segment_queue.put(seg)
-
-        self.tasks[project_name] = task
-
-        coordinator = threading.Thread(
-            target=self._run_translation,
-            args=(task,),
-            daemon=True,
-        )
-        task._coordinator = coordinator
-        coordinator.start()
 
         return task
 
@@ -323,8 +381,10 @@ class TaskManager:
     def _run_translation(self, task: TranslationTask):
         """Coordinator: set up resources, launch workers, process results."""
         project_dir = os.path.join(task.projects_dir, task.project_name)
-        handler = setup_project_logging(project_dir)
+        handler = None
+        unsaved = []  # results applied in memory since the last save
         try:
+            handler = setup_project_logging(project_dir)
             pm = task.pm
 
             # Load glossary
@@ -379,7 +439,9 @@ class TaskManager:
                 # Process batch, then save once
                 for res in batch:
                     self._apply_result(task, pm, res)
+                    unsaved.append(res.segment_id)
                 pm.save()
+                unsaved.clear()
 
                 # Results that arrived meanwhile are taken by the next round
                 with task._lock:
@@ -403,24 +465,48 @@ class TaskManager:
                 }})
 
         except Exception as e:
-            logger.error("Translation task failed: %s", e)
-            task.state = 'failed'
-            task.error = str(e)
-            task.progress.put({'event': 'error', 'data': {
-                'error': str(e),
-            }})
+            self._fail_task(task, e, unsaved)
         finally:
             if task.project_lock is not None:
                 task.project_lock.release()
             teardown_project_logging(handler)
 
+    def _fail_task(self, task: TranslationTask, error: Exception, unsaved: list) -> None:
+        """The coordinator failed: stop dispatching, wake paused workers,
+        wait for the calls in flight and report every result not saved,
+        before the caller releases the lock."""
+        with task._lock:
+            task.state = 'failed'
+            task.stop_event.set()
+            task.pause_event.set()
+        for t in list(task._threads):
+            t.join()
+        while True:
+            try:
+                unsaved.append(task.result_queue.get_nowait().segment_id)
+            except queue.Empty:
+                break
+        message = str(error)
+        if unsaved:
+            message += f'（{len(unsaved)} 個段落的結果未儲存：{", ".join(unsaved)}）'
+        logger.error("Translation task failed: %s", message)
+        task.error = message
+        task.progress.put({'event': 'error', 'data': {
+            'error': message,
+            'unsaved': unsaved,
+        }})
+
     def _apply_result(self, task: TranslationTask, pm: ProjectManager,
                       res: TranslationResult) -> None:
         """Store one worker result in memory and report it (coordinator only)."""
         outcome = res.outcome
-        if not pm.apply_outcome(res.segment_id, outcome, revision=res.revision):
+        if outcome is None:
+            # Skipped by the worker: edited or approved after it was queued
+            logger.info("段落已在排隊期間被編輯，略過: %s", res.segment_id)
+        elif not pm.apply_outcome(res.segment_id, outcome, revision=res.revision):
             # Edited while its translation was in flight: the edit wins
             logger.info("段落已在翻譯期間被編輯，捨棄結果: %s", res.segment_id)
+            outcome = None
         elif outcome.status == SegmentStatus.FAILED:
             detail = outcome.issues[0].detail
             logger.warning("段落翻譯失敗: %s — %s", res.segment_id, detail)
@@ -432,19 +518,20 @@ class TaskManager:
         with task._lock:
             task.completed += 1
             completed = task.completed
-        logger.info("段落完成 [%d/%d]: %s (%s)",
-                    completed, task.total, res.segment_id, outcome.model)
         task.progress.put({'event': 'progress', 'data': {
             'completed': completed,
             'total': task.total,  # > 0: a task with nothing to do has no workers
             'percent': round(completed / task.total * 100, 1),
         }})
-        if outcome.status == SegmentStatus.TRANSLATED:
-            task.progress.put({'event': 'segment_complete', 'data': {
-                'segment_id': res.segment_id,
-                'translated_text': outcome.text[:200],
-                'model': outcome.model,
-            }})
+        if outcome is None:
+            return  # nothing of the machine's was kept: no success event
+        logger.info("段落完成 [%d/%d]: %s (%s)",
+                    completed, task.total, res.segment_id, outcome.model)
+        task.progress.put({'event': 'segment_complete', 'data': {
+            'segment_id': res.segment_id,
+            'translated_text': outcome.text[:200],
+            'model': outcome.model,
+        }})
 
     def _worker_loop(self, task: TranslationTask, worker_id: int):
         """Single worker loop: fetch segments from queue and translate."""
@@ -488,22 +575,44 @@ class TaskManager:
                     logger.info("[%s] 模型切換: %s → %s", tag, engine.model, pm.data.model)
                     engine.model = pm.data.model
 
+                revision, queued_status = task.queued.get(
+                    seg.segment_id, (seg.revision, seg.status))
+                with pm.mutex:
+                    # Edited or approved since it was queued: the person's
+                    # version wins, so do not spend a call on it
+                    skip = seg.revision != revision or (
+                        seg.status == SegmentStatus.REVIEWED
+                        and queued_status != SegmentStatus.REVIEWED)
+                if skip:
+                    task.result_queue.put(TranslationResult(
+                        segment_id=seg.segment_id, outcome=None, revision=revision))
+                    continue
+
                 try:
-                    revision = seg.revision
-                    outcome = translate_segment(engine, seg, all_segments, gm,
-                                                log_dir=log_dir)
+                    try:
+                        outcome = translate_segment(engine, seg, all_segments, gm,
+                                                    log_dir=log_dir)
+                    except RUN_ERRORS:
+                        raise
+                    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on
+                        logger.exception("[%s] 未預期的錯誤: %s", tag, seg.segment_id)
+                        outcome = unexpected_error_outcome(engine.model, e)
                     # A failed segment is a result too: recorded as FAILED
                     task.result_queue.put(TranslationResult(
                         segment_id=seg.segment_id, outcome=outcome, revision=revision))
 
-                except (AuthError, RateLimitError) as e:
-                    event_name = 'auth_error' if isinstance(e, AuthError) else 'rate_limit'
+                except RUN_ERRORS as e:
+                    event_name = next(name for cls, name in RUN_ERROR_EVENTS
+                                      if isinstance(e, cls))
                     logger.warning("[%s] %s, pausing: %s", tag, event_name, e)
 
                     # Return segment to queue for retry
                     task.segment_queue.put(seg)
 
                     with task._lock:
+                        # Stopped meanwhile: do not pause a task that is ending
+                        if task.stop_event.is_set():
+                            break
                         # Only first worker to hit this sends the event
                         if task.state == 'running':
                             task.state = 'paused'

@@ -15,13 +15,9 @@
                         開始翻譯
                     </button>
                 </template>
-                {% if progress.failed %}
-                <template x-if="state === 'idle' || state === 'completed' || state === 'failed'">
-                    <button class="btn btn-secondary" @click="startTranslation(true)" :disabled="starting">
-                        重試失敗段落（{{ progress.failed }}）
-                    </button>
-                </template>
-                {% endif %}
+                <button class="btn btn-secondary" @click="startTranslation(true)" :disabled="starting"
+                        x-show="failedCount > 0 && (state === 'idle' || state === 'completed' || state === 'failed' || state === 'stopped')"
+                        x-text="'重試失敗段落（' + failedCount + '）'">重試失敗段落（{{ progress.failed }}）</button>
                 <template x-if="state === 'running'">
                     <button class="btn btn-secondary" @click="pauseTranslation()">
                         ⏸ 暫停
@@ -41,7 +37,7 @@
                     <label for="model-select" style="font-weight: 600; margin-right: 0.5rem;">翻譯模型</label>
                     <select id="model-select"
                             :disabled="modelLoading"
-                            @change="model = $event.target.value; setModel($event.target.value)"
+                            @change="setModel($event.target.value)"
                             style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
                         <template x-for="m in availableModels" :key="m.alias">
                             <option :value="m.alias" :selected="m.alias === model"
@@ -146,7 +142,8 @@ function translationController() {
         logs: [],
         eventSource: null,
         logCounter: 0,
-        model: 'sonnet',
+        model: '',
+        failedCount: {{ progress.failed }},
         availableModels: [],
         modelLoading: false,
         workers: 1,
@@ -182,21 +179,41 @@ function translationController() {
         },
 
         async setModel(alias) {
+            const previous = this.model;
+            this.model = alias;
             this.modelLoading = true;
+            let data = {};
+            let ok = false;
             try {
                 const res = await fetch('/api/projects/{{ project_name }}/model', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ model: alias }),
                 });
-                const data = await res.json();
-                if (data.status === 'ok') {
-                    this.model = data.model;
-                }
+                data = await res.json();
+                ok = res.ok && data.status === 'ok';
             } catch (e) {
-                console.error('Failed to set model:', e);
+                data = { error: '模型設定失敗: ' + e.message };
+            }
+            if (ok) {
+                this.model = data.model;
+            } else {
+                // Not saved: show the stored model again
+                this.model = previous;
+                document.getElementById('model-select').value = previous;
+                this.error = data.error || '模型設定失敗';
             }
             this.modelLoading = false;
+        },
+
+        async refreshFailedCount() {
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/progress');
+                const data = await res.json();
+                if (res.ok) this.failedCount = data.failed;
+            } catch (e) {
+                console.error('Failed to fetch progress:', e);
+            }
         },
 
         async fetchStatus() {
@@ -349,7 +366,17 @@ function translationController() {
             this.eventSource.addEventListener('auth_error', (e) => {
                 const data = JSON.parse(e.data);
                 this.state = 'paused';
-                this.error = data.error || 'Claude CLI 認證已過期，請在終端執行 claude /login 重新登入';
+                this.error = data.error || {{ auth_hint|tojson }};
+            });
+
+            this.eventSource.addEventListener('backend_error', (e) => {
+                const data = JSON.parse(e.data);
+                this.state = 'paused';
+                this.error = data.error;
+            });
+
+            this.eventSource.addEventListener('stopped', (e) => {
+                this.refreshFailedCount();
             });
 
             this.eventSource.addEventListener('complete', (e) => {
@@ -360,6 +387,7 @@ function translationController() {
                 if (this.total > 0) {
                     this.percent = Math.round(this.completed / this.total * 1000) / 10;
                 }
+                this.refreshFailedCount();
                 this.eventSource.close();
                 this.eventSource = null;
             });
@@ -369,6 +397,7 @@ function translationController() {
                     const data = JSON.parse(e.data);
                     this.error = data.error;
                     this.state = 'failed';
+                    this.refreshFailedCount();
                 }
                 this.eventSource.close();
                 this.eventSource = null;
