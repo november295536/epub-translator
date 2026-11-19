@@ -46,9 +46,10 @@ MERGE_BASE="$(git merge-base "$BASE" HEAD)"
 # (not named GROUPS: that is a read-only bash variable)
 MUT_GROUPS=(
     "core|src/core/project.py,src/core/segmenter.py,src/core/translator.py,src/epub/builder.py,src/epub/extractor.py,src/glossary/glossary_manager.py,src/glossary/term_extractor.py|tests/test_project.py tests/test_segmenter.py tests/test_translator.py tests/test_builder.py tests/test_extractor.py tests/test_glossary.py tests/test_verify_scripts.py"
-    "web|src/web/tasks.py,src/web/blueprints/glossary.py,src/web/blueprints/review.py|tests/test_web.py -k TermExtractionCoverage or RetranslateContext or WorkerContext or CreateProjectMarker"
-    "cli|translate.py|tests/test_cli.py"
-    "scripts|scripts/verify/phase0_code_segments.py,scripts/verify/phase0_builder_alignment.py|tests/test_verify_scripts.py"
+    "llm|src/llm/__init__.py,src/llm/base.py,src/llm/cli.py,src/llm/claude_cli.py,src/llm/fake.py|tests/test_llm.py tests/test_translator.py tests/test_glossary.py"
+    "web|src/web/tasks.py,src/web/server.py,src/web/blueprints/glossary.py,src/web/blueprints/projects.py,src/web/blueprints/review.py,src/web/blueprints/search.py,src/web/blueprints/translation.py|tests/test_web.py -k TermExtractionCoverage or RetranslateContext or WorkerContext or CreateProjectMarker or WorkerFailedSegment or EditDuringTranslation or RetranslateOutcome or WebProjectLock or FailedInPages or TermExtractionModel or RateLimitPause or RetranslateModel or SegmentCompleteModel or MultiWorker or SearchSegments or StartWithSegmentIds or WorkerEventsAndLogs or RetranslateDetails or LockedSaveResponse or TaskWithoutLock or DeleteProjectAPI or RetranslateTransaction or OverlappingTasks or StartFailures or CoordinatorFailure or StopThenLateRunError or WorkerUnexpectedErrors or BackendUnavailable or QueuedEdits or EditRemovesFailureLog or DeleteGuard or BackendModels or TemplatesHandleErrors or TermExtractionStop or StopThenStartJoin or SharedProjectManager or ModelAPI or SetModelDuringTranslation or Round1Exact or Round2 or Round3 or Round4"
+    "cli|translate.py,src/__init__.py|tests/test_cli.py"
+    "scripts|scripts/verify/phase0_code_segments.py,scripts/verify/phase0_builder_alignment.py,scripts/verify/phase1_load_projects.py|tests/test_verify_scripts.py"
 )
 
 ALL_FILES=()

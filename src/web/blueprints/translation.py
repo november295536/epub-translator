@@ -6,8 +6,8 @@ import json
 import os
 from flask import Blueprint, Response, jsonify, request, current_app
 
-from src.core.project import ProjectManager
-from src.core.translator import AVAILABLE_MODELS, DEFAULT_MODEL
+from src.core.project import ProjectLockedError, ProjectManager
+from src.core.translator import available_models
 from src.web.tasks import TaskManager
 
 
@@ -35,9 +35,12 @@ def start_translation(project_name: str):
         num_workers = max(1, min(num_workers, 20))
 
         segment_ids = data.get('segment_ids')  # list[str] | None
+        # Normal start leaves FAILED segments alone unless asked to retry them
+        retry_failed = bool(data.get('retry_failed', False))
         task = tm.start_translation(project_name, projects_dir,
                                     num_workers=num_workers,
-                                    segment_ids=segment_ids)
+                                    segment_ids=segment_ids,
+                                    retry_failed=retry_failed)
         return jsonify({
             'status': 'ok',
             'task_id': task.task_id,
@@ -45,7 +48,9 @@ def start_translation(project_name: str):
             'total': task.total,
             'workers': task.num_workers,
         })
-    except ValueError as e:
+    except FileNotFoundError:
+        return jsonify({'error': '專案不存在'}), 404
+    except (ValueError, ProjectLockedError) as e:
         return jsonify({'error': str(e)}), 409
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -122,10 +127,17 @@ def translation_stream(project_name: str):
             yield f"event: error\ndata: {json.dumps({'error': '沒有翻譯任務'})}\n\n"
             return
 
-        # Send initial status
-        yield f"event: status\ndata: {json.dumps({'state': task.state, 'completed': task.completed, 'total': task.total})}\n\n"
-
+        # The cursor before the snapshot: an event sent in between is
+        # delivered (possibly repeating what the snapshot shows), not lost
         cursor = task.progress.cursor_end
+        # Initial status, with a run-level error that paused the task before
+        # this page connected
+        status = {'state': task.state, 'completed': task.completed,
+                  'total': task.total, 'error': task.error}
+        yield f"event: status\ndata: {json.dumps(status, ensure_ascii=False)}\n\n"
+        if status['state'] in ('completed', 'failed', 'stopped'):
+            return  # ended before this stream opened: its last event is gone
+
         while True:
             events, cursor = task.progress.iter_from(cursor, timeout=30)
 
@@ -169,7 +181,7 @@ def get_model(project_name: str):
 
     return jsonify({
         'current': pm.data.model,
-        'available': AVAILABLE_MODELS,
+        'available': available_models(),
     })
 
 
@@ -183,17 +195,16 @@ def set_model(project_name: str):
         return jsonify({'error': '未提供模型名稱'}), 400
 
     model = data['model']
-    valid_aliases = [m['alias'] for m in AVAILABLE_MODELS]
+    valid_aliases = [m['alias'] for m in available_models()]
     if model not in valid_aliases:
         return jsonify({'error': f'無效的模型：{model}，可用模型：{", ".join(valid_aliases)}'}), 400
 
     tm = _get_task_manager()
     try:
-        pm = tm.get_or_load_pm(project_name, projects_dir)
-    except Exception as e:
+        with tm.transaction(project_name, projects_dir) as pm:
+            pm.set_model(model)
+            pm.save()
+    except (FileNotFoundError, ValueError) as e:
         return jsonify({'error': str(e)}), 404
-
-    pm.set_model(model)
-    pm.save()
 
     return jsonify({'status': 'ok', 'model': model})

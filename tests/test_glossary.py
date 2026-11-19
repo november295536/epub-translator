@@ -209,7 +209,7 @@ class TestTermExtractor:
         mock_result.stdout = '[{"term": "API", "translation": "介面", "category": "term"}]'
 
         extractor = TermExtractor()
-        with patch('src.glossary.term_extractor.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             terms = extractor.extract_from_text('Text about APIs')
 
         assert len(terms) == 1
@@ -221,7 +221,7 @@ class TestTermExtractor:
         mock_result.stderr = 'error'
 
         extractor = TermExtractor()
-        with patch('src.glossary.term_extractor.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             terms = extractor.extract_from_text('Some text')
 
         assert terms == []
@@ -234,7 +234,7 @@ class TestTermExtractor:
         extractor = TermExtractor()
         segments = [{'text': 'First batch'}, {'text': 'Second batch'}]
 
-        with patch('src.glossary.term_extractor.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             terms = extractor.extract_from_segments(segments)
 
         # Same term from both batches should be deduplicated
@@ -252,7 +252,7 @@ class TestTermExtractor:
         segments = [{'text': 'a' * chunk} for _ in range(4)]
         segments.append({'text': 'a' * (chunk - 8) + 'TAILTERM'})
 
-        with patch('src.glossary.term_extractor.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    return_value=mock_result) as mock_run:
             TermExtractor().extract_from_segments(segments)
 
@@ -276,7 +276,7 @@ class TestTermExtractor:
         text = words[:6000] + ' BEYONDLIMIT ' + words[6000:12000] + ' ENDTERM'
         assert text.index('BEYONDLIMIT') > MAX_CHARS_PER_BATCH
 
-        with patch('src.glossary.term_extractor.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    return_value=mock_result) as mock_run:
             TermExtractor().extract_from_segments(
                 [{'text': 'Short first segment.'}, {'text': text}])
@@ -308,7 +308,7 @@ class TestTermExtractor:
         assert _split_text(' abcdef', 4) == [' ', 'abcd', 'ef']     # break after index 0
 
     def test_segment_without_text_sends_nothing(self):
-        with patch('src.glossary.term_extractor.subprocess.run') as mock_run:
+        with patch('src.llm.cli.run_process') as mock_run:
             assert TermExtractor().extract_from_segments([{}]) == []
         mock_run.assert_not_called()
 
@@ -321,7 +321,7 @@ class TestTermExtractor:
         segments = [{'text': 'a' * half}, {'text': 'b' * half}]
         assert len('\n\n'.join(s['text'] for s in segments)) == MAX_CHARS_PER_BATCH
 
-        with patch('src.glossary.term_extractor.subprocess.run',
+        with patch('src.llm.cli.run_process',
                    return_value=mock_result) as mock_run:
             TermExtractor().extract_from_segments(segments)
 
@@ -335,6 +335,127 @@ class TestTermExtractor:
         mock_result.stderr = 'authentication_error: OAuth token has expired'
 
         extractor = TermExtractor()
-        with patch('src.glossary.term_extractor.subprocess.run', return_value=mock_result):
+        with patch('src.llm.cli.run_process', return_value=mock_result):
             with pytest.raises(ExtractionError, match='認證已過期'):
                 extractor.extract_from_text('Some text')
+
+
+class TestTermExtractorBackend:
+    """Term extraction goes through the backend (Phase 1)."""
+
+    def _fake(self, replies):
+        from src.llm.fake import FakeBackend
+        return FakeBackend(replies)
+
+    def test_model_and_timeout_in_request(self):
+        fake = self._fake(['[]'])
+        TermExtractor(model='haiku', timeout=99, backend=fake).extract_from_text('Some text')
+        request = fake.requests[0]
+        assert (request.model, request.timeout, request.system) == ('haiku', 99, '')
+        assert 'Some text' in request.messages[0].content
+
+    def test_claude_cli_command_has_model_and_clean_environment(self, monkeypatch):
+        import tempfile
+        monkeypatch.setenv('CLAUDECODE', '1')
+        mock_result = MagicMock(returncode=0, stdout='[]', stderr='')
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
+            TermExtractor(model='opus').extract_from_text('Some text')
+        cmd = mock_run.call_args[0][0]
+        assert cmd[:2] == ['claude', '-p'] and cmd[3:] == ['--model', 'opus']
+        assert 'CLAUDECODE' not in mock_run.call_args[1]['env']
+        assert mock_run.call_args[1]['cwd'] == tempfile.gettempdir()
+
+    def test_without_model_no_model_flag(self):
+        mock_result = MagicMock(returncode=0, stdout='[]', stderr='')
+        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
+            TermExtractor().extract_from_text('Some text')
+        assert mock_run.call_args[0][0][3:] == []
+
+    def test_rate_limit_stops_extraction(self):
+        from src.llm import RateLimitError
+        fake = self._fake([RateLimitError("You've hit your limit")])
+        with pytest.raises(ExtractionError, match='hit your limit'):
+            TermExtractor(backend=fake).extract_from_text('Some text')
+
+    def test_auth_error_stops_extraction(self):
+        from src.llm import AuthError
+        fake = self._fake([AuthError('login expired')])
+        with pytest.raises(ExtractionError, match='login expired'):
+            TermExtractor(backend=fake).extract_from_text('Some text')
+
+    @pytest.mark.parametrize('error_name', ['TransientError', 'RefusalError', 'LLMError'])
+    def test_other_errors_give_no_terms(self, error_name):
+        import src.llm as llm
+        fake = self._fake([getattr(llm, error_name)('x'), '[{"term": "A", "translation": "甲"}]'])
+        extractor = TermExtractor(backend=fake)
+        assert extractor.extract_from_text('Some text') == []
+        assert extractor.extract_from_text('Some text') == [{'term': 'A', 'translation': '甲'}]
+
+    def test_unparseable_reply_gives_no_terms(self):
+        assert TermExtractor(backend=self._fake(['no json here'])).extract_from_text('x') == []
+
+    def test_parse_crash_gives_no_terms(self):
+        fake = self._fake(['[]'])
+        with patch.object(TermExtractor, '_parse_response', side_effect=TypeError('bad')):
+            assert TermExtractor(backend=fake).extract_from_text('x') == []
+
+
+class TestTermExtractorRequest:
+
+    def test_default_timeout_and_one_user_message(self):
+        from src.llm import Message
+        from src.llm.fake import FakeBackend
+        from src.glossary.term_extractor import EXTRACT_PROMPT
+        fake = FakeBackend(['[]'])
+        TermExtractor(backend=fake).extract_from_text('Some text')
+        request = fake.requests[0]
+        assert request.timeout == 180
+        assert request.system == ''
+        assert request.messages == [Message('user', EXTRACT_PROMPT.format(text='Some text'))]
+
+    def test_failure_logged(self, caplog):
+        import logging
+        from src.llm import TransientError
+        from src.llm.fake import FakeBackend
+        caplog.set_level(logging.WARNING, logger='src.glossary.term_extractor')
+        TermExtractor(backend=FakeBackend([TransientError('boom')])).extract_from_text('x')
+        assert [r.getMessage() for r in caplog.records] == ['Term extraction failed: boom']
+
+
+# --- Review round 1 ---------------------------------------------------------------
+
+class TestExtractionStopKeepsTerms:
+    """Item 19: a stop keeps the terms of the batches already finished."""
+
+    def test_rate_limit_after_first_batch(self, monkeypatch):
+        from src.glossary.term_extractor import ExtractionError, TermExtractor
+        from src.llm import BackendUnavailableError, RateLimitError
+        from src.llm.fake import FakeBackend
+        monkeypatch.setattr('src.glossary.term_extractor.MAX_CHARS_PER_BATCH', 20)
+        for stop in (RateLimitError('limit'), BackendUnavailableError('missing')):
+            fake = FakeBackend(['[{"term": "Beta", "translation": "乙", "category": "term"},'
+                                ' {"term": "alpha", "translation": "甲", "category": "term"}]',
+                                stop])
+            extractor = TermExtractor(model='m', backend=fake)
+            with pytest.raises(ExtractionError) as info:
+                extractor.extract_from_segments([{'text': 'first batch text'},
+                                                 {'text': 'second batch text'},
+                                                 {'text': 'third batch text'}])
+            assert [t['term'] for t in info.value.terms] == ['alpha', 'Beta']
+            assert str(info.value) == str(stop)
+            assert len(fake.requests) == 2
+
+    def test_batches_joined_with_blank_line(self, monkeypatch):
+        from src.glossary.term_extractor import TermExtractor
+        from src.llm.fake import FakeBackend
+        monkeypatch.setattr('src.glossary.term_extractor.MAX_CHARS_PER_BATCH', 20)
+        fake = FakeBackend(['[]', '[]'])
+        TermExtractor(model='m', backend=fake).extract_from_segments(
+            [{'text': 'aaaa'}, {'text': 'bbbb'}, {'text': 'c' * 15}, {'text': 'dd'}])
+        assert len(fake.prompts) == 2
+        assert fake.prompts[0].endswith('aaaa\n\nbbbb')
+        assert fake.prompts[1].endswith('c' * 15 + '\n\ndd')
+
+    def test_error_without_terms(self):
+        from src.glossary.term_extractor import ExtractionError
+        assert ExtractionError('x').terms == []

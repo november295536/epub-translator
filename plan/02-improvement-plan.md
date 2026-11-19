@@ -376,8 +376,24 @@ Acceptance (one unit test per item, each failing on the current code and passing
 - For failed segments, keep the raw request and response on disk for diagnosis.
 - Record token usage when the backend reports it.
 
+As built (2026-11-19), where it differs from 4.3/4.4:
+
+- `project.json` does not store a backend name yet: only `ClaudeCLI` exists; the field comes
+  with the second backend (Phase 7).
+- `ClaudeCLI` keeps plain-text output (`claude -p <prompt> --model <alias>`), which reports no
+  usage, so usage is recorded as absent. `--output-format json` is left to the Phase 7
+  measurements.
+- The project lock is an exclusive `flock` on `<project>/project.lock`, taken by every save,
+  for the whole CLI `start` run, and for the whole web task. The kernel drops it when the
+  holder dies, so a stale lock never blocks. Not available on Windows.
+- `FAILED` segments are retried with `start --retry-failed` (CLI) or `retry_failed: true` on
+  the web start API (a "retry failed segments" button on the translation tab).
+- Failure diagnostics: `log/failed/<segment id>-<digest>.txt`, one file per segment, replaced by each
+  failed run and removed when the segment later succeeds.
+
 Acceptance:
 
+- `python3 translate.py --version` prints a line containing `1.0.0`.
 - `grep -rn "subprocess" src/ translate.py` finds matches only in the backend module.
 - Tests with the fake backend: a failing segment in the sequential CLI path and in the parallel
   path is recorded as `FAILED` and the remaining segments are translated; a result for a segment

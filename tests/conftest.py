@@ -264,3 +264,74 @@ def assert_context_prompts(prompts, project_dir):
     stored = {s.segment_id: s for s in pm.data.segments}
     assert stored['chB_seg0002'].translated_text == CONTEXT_CODE
     assert stored['chB_seg0004'].translated_text == CONTEXT_CODE
+
+
+# --- Backend seam -------------------------------------------------------------
+
+def use_fake_backend(fake):
+    """Make every engine and extractor created inside the block use `fake`."""
+    from unittest.mock import patch
+    return patch('src.llm.default_backend', return_value=fake)
+
+
+# --- Project lock held by another process --------------------------------------
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+_HOLD_LOCK = '''
+import sys
+sys.path.insert(0, sys.argv[1])
+from src.core.project import ProjectLock
+ProjectLock(sys.argv[2]).acquire()
+print('locked', flush=True)
+sys.stdin.read()  # hold until the parent closes stdin or kills us
+'''
+
+
+def hold_lock_in_child(project_dir):
+    """Start a separate process that takes the project lock and keeps it.
+    Close its stdin to let it exit normally, or kill it."""
+    import subprocess
+    import sys
+    child = subprocess.Popen([sys.executable, '-c', _HOLD_LOCK, _REPO_ROOT, project_dir],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    assert child.stdout.readline().strip() == 'locked'
+    return child
+
+
+def lock_free_for_other_process(project_dir):
+    """True when a separate process can take the project lock now."""
+    import subprocess
+    import sys
+    code = ('import sys; sys.path.insert(0, sys.argv[1]); '
+            'from src.core.project import ProjectLock, ProjectLockedError\n'
+            'try:\n    ProjectLock(sys.argv[2]).acquire()\n'
+            'except ProjectLockedError:\n    sys.exit(3)\n')
+    result = subprocess.run([sys.executable, '-c', code, _REPO_ROOT, project_dir])
+    return result.returncode == 0
+
+
+@pytest.fixture(autouse=True)
+def no_fake_backend_overcalls():
+    """A scripted FakeBackend called more often than scripted fails the test,
+    also when the call was made in a worker thread (where the exception
+    only ends the thread)."""
+    from src.llm.fake import FakeBackend
+    FakeBackend.overcalls.clear()
+    yield
+    overcalls = list(FakeBackend.overcalls)
+    FakeBackend.overcalls.clear()
+    assert not overcalls, f'FakeBackend called {len(overcalls)} time(s) beyond its script'
+
+
+@pytest.fixture(autouse=True)
+def no_real_model_calls(monkeypatch):
+    """No test starts the real `claude` program: a call that reaches the
+    process layer without a test's own stub fails like an error exit.
+    (Tests of run_process itself import the function directly.)"""
+    from src.llm.cli import ProcessResult
+
+    def refuse(cmd, **kwargs):
+        return ProcessResult(1, '', 'tests do not run the real CLI')
+
+    monkeypatch.setattr('src.llm.cli.run_process', refuse)
