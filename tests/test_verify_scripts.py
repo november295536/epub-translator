@@ -587,5 +587,7 @@ class TestLoadCheckOutput:
         assert 'Phase 1 check: every existing project loads with the new code, untouched.' \
             in help_text
         assert 'For each directory' not in help_text
-        assert 'Directory that holds the project folders (default: projects)' in help_text
-        assert 'Print project-N labels; omit names and paths' in help_text
+        assert ('--projects-dir PROJECTS_DIR Directory that holds the project folders '
+                '(default: projects) --anonymize Print project-N labels; omit names and '
+                'paths') in help_text
+        assert help_text.endswith('omit names and paths')

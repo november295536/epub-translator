@@ -1872,3 +1872,20 @@ class TestLockedSaveResponse:
                                    json={'text': '改'})
         assert response.status_code == 409
         assert response.get_json() == {'error': 'held elsewhere'}
+
+
+class TestTaskWithoutLock:
+
+    def test_coordinator_of_task_built_directly_ends_cleanly(self, project_with_translations):
+        """A task that did not come from start_translation holds no lock;
+        its coordinator must not try to release one."""
+        TaskManager._instance = None
+        tm = TaskManager()
+        task = TranslationTask(task_id='direct', project_name=PROJECT_NAME,
+                               projects_dir=project_with_translations, state='running',
+                               total=3)
+        _setup_task_pm(task, project_with_translations)
+        with use_fake_backend(FakeBackend(responder=lambda request: '<p>譯</p>')):
+            tm._run_translation(task)  # in this thread: an exception would fail the test
+        assert task.state == 'completed'
+        TaskManager._instance = None
