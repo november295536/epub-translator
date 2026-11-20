@@ -145,7 +145,7 @@ def _run_export(project_dir: str, output_path: str, fmt: str, project_name: str)
             task = _export_tasks.get(project_name)
             if task:
                 task['state'] = 'completed'
-                task['summary'] = report.summary()
+                task['summary'] = {**report.summary(), 'lines': report.lines()}
     except Exception as e:
         with _export_lock:
             task = _export_tasks.get(project_name)
