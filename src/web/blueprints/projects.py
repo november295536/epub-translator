@@ -182,6 +182,7 @@ def create_project():
                         author=metadata.get('author', '未知作者'),
                         segments=all_segments,
                         source_sha256=sha256_file(tmp_epub_path),
+                        segmentation=segmenter.rules,
                     )
                     os.replace(tmp_epub_path, final_epub_path)
                 except BaseException:

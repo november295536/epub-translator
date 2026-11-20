@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html as html_lib
 import os
 import re
 import logging
@@ -160,17 +161,35 @@ def _is_empty_reply(translated: str, source: str) -> bool:
 CONTEXT_CHARS = 200
 
 
-def get_context(segments, segment_id: str) -> tuple:
-    """Return (context_before, context_after) source texts for a segment.
+_TAG = re.compile(r'<[^>]*>')
+
+
+def translation_text(seg) -> str:
+    """The text of a segment's accepted translation, tags removed and
+    entities decoded; '' when it has none (not translated or reviewed)."""
+    text = seg.translated_text  # read once: a worker may be storing a new one
+    if seg.status not in (SegmentStatus.TRANSLATED, SegmentStatus.REVIEWED):
+        return ''
+    return html_lib.unescape(_TAG.sub('', text)).strip()
+
+
+def get_context(segments, segment_id: str, translations: bool = False) -> tuple:
+    """Return (context_before, context_after) texts for a segment.
 
     On each side, code segments are stepped over to the nearest text
     segment; the search never crosses into another chapter. A side with no
-    such segment is an empty string.
+    such segment is an empty string. The text is the segment's source text,
+    except that with `translations` (projects of segmentation rules 2) the
+    text before is the previous segment's translation when it has one
+    (translation_text). With several workers that segment may not be
+    translated yet: its source text is used then.
 
     Args:
         segments: All project segments in reading order (objects with
-                  segment_id, chapter_id, segment_type and text).
+                  segment_id, chapter_id, segment_type, text, status and
+                  translated_text).
         segment_id: ID of the segment about to be translated.
+        translations: Use the previous segment's translation when it has one.
     """
     ids = [s.segment_id for s in segments]
     if segment_id not in ids:
@@ -178,15 +197,15 @@ def get_context(segments, segment_id: str) -> tuple:
     idx = ids.index(segment_id)
     chapter_id = segments[idx].chapter_id
 
-    def nearest_text(step: int) -> str:
+    def nearest_text(step: int, translated: bool) -> str:
         i = idx + step
         while 0 <= i < len(segments) and segments[i].chapter_id == chapter_id:
             if segments[i].segment_type != SegmentType.CODE:
-                return segments[i].text
+                return (translated and translation_text(segments[i])) or segments[i].text
             i += step
         return ''
 
-    return nearest_text(-1), nearest_text(1)
+    return nearest_text(-1, translations), nearest_text(1, False)
 
 
 class TranslationError(Exception):
@@ -594,7 +613,8 @@ class TranslationEngine:
 
 def translate_segment(engine: TranslationEngine, seg, segments,
                       glossary=None,
-                      cancel: threading.Event | None = None) -> TranslationOutcome:
+                      cancel: threading.Event | None = None,
+                      translations: bool = False) -> TranslationOutcome:
     """Translate one project segment: the single entry point for the web
     worker, both CLI modes and the re-translate endpoint.
 
@@ -605,6 +625,8 @@ def translate_segment(engine: TranslationEngine, seg, segments,
     it carries the error for the diagnostics, which the caller writes with
     record_failure_log once it has accepted and saved the outcome. Any
     other exception also gives a FAILED outcome (issue code `unexpected`).
+    `translations`: the context before is the previous segment's
+    translation when it has one (get_context; projects of segmentation 2).
     RateLimitError, AuthError, BackendUnavailableError and CancelledError
     are raised: they concern the run, not the segment. Writes no file.
     """
@@ -617,7 +639,7 @@ def translate_segment(engine: TranslationEngine, seg, segments,
             if found:
                 glossary_text = glossary.format_for_prompt(found)
 
-        context = context_before, context_after = get_context(segments, seg.segment_id)
+        context = context_before, context_after = get_context(segments, seg.segment_id, translations)
         reply = engine.translate_reply(
             seg.text,
             segment_type=seg.segment_type,

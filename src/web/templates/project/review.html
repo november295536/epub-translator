@@ -39,7 +39,7 @@
                 <span class="segment-id">{{ seg.segment_id }}</span>
                 {% if seg.segment_type == 'code' %}<span class="segment-type">code</span>{% endif %}
                 {% if issues_only and not current_chapter %}<a class="segment-chapter" href="/project/{{ project_name }}/review/chapter/{{ seg.chapter_id }}#seg-{{ seg.segment_id }}">{{ seg.chapter_id }}</a>{% endif %}
-                <span class="segment-status status-{{ seg.status }}"{% if seg.issues %} title="{{ seg.issues | map(attribute='detail') | join('; ') }}"{% endif %}>{{ seg.status }}</span>
+                {% if seg.passthrough %}<span class="segment-status status-passthrough" title="沒有註解的程式碼：不送模型翻譯，匯出時原樣保留">passthrough</span>{% else %}<span class="segment-status status-{{ seg.status }}"{% if seg.issues %} title="{{ seg.issues | map(attribute='detail') | join('; ') }}"{% endif %}>{{ seg.status }}</span>{% endif %}
                 <span class="issue-badge"{% if not seg.issues %} hidden{% endif %}>{{ seg.issues | length }} 個問題</span>
             </div>
             <ul class="segment-issues"{% if not seg.issues %} hidden{% endif %}>
@@ -62,6 +62,12 @@
                     <div class="html-preview" x-show="view === 'preview'">{{ seg.html|safe }}</div>
                     <pre class="html-source" x-show="view === 'html'"><code>{{ seg.html }}</code></pre>
                 </div>
+                {% if seg.passthrough %}
+                <div class="translation passthrough-note">
+                    <div class="original-header"><h4>譯文</h4></div>
+                    <p>沒有註解的程式碼，不需翻譯：不送模型，匯出時在每種格式都原樣保留（雙語版只出現一次）。</p>
+                </div>
+                {% else %}
                 <div class="translation" x-data="{ tView: 'edit', previewHtml: '' }">
                     <div class="original-header">
                         <h4>譯文</h4>
@@ -81,6 +87,7 @@
                         <button class="btn-approve" onclick="approveSegment('{{ seg.segment_id }}')">通過審閱</button>
                     </div>
                 </div>
+                {% endif %}
             </div>
         </div>
         {% endfor %}

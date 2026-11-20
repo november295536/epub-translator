@@ -59,7 +59,8 @@ class Issue:
 # Per-segment fields written to project.json only when they differ from
 # these defaults, so an existing project round-trips without new keys
 _SEGMENT_DEFAULTS = {'issues': [], 'revision': 0, 'model': '', 'usage': None,
-                     'block_start': None, 'block_end': None, 'fingerprints': []}
+                     'block_start': None, 'block_end': None, 'fingerprints': [],
+                     'passthrough': False}
 
 
 @dataclass
@@ -85,6 +86,10 @@ class SegmentState:
     block_start: int | None = None
     block_end: int | None = None
     fingerprints: list[str] = field(default_factory=list)
+    # Segmentation rules 2: a code block without a comment line. Created
+    # TRANSLATED with the code itself as its text; never sent to a model,
+    # never edited, left as it is by the export
+    passthrough: bool = False
 
 
 @dataclass
@@ -110,6 +115,11 @@ class ProjectData:
     schema: int = 1
     # SHA-256 of the project's copy of the source EPUB (schema 2)
     source_sha256: str = ''
+    # The segmentation rules the segments were cut by (src/core/segmenter.py):
+    # 1 before Phase 6 (never written, so those files round-trip unchanged),
+    # 2 for projects created since (written). With 2 the prompt's context is
+    # the previous segment's translation when it has one (translator.get_context)
+    segmentation: int = 1
     segments: list[SegmentState] = field(default_factory=list)
 
 
@@ -144,7 +154,8 @@ class ProjectManager:
         self.mutex = project_mutex(project_dir)
 
     def create(self, epub_path: str, title: str, author: str,
-               segments: list[Segment], source_sha256: str = '') -> ProjectData:
+               segments: list[Segment], source_sha256: str = '',
+               segmentation: int = 1) -> ProjectData:
         """Create a new translation project (schema 2).
 
         Args:
@@ -153,6 +164,9 @@ class ProjectManager:
             author: Book author.
             segments: List of segments from the segmenter.
             source_sha256: SHA-256 of that copy.
+            segmentation: The rules `segments` were cut by (Segmenter.rules).
+
+        A passthrough segment is created translated, its code as its text.
         """
         os.makedirs(self.project_dir, exist_ok=True)
 
@@ -171,6 +185,11 @@ class ProjectManager:
                 block_end=seg.block_end,
                 fingerprints=list(seg.fingerprints),
             ))
+            if seg.passthrough:
+                state = segment_states[-1]
+                state.passthrough = True
+                state.status = SegmentStatus.TRANSLATED
+                state.translated_text = seg.text
 
         self.data = ProjectData(
             epub_path=os.path.abspath(epub_path),
@@ -182,6 +201,7 @@ class ProjectManager:
             model=llm.default_backend().default_model,
             schema=SCHEMA,
             source_sha256=source_sha256,
+            segmentation=segmentation,
             segments=segment_states,
         )
         self.save()
@@ -225,6 +245,8 @@ class ProjectManager:
                 del raw['segmenter_version']
         else:
             del raw['segmenter_version']  # superseded by the schema
+        if raw['segmentation'] == 1:
+            del raw['segmentation']  # projects from before Phase 6 save as before
         for seg in raw['segments']:
             for key, default in _SEGMENT_DEFAULTS.items():
                 if seg[key] == default:
@@ -329,6 +351,8 @@ class ProjectManager:
         reviewed = sum(1 for s in self.data.segments if s.status == SegmentStatus.REVIEWED)
         pending = sum(1 for s in self.data.segments if s.status == SegmentStatus.PENDING)
         failed = sum(1 for s in self.data.segments if s.status == SegmentStatus.FAILED)
+        # of the translated ones: code without comment lines, done without a model call
+        passthrough = sum(1 for s in self.data.segments if s.passthrough)
 
         return {
             'total': total,
@@ -336,6 +360,7 @@ class ProjectManager:
             'reviewed': reviewed,
             'pending': pending,
             'failed': failed,
+            'passthrough': passthrough,
             'percent': round(((translated + reviewed) / total * 100) if total > 0 else 0, 1),
         }
 

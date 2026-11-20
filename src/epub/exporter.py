@@ -223,7 +223,8 @@ def _export(project_dir: str, output_path: str, fmt: str) -> ExportReport:
     replaced: dict = {}   # member -> new bytes
     labels: dict = {}     # chapter member -> {fragment or None: TOC label}
     for chapter_id, segments in by_chapter.items():
-        todo = [s for s in segments if accepted(s)]
+        # A passthrough segment (code without comment lines) is left as it is
+        todo = [s for s in segments if accepted(s) and not s.passthrough]
         if not todo:
             continue
         chapter = ChapterReport(chapter_id)

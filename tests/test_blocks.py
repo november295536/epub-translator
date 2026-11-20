@@ -105,8 +105,8 @@ LONG_BARE = ' '.join(f'word{i}' for i in range(1200))
 class TestSchema2Segments:
 
     @staticmethod
-    def _segments(html):
-        return Segmenter().segment_chapter('ch', body_of(html))
+    def _segments(html, rules=2):
+        return Segmenter(rules=rules).segment_chapter('ch', body_of(html))
 
     def test_bare_text_with_br(self):
         segs = self._segments('<div>First line<br/>Second line</div><p>After.</p>')
@@ -141,12 +141,15 @@ class TestSchema2Segments:
     def test_ranges_contiguous_and_cover_all_blocks(self):
         html = ('<h1>T</h1>' + ''.join(f'<p>{" ".join(["w"] * 120)}</p>' for _ in range(7))
                 + '<pre>x = 1  # one</pre><table><tr><td>c</td></tr></table>Tail')
-        segs = self._segments(html)
-        ends = [0] + [s.block_end for s in segs]
-        assert [s.block_start for s in segs] == ends[:-1]
-        assert ends[-1] == len(walk_blocks(body_of(html)))
-        assert [s.segment_type for s in segs].count(SegmentType.CODE) == 1
-        assert [s.standalone for s in segs] == [True, False, False, False, True, True, False]
+        for rules, standalone in ((1, [True, False, False, False, True, True, False]),
+                                  # Phase 6: the heading joins the first paragraphs
+                                  (2, [False, False, False, True, True, False])):
+            segs = self._segments(html, rules)
+            ends = [0] + [s.block_end for s in segs]
+            assert [s.block_start for s in segs] == ends[:-1]
+            assert ends[-1] == len(walk_blocks(body_of(html)))
+            assert [s.segment_type for s in segs].count(SegmentType.CODE) == 1
+            assert [s.standalone for s in segs] == standalone
 
     def test_code_text_kept_verbatim(self):
         segs = self._segments('<pre>  def f():\n      return 1\n</pre>')
@@ -309,7 +312,9 @@ class TestRules:
 
     @pytest.mark.parametrize('tag', ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table'])
     def test_standalone_tags(self, tag):
-        segs = Segmenter().segment_chapter('ch', body_of(f'<p>a</p><{tag}>b</{tag}><p>c</p>'))
+        # Phase 6: rules 1; under rules 2 only a table (TestRules2 in test_segmenter.py)
+        segs = Segmenter(rules=1).segment_chapter(
+            'ch', body_of(f'<p>a</p><{tag}>b</{tag}><p>c</p>'))
         assert [(s.block_start, s.standalone) for s in segs] == [(0, False), (1, True),
                                                                   (2, False)]
 
