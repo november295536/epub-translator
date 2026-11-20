@@ -638,11 +638,22 @@ def translate_segment(engine: TranslationEngine, seg, segments,
         logger.exception("未預期的錯誤: %s", seg.segment_id)
         prompt = _request_text(engine, seg, glossary_text, context) if context else ''
         return unexpected_error_outcome(model, e, prompt)
-    issues = list(reply.issues)
-    if seg.segment_type != SegmentType.CODE:  # code gets no glossary
-        issues += validation.glossary_issues(seg.text, reply.text, glossary)
+    issues = list(reply.issues) + _glossary_warnings(seg, reply.text, glossary)
     return TranslationOutcome(text=reply.text, status=SegmentStatus.TRANSLATED,
                               issues=issues, model=model, usage=reply.usage)
+
+
+def _glossary_warnings(seg, text: str, glossary) -> list:
+    """The glossary warnings of an accepted text (none for code). A
+    failure of the check (a damaged glossary) drops the warnings, never the
+    translation."""
+    if seg.segment_type == SegmentType.CODE:  # code gets no glossary
+        return []
+    try:
+        return validation.glossary_issues(seg.text, text, glossary)
+    except Exception:  # noqa: BLE001 - the warnings are optional
+        logger.warning("術語檢查失敗，略過術語警告: %s", seg.segment_id, exc_info=True)
+        return []
 
 
 def _request_text(engine: TranslationEngine, seg, glossary_text: str, context) -> str:

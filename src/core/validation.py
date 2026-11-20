@@ -29,7 +29,6 @@ quality rules only warn.
 
 from __future__ import annotations
 
-from html import unescape
 import re
 import unicodedata
 from collections import Counter
@@ -725,39 +724,92 @@ def _quality(source_text: str, translation_text: str) -> list:
 
 # --- Glossary -------------------------------------------------------------------------
 
-_MARKUP = re.compile(r'<[^>]*>')
-# A parenthetical without Chinese characters: the original a translation
-# may add after a term (滴水線（drip line）); full-width brackets are ASCII
-# after NFKC
-_ORIGINAL = re.compile(r'\([^()㐀-鿿]*\)')
+# Han characters (CJK unified ideographs, extensions and compatibility
+# ideographs, also outside the basic plane)
+_HAN = re.compile('[㐀-䶿一-鿿豈-﫿\U00020000-\U0003ffff]')
 # Middle dots in names (艾拉·維恩 / 艾拉・維恩 / 艾拉‧維恩)
 _DOTS = str.maketrans('・‧•', '···')
+# Categories whose terms are names: only a plural or possessive ending is
+# an inflection of them
+NAME_CATEGORIES = frozenset({'person', 'place', 'organization', 'work'})
+_POSSESSIVE = r"(?:['’]s?)?"
+
+
+def plain_text(translation: str) -> str:
+    """The text a reader sees in a translation: parsed as a fragment (it has
+    passed the structural check), without tags, comments, script and style,
+    entities decoded. A text that does not parse (plain text of a legacy
+    segment) is taken as it is."""
+    try:
+        frag = fragment(translation, declarations(translation))
+    except (etree.XMLSyntaxError, ValueError):
+        return translation
+    return element_text(frag)
+
+
+def _without_originals(text: str) -> str:
+    """`text` without the balanced parenthetical groups that hold no Han
+    character (the original a translation may add after a term: 滴水線（drip
+    line）, 介面（API (v2)）); a group with Han stays, an unmatched parenthesis
+    stays."""
+    removed = [False] * len(text)
+    opened = []
+    for i, ch in enumerate(text):
+        if ch == '(':
+            opened.append(i)
+        elif ch == ')' and opened:
+            start = opened.pop()
+            if not _HAN.search(text, start, i):
+                removed[start:i + 1] = [True] * (i + 1 - start)
+    return ''.join(ch for ch, gone in zip(text, removed) if not gone)
 
 
 def _comparable(text: str) -> str:
-    """`text` without tags, entities decoded, NFKC, one kind of middle dot,
-    parenthetical originals and whitespace removed, case-folded."""
-    text = unicodedata.normalize('NFKC', unescape(_MARKUP.sub('', text))).translate(_DOTS)
-    return re.sub(r'\s+', '', _ORIGINAL.sub('', text)).casefold()
+    """Plain `text` in NFKC (full-width parentheses become ASCII), one kind of
+    middle dot, parenthetical originals and whitespace removed, case-folded."""
+    text = unicodedata.normalize('NFKC', text).translate(_DOTS)
+    return re.sub(r'\s+', '', _without_originals(text)).casefold()
+
+
+def occurrence_pattern(entry) -> re.Pattern:
+    """Where the check takes a term as occurring in a source text: the
+    prompt's start (`term_pattern`), then at most a short inflection and a
+    word boundary (the prompt's matching has no end boundary: `Eve` would
+    match "every"). A name (NAME_CATEGORIES) may take a plural and a
+    possessive; another term also -ed / -ing (a final e dropped or kept).
+    A `work` entry is case-sensitive: the prompt applies its translation only
+    to the title of a work, taken as written with the glossary's capitals."""
+    term = entry.term.strip()
+    category = entry.category if isinstance(entry.category, str) else ''
+    if category in NAME_CATEGORIES:
+        body = term_pattern(term) + '(?:e?s)?'
+    elif len(term) > 1 and term[-1] in 'eE' and term[-2].isalpha():  # activate -> activating
+        body = term_pattern(term[:-1]) + '(?:e(?:s|d)?|ing)'
+    else:
+        body = term_pattern(term) + '(?:e?s|ed|ing)?'
+    flags = 0 if category == 'work' else re.IGNORECASE
+    return re.compile(body + _POSSESSIVE + r'(?!\w)', flags)
+
+
+def _checkable(entry) -> bool:
+    return all(isinstance(v, str) and v.strip() for v in (entry.term, entry.translation))
 
 
 def terms_not_applied(source_text: str, translation: str, glossary) -> list:
-    """The glossary entries the prompt gave for `source_text`
-    (`terms_for_prompt`) that occur in it (the prompt's matching,
-    `term_pattern`) and whose translation is not in `translation` (both
-    compared as `_comparable`). An entry with an empty translation is
-    skipped. A `work` entry is checked only where the prompt's rule for it
-    applies, a title of a work: written in the source exactly as in the
-    glossary (same capitals)."""
+    """The glossary entries that occur in `source_text` (occurrence_pattern)
+    and whose translation is not in the text of `translation` (both
+    compared as `_comparable`). The prompt holds every such entry
+    (`terms_for_prompt`: the whole glossary, or above its size limit the
+    entries whose start matches, which an occurrence implies). An entry
+    whose term or translation is not a non-empty string is skipped."""
     if glossary is None or not glossary.entries:
         return []
-    text = _comparable(translation)
+    text = _comparable(plain_text(translation))
     missing = []
-    for entry in glossary.terms_for_prompt(source_text):
+    for entry in sorted(filter(_checkable, glossary.entries.values()),
+                        key=lambda e: e.term.lower()):
         expected = _comparable(entry.translation)
-        flags = 0 if entry.category == 'work' else re.IGNORECASE
-        if expected and entry.term.strip() and expected not in text \
-                and re.search(term_pattern(entry.term), source_text, flags):
+        if expected and expected not in text and occurrence_pattern(entry).search(source_text):
             missing.append(entry)
     return missing
 

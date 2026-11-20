@@ -2,8 +2,8 @@
 """Phase 5 check: glossary compliance of the existing translations.
 
 Copies every project of --projects-dir (its project.json, source.epub and
-glossary.json) into a new temporary directory outside the repository and
-outside --projects-dir, migrates the copies that are schema 1 (the code of
+glossary.json) into a new temporary directory outside every git work tree
+and outside --projects-dir, migrates the copies that are schema 1 (the code of
 the migrate command), and then, per project, runs the check of
 `translate.py validate` (src/core/validation.py, check_segment with the
 project's glossary) over every translated or reviewed segment with text.
@@ -11,9 +11,14 @@ It prints the number of glossary entries, translated segments, segments
 that pass the structural check (only those get glossary warnings), segments
 with at least one term_not_applied warning, the number of distinct terms
 involved, and per glossary category the number of warnings (one per
-segment and term) and of distinct terms.
+segment and term) and of distinct terms. Projects are separate books:
+distinct terms are counted per project and summed.
 
-Only counts and category names are printed, never book text or terms.
+Only counts and the known category keys (CATEGORY_LABELS; any other
+category is counted as `other`) are printed, never book text or terms.
+An error outside a project's check prints a fixed message with the
+exception's type only (no path), and the temporary directory is still
+removed.
 Everything in the temporary directory is removed at the end. The projects
 directory is only read: a project FAILs if any file in it changed during
 the run.
@@ -27,18 +32,20 @@ SAMPLE_SEED, taken in turn from each project) as Markdown, for a person to
 judge: project label, segment id, the term, its category and expected
 translation, and an excerpt of source and translation around the term.
 That file holds book text: it is written only to FILE, which must lie
-outside the repository and outside --projects-dir, and its path and content
-are never printed.
+outside every git work tree (no ancestor of its resolved path holds a
+`.git` file or directory: a linked worktree's main checkout counts too) and
+outside --projects-dir, and its path and content are never printed.
 
 Usage:
     python3 scripts/verify/phase5_glossary_check.py [--projects-dir projects] [--anonymize]
         [--sample-out FILE]
 
 Exit code: 0 when every project PASSes, 1 when any FAILs (a migration that
-does not match, an error, a changed project directory), 2 when the projects
-directory cannot be listed, or the temporary directory or the sample file
-would be inside the repository or the projects directory (checked before
-anything is written).
+does not match, an unreadable glossary, an error, a changed project
+directory) or the check stops on an error, 2 when the projects directory
+cannot be listed, or the temporary directory or the sample file would be
+inside a git work tree or the projects directory (checked before anything
+is written).
 """
 
 from __future__ import annotations
@@ -46,12 +53,10 @@ from __future__ import annotations
 import argparse
 import os
 import random
-import re
 import shutil
 import sys
 import tempfile
 from collections import Counter
-from html import unescape
 from itertools import zip_longest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -60,8 +65,10 @@ sys.path.insert(0, ROOT)
 
 from src.core.migrate import migrate_project  # noqa: E402
 from src.core.project import ProjectManager, SegmentStatus  # noqa: E402
-from src.core.validation import check_segment, terms_not_applied  # noqa: E402
-from src.glossary.glossary_manager import CATEGORY_LABELS, GlossaryManager, term_pattern  # noqa: E402
+from src.core.validation import (  # noqa: E402
+    check_segment, occurrence_pattern, plain_text, terms_not_applied,
+)
+from src.glossary.glossary_manager import CATEGORY_LABELS, load_glossary  # noqa: E402
 
 PROJECT_FILE = 'project.json'
 COPIED = (PROJECT_FILE, 'source.epub', 'glossary.json')
@@ -69,7 +76,6 @@ COUNTS = ('entries', 'translated', 'passing', 'with_issue')
 SAMPLE_SIZE = 20
 SAMPLE_SEED = 5
 EXCERPT = 60  # characters on each side of the term
-_TAG = re.compile(r'<[^>]*>')
 
 
 def snapshot(project_dir: str) -> list:
@@ -93,8 +99,9 @@ def check_copy(copy_dir: str) -> tuple[dict, list[str]]:
         if migration.unmatched:
             return {}, [f'{len(migration.unmatched)} chapters unmatched by the migration']
         pm.load()
-    gm = GlossaryManager(os.path.join(copy_dir, 'glossary.json'))
-    gm.load()
+    gm = load_glossary(os.path.join(copy_dir, 'glossary.json'))
+    if gm is None:
+        return {}, ['the glossary cannot be read']
     r = dict.fromkeys(COUNTS, 0)
     r.update(entries=len(gm.entries), found=[])
     for seg in pm.data.segments:
@@ -113,14 +120,25 @@ def check_copy(copy_dir: str) -> tuple[dict, list[str]]:
     return r, []
 
 
-def category_text(found: list) -> str:
-    """Per category: warnings and distinct terms ('none' without any)."""
+def category_key(entry) -> str:
+    """The category printed for an entry: a known key, else `other`
+    (categories are free text and could hold anything)."""
+    return entry.category if entry.category in CATEGORY_LABELS else 'other'
+
+
+def category_counts(found: list) -> tuple[Counter, Counter]:
+    """Of one project's warnings: per category, the warnings and the
+    distinct terms."""
     issues, terms = Counter(), {}
     for _, entry in found:
-        category = entry.category or 'none'
-        issues[category] += 1
-        terms.setdefault(category, set()).add(entry.term.lower())
-    return ', '.join(f'{c}: {issues[c]} warnings, {len(terms[c])} terms'
+        key = category_key(entry)
+        issues[key] += 1
+        terms.setdefault(key, set()).add(entry.term.lower())
+    return issues, Counter({key: len(t) for key, t in terms.items()})
+
+
+def category_text(issues: Counter, terms: Counter) -> str:
+    return ', '.join(f'{c}: {issues[c]} warnings, {terms[c]} terms'
                      for c in sorted(issues)) or 'none'
 
 
@@ -128,16 +146,39 @@ def distinct_terms(found: list) -> int:
     return len({entry.term.lower() for _, entry in found})
 
 
-def counts_line(r: dict, terms: int) -> str:
+def counts_line(r: dict) -> str:
     return (f"glossary entries {r['entries']}, translated {r['translated']}, "
             f"passing the structural check {r['passing']}, "
-            f"with term_not_applied {r['with_issue']}, terms {terms}, "
-            f"by category ({category_text(r['found'])})")
+            f"with term_not_applied {r['with_issue']}, terms {r['terms']}, "
+            f"by category ({category_text(r['issues'], r['category_terms'])})")
 
 
 def inside(path: str, place: str) -> bool:
     path, place = os.path.realpath(path), os.path.realpath(place)
     return os.path.commonpath([path, place]) == place
+
+
+def in_work_tree(path: str) -> bool:
+    """Whether the resolved `path` lies in a git work tree: it or an
+    ancestor holds `.git` (a directory in a main checkout, a file in a
+    linked worktree)."""
+    current = os.path.realpath(path)
+    while True:
+        if os.path.lexists(os.path.join(current, '.git')):
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+
+
+def refusal(path: str, what: str, projects_dir: str) -> str | None:
+    """The message refusing `path` for `what`, or None when it may be used."""
+    if in_work_tree(path):
+        return f'ERROR {what} would be inside a git work tree'
+    if inside(path, projects_dir):
+        return f'ERROR {what} would be inside the projects directory'
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -148,9 +189,16 @@ def main(argv: list[str] | None = None) -> int:
                         help='Print project-N labels; omit names and paths')
     parser.add_argument('--sample-out', metavar='FILE',
                         help='Write a sample of the warnings, with book text, to FILE '
-                             '(outside the repository and the projects directory)')
+                             '(outside every git work tree and the projects directory)')
     args = parser.parse_args(argv)
+    try:
+        return check(args)
+    except Exception as e:  # noqa: BLE001 - no path or text may reach the output
+        print(f'ERROR the check stopped ({type(e).__name__})')
+        return 1
 
+
+def check(args) -> int:
     shown_dir = '<projects-dir>' if args.anonymize else args.projects_dir
     try:
         entries = os.listdir(args.projects_dir)
@@ -160,25 +208,30 @@ def main(argv: list[str] | None = None) -> int:
     names = sorted(name for name in entries
                    if os.path.isfile(os.path.join(args.projects_dir, name, PROJECT_FILE)))
 
-    places = ((ROOT, 'the repository'), (args.projects_dir, 'the projects directory'))
     parent = os.path.realpath(tempfile.gettempdir())
-    for what_path, what in ((parent, 'the temporary directory'),
-                            *(((args.sample_out, 'the sample file'),) if args.sample_out else ())):
-        for place, where in places:
-            if inside(what_path, place):
-                print(f'ERROR {what} would be inside {where}')
-                return 2
+    for path, what in ((parent, 'the temporary directory'),
+                       *(((args.sample_out, 'the sample file'),) if args.sample_out else ())):
+        message = refusal(path, what, args.projects_dir)
+        if message:
+            print(message)
+            return 2
     work = tempfile.mkdtemp(prefix='phase5-glossary-', dir=parent)
+    code = 1
     try:
-        return run(args, names, work)
+        code = run(args, names, work)
     finally:
-        shutil.rmtree(work)
+        try:
+            shutil.rmtree(work)
+        except OSError as e:
+            print(f'ERROR cannot remove the temporary directory ({type(e).__name__})')
+            code = 1
+    return code
 
 
 def run(args, names: list[str], work: str) -> int:
     totals = dict.fromkeys(COUNTS, 0)
-    totals['found'] = []
-    terms_total, failed, per_project = 0, 0, []
+    totals.update(terms=0, issues=Counter(), category_terms=Counter())
+    failed, per_project = 0, []
     for index, name in enumerate(names, 1):
         label = f'project-{index}' if args.anonymize else name
         project_dir = os.path.join(args.projects_dir, name)
@@ -204,18 +257,18 @@ def run(args, names: list[str], work: str) -> int:
             failed += 1
             print(f'FAIL {label}: ' + '; '.join(problems))
             continue
-        for key in (*COUNTS, 'found'):
+        r['issues'], r['category_terms'] = category_counts(r['found'])
+        r['terms'] = distinct_terms(r['found'])
+        for key in (*COUNTS, 'terms', 'issues', 'category_terms'):
             totals[key] += r[key]
-        terms = distinct_terms(r['found'])
-        terms_total += terms  # glossaries are per project: a term counts once per project
         per_project.append((label, r['found']))
-        line = f'{label}: {counts_line(r, terms)}'
+        line = f'{label}: {counts_line(r)}'
         if problems:
             failed += 1
             print(f'FAIL {line}; ' + '; '.join(problems))
         else:
             print(f'PASS {line}')
-    print(f'TOTAL projects {len(names)}  {counts_line(totals, terms_total)}  failed projects {failed}')
+    print(f'TOTAL projects {len(names)}  {counts_line(totals)}  failed projects {failed}')
     if args.sample_out:
         sample = pick_sample(per_project)
         with open(args.sample_out, 'w', encoding='utf-8') as f:
@@ -245,16 +298,11 @@ def excerpt(text: str, start: int, end: int, width: int = EXCERPT) -> str:
     return ('…' if a else '') + piece + ('…' if b < len(text) else '')
 
 
-def plain(translation: str) -> str:
-    """The text of a stored translation: tags removed, entities decoded."""
-    return unescape(_TAG.sub('', translation))
-
-
 def sample_item(number: int, label: str, seg, entry) -> str:
     source = seg.text
-    m = re.search(term_pattern(entry.term), source, re.IGNORECASE)
+    m = occurrence_pattern(entry).search(source)  # where the check found it
     start, end = (m.start(), m.end()) if m else (0, 0)
-    translation = plain(seg.translated_text)
+    translation = plain_text(seg.translated_text)
     # the same relative place in the translation (the term itself is not there)
     middle = round(len(translation) * start / len(source)) if source else 0
     category = CATEGORY_LABELS.get(entry.category, entry.category or '（無）')

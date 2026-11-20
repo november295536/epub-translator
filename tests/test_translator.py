@@ -1988,3 +1988,44 @@ class TestTranslateSegmentGlossary:
         outcome = translate_segment(_engine(FakeBackend(['# 滴線\nx = 1'])), seg, [seg],
                                     self._gm())
         assert outcome.status == SegmentStatus.TRANSLATED and outcome.issues == []
+
+
+class TestTranslateSegmentGlossaryRound1:
+    """Item 13: a failing glossary check drops the warnings, never the reply."""
+
+    def test_check_failure_keeps_the_translation(self, caplog):
+        from tests.test_validation import glossary
+
+        class Broken:
+            def __init__(self):
+                self.real = glossary(('drip line', '滴水線'))
+
+            @property
+            def entries(self):
+                if getattr(self, 'prompt_built', False):
+                    raise RuntimeError('damaged')
+                return self.real.entries
+
+            def terms_for_prompt(self, text):
+                self.prompt_built = True
+                return self.real.terms_for_prompt(text)
+
+            def format_for_prompt(self, found):
+                return self.real.format_for_prompt(found)
+
+        seg = _seg(text='The drip line moved.')
+        outcome = translate_segment(_engine(FakeBackend(['<p k="1">滴線移動了。</p>'])),
+                                    seg, [seg], Broken())
+        assert outcome.status == SegmentStatus.TRANSLATED
+        assert (outcome.text, outcome.issues) == ('<p>滴線移動了。</p>', [])
+        assert any('術語檢查失敗' in r.getMessage() for r in caplog.records)
+
+    def test_bad_entries_do_not_fail(self):
+        from tests.test_validation import glossary
+        gm = glossary(('drip line', '滴水線', 'term'))
+        gm.entries['x'] = GlossaryEntry('moved', None, 'term')
+        seg = _seg(text='The drip line moved.')
+        outcome = translate_segment(_engine(FakeBackend(['<p k="1">滴線移動了。</p>'])),
+                                    seg, [seg], gm)
+        assert outcome.status == SegmentStatus.TRANSLATED
+        assert [i.detail for i in outcome.issues] == ['術語「drip line」未譯為「滴水線」']
