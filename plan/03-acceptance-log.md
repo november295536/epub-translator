@@ -2259,7 +2259,7 @@ run (section 5).
 
 | Item | Where | Main names |
 |---|---|---|
-| Exporter | `src/epub/exporter.py` (new) | `export_project(project_dir, output_path, fmt)` → `ExportReport` (`chapters`: `ChapterReport` per chapter with translations — `translated`, `kept` as (segment id, reason); `untranslated`; `summary()`, `lines()`); `ExportError`; reasons `chapter_unreadable`, `chapter_mismatch`, `not_well_formed`, `structure_mismatch`, `ambiguous_source`, `code_markup` |
+| Exporter | `src/epub/exporter.py` (new) | `export_project(project_dir, output_path, fmt)` → `ExportReport` (`chapters`: `ChapterReport` per chapter with translations — `translated`, `kept` as (segment id, reason); `untranslated`; `summary()`, `lines()`); `ExportError`; reasons `chapter_unreadable`, `chapter_mismatch`, `not_well_formed`, `structure_mismatch`, `ambiguous_source`, `code_markup`, `missing_anchor` |
 | Run positions | `src/epub/blocks.py` | `Block.parent` (the walked element), `Block.prev` (for a run: the child whose tail begins it) |
 | OPF path | `src/epub/extractor.py` | `package_path(zf)` (container.xml → OPF member), used by `read_package` |
 | CLI | `translate.py export` | schema 1 → the migrate message, exit 1; prints the report lines; output `<project>/output/<project dir name>-<format>.epub` |
@@ -2311,8 +2311,11 @@ Per item of the brief:
    source tree, or the chapter's first `h1`–`h6` without fragment; the block must be a block
    element that is the target or contains it, its segment must have been filled, and the
    translated block must hold a heading (the block itself or its first heading descendant);
-   the label is that heading's text, whitespace-normalized, non-empty. Any failed step: label
-   unchanged. A nav `a` gets the label as its only content. Applied in all three formats.
+   the label is that heading's text, whitespace-normalized, non-empty. Added in the fix round
+   (decided by the orchestrator): when the target is not inside a block but contains blocks
+   (a wrapper `div`/`section`, or `<body>`), its first block is used if that block is a filled
+   `h1`–`h6`. Any other case: label unchanged. A nav `a` gets the label as its only content.
+   Applied in all three formats.
 6. **Language.** chinese-only: the first `dc:language` becomes `zh-TW`; the root of each
    filled chapter gets `xml:lang="zh-TW"` (and `lang` when the package is EPUB 3 or the root
    already has one); inside filled blocks every `lang`/`xml:lang` whose primary subtag equals
@@ -2354,14 +2357,22 @@ translation must:
 3. The same split is applied to the stored html itself, and each source piece's text must have
    the fingerprint of its block; otherwise the segment is `ambiguous_source` (a run whose own
    top-level text holds a newline, next to another run).
+4. **keep the anchors** (added in the fix round, decided by the orchestrator): every `id` value,
+   and every `name` value of an `<a>`, found inside a source block must occur, as an `id` or as
+   the `name` of an `<a>`, in that block's translation; otherwise the segment is
+   `missing_anchor`. "Inside" means below the block element itself (its own attributes always
+   come from the source) or anywhere in a run. Code segments are not checked (their
+   translation is text filled into a copy of the source element). No other attribute or tag is
+   checked.
 
 Why this rule: it uses only what the segmenter guarantees (a block element is one element, a
 run is inline content, blocks are joined by newlines), so the split of the source is exact and
 checkable, and a translation is either mapped block by block or not at all. It accepts no
 translation whose structure has to be guessed: a run wrapped by the model in `<p>`, merged or
 split paragraphs, text outside the elements, a `<br>` for a newline — all stay in the original
-language. Inner structure (inline tags, their attributes, ids) is not checked: that is Phase
-4's keyed validation; inner attributes come from the translation until then.
+language. Inner structure (inline tags and their attributes) is not checked, except that the
+anchors of step 4 must survive, so internal links keep resolving: the rest is Phase 4's keyed
+validation; inner attributes come from the translation until then.
 
 Code segments: the translation is plain text. The target is the `<pre>` (or the `<code>` of a
 code run), or its only child when that is a `<code>` with no text around it; a target that
@@ -2373,13 +2384,14 @@ counts as exported.
 
 ```
 $ python3 -m pytest tests/ -q -p no:cacheprovider
-1210 passed in 131.57s (0:02:11)
+1243 passed in 130.91s (0:02:10)
 ```
 
-1176 before the phase. New: `tests/test_exporter.py` (raw-ZIP fixtures, every assertion reads
+1176 before the phase (1210 at the first hand-back; the fix round added 33). New: `tests/test_exporter.py` (raw-ZIP fixtures, every assertion reads
 the output members from the ZIP), `TestExportCheck`, `TestExportCheckEpubcheck`,
-`TestExportCheckSurvivors`, `TestExportCheckEpubcheckSurvivors` in
-`tests/test_verify_scripts.py`. `write_raw_epub` (conftest) takes the package `version`.
+`TestExportCheckSurvivors`, `TestExportCheckEpubcheckSurvivors`, `TestExportCheckTocDenominator`
+in `tests/test_verify_scripts.py`; the fix round added `TestAnchorsInTheGate` and
+`TestTocContainerTarget` to `tests/test_exporter.py`. `write_raw_epub` (conftest) takes the package `version`.
 
 | Acceptance item | Tests |
 |---|---|
@@ -2392,14 +2404,15 @@ the output members from the ZIP), `TestExportCheck`, `TestExportCheckEpubcheck`,
 | well-formed output | `TestProjectLevel::test_every_output_chapter_well_formed`, `TestChineseOnly::test_xhtml_10_doctype_gets_no_meta` |
 | failed-fingerprint chapter kept original and reported | `TestChapterVerification::test_mismatched_chapter_kept_and_reported[*]` (7 kinds × 3 formats), `test_chapter_not_in_the_spine`, `test_unreadable_chapter_kept[*]`, `TestSurvivors::test_empty_range_is_a_mismatch` |
 | segment failing the reduced check kept original | `TestReducedCheck::test_kept_original_and_reported[*]` (9 translations × 3 formats), `test_run_wrapped_in_a_paragraph_kept`, `test_br_runs_need_one_line_each[*]`, `test_ambiguous_source_kept`, `test_one_failing_segment_does_not_stop_the_chapter`, `TestCode::test_code_with_markup_kept[*]` |
+| anchors in the gate (fix round) | `TestAnchorsInTheGate::test_missing_anchor_kept_original[*]` (6 cases × 3 formats: inner id lost, `a@name` lost, a `name` on another tag does not count, id in a run, id moved to another line), `test_anchor_present_accepted[*]`, `test_code_not_checked` |
 | what the rule accepts | `TestReducedCheck::test_whitespace_and_comments_between_blocks_accepted`, `test_br_runs_split_at_newlines[*]`, `test_newline_inside_an_inline_element_does_not_split`, `test_single_run_keeps_its_newlines`, `test_runs_and_elements_mixed`, `test_epub_prefix_in_translation_parses` |
-| TOC label from the translated heading; unchanged on failure | `TestToc::test_labels_from_translated_headings[*]` (first heading, target heading, `<p>` target, unknown id, container target, external, untranslated chapter, no href, link outside a nav), `test_target_inside_a_heading_and_header_block`, `test_label_unchanged_when_the_heading_segment_fails`, `test_label_unchanged_for_an_empty_heading`, `test_toc_files_kept_when_no_label_changes`, `test_unreadable_toc_kept`, `test_relative_to_the_toc_file`, `TestSurvivors::test_every_heading_level_labels[*]`, `test_nav_list_targets_relabelled` |
+| TOC label from the translated heading; unchanged on failure | `TestToc::test_labels_from_translated_headings[*]` (first heading, target heading, `<p>` target, unknown id, container target, external, untranslated chapter, no href, link outside a nav), `test_target_inside_a_heading_and_header_block`, `test_label_unchanged_when_the_heading_segment_fails`, `test_label_unchanged_for_an_empty_heading`, `test_toc_files_kept_when_no_label_changes`, `test_unreadable_toc_kept`, `test_relative_to_the_toc_file`, `TestSurvivors::test_every_heading_level_labels[*]`, `test_nav_list_targets_relabelled`; container targets (fix round): `TestTocContainerTarget::test_first_block_heading[*]` (wrapper, nested wrapper, `<body>`; first block a `<p>` or a run stays), `test_unfilled_heading_leaves_labels`, `test_target_inside_a_block_wins` |
 | language | `TestChineseOnly::test_language`, `test_explicit_source_language_rewritten`, `test_epub2_root_gets_only_xml_lang`, `test_existing_root_lang_set_in_epub2`, `TestBilingual::test_epub2_copy_gets_only_xml_lang`, `test_copy_source_language_rewritten`, `TestSurvivors::test_source_language_with_region` |
 | schema 1 message | `TestProjectLevel::test_schema_1_message`, `TestCLIAndWeb::test_web_schema_1_message`, `test_cli.py::TestCLIPhase2::test_schema_1_export_asks_for_migration` |
 | export of a project with failed segments | `TestProjectLevel::test_failed_and_pending_segments_exported_in_the_original[*]` |
 | source hash | `TestProjectLevel::test_source_hash_verified[*]`, `test_unreadable_package_is_an_export_error` |
 | report, CLI, web | `TestProjectLevel::test_report_lines`, `TestCLIAndWeb` (6) |
-| check script | `test_verify_scripts.py::TestExportCheck` (one test per check, each failing on a tampered export), `TestExportCheckEpubcheck`, the two survivor classes |
+| check script | `test_verify_scripts.py::TestExportCheck` (one test per check, each failing on a tampered export), `TestExportCheckEpubcheck` (incl. the chinese-only and bilingual epubcheck rules), `TestExportCheckTocDenominator`, the two survivor classes |
 
 Tests removed or changed, and why:
 
@@ -2419,17 +2432,17 @@ Tests removed or changed, and why:
 ```
 $ python3 scripts/verify/phase3_export_check.py --projects-dir <repo>/projects --anonymize
 epubcheck found; errors compared by message ID (chinese-only, bilingual-horizontal, bilingual-vertical)
-PASS project-1: exports 3, translated segments 220: as translation 218, kept original 2 (not_well_formed 2), toc labels changed 0/23, epubcheck errors source 51 (HTM-004:24 NCX-001:1 RSC-005:26), exports 51/51/51
-FAIL project-2: exports 3, translated segments 278: as translation 261, kept original 17 (not_well_formed 10, structure_mismatch 7), toc labels changed 0/37, epubcheck errors source 27 (OPF-034:1 RSC-005:25 RSC-020:1), exports 27/28/28; bilingual-horizontal: epubcheck new errors RSC-020 1; bilingual-vertical: epubcheck new errors RSC-020 1
-PASS project-3: exports 3, translated segments 36: as translation 35, kept original 1 (structure_mismatch 1), toc labels changed 0/1358, epubcheck errors source 0, exports 0/0/0
-FAIL project-4: exports 3, translated segments 1333: as translation 1300, kept original 33 (not_well_formed 2, structure_mismatch 31), toc labels changed 123/145, epubcheck errors source 11 (RSC-012:11), exports 11/22/22; bilingual-horizontal: epubcheck new errors RSC-012 11; bilingual-vertical: epubcheck new errors RSC-012 11
-FAIL project-5: exports 3, translated segments 832: as translation 831, kept original 1 (structure_mismatch 1), toc labels changed 0/247, epubcheck errors source 470 (HTM-004:25 NCX-001:1 PKG-006:1 RSC-005:440 RSC-007:3), exports 467/509/509; chinese-only: 1 fragment links do not resolve; chinese-only: epubcheck new errors RSC-012 1; bilingual-horizontal: epubcheck new errors RSC-005 40; bilingual-vertical: epubcheck new errors RSC-005 40
-PASS project-6: exports 3, translated segments 581: as translation 581, kept original 0, toc labels changed 19/20, epubcheck errors source 1 (RSC-005:1), exports 1/1/1
-FAIL project-7: exports 3, translated segments 551: as translation 536, kept original 15 (not_well_formed 6, structure_mismatch 9), toc labels changed 1/46, epubcheck errors source 151 (RSC-005:151), exports 157/187/187; chinese-only: 6 fragment links do not resolve; chinese-only: epubcheck new errors RSC-012 6; bilingual-horizontal: epubcheck new errors RSC-005 36; bilingual-vertical: epubcheck new errors RSC-005 36
-PASS project-8: exports 3, translated segments 331: as translation 315, kept original 16 (structure_mismatch 16), toc labels changed 0/19, epubcheck errors source 27 (RSC-005:26 RSC-007:1), exports 27/27/27
-TOTAL projects 8  exports 24  translated segments 4162  as translation 4077  kept original 85 (not_well_formed 20, structure_mismatch 65)  toc labels changed 143/1895  exports with new epubcheck errors 10  failed projects 4
+PASS project-1: exports 3, translated segments 220: as translation 218, kept original 2 (not_well_formed 2), toc labels changed 0/23 (22 into translated chapters), epubcheck errors source 51 (HTM-004:24 NCX-001:1 RSC-005:26), exports 51/51/51
+PASS project-2: exports 3, translated segments 278: as translation 261, kept original 17 (not_well_formed 10, structure_mismatch 7), toc labels changed 0/37 (33 into translated chapters), epubcheck errors source 27 (OPF-034:1 RSC-005:25 RSC-020:1), exports 27/28/28
+PASS project-3: exports 3, translated segments 36: as translation 35, kept original 1 (structure_mismatch 1), toc labels changed 18/1358 (22 into translated chapters), epubcheck errors source 0, exports 0/0/0
+PASS project-4: exports 3, translated segments 1333: as translation 1300, kept original 33 (not_well_formed 2, structure_mismatch 31), toc labels changed 123/145 (126 into translated chapters), epubcheck errors source 11 (RSC-012:11), exports 11/22/22
+PASS project-5: exports 3, translated segments 832: as translation 830, kept original 2 (missing_anchor 1, structure_mismatch 1), toc labels changed 245/247 (245 into translated chapters), epubcheck errors source 470 (HTM-004:25 NCX-001:1 PKG-006:1 RSC-005:440 RSC-007:3), exports 466/509/509
+PASS project-6: exports 3, translated segments 581: as translation 581, kept original 0, toc labels changed 19/20 (19 into translated chapters), epubcheck errors source 1 (RSC-005:1), exports 1/1/1
+PASS project-7: exports 3, translated segments 551: as translation 532, kept original 19 (missing_anchor 4, not_well_formed 6, structure_mismatch 9), toc labels changed 1/46 (44 into translated chapters), epubcheck errors source 151 (RSC-005:151), exports 151/183/183
+PASS project-8: exports 3, translated segments 331: as translation 315, kept original 16 (structure_mismatch 16), toc labels changed 0/19 (16 into translated chapters), epubcheck errors source 27 (RSC-005:26 RSC-007:1), exports 27/27/27
+TOTAL projects 8  exports 24  translated segments 4162  as translation 4072  kept original 90 (missing_anchor 5, not_well_formed 20, structure_mismatch 65)  toc labels changed 406/1895 (527 into translated chapters)  exports with new epubcheck errors 0  failed projects 0
 $ echo $?
-1
+0
 ```
 
 The script copies `project.json`, `source.epub` and `glossary.json` of each project into a new
@@ -2444,25 +2457,35 @@ duplicated that the source does not duplicate, internal fragment links (any `hre
 resolve unless they already fail in the source, bilingual chapters link a stylesheet that is
 in the archive and the manifest and defines both classes, SVG attribute names a subset of the
 source chapter's, the three formats give the same counts, epubcheck (section 5). A project
-also FAILs when any file under its real directory changed.
+also FAILs when any file under its real directory changed. The TOC count is followed by the
+number of entries that point into a chapter with at least one segment exported as
+translation (the meaningful denominator).
+
+The output above is after the fix round. Before it (first hand-back) the same command exited 1
+with 4 projects failing (7 unresolved fragment links in chinese-only, and bilingual epubcheck
+counts above the source's): the 7 links are gone with the anchor rule (section 2), and the
+bilingual epubcheck counts pass under the bilingual rule (section 5).
 
 Translated segments (status translated or reviewed) per project: exported as translation /
 kept in the original language, by reason (the same in all three formats):
 
-| project | translated | as translation | kept | not_well_formed | structure_mismatch |
-|---|---|---|---|---|---|
-| project-1 | 220 | 218 | 2 | 2 | 0 |
-| project-2 | 278 | 261 | 17 | 10 | 7 |
-| project-3 | 36 | 35 | 1 | 0 | 1 |
-| project-4 | 1333 | 1300 | 33 | 2 | 31 |
-| project-5 | 832 | 831 | 1 | 0 | 1 |
-| project-6 | 581 | 581 | 0 | 0 | 0 |
-| project-7 | 551 | 536 | 15 | 6 | 9 |
-| project-8 | 331 | 315 | 16 | 0 | 16 |
-| total | 4162 | 4077 (98.0%) | 85 (2.0%) | 20 | 65 |
+| project | translated | as translation | kept | missing_anchor | not_well_formed | structure_mismatch |
+|---|---|---|---|---|---|---|
+| project-1 | 220 | 218 | 2 | 0 | 2 | 0 |
+| project-2 | 278 | 261 | 17 | 0 | 10 | 7 |
+| project-3 | 36 | 35 | 1 | 0 | 0 | 1 |
+| project-4 | 1333 | 1300 | 33 | 0 | 2 | 31 |
+| project-5 | 832 | 830 | 2 | 1 | 0 | 1 |
+| project-6 | 581 | 581 | 0 | 0 | 0 | 0 |
+| project-7 | 551 | 532 | 19 | 4 | 6 | 9 |
+| project-8 | 331 | 315 | 16 | 0 | 0 | 16 |
+| total | 4162 | 4072 (97.8%) | 90 (2.2%) | 5 | 20 | 65 |
 
 No chapter is kept for `chapter_mismatch` or `chapter_unreadable` (all 2155 chapters with
-segments match), and no segment is `ambiguous_source` or `code_markup`. What the 85 are (shapes
+segments match), and no segment is `ambiguous_source` or `code_markup`. 85 → 90: the anchor rule
+keeps 5 more segments original (project-5 1, project-7 4), exactly the 5 measured before the
+fix round: their translations dropped 6 ids of inner footnote anchors, which broke 7 fragment
+links in chinese-only. What the other 85 are (shapes
 only, from a read-only scratch script on the same copies, not kept): `not_well_formed` — an
 unclosed `<p>` or mismatched end tag (18), a bare `&` (2); `structure_mismatch` — the model
 merged or split paragraphs (count of top-level elements differs by 1 to 20; most of the 31 in
@@ -2470,57 +2493,66 @@ project-4 have one element fewer), wrapped a run in `<p>` or `<div>` (project-7,
 in project-8 alone, where `<br>`-separated runs between `div`s came back as `div`s), or left
 text outside a heading (3). None is a false rejection of a translation whose structure matches.
 
-The check FAILs on 4 projects; the failures are real and are not caused by the mapping rule:
+TOC labels changed: 406 of 1895 entries; 527 entries point into a chapter with at least one
+segment exported as translation (the other 1368 point at untranslated chapters: 1336 in
+project-3 alone). Before the fix round 143 changed; the container rule adds 263 (project-5 245,
+project-3 18).
 
-- **chinese-only, fragment links (project-5 1, project-7 6) and the matching epubcheck
-  RSC-012 (1, 6):** 5 accepted segments (project-5 1, project-7 4) whose translation dropped 6
-  ids of inner elements (footnote anchors); links to them break. The reduced check does not
-  look inside blocks (by design until Phase 4's required keys). Measured: adding "every id of
-  the source block occurs in the translation" to the gate would keep these 5 more segments in
-  the original language (85 → 90) and remove all 7 broken links.
-- **bilingual, epubcheck RSC-005 (project-5 40, project-7 36), RSC-012 (project-4 11), RSC-020
-  (project-2 1):** every one is a source error repeated in the translated copy: the copy takes
-  the source element's attributes and the translation's inner markup, so an attribute or
-  element the source already gets wrong (HTML5 attributes and elements in an EPUB 2 book in
-  project-5, invalid attribute names in project-7, an href with a space in project-2, links to
-  ids that do not exist in project-4) appears twice. Compared as sets of (message ID, message
-  text), bilingual exports add no new message except two RSC-005 of project-5 whose text
-  differs only in the "expected" element list, because the same disallowed `figure`/`aside`
-  now sits inside `div.original` instead of `<body>`. Counting by ID and location count, as
-  the plan says, they are new errors.
+**Known limitation: entries into translated chapters whose label stays in the source
+language** — 121 of the 527 (read-only scratch classification over copies of the same
+projects, not kept):
 
-TOC labels changed: 143 of 1895 entries (project-4 123/145, project-6 19/20, project-7 1/46,
-all others 0). **The plan's element-based rule does not hold on most real books** (read-only
-scratch count over the same copies, entries pointing at chapters that have translations):
-project-5 245 entries and project-3 18 point at a `div` that contains the heading (the target
-is a container, not inside a block); project-8 17 point at `<body>`; project-1 22, project-7 40
-point at a block without a heading (`p` or `blockquote` styled as a heading); project-2 32
-point at chapters without any `h1`–`h6`. Per the brief the rule was implemented as written
-(any failed step leaves the label unchanged). An extension that would add 263 labels
-(project-5 245, project-3 18) with no guessing: when the target element contains blocks, use
-its first block if that is a heading.
+| project | unchanged / into translated | why |
+|---|---|---|
+| project-1 | 22 / 22 | the target block is a `<p>` without heading (headings styled as paragraphs) |
+| project-2 | 33 / 33 | 32: the chapter has no `h1`–`h6` at all; 1: target block a `<p>` without heading |
+| project-3 | 4 / 22 | the heading's segment was kept original (`structure_mismatch`) |
+| project-4 | 3 / 126 | the heading's segment was kept original |
+| project-5 | 0 / 245 | — |
+| project-6 | 0 / 19 | — |
+| project-7 | 43 / 44 | the target has no heading: 24 a `<p>` block, 15 a `<blockquote>`, 1 a `<ul>`, 3 an empty element outside every block (2 `div`, 1 `a`) |
+| project-8 | 16 / 16 | the target is `<body>`, whose first block is a `div` (not a heading) |
+
+So 114 stay because the target has no heading element to take a label from, and 7 because the
+heading itself was kept in the source language.
 
 ### 5. epubcheck
 
 EPUBCheck v5.4.0 (`/opt/homebrew/bin/epubcheck`) was on PATH, so the check script ran it on
 each source and on each of the 24 exports (JSON report written to a temporary file outside the
 repository, deleted after reading; only message IDs and counts are printed, never messages).
-ERROR and FATAL counts by ID, source → chinese-only / bilingual-horizontal / bilingual-vertical
-(one count per reported location):
+Errors are ERROR and FATAL messages, counted per message ID as reported locations.
 
-| project | source | exports | new in the export |
+The rule (fix round, decided by the orchestrator; also in the script's docstring):
+
+- chinese-only: per message ID, the export's count must not be above the source's.
+- bilingual: every error ID of the export must also occur in the source, and per ID the
+  export's count must be at most twice the source's.
+
+The bilingual rule is looser than chinese-only on purpose: the translated copy of a block takes
+the source element's attributes and the source's markup errors inside it (the model repeats
+what it was given), so each source error in a translated block can appear once more. Measured
+before the fix round, all bilingual excess was of that kind: compared as sets of (message ID,
+message text) the bilingual exports added no new message, except two project-5 RSC-005 whose
+"expected elements" list differs because the same disallowed `figure`/`aside` now sits inside
+`div.original` instead of `<body>`. An error ID the source does not have still fails, and so
+does more than one repetition per source error.
+
+ERROR and FATAL counts, source → chinese-only / bilingual-horizontal / bilingual-vertical:
+
+| project | source | exports | result |
 |---|---|---|---|
-| project-1 | 51 (HTM-004 24, NCX-001 1, RSC-005 26) | 51 / 51 / 51 | — |
-| project-2 | 27 (OPF-034 1, RSC-005 25, RSC-020 1) | 27 / 28 / 28 | bilingual: RSC-020 +1 |
-| project-3 | 0 | 0 / 0 / 0 | — |
-| project-4 | 11 (RSC-012 11) | 11 / 22 / 22 | bilingual: RSC-012 +11 |
-| project-5 | 470 (HTM-004 25, NCX-001 1, PKG-006 1, RSC-005 440, RSC-007 3) | 467 / 509 / 509 | chinese-only: RSC-012 +1; bilingual: RSC-005 +40 |
-| project-6 | 1 (RSC-005 1) | 1 / 1 / 1 | — |
-| project-7 | 151 (RSC-005 151) | 157 / 187 / 187 | chinese-only: RSC-012 +6; bilingual: RSC-005 +36 |
-| project-8 | 27 (RSC-005 26, RSC-007 1) | 27 / 27 / 27 | — |
+| project-1 | 51 (HTM-004 24, NCX-001 1, RSC-005 26) | 51 / 51 / 51 | pass |
+| project-2 | 27 (OPF-034 1, RSC-005 25, RSC-020 1) | 27 / 28 / 28 | pass (bilingual RSC-020 2 ≤ 2 × 1) |
+| project-3 | 0 | 0 / 0 / 0 | pass |
+| project-4 | 11 (RSC-012 11) | 11 / 22 / 22 | pass (bilingual RSC-012 22 ≤ 2 × 11) |
+| project-5 | 470 (HTM-004 25, NCX-001 1, PKG-006 1, RSC-005 440, RSC-007 3) | 466 / 509 / 509 | pass |
+| project-6 | 1 (RSC-005 1) | 1 / 1 / 1 | pass |
+| project-7 | 151 (RSC-005 151) | 151 / 183 / 183 | pass |
+| project-8 | 27 (RSC-005 26, RSC-007 1) | 27 / 27 / 27 | pass |
 
-10 of the 24 exports have an error count above the source's for some ID; section 4 explains
-each. The chinese-only export of project-5 has 3 errors fewer than its source.
+0 of the 24 exports fail. Before the fix round, chinese-only of project-5 and project-7 had
+RSC-012 +1 and +6 (the dropped anchors, now kept original) and are now at or below the source.
 
 ### 6. Mutation testing
 
@@ -2536,11 +2568,12 @@ lines changed versus `main` are mutated. Each full run took about 2 hours.
 |---|---|---|---|---|---|
 | 1, after "chore: mutate the exporter and the Phase 3 check script" | 1059 | 933 | 124 | 2 | 0 |
 | 2, after "test: kill the Phase 3 mutation survivors of run 1" | 1011 | 978 | 31 | 2 | 0 |
+| 3, fix round, after "feat: bilingual epubcheck rule and TOC denominator in the export check" | 1067 | 1033 | 32 | 2 | 0 |
 
 ```
 $ scripts/verify/mutation.sh main
 ...
-TOTAL mutants 1011  killed 978  survived 31  timeout 2  suspicious 0  untested 0
+TOTAL mutants 1067  killed 1033  survived 32  timeout 2  suspicious 0  untested 0
 $ echo $?
 1
 ```
@@ -2579,24 +2612,39 @@ Run 2's survivors (ids of run 2) and timeouts:
 | 106 | `phase3_export_check.py:191` | the epubcheck report file's suffix | equivalent: a temporary file in the system temporary directory, removed after reading (`test_report_file_removed_and_not_next_to_the_book`) |
 | 358 | `phase3_export_check.py:375` | the exports directory name inside the work directory | equivalent: any name inside the work directory that differs from the copy's (`test_work_directory_removed_and_outside_repository` checks that every export lies in the work directory) |
 
+Run 3 (fix round: the anchor rule, the container TOC rule, the bilingual epubcheck rule, the
+TOC denominator). Every mutant in the new lines was killed except two. The 32 survivors are
+the 31 of run 2 under new ids — exporter 99, 101 (run 2: 96, 98), 104 (101), 155 (152), 158,
+475, 485 (155, 455, 465), 164, 165 (161, 162), 247–249, 263–265 (244–246, 260–262), 477, 487,
+522 (457, 467, 502), 502, 503 (482, 483), 532, 539, 544 (512, 519, 524); script 21 (21), 89,
+241 (89, 222), 219, 246 (200, 227), 119 (106), 389 (358), with the dispositions of the run 2
+table — minus run 2's script 60, now killed, plus:
+
+| id | location | mutation | disposition |
+|---|---|---|---|
+| 275, 276 | `phase3_export_check.py:318` | the initial `'into': 0` renamed or set to 1 | code changed after run 3: the initial value is removed (the chinese-only iteration, always first, sets it, as it already did for the other counts); the two mutants no longer exist. The suite passes after the change; no fourth full run |
+| timeout 142, 204 | `exporter.py:235, 306` | `while … in` → `not in` | detected (run 2's 139, 201) |
+
 ### 7. Known consequences
 
 - Schema 1 projects can no longer be exported; `translate.py migrate <project>` first (the
   8 real projects are all schema 1).
 - The exporter needs `source_sha256`: a schema 2 project without a stored hash (none is
   created that way by the CLI, the web UI or the migration) cannot be exported.
-- 85 of 4162 translated segments of the real projects are exported in the original language
+- 90 of 4162 translated segments of the real projects are exported in the original language
   (section 4) until they are re-translated or edited, or Phase 4 brings retries.
-- Inner markup comes from the translation: inline elements, their attributes and their ids are
-  the model's (Phase 4). In chinese-only, 6 inner ids are lost in 5 real segments and 7 links
-  break (section 4); the bilingual copies keep the model's inner hrefs, so a broken link of the
-  source is broken twice.
-- Bilingual output repeats the source's markup errors in the translated copies (section 4).
+- Inner markup comes from the translation: inline elements and their attributes are the
+  model's (Phase 4); only the anchors (ids, `a@name`) are required to survive. The bilingual
+  copies keep the model's inner hrefs, so a broken link of the source is broken twice.
+- Bilingual output repeats the source's markup errors in the translated copies; the check
+  script allows at most one repetition per source error (section 5).
 - Bilingual runs separated by `<br>` become one row each; the `<br>` elements stay between the
   rows (an extra line break each). Comments inside a run move into `div.original`
   (bilingual) or are dropped (chinese-only). The newlines that the rule splits on are not kept
   in the output.
-- TOC labels follow the element rule only: 143 of 1895 real entries change (section 4).
+- TOC labels: 406 of 1895 real entries change; of the 527 that point into translated
+  chapters, 121 stay in the source language, 114 of them because the target has no heading
+  (section 4).
 - In chinese-only a block's own attributes are the source's even when the model changed them
   (e.g. `class`, `id` on the top-level element); the language attributes that matched the
   source language become `zh-TW`.
@@ -2639,7 +2687,6 @@ in the session's scratch directory, deleted at the end.
 
 - The full structural validation (keyed, required ids) is Phase 4; the reduced check is the
   gate until then.
-- TOC rule extension for container targets (section 4): reported, not implemented.
 - `CLAUDE.md` and `README.md` are not updated.
 
 ### Not verified
@@ -2649,6 +2696,7 @@ in the session's scratch directory, deleted at the end.
   the command of section 8.
 - The web export tab's summary was checked as rendered page source and through the status
   API with the Flask test client, not in a browser.
-- epubcheck's message-level comparison (section 4, sets of ID and text) was a read-only
-  scratch script on copies, not kept; the kept script compares by ID and count only.
+- epubcheck's message-level comparison (section 5, sets of ID and text) and the TOC
+  classification of section 4 were read-only scratch scripts on copies, not kept; the kept
+  script compares by ID and count only.
 - Mutation testing ran on Python 3.12.7, the suite on 3.9.6 (both pass).
