@@ -1,5 +1,7 @@
 # Development-only tools. Not needed to run the application.
-# Mutation testing (scripts/verify/mutation.sh); mutmut 2.x supports Python 3.9.
-mutmut[patch]==2.5.1
+# Mutation testing (scripts/verify/mutation.sh): mutmut 3 needs Python 3.10+, so
+# install this file in a 3.10+ environment to run it; the pinned version
+# matters (mutation.py hooks into mutmut's internals).
+mutmut==3.8.1; python_version >= "3.10"
 # Test fixtures (tests/conftest.py builds sample EPUBs with it); not used by src/
 ebooklib>=0.18
