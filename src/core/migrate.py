@@ -59,7 +59,7 @@ class MigrationReport:
     chapters_with_comment_text: int = 0
     segments_matched: int = 0
     merged: list = field(default_factory=list)       # [legacy segment ids] per merge group
-    notes: list = field(default_factory=list)        # groups of mixed status or cleared
+    notes: list = field(default_factory=list)        # groups of mixed status, cleared or demoted
     unmatched: list = field(default_factory=list)    # (chapter id, reason)
     count_differs: int = 0
     written: bool = False
@@ -168,16 +168,18 @@ def _match_chapter(chapter_id: str, segs: list[SegmentState], body, report: Migr
             incomplete = any(s.status in (SegmentStatus.PENDING, SegmentStatus.FAILED)
                              or not s.translated_text.strip() for s in olds)
             cleared = incomplete and merged.translated_text != ''
+            demoted = incomplete and merged.status in (SegmentStatus.TRANSLATED,
+                                                       SegmentStatus.REVIEWED)
             if incomplete:
                 merged.translated_text = ''
-                if merged.status in (SegmentStatus.TRANSLATED, SegmentStatus.REVIEWED):
-                    merged.status = SegmentStatus.PENDING
-            if cleared or len({s.status for s in olds}) > 1:
+            if demoted:
+                merged.status = SegmentStatus.PENDING
+            if cleared or demoted or len({s.status for s in olds}) > 1:
                 report.notes.append(
                     f'{merged.segment_id}：{len(olds)} 個段落的狀態為 '
                     f'{", ".join(str(s.status) for s in olds)}；合併後為 {merged.status}，'
                     + ('部分譯文已清除（保留於 project.schema1.json）' if cleared
-                       else '譯文依序接合保留'))
+                       else '譯文為空' if incomplete else '譯文依序接合保留'))
         new.append(merged)
     if not new:
         report.unmatched.append((chapter_id, 'no text'))
@@ -256,6 +258,10 @@ def migrate_project(project_dir: str, dry_run: bool = False) -> MigrationReport:
             new_segments, report = plan_migration(pm, source)
         except EPUBError as e:
             raise MigrationError(f'來源 EPUB 無法讀取：{e}') from e
+        except (TypeError, ValueError, AttributeError, KeyError) as e:
+            # a segment field of the wrong type or value (null text, an
+            # unknown segment type, ...): a message, nothing written
+            raise MigrationError(f'project.json 的段落資料格式不正確：{e!r}') from e
         if dry_run or report.unmatched:
             return report
 
@@ -268,7 +274,14 @@ def migrate_project(project_dir: str, dry_run: bool = False) -> MigrationReport:
             finally:
                 if os.path.exists(tmp):
                     os.remove(tmp)
-        shutil.copy2(pm.project_file, backup)
+        # Through a temporary file: a partial backup would refuse later runs
+        tmp = f'{backup}.{uuid.uuid4().hex}.tmp'
+        try:
+            shutil.copy2(pm.project_file, tmp)
+            os.replace(tmp, backup)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
         try:
             with pm.mutex:
                 pm.data.segments = new_segments
