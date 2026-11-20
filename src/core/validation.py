@@ -83,6 +83,10 @@ _NAMED = {'amp': '&', 'lt': '<', 'gt': '>', 'quot': '"', 'apos': "'"}
 
 
 def _unescape(raw: str) -> str:
+    """The value of a raw attribute value: literal tabs and line ends are
+    spaces (XML attribute-value normalization), then references decoded."""
+    raw = re.sub(r'\r\n|[\t\n\r]', ' ', raw)
+
     def one(m):
         ref = m.group(1)
         if ref.startswith('#x'):
@@ -94,7 +98,10 @@ def _unescape(raw: str) -> str:
 
 
 def _escape(value: str, quote: str) -> str:
+    """`value` as a raw attribute value in `quote`; tabs and line ends as
+    numeric references, so normalization keeps them."""
     out = value.replace('&', '&amp;').replace('<', '&lt;')
+    out = out.replace('\t', '&#9;').replace('\n', '&#10;').replace('\r', '&#13;')
     return out.replace(quote, '&quot;' if quote == '"' else '&apos;')
 
 
@@ -159,11 +166,13 @@ def top_level_units(html: str) -> list:
 @dataclass
 class Key:
     """What a key stands for: the tag name, the attribute text (None for the
-    run wrapper) and the translatable attributes in it, as name ->
-    (quote, raw value, start, end within the attribute text)."""
+    run wrapper), the translatable attributes in it, as name -> (quote, raw
+    value, start, end within the attribute text), and the top-level key of
+    the unit (block or run) it is in (its own key at the top level)."""
     name: str
     attrs: str | None
     shown: dict = field(default_factory=dict)
+    owner: str | None = None
 
 
 @dataclass
@@ -188,6 +197,7 @@ def protect(html: str, first_key: int = 1) -> Protected:
         keys[k] = key
         if at_top:
             top.append(k)
+        key.owner = top[-1]  # inside the latest top-level unit, or that unit
         return k
 
     for start, end, m in _tokens(html):
@@ -301,6 +311,7 @@ def check_keys(reply: str, protected: Protected) -> list:
         if depth == 0:
             top.append(k)
         key = protected.keys.get(k)
+        owner = top[-1] if top else None
         if k is None:
             if reply_attrs:
                 attrs.append(f'<{name}> 帶有原文沒有的屬性')
@@ -310,14 +321,18 @@ def check_keys(reply: str, protected: Protected) -> list:
             seen[k] += 1
             if key.attrs is None and depth:
                 misplaced.append(f'<{WRAPPER} k="{k}"> 不在最外層')
+            elif depth and owner != key.owner:
+                misplaced.append(f'<{name} k="{k}"> 不在原來的區塊（原文在 k="{key.owner}" 內）')
             given = {n: raw for n, _, raw, _, _ in reply_attrs if n != 'k'}
             for n in sorted(set(given) - set(key.shown)):
                 attrs.append(f'<{name} k="{k}"> 多了 {n} 屬性')
             for n in sorted(set(key.shown) - set(given)):
                 attrs.append(f'<{name} k="{k}"> 少了 {n} 屬性')
             for n in sorted(set(given) & set(key.shown)):
-                if key.shown[n][1] == '' and given[n] != '':
-                    attrs.append(f'<{name} k="{k}"> 的 {n} 原文是空的')
+                source_blank = not _unescape(key.shown[n][1]).strip()
+                if source_blank != (not _unescape(given[n]).strip()):
+                    attrs.append(f'<{name} k="{k}"> 的 {n} 原文是空的' if source_blank
+                                 else f'<{name} k="{k}"> 的 {n} 不可為空')
         if not m.group('close'):
             depth += 1
     issues = []
@@ -483,8 +498,9 @@ _FREE = '\x00translated'
 
 
 def _signature(el) -> tuple:
-    return (el.tag, tuple(sorted((name, _FREE if name in TRANSLATABLE_ATTRIBUTES and value
-                                  else value) for name, value in el.attrib.items())))
+    return (el.tag, tuple(sorted((name, ('' if not value.strip() else _FREE)
+                                  if name in TRANSLATABLE_ATTRIBUTES else value)
+                                 for name, value in el.attrib.items())))
 
 
 def _shown(tag: str) -> str:
@@ -559,6 +575,13 @@ def _source(source: str, fingerprints, nsmap):
 
 def _ambiguous() -> Issue:
     return _issue(STRUCTURE, AMBIGUOUS_SOURCE, '原文無法切成各個區塊')
+
+
+def pieces_per_group(source: str, fingerprints=None):
+    """How many blocks each top-level group of `source` holds (a run group
+    cut by the fingerprints holds several), or None when it cannot be cut."""
+    shaped = _source(source, fingerprints, declarations(source))
+    return None if shaped is None else [w if isinstance(w, int) else 1 for w in shaped[2]]
 
 
 def source_issues(source: str, fingerprints=None) -> list:
@@ -696,7 +719,10 @@ def check_code(source: str, translation: str) -> Result:
 def check_segment(seg, text: str) -> Result:
     """The check for a stored segment (SegmentState) and a translation of
     it: code or HTML by the segment's type; runs cut by the segment's
-    fingerprints (none for schema 1)."""
+    fingerprints (none for schema 1). A text segment without HTML (legacy
+    schema 1 data) has no structure to compare: nothing is checked."""
     if seg.segment_type == 'code':
         return check_code(seg.text, text)
+    if not seg.html.strip():  # a schema 1 text segment without HTML: nothing to compare
+        return Result([])
     return check_html(seg.html, text, seg.fingerprints or None)

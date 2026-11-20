@@ -3790,6 +3790,43 @@ class TestRound1Review:
             assert response.status_code == 200, response.get_json()
 
 
+class TestRound2Review:
+    """Phase 4 review round 2: approve bodies; schema 1 segments without HTML."""
+
+    @pytest.mark.parametrize('body', ['[1, 2]', '"x"', 'not json', '{"text": '])
+    def test_approve_body_not_an_object_is_400(self, client, project_with_translations, body):
+        before = _load(project_with_translations)['ch1_seg0002']
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/approve',
+                               data=body, content_type='application/json')
+        assert response.status_code == 400
+        assert response.get_json() == {'error': 'Body must be a JSON object'}
+        assert _load(project_with_translations)['ch1_seg0002'] == before
+
+    @pytest.mark.parametrize('kwargs', [{}, {'data': '', 'content_type': 'application/json'},
+                                        {'json': {}}])
+    def test_approve_without_a_body_approves_the_stored_text(self, client,
+                                                            project_with_translations, kwargs):
+        before = _load(project_with_translations)['ch1_seg0002']
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/approve',
+                               **kwargs)
+        assert response.status_code == 200, response.get_json()
+        after = _load(project_with_translations)['ch1_seg0002']
+        assert (after.status, after.translated_text) == \
+            (SegmentStatus.REVIEWED, before.translated_text)
+
+    @pytest.mark.parametrize('suffix', ['', '/approve'])
+    def test_text_segment_without_html_can_be_saved(self, client, project_with_translations,
+                                                    suffix):
+        pm = ProjectManager(os.path.join(project_with_translations, PROJECT_NAME))
+        pm.load()
+        pm._find('ch1_seg0002').html = ''  # legacy schema 1 data
+        pm.save()
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002{suffix}',
+                               json={'text': '人工譯文'})
+        assert response.status_code == 200, response.get_json()
+        assert _load(project_with_translations)['ch1_seg0002'].translated_text == '人工譯文'
+
+
 class TestPhase4HeaderProgress:
 
     def test_header_bar_refreshed_when_a_run_ends(self, client):

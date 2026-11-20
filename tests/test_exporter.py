@@ -2206,3 +2206,34 @@ class TestRound1Export:
             f.write(text.replace('SURROGATE', '<p>\\ud800</p>'))
         report, _ = _export(tmp_path, project_dir, 'chinese-only')
         assert report.chapters[0].kept == [('c_seg0001', 'not_well_formed')]
+
+
+class TestRound2Export:
+    """Phase 4 review round 2: a translated alt/title/aria-label on the
+    block element itself reaches every format."""
+
+    @pytest.mark.parametrize('fmt', ['chinese-only', *BILINGUAL])
+    @pytest.mark.parametrize('chapter, translation, tag, source_value, value', [
+        ('<p title="Note" class="c">Hi.</p>', '<p title="註" class="c">嗨。</p>',
+         'p', 'Note', '註'),
+        ('<table title="Totals" id="t"><tr><td>One</td></tr></table>',
+         '<table title="合計" id="t"><tr><td>一</td></tr></table>', 'table', 'Totals', '合計'),
+        ('<figure aria-label="Map" id="f"><img src="m.png" alt="A map"/>Map one.</figure>',
+         '<figure aria-label="地圖" id="f"><img src="m.png" alt="一張地圖"/>地圖一。</figure>',
+         'figure', 'Map', '地圖'),
+    ])
+    def test_block_root_value(self, tmp_path, fmt, chapter, translation, tag, source_value,
+                              value):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml(chapter))}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': translation})
+        report, z = _export(tmp_path, project_dir, fmt)
+        assert report.translated == 1, report.lines()
+        body = _body(z, 'OEBPS/Text/c.xhtml')
+        name = 'aria-label' if tag == 'figure' else 'title'
+        els = list(body.iter(f'{XHTML_NS}{tag}'))
+        if fmt == 'chinese-only':
+            assert [e.get(name) for e in els] == [value]
+            machine = {'p': ('class', 'c'), 'table': ('id', 't'), 'figure': ('id', 'f')}[tag]
+            assert els[0].get(machine[0]) == machine[1]  # untouched
+        else:  # the original keeps the source's value, the copy gets the translation's
+            assert [e.get(name) for e in els] == [source_value, value]

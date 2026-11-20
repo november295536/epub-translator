@@ -128,16 +128,18 @@ prompt   <p k="1">See <a k="2"><sup>3</sup></a> for the <em k="3">core idea</em>
 
 | Class | Rules | On failure |
 |---|---|---|
-| Structural (blocking) | Output is well-formed. The sequence of top-level keys equals the source's, with no text between them. Each key appears exactly once, on the same tag name; the run wrapper only at the top level. For tags without a key, the count per tag name in each block equals the source's. No attribute other than `k` and the key's translatable attributes; those are all present, and one empty in the source stays empty (their values are free). No tag name absent from the source segment. | Retry; if still failing, the segment is `failed` and is exported in the original language. |
+| Structural (blocking) | Output is well-formed. The sequence of top-level keys equals the source's, with no text between them. Each key appears exactly once, on the same tag name, in the same top-level unit; the run wrapper only at the top level. For tags without a key, the count per tag name in each block equals the source's. No attribute other than `k` and the key's translatable attributes; those are all present, and one empty in the source stays empty (their values are free). No tag name absent from the source segment. | Retry; if still failing, the segment is `failed` and is exported in the original language. |
 | Quality (warning) | Identical to source although the source has translatable words. Length ratio outside the default band. Glossary term not applied. | Stored as translated, with a typed issue shown in review. |
 
 Quality rules never block, because legitimate exceptions are common: headings that are only a
 name, formulas, acronyms, URLs.
 
-A model reply is first checked in its keyed form: every key once on its tag, the top-level
-keys in order, the wrapper only at the top level, no other attribute. Restoring cannot see
-these violations (two blocks with equal attributes swapped, a key used twice, a missing key
-replaced by a bare tag of the same attributes), so they are checked before it.
+A model reply is first checked in its keyed form: every key once on its tag and inside the
+same top-level block or run as in the source, the top-level keys in order, the wrapper only at
+the top level, no other attribute, a translatable value blank exactly when the source's is.
+Restoring cannot see these violations (two blocks with equal attributes swapped, a key used
+twice, a missing key replaced by a bare tag of the same attributes, inline keys of equal
+attributes exchanged between blocks), so they are checked before it.
 Then the same comparison checks a model reply, a text saved or approved in the review, and a
 stored translation at export. A stored translation has real attributes instead of keys, so this
 check works on the restored form: source and translation are parsed and compared block by

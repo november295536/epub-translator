@@ -1075,14 +1075,14 @@ class TestRound1Validate:
 
     @pytest.mark.parametrize('flag', [[], ['--mark-failed']])
     def test_schema_1_refused(self, runner, tmp_path, flag):
-        from src.epub.exporter import SCHEMA_1_MESSAGE
         from tests.test_migrate import _legacy_project
         project_dir = _legacy_project(tmp_path)
         before = open(os.path.join(project_dir, 'project.json'), encoding='utf-8').read()
         files = sorted(os.listdir(project_dir))
         result = runner.invoke(cli, ['validate', str(project_dir), *flag])
         assert result.exit_code == 1
-        assert result.output == SCHEMA_1_MESSAGE + '\n'
+        assert result.output == ('此專案是舊格式（schema 1），無法檢查譯文。'
+                                 '請先執行 python3 translate.py migrate <專案目錄> 再檢查。\n')
         assert open(os.path.join(project_dir, 'project.json'), encoding='utf-8').read() == before
         assert sorted(os.listdir(project_dir)) == sorted(files + (['project.lock'] if flag else []))
 

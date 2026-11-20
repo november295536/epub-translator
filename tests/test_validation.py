@@ -714,3 +714,97 @@ class TestRound1Survivors:
             ['structure_mismatch']
         assert [i.code for i in check_keys('<p k="1">甲<?pi x?><b x="1">乙</b></p>\n'
                                            '<p k="2">丙</p>', p)] == ['extra_attributes']
+
+
+# --- Phase 4 review round 2 ------------------------------------------------------
+
+class TestRound2Keys:
+
+    def test_key_moved_to_another_block(self):
+        source = '<p><em class="i">First</em></p>\n<p><em class="i">Second</em></p>'
+        p = protect(source)
+        assert p.html == '<p k="1"><em k="2">First</em></p>\n<p k="3"><em k="4">Second</em></p>'
+        assert [(k, key.owner) for k, key in p.keys.items()] == \
+            [('1', '1'), ('2', '1'), ('3', '3'), ('4', '3')]
+        reply = '<p k="1"><em k="4">第一</em></p>\n<p k="3"><em k="2">第二</em></p>'
+        assert [(i.code, i.detail) for i in check_keys(reply, p)] == [
+            ('key_mismatch', '<em k="4"> 不在原來的區塊（原文在 k="3" 內）；'
+                             '<em k="2"> 不在原來的區塊（原文在 k="1" 內）'
+                             '（每個 k 必須在原來的標籤上出現一次）')]
+        # restored, the two blocks look right: only the keyed check sees it
+        assert check_html(source, restore(reply, p)).issues == []
+
+    def test_key_moved_into_or_out_of_a_run(self):
+        source = '<p>A <b class="x">b</b></p>\nrun <i class="y">i</i>'
+        p = protect(source)
+        assert p.html == ('<p k="1">A <b k="2">b</b></p>\n'
+                          '<run k="3">run <i k="4">i</i></run>')
+        assert p.keys['4'].owner == '3'
+        assert check_keys('<p k="1">甲<b k="2">乙</b></p>\n<run k="3">丙<i k="4">丁</i></run>',
+                          p) == []
+        assert [i.detail for i in check_keys(
+            '<p k="1">甲<i k="4">丁</i></p>\n<run k="3">丙<b k="2">乙</b></run>', p)] == [
+            '<i k="4"> 不在原來的區塊（原文在 k="3" 內）；<b k="2"> 不在原來的區塊（原文在 k="1" 內）'
+            '（每個 k 必須在原來的標籤上出現一次）']
+
+    def test_nested_key_stays_in_its_block(self):
+        p = protect('<div class="d"><p class="a">A</p></div>\n<p>B</p>')
+        assert p.keys['2'].owner == '1'
+        assert check_keys('<div k="1"><p k="2">甲</p></div>\n<p k="3">乙</p>', p) == []
+
+
+class TestRound2Values:
+
+    @pytest.mark.parametrize('value', ['', ' ', '&#32;', '&#10;'])
+    def test_non_empty_source_value_cannot_be_emptied(self, value):
+        p = protect('<p>A <img src="s" alt="A map"/></p>')
+        assert [(i.code, i.detail) for i in check_keys(
+            f'<p k="1">甲<img k="2" alt="{value}"/></p>', p)] == \
+            [('extra_attributes', '屬性與原文不符：<img k="2"> 的 alt 不可為空')]
+
+    @pytest.mark.parametrize('source_value', ['', ' '])
+    def test_blank_source_value_stays_blank(self, source_value):
+        p = protect(f'<p>A <img src="s" alt="{source_value}"/></p>')
+        assert check_keys('<p k="1">甲<img k="2" alt=" "/></p>', p) == []
+        assert [i.detail for i in check_keys('<p k="1">甲<img k="2" alt="圖"/></p>', p)] == \
+            ['屬性與原文不符：<img k="2"> 的 alt 原文是空的']
+
+    def test_whitespace_only_is_empty_in_the_stored_form(self):
+        source = '<p>A <img src="s" alt="A"/></p>'
+        assert codes(check_html(source, '<p>甲<img src="s" alt="  "/></p>')) == \
+            ['key_mismatch', 'extra_attributes']
+        assert check_html('<p>A <img src="s" alt=""/></p>',
+                          '<p>甲<img src="s" alt="  "/></p>').issues == []
+
+    def test_whitespace_references_survive_restore(self):
+        source = '<p>A <img src="s" alt="A"/></p>'
+        p = protect(source)
+        restored = restore('<p k="1">甲<img k="2" alt="一&#10;二&#9;三&#13;四"/></p>', p)
+        assert restored == '<p>甲<img src="s" alt="一&#10;二&#9;三&#13;四"/></p>'
+        img = validation.fragment(restored, declarations(restored))[0][0]
+        assert img.get('alt') == '一\n二\t三\r四'
+
+    def test_literal_line_breaks_are_spaces(self):
+        p = protect('<p>A <img src="s" alt="A"/></p>')
+        assert restore('<p k="1">甲<img k="2" alt="一\n二\t三\r\n四"/></p>', p) == \
+            '<p>甲<img src="s" alt="一 二 三 四"/></p>'
+
+    def test_unchanged_value_keeps_its_exact_token(self):
+        source = '<p>A <img src="s" alt="a&#10;b"/></p>'
+        p = protect(source)
+        assert restore(p.html, p) == source
+
+
+class TestRound2Segments:
+
+    def test_schema_1_text_segment_without_html(self):
+        seg = SimpleNamespace(segment_type='text', html='', text='Some words.', fingerprints=[])
+        assert validation.check_segment(seg, '一些字。').issues == []
+        assert validation.check_segment(seg, '<p>一些字。</p>').issues == []
+
+    def test_pieces_per_group(self):
+        source = '<p>A</p>\nL1\nL2\n<p>B</p>'
+        fps = [fingerprint(t) for t in ('A', 'L1', 'L2', 'B')]
+        assert validation.pieces_per_group(source, fps) == [1, 2, 1]
+        assert validation.pieces_per_group(source) == [1, 1, 1]
+        assert validation.pieces_per_group('<p>A') is None
