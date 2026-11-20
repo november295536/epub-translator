@@ -1,8 +1,7 @@
 """Tests for smart segmentation module."""
 
 import pytest
-from bs4 import BeautifulSoup, Tag
-from src.core.segmenter import Segmenter, Segment, SegmentType, MIN_WORDS, MAX_WORDS, _is_container
+from src.core.segmenter import Segmenter, Segment, SegmentType, MIN_WORDS, MAX_WORDS
 from tests.conftest import body_of
 
 
@@ -306,46 +305,6 @@ class TestSpaceExtraction:
         assert 'Hello world' in segments[0].text or 'Hello world from Python' in segments[0].text
 
 
-def _make_tag(html: str) -> Tag:
-    """Parse HTML string and return the first Tag child."""
-    soup = BeautifulSoup(html, 'html.parser')
-    for child in soup.children:
-        if isinstance(child, Tag):
-            return child
-    raise ValueError(f"No Tag found in: {html}")
-
-
-class TestIsContainer:
-
-    def test_div_with_only_block_children(self):
-        tag = _make_tag('<div><p>Hello</p><p>World</p></div>')
-        assert _is_container(tag) is True
-
-    def test_div_with_text_content(self):
-        tag = _make_tag('<div>Some text</div>')
-        assert _is_container(tag) is False
-
-    def test_div_with_inline_tag(self):
-        tag = _make_tag('<div><span>inline</span></div>')
-        assert _is_container(tag) is False
-
-    def test_div_with_mixed_content(self):
-        tag = _make_tag('<div>Text <p>Block</p></div>')
-        assert _is_container(tag) is False
-
-    def test_div_with_whitespace_and_blocks(self):
-        tag = _make_tag('<div>\n  <h1>Title</h1>\n  <p>Paragraph</p>\n</div>')
-        assert _is_container(tag) is True
-
-    def test_empty_div(self):
-        tag = _make_tag('<div></div>')
-        assert _is_container(tag) is True
-
-    def test_div_with_nested_div_container(self):
-        tag = _make_tag('<div><div><p>Nested</p></div></div>')
-        assert _is_container(tag) is True
-
-
 class TestContentDivHandling:
 
     def test_content_div_preserves_html_structure(self, segmenter):
@@ -468,14 +427,6 @@ class TestCommentHandling:
         html = '<html><body><p>Visible text.</p><?hidden marker?></body></html>'
         segments = segmenter.segment_chapter('ch1', html)
         assert all('marker' not in s.text for s in segments)
-
-    def test_is_container_ignores_comment(self):
-        tag = _make_tag('<div><!-- note --><p>Para 1</p><p>Para 2</p></div>')
-        assert _is_container(tag) is True
-
-    def test_is_container_legacy_counts_comment(self):
-        tag = _make_tag('<div><!-- note --><p>Para 1</p><p>Para 2</p></div>')
-        assert _is_container(tag, legacy=True) is False
 
     def test_container_div_with_comment_recursed(self, segmenter):
         html = ('<html><body><div><!-- note -->'

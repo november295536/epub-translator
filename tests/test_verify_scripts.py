@@ -7,7 +7,6 @@ import subprocess
 import sys
 
 import pytest
-from ebooklib import epub
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -21,7 +20,6 @@ def _load(name):
 
 
 code_check = _load('phase0_code_segments')
-align_check = _load('phase0_builder_alignment')
 
 
 def _code_seg(seg_id, text, translated, status='translated', seg_type='code'):
@@ -142,81 +140,6 @@ class TestCodeCheckMain:
         assert '<projects-dir>' in out
 
 
-def _write_full_project(directory, segments, epub_path, segmenter_version=None):
-    """project.json as ProjectManager writes it; without segmenter_version
-    when None (a project created before the field existed)."""
-    os.makedirs(directory, exist_ok=True)
-    raw = {'epub_path': epub_path, 'project_dir': directory,
-           'segments': [dict({'segment_id': f's{i}', 'text': 'x', 'word_count': 1,
-                              'segment_type': 'text', 'html': '<p>x</p>'}, **seg)
-                        for i, seg in enumerate(segments)]}
-    if segmenter_version is not None:
-        raw['segmenter_version'] = segmenter_version
-    with open(os.path.join(directory, 'project.json'), 'w', encoding='utf-8') as f:
-        json.dump(raw, f)
-
-
-def _write_epub_project(directory, body, segmenter_version=None):
-    """A project dir with source.epub (one chapter) and one segment for it."""
-    os.makedirs(directory, exist_ok=True)
-    book = epub.EpubBook()
-    book.set_identifier('align-test')
-    book.set_title('Align Test')
-    book.set_language('en')
-    chapter = epub.EpubHtml(title='One', file_name='one.xhtml', lang='en')
-    chapter.content = f'<html><body>{body}</body></html>'
-    book.add_item(chapter)
-    book.spine = [chapter]
-    book.add_item(epub.EpubNcx())
-    book.add_item(epub.EpubNav())
-    source = os.path.join(directory, 'source.epub')
-    epub.write_epub(source, book)
-    _write_full_project(directory, [{'chapter_id': chapter.id}], source, segmenter_version)
-
-
-class TestAlignmentCheck:
-
-    BODY = '<div class="box"><!-- note --><p>One</p><p>Two</p></div><p>Three</p>'
-
-    def test_project_without_marker_passes(self, tmp_path, capsys):
-        _write_epub_project(str(tmp_path / 'old'), self.BODY)
-        before = (tmp_path / 'old' / 'project.json').read_bytes()
-
-        code = align_check.main(['--projects-dir', str(tmp_path), '--anonymize'])
-
-        out = capsys.readouterr().out
-        assert code == 0
-        assert ('PASS project-1: segmenter_version 1, chapters 1, '
-                'with comment-dependent walk 1, not on legacy walk 0') in out
-        assert (tmp_path / 'old' / 'project.json').read_bytes() == before
-
-    @pytest.mark.parametrize('version, code', [(1, 0), (2, 1)])
-    def test_result_follows_marker(self, tmp_path, capsys, version, code):
-        _write_epub_project(str(tmp_path / 'p'), self.BODY, segmenter_version=version)
-
-        assert align_check.main(['--projects-dir', str(tmp_path)]) == code
-
-        out = capsys.readouterr().out
-        assert f'segmenter_version {version}, chapters 1' in out
-        assert f'not on legacy walk {code}' in out
-
-    def test_unreadable_source_fails_without_path(self, tmp_path, capsys):
-        _write_full_project(str(tmp_path / 'secret-name'), [{'chapter_id': 'c'}],
-                            str(tmp_path / 'secret-name' / 'missing.epub'))
-
-        code = align_check.main(['--projects-dir', str(tmp_path), '--anonymize'])
-
-        out = capsys.readouterr().out
-        assert code == 1
-        assert 'FAIL project-1: cannot read project or source' in out
-        assert 'secret-name' not in out
-
-    def test_missing_directory(self, tmp_path, capsys):
-        code = align_check.main(['--projects-dir', str(tmp_path / 'nope'), '--anonymize'])
-        assert code == 2
-        assert 'nope' not in capsys.readouterr().out
-
-
 def _assert_help(stdout, description, anonymize_help):
     """The description is exactly the docstring's first line and each option's
     help text is exactly as written (whitespace normalised)."""
@@ -300,147 +223,6 @@ class TestCodeCheckOutput:
                      'Phase 0 check: list translated code segments that may have been corrupted.',
                      'Print project-N labels; omit names, segment IDs and paths')
 
-
-def _write_multi_chapter_project(directory, segmenter_version=None, epub_path=None,
-                                 extra_spine=()):
-    """source.epub with chapters c0 (no segments), c1 (div with comment) and
-    c2 (body comment), plus the spine entries in extra_spine placed first:
-    'ghost' (an id with no manifest item), 'img' (an image) and/or 'nobody'
-    (an empty document: ebooklib renders it without <body>). Every
-    spine entry except c0 has a segment in project.json."""
-    os.makedirs(directory, exist_ok=True)
-    book = epub.EpubBook()
-    book.set_identifier('multi')
-    book.set_title('Multi')
-    book.set_language('en')
-    bodies = {
-        'c0': '<p>Zero</p>',
-        'c1': '<div class="box"><!-- note --><p>One</p><p>Two</p></div>',
-        'c2': '<p>Three</p><!-- c --><p>Four</p>',
-    }
-    chapters = []
-    for uid, body in bodies.items():
-        chapter = epub.EpubHtml(uid=uid, title=uid, file_name=f'{uid}.xhtml', lang='en')
-        chapter.content = f'<html><body>{body}</body></html>'
-        book.add_item(chapter)
-        chapters.append(chapter)
-    if 'img' in extra_spine:
-        book.add_item(epub.EpubImage(uid='img', file_name='img.png',
-                                     media_type='image/png', content=b'\x89PNG\xff\xfe'))
-    if 'nobody' in extra_spine:
-        book.add_item(epub.EpubItem(uid='nobody', file_name='nobody.xhtml',
-                                    media_type='application/xhtml+xml',
-                                    content=b''))
-    book.spine = list(extra_spine) + chapters
-    book.add_item(epub.EpubNcx())
-    book.add_item(epub.EpubNav())
-    target = epub_path or os.path.join(directory, 'source.epub')
-    epub.write_epub(target, book)
-    _write_full_project(directory, [{'chapter_id': cid} for cid in
-                                    list(extra_spine) + ['c1', 'c2']],
-                        target, segmenter_version)
-
-
-class TestAlignmentOutput:
-
-    def _make(self, root):
-        _write_full_project(str(root / 'a-broken'), [], str(root / 'missing.epub'))
-        _write_multi_chapter_project(str(root / 'b-old'))
-        _write_multi_chapter_project(str(root / 'c-new'), segmenter_version=2)
-        _write_multi_chapter_project(str(root / 'd-new'), segmenter_version=2)
-
-    def test_exact_output_named(self, tmp_path, capsys):
-        self._make(tmp_path)
-        assert align_check.main(['--projects-dir', str(tmp_path)]) == 1
-        assert capsys.readouterr().out.splitlines() == [
-            'FAIL a-broken: cannot read project or source (FileNotFoundError)',
-            'PASS b-old: segmenter_version 1, chapters 2, with comment-dependent walk 2, '
-            'not on legacy walk 0',
-            'FAIL c-new: segmenter_version 2, chapters 2, with comment-dependent walk 2, '
-            'not on legacy walk 2: c1 c2',
-            'FAIL d-new: segmenter_version 2, chapters 2, with comment-dependent walk 2, '
-            'not on legacy walk 2: c1 c2',
-            'TOTAL projects 4  chapters 6  comment-dependent 6  not on legacy walk 4  '
-            'failed projects 3',
-        ]
-
-    def test_exact_output_anonymized(self, tmp_path, capsys):
-        self._make(tmp_path)
-        assert align_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
-        lines = capsys.readouterr().out.splitlines()
-        assert lines[2] == ('FAIL project-3: segmenter_version 2, chapters 2, '
-                            'with comment-dependent walk 2, not on legacy walk 2')
-
-    def test_two_unreadable_projects_counted(self, tmp_path, capsys):
-        _write_project(str(tmp_path / 'p1'), [])
-        _write_project(str(tmp_path / 'p2'), [])
-        assert align_check.main(['--projects-dir', str(tmp_path)]) == 1
-        assert capsys.readouterr().out.splitlines()[-1].endswith('failed projects 2')
-
-    def test_all_pass_exits_zero(self, tmp_path, capsys):
-        _write_multi_chapter_project(str(tmp_path / 'old'))
-        assert align_check.main(['--projects-dir', str(tmp_path)]) == 0
-        assert capsys.readouterr().out.splitlines()[-1].endswith('failed projects 0')
-
-    def test_source_from_epub_path_when_no_local_copy(self, tmp_path, capsys):
-        elsewhere = str(tmp_path / 'book.epub')
-        _write_multi_chapter_project(str(tmp_path / 'projects' / 'old'), epub_path=elsewhere)
-        assert align_check.main(['--projects-dir', str(tmp_path / 'projects')]) == 0
-        assert 'chapters 2' in capsys.readouterr().out
-
-    def test_local_source_copy_preferred_over_epub_path(self, tmp_path, capsys):
-        _write_multi_chapter_project(str(tmp_path / 'p'))
-        with open(tmp_path / 'p' / 'project.json', encoding='utf-8') as f:
-            raw = json.load(f)
-        raw['epub_path'] = str(tmp_path / 'moved-away.epub')
-        with open(tmp_path / 'p' / 'project.json', 'w', encoding='utf-8') as f:
-            json.dump(raw, f)
-        assert align_check.main(['--projects-dir', str(tmp_path)]) == 0
-        assert 'PASS p: segmenter_version 1, chapters 2' in capsys.readouterr().out
-
-    def test_missing_spine_item_is_skipped_not_the_rest(self, tmp_path, capsys):
-        _write_multi_chapter_project(str(tmp_path / 'p'), segmenter_version=2,
-                                     extra_spine=('ghost',))
-        assert align_check.main(['--projects-dir', str(tmp_path)]) == 1
-        assert 'chapters 2' in capsys.readouterr().out
-
-    def test_non_document_spine_item_is_skipped(self, tmp_path, capsys):
-        _write_multi_chapter_project(str(tmp_path / 'p'), extra_spine=('img',))
-        assert align_check.main(['--projects-dir', str(tmp_path)]) == 0
-        assert 'PASS p: segmenter_version 1, chapters 2' in capsys.readouterr().out
-
-    def test_document_without_body_is_skipped_not_the_rest(self, tmp_path, capsys):
-        _write_multi_chapter_project(str(tmp_path / 'p'), segmenter_version=2,
-                                     extra_spine=('nobody',))
-        assert align_check.main(['--projects-dir', str(tmp_path)]) == 1
-        assert 'chapters 2' in capsys.readouterr().out
-
-    def test_missing_directory_named(self, tmp_path, capsys):
-        missing = str(tmp_path / 'nope')
-        assert align_check.main(['--projects-dir', missing]) == 2
-        assert capsys.readouterr().out.splitlines() == [
-            f'ERROR cannot list projects directory {missing} (FileNotFoundError)']
-
-    def test_missing_directory_anonymized(self, tmp_path, capsys):
-        assert align_check.main(['--projects-dir', str(tmp_path / 'x'), '--anonymize']) == 2
-        assert capsys.readouterr().out.splitlines() == [
-            'ERROR cannot list projects directory <projects-dir> (FileNotFoundError)']
-
-    def test_runs_as_script_quietly_with_default_directory(self, tmp_path):
-        _write_multi_chapter_project(str(tmp_path / 'projects' / 'old'))
-        result = _run_script('phase0_builder_alignment', ['--anonymize'], str(tmp_path))
-        assert result.returncode == 0, result.stderr
-        assert result.stdout.startswith('PASS project-1: segmenter_version 1, chapters 2')
-        assert result.stderr == ''
-
-    def test_help(self, tmp_path):
-        result = _run_script('phase0_builder_alignment', ['--help'], str(tmp_path))
-        _assert_help(result.stdout,
-                     "Phase 0 check: existing projects resolve to the builder's legacy walk.",
-                     'Print project-N labels; omit names, chapter IDs and paths')
-
-
-# --- Phase 1: every project loads, untouched -----------------------------------
 
 load_check = _load('phase1_load_projects')
 
@@ -827,7 +609,7 @@ def _migratable(root, name, unmatched=False):
 class TestMigrateCopiesCheck:
 
     PASS_LINE = ('PASS project-1: chapters 2/2, segments 4/4, merge groups 1 (2 segments), '
-                 'count differs 0, export fallback 1 (cross-parent 0), translated chars 54 -> 54, '
+                 'count differs 0, translated chars 54 -> 54, '
                  'export places 2/2, web load ok')
 
     def _main(self, root, anonymize=True):
@@ -847,11 +629,11 @@ class TestMigrateCopiesCheck:
         assert capsys.readouterr().out.splitlines() == [
             self.PASS_LINE,
             'FAIL project-2: chapters 1/2, segments 2/4, merge groups 0 (0 segments), '
-            'count differs 0, export fallback 0 (cross-parent 0), translated chars 52 -> 52, '
+            'count differs 0, translated chars 52 -> 52, '
             'export places 0/2, web load ok; '
             '1 chapters unmatched, nothing written; 2 chapters not placed by the export',
             'TOTAL projects 2  chapters 3/4  segments 6/8  merge groups 1 (2 segments)  '
-            'count differs 0  export fallback 1 (cross-parent 0)  translated chars unchanged 2  '
+            'count differs 0  translated chars unchanged 2  '
             'export places 2/4  web loads 2  failed projects 1',
         ]
         # the originals were only read
@@ -903,50 +685,6 @@ class TestMigrateCopiesCheck:
             'ERROR the temporary directory would be inside the projects directory\n')
         assert roundtrip_check.snapshot(str(root)) == before
 
-    def test_export_fallback_counted(self, tmp_path, capsys):
-        # Review round 2: a segment with an inline run always takes the
-        # whole-segment path, whatever its node counts (c1, c4); a joined
-        # translation of two paragraphs does too (c2); paragraphs translated
-        # one by one do not (c3)
-        from tests.test_migrate import _legacy_project, _segment
-        root = tmp_path / 'projects'
-        root.mkdir()
-        chapters = {'c1': '<div class="verse">Line one<br/>Line two</div>',
-                    'c2': '<p>Para one.</p><p>Para two.</p>',
-                    'c3': '<p>X one.</p><p>Y two.</p>',
-                    'c4': '<p>Lead.</p>Bare text.'}
-        segments = [_segment('c1', 1, '<div class="verse">Line one<br/>Line two</div>',
-                             '<p>一</p><p>二</p>', 'translated'),
-                    _segment('c2', 1, '<p>Para one.</p>\n<p>Para two.</p>',
-                             '<p>一二。</p>', 'translated'),
-                    _segment('c3', 1, '<p>X one.</p>\n<p>Y two.</p>',
-                             '<p>甲</p><p>乙</p>', 'translated'),
-                    _segment('c4', 1, '<p>Lead.</p>\nBare text.', '<p>引。</p>\n裸。',
-                             'translated')]
-        _legacy_project(root, chapters, segments, name='alpha')
-        assert self._main(root) == 0
-        out = capsys.readouterr().out.splitlines()
-        assert 'count differs 2, export fallback 3 (cross-parent 0),' in out[0]
-        assert 'count differs 2  export fallback 3 (cross-parent 0)  ' in out[1]
-
-    def test_cross_parent_fallback_counted(self, tmp_path, capsys):
-        # Review round 3: a whole-segment placement whose blocks sit in a
-        # div and after it (c1); one inside a single parent does not count (c2)
-        from tests.test_migrate import _legacy_project, _segment
-        root = tmp_path / 'projects'
-        root.mkdir()
-        chapters = {'c1': '<div class="footnote">Note one<br/>Note two</div><p>Body.</p>',
-                    'c2': '<div class="box">Line one<br/>Line two</div>'}
-        segments = [_segment('c1', 1, '<div class="footnote">Note one<br/>Note two</div>\n'
-                                      '<p>Body.</p>', '<p>一</p><p>二</p><p>本</p>', 'translated'),
-                    _segment('c2', 1, '<div class="box">Line one<br/>Line two</div>',
-                             '<p>一</p><p>二</p>', 'translated')]
-        _legacy_project(root, chapters, segments, name='alpha')
-        assert self._main(root) == 0
-        out = capsys.readouterr().out.splitlines()
-        assert 'export fallback 2 (cross-parent 1),' in out[0]
-        assert 'export fallback 2 (cross-parent 1)  ' in out[1]
-
     def test_glossary_copied_and_names_shown(self, tmp_path, capsys, monkeypatch):
         root = tmp_path / 'projects'
         root.mkdir()
@@ -982,9 +720,7 @@ class TestMigrateCopiesCheck:
         monkeypatch.setattr(migrate_check, 'migrate_project', migrate)
         assert self._main(root) == 1
         out = capsys.readouterr().out.splitlines()
-        # the appended '!' is a second top-level node: one more fallback
         assert out[0] == (self.PASS_LINE.replace('PASS', 'FAIL').replace('54 -> 54', '54 -> 55')
-                          .replace('fallback 1', 'fallback 2')
                           + '; translated characters changed')
         assert 'translated chars unchanged 0' in out[1]
 
@@ -992,13 +728,11 @@ class TestMigrateCopiesCheck:
         root = tmp_path / 'projects'
         root.mkdir()
         _migratable(root, 'alpha')
-        monkeypatch.setattr(migrate_check.EPUBBuilder, '_place_by_blocks',
-                            staticmethod(lambda body, segments: None))
+        monkeypatch.setattr(migrate_check, '_matches', lambda blocks, segments: False)
         assert self._main(root) == 1
         out = capsys.readouterr().out.splitlines()
         assert out[0] == (self.PASS_LINE.replace('PASS', 'FAIL')
                           .replace('export places 2/2', 'export places 0/2')
-                          .replace('fallback 1', 'fallback 0')   # nothing placed
                           + '; 2 chapters not placed by the export')
         assert 'export places 0/2' in out[1]
 
@@ -1007,15 +741,13 @@ class TestMigrateCopiesCheck:
         root.mkdir()
         directory = _migratable(root, 'alpha')
         migrate_check.migrate_project(directory)
-        real = migrate_check.epub.read_epub
+        real = migrate_check.read_package
 
-        def read_epub(path):
-            book = real(path)
-            book.items = [i for i in book.items if i.get_id() != 'c1']
-            return book
-        monkeypatch.setattr(migrate_check.epub, 'read_epub', read_epub)
-        # c2 (left) holds the merged segment with a run: the one fallback
-        assert migrate_check.placed_chapters(directory) == (2, 1, 1, 0)
+        def read_package(zf):
+            opf, manifest, spine = real(zf)
+            return opf, manifest, [item for item in spine if item.id != 'c1']
+        monkeypatch.setattr(migrate_check, 'read_package', read_package)
+        assert migrate_check.placed_chapters(directory) == (2, 1)
 
     def test_web_load_checked(self, tmp_path, capsys, monkeypatch):
         root = tmp_path / 'projects'
@@ -1181,11 +913,11 @@ class TestPhase2ScriptSurvivors:
         root = tmp_path / 'projects'
         root.mkdir()
         _migratable(root, 'alpha')
-        real = migrate_check.EPUBBuilder._place_by_blocks
+        real = migrate_check._matches
 
-        def place(body, segments):
-            return None if segments[0].chapter_id == 'c1' else real(body, segments)
-        monkeypatch.setattr(migrate_check.EPUBBuilder, '_place_by_blocks', staticmethod(place))
+        def matches(blocks, segments):
+            return False if segments[0].chapter_id == 'c1' else real(blocks, segments)
+        monkeypatch.setattr(migrate_check, '_matches', matches)
         assert migrate_check.main(['--projects-dir', str(root), '--anonymize']) == 1
         assert capsys.readouterr().out.splitlines()[0].endswith(
             'export places 1/2, web load ok; 1 chapters not placed by the export')

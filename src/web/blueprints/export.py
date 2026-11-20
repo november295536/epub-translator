@@ -7,7 +7,7 @@ import threading
 import time
 from flask import Blueprint, Response, jsonify, current_app, send_file
 
-from src.epub.builder import EPUBBuilder
+from src.epub.exporter import FORMATS, export_project
 
 export_bp = Blueprint('export', __name__)
 
@@ -23,9 +23,8 @@ def start_export(project_name: str):
     data = request.get_json(silent=True) or {}
     fmt = data.get('format', 'chinese-only')
 
-    valid_formats = ('chinese-only', 'bilingual-horizontal', 'bilingual-vertical')
-    if fmt not in valid_formats:
-        return jsonify({'error': f'無效的格式。可選: {", ".join(valid_formats)}'}), 400
+    if fmt not in FORMATS:
+        return jsonify({'error': f'無效的格式。可選: {", ".join(FORMATS)}'}), 400
 
     projects_dir = current_app.config['PROJECTS_DIR']
     project_dir = os.path.join(projects_dir, project_name)
@@ -51,6 +50,7 @@ def start_export(project_name: str):
         'filename': filename,
         'output_path': output_path,
         'error': None,
+        'summary': None,
         'started_at': time.time(),
     }
 
@@ -85,6 +85,7 @@ def export_status(project_name: str):
         'format': task['format'],
         'filename': task['filename'],
         'error': task['error'],
+        'summary': task.get('summary'),
     }
     return jsonify(result)
 
@@ -139,13 +140,13 @@ def download_file(project_name: str, filename: str):
 def _run_export(project_dir: str, output_path: str, fmt: str, project_name: str):
     """Execute EPUB export in background thread."""
     try:
-        builder = EPUBBuilder(project_dir)
-        builder.build(output_path, fmt=fmt)
+        report = export_project(project_dir, output_path, fmt)
 
         with _export_lock:
             task = _export_tasks.get(project_name)
             if task:
                 task['state'] = 'completed'
+                task['summary'] = report.summary()
     except Exception as e:
         with _export_lock:
             task = _export_tasks.get(project_name)

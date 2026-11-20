@@ -102,9 +102,9 @@ class ProjectData:
     # Schema 1 only. 1: segmented before comments were skipped; never written
     # to project.json, so projects that existed before Phase 0 remain loadable
     # by pre-Phase-0 code. 2: comments skipped; always written, so projects
-    # created after Phase 0 are not. The builder walks chapters to match.
+    # created after Phase 0 are not. Kept so schema 1 files round-trip.
     segmenter_version: int = 1
-    # 1: segments are matched to the chapter by the builder's walk (never
+    # 1: legacy segments; cannot be exported until migrated (never
     # written). 2: segments are block ranges with fingerprints (plan 4.2);
     # the field is written, and segmenter_version is not.
     schema: int = 1
