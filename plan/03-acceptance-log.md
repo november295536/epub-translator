@@ -4181,3 +4181,131 @@ Tests changed, none removed:
   concurrent reader or another user's umask in a running server.
 - `translate.py validate` was not run on the real projects (schema 1; only the check scripts
   touch them, on copies).
+
+## Phase 6 — Segmentation for technical books
+
+Date: 2026-11-21. Branch: `phase-6/technical-segmentation`, worktree `<repo>/.worktree/phase-6`,
+shared virtualenv. New projects only; projects created before keep their stored segments.
+
+### What was built
+
+| Item | Rule | Where |
+|---|---|---|
+| Rules marker | `project.json` field `segmentation` (2 for projects created now, written; absent = 1, never written, so existing files save byte-identical). `Segmenter(rules=1\|2)`, default 2; `pm.create(..., segmentation=segmenter.rules)` in CLI `init` and web create. | `project.py`, `segmenter.py`, `translate.py`, `projects.py` |
+| Headings merged | A heading (`h1`–`h6`) ends the segment being built unless it holds only headings, and starts a new one. The first text block after a heading always joins (even past `MAX_WORDS`); later blocks follow the usual 300/500 rules. Consecutive headings share a segment. A code block, a table or the chapter end after a heading leaves the heading(s) alone (`standalone`). Tables unchanged (own segment). | `Segmenter.segment_chapter` |
+| Code boundaries | Unchanged: every code block is a segment of its own. | same |
+| Passthrough | Code segment with no comment line (`validation.COMMENT_LINE`; `#include`, a trailing `# x` are not comment lines) gets the segment flag `passthrough` and is created `TRANSLATED` with its own code as text, no model. Flag, not a status: every status consumer (queue, progress, chapters, export's `accepted`) already does the right thing with `TRANSLATED`; a new status would have touched all of them. The flag is written only when true. | `segmenter.py`, `project.py` |
+| … never queued | Not pending; also skipped by the web start's explicit `segment_ids`. | `tasks.start_translation` |
+| … progress | Counts as translated; `get_progress()` also returns `passthrough`; `status` and `init` print it. | `project.py`, `translate.py` |
+| … review | Shown as `passthrough` without editor or buttons; save, approve and re-translate answer 409, nothing changed, no model call. | `review.html`, `review.py`, `style.css` |
+| … validate | Skipped (not counted as checked). | `translate._validate` |
+| … export | Skipped: its DOM is never touched; a chapter of only passthrough code is copied byte for byte; it is not counted as translated nor untranslated in the report. | `exporter._export` |
+| Context | Rules 2 only: the text before is the previous text segment's translation when it is `TRANSLATED`/`REVIEWED` and non-empty, tags removed, entities decoded (`translation_text`); otherwise its source text. The last 200 characters are taken by the prompt as before. Parallel workers: a neighbour not yet translated gives its source; no ordering added. Rules 1 projects: prompts unchanged. All four callers pass `translations=pm.data.segmentation == 2`. | `translator.get_context`, `translate_segment`, `tasks.py`, `translate.py`, `review.py` |
+| TOC labels | Nothing to change: labels come from the translated heading element of the block that holds the target (Phase 3); a merged heading is still a block of its own. Tested in NCX and nav, all formats. | — |
+| Check script | `scripts/verify/phase6_segmentation_check.py` | — |
+
+### Checks
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase6_segmentation_check.py --projects-dir <repo>/projects --anonymize
+PASS project-1: segments 220 -> 220, calls 220 -> 220 (ratio 1.000), passthrough 0, headings merged 0 of 0, blocks covered identically
+PASS project-2: segments 292 -> 292, calls 292 -> 292 (ratio 1.000), passthrough 0, headings merged 0 of 0, blocks covered identically
+PASS project-3: segments 4383 -> 3592, calls 4383 -> 2173 (ratio 0.496), passthrough 1419, headings merged 791 of 895, blocks covered identically
+PASS project-4: segments 2236 -> 2089, calls 2236 -> 2089 (ratio 0.934), passthrough 0, headings merged 149 of 150, blocks covered identically
+PASS project-5: segments 841 -> 520, calls 841 -> 501 (ratio 0.596), passthrough 19, headings merged 322 of 322, blocks covered identically
+PASS project-6: segments 580 -> 311, calls 580 -> 311 (ratio 0.536), passthrough 0, headings merged 270 of 270, blocks covered identically
+PASS project-7: segments 636 -> 588, calls 636 -> 588 (ratio 0.925), passthrough 0, headings merged 48 of 58, blocks covered identically
+PASS project-8: segments 332 -> 258, calls 332 -> 258 (ratio 0.777), passthrough 0, headings merged 75 of 75, blocks covered identically
+TOTAL projects 8  segments 9520 -> 7870, calls 9520 -> 6432 (ratio 0.676), passthrough 1438, headings merged 1655 of 1770  failed projects 0
+$ echo $?
+0
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+Plan acceptance: project-3 needs 2173 calls, fewer than half of 4385 (2192.5) and of the 4383
+the old rules give when re-cut from the source (the stored 4385 come from the migrated legacy
+cut). The margin is small (19 calls): 1419 of the saved calls are passthrough code, 791 are
+merged headings. 104 headings of project-3 stay alone (followed by code or a table).
+
+Older checks, rerun at the end; TOTAL lines unchanged from Phase 5:
+
+```
+$ python3 scripts/verify/phase3_export_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  exports 24  translated segments 4162  as translation 3956  kept original 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 53)  toc labels changed 405/1885 (527 into translated chapters)  exports with new epubcheck errors 0  failed projects 0
+$ python3 scripts/verify/phase4_validate_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  round trip 9491/9491  translated 4162  failing the structural check 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 54; only tag rules 88)  warnings (length_ratio 36, untranslated 8)  length ratio over 2925 segments: p1 0.312 p5 0.333 p50 0.404 p95 0.547 p99 0.976; outside 0.25-0.8: 38 (1.3%)  sources that cannot be cut 0  with translatable attributes 22  failed projects 0
+$ python3 scripts/verify/phase5_glossary_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  glossary entries 15, translated 4162, passing the structural check 3956, with term_not_applied 12, terms 4, by category (person: 9 warnings, 2 terms, term: 6 warnings, 2 terms)  failed projects 0
+```
+
+All four exited 0; the md5 above was taken before the first and after the last. No
+`phase6-segmentation-*` directory left. Review page checked by hand on an invented project on a
+local port: the passthrough segment shows its label and note, no editor; a save answers 409;
+`/progress` reports `passthrough`.
+
+### Tests
+
+2089 passed (main: 1981). New: `tests/test_technical_segmentation.py` (rules 2 segmentation,
+passthrough decision, project state and round trip, progress, context, export in all three
+formats including byte identity and a single copy of passthrough code, TOC labels of merged
+headings in NCX and nav, a failing merged segment kept whole, rules 1 and rules 2 exports
+identical for the same translations, validate, CLI start/init/status, web review page and API,
+the context flag on every caller), `TestSegmentationCheck` and `TestSegmentationCheckSurvivors`
+(`test_verify_scripts.py`).
+
+Tests changed, none removed:
+
+| Test | Change | Reason |
+|---|---|---|
+| `test_exporter._project` (helper used by many tests) | takes `rules`, default 1 | its projects stand for existing projects; under rules 2 their segment IDs would change |
+| `test_segmenter.py` `test_heading_standalone_segment`, `test_multiple_headings`, `test_heading_breaks_small_merge` | run with rules 1 | they describe standalone headings (plan section 7 announced this); rules 2 counterparts in `TestRules2` |
+| `test_blocks.py` `test_ranges_contiguous_and_cover_all_blocks` | both rules, each with its `standalone` list | same |
+| `test_blocks.py` `test_standalone_tags` | rules 1 | same |
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, mutmut 3.8.1, parallel, about 7 minutes per run. The check
+script was added to the mutated files.
+
+| Run | Mutants | Killed | Survived | Timeout |
+|---|---|---|---|---|
+| 1 | 498 | 459 | 39 | 0 |
+| 2 (final) | 498 | 495 | 3 | 0 |
+
+| mutant(s) | done |
+|---|---|
+| `Segmenter.__init__` 4 (message) | killed: `test_unknown_rules_message` |
+| `tasks._worker_loop` 1, 3, 9, 14; `translate._start_parallel` 6, 11–13 (the context flag) | killed: `TestContextOnEveryPath::test_web`, `test_cli[2]` (a rules 2 and a rules 1 project, previous segment already translated) |
+| check script `main` 2–5, 8, 11, 15–18, 21, 24, 29–31 (help texts, default directory) | killed: `test_help_in_process`, `test_default_projects_directory_listed` |
+| `check` 39, 41 (`dir=parent`) | killed: `test_work_directory_under_the_resolved_temporary_directory` |
+| `in_work_tree` 10 (`.GIT`) | killed: `test_looks_for_dot_git` |
+| `check_source` 27 (`=` for `+=`) | killed: `test_every_uncovered_segmentation_counted` |
+| `run` 27, 50, 56, 57, 69 | killed: `test_first_snapshot_fails`, `test_two_failing_projects_with_two_problems`, `test_counted_project_with_two_problems` |
+| `source_of` 8, 10, 16 (encoding) | killed: `test_project_file_read_as_utf8` |
+| `get_context` 12 (`nearest_text(1, None)` for `False`) | equivalent: the argument is used only as `(translated and x) or text`; `None` and `False` are both false, so the expression is `text` for every input |
+| check script `check_source` 14, 21 (`segment_chapter(None, ...)`) | equivalent: the chapter id only builds segment ids, and the check reads only ranges, fingerprints, block tags and `passthrough`; `f"{None}_seg..."` is a valid string, so every count is the same for every book |
+
+### Known consequences and limitations
+
+- A project created now cannot be loaded by code from before this phase: its `ProjectData(**raw)`
+  rejects the unknown `segmentation` key (the unknown segment key `passthrough` would be
+  dropped). This matters only for a rollback, as with Phase 0's marker.
+- A merged segment that fails the structural check is exported in the original language as a
+  whole, heading included (one failure now covers more text). The Phase 4 retry (feedback, then
+  a split at a block boundary) applies to merged segments as to any other.
+- What a reader sees does not change: each block keeps its own original/translation pair in
+  bilingual output (`TestReaderSeesTheSame`).
+- Passthrough code cannot be edited in the review; a reader who wants it translated has to
+  live with it (it has no comment to translate).
+- In parallel runs the context of a segment depends on which neighbour finished first; the
+  prompt may get the translation in one run and the source in another.
+
+### Not verified
+
+- No real `claude` call: the effect of larger segments on the structural failure rate, and
+  of translated context on quality, is for the owner to measure with the real model.
+- The new rules were not applied to any real project (none was created); the check script
+  re-cuts copies of the sources only.
