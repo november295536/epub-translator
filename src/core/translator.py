@@ -12,6 +12,9 @@ import traceback
 from dataclasses import asdict, dataclass, field
 
 import src.llm as llm
+from lxml import etree
+
+import src.core.validation as validation
 from src.core.project import Issue, SegmentStatus
 from src.core.segmenter import SegmentType
 from src.llm import (  # noqa: F401  (RateLimitError, AuthError re-exported)
@@ -41,7 +44,7 @@ _SHARED_RULES = """1. 使用台灣慣用的繁體中文用語
 8. 翻譯名稱時不要出現什麼乖乖等錯誤翻譯的字眼
 
 中英文句型差異——翻譯時請特別注意：
-- 不要逐句對譯，先理解整段語意，再用自然的中文重新表達；必要時可合併、拆分或調整語序
+{restructure}
 - 英文被動句（was done by...）應盡量轉為中文主動句，除非「被」在中文語境中自然（如被騙、被開除）
 - 英文每句都需要主詞，中文在主詞不變時應省略，避免反覆出現「他」「它」「這」
 - 英文的名詞化表達（the implementation of...）應轉為中文動詞句（實作……）
@@ -50,6 +53,12 @@ _SHARED_RULES = """1. 使用台灣慣用的繁體中文用語
 - 英文的 this/that/it 等回指代詞，中文應視情況重複關鍵詞或直接省略，避免指代不明
 - 英文介系詞片語可以層層堆疊（the increase in the rate of errors in...），中文必須拆開重組"""
 
+# The first sentence-structure rule: the plain-text prompt may merge and
+# split sentences; the HTML prompt keeps its blocks (the check compares them)
+_RESTRUCTURE_TEXT = '- 不要逐句對譯，先理解整段語意，再用自然的中文重新表達；必要時可合併、拆分或調整語序'
+_RESTRUCTURE_HTML = ('- 不要逐句對譯，先理解整段語意，再用自然的中文重新表達；'
+                     '可以在同一個區塊內合併、拆分句子或調整語序，但不可合併或拆分區塊')
+
 _SHARED_PROHIBITIONS = """嚴格禁止：
 - 不要加任何說明、前綴或後綴（例如「以下是翻譯」「翻譯如下」等）
 - 不要使用 markdown 語法"""
@@ -57,7 +66,7 @@ _SHARED_PROHIBITIONS = """嚴格禁止：
 TRANSLATION_PROMPT = f"""你是一位專業的英文翻譯，請將以下英文內容翻譯成繁體中文。
 
 翻譯要求：
-{_SHARED_RULES}
+{_SHARED_RULES.format(restructure=_RESTRUCTURE_TEXT)}
 9. 保持原文的段落結構和格式
 10. 英文中的斜體或粗體強調，翻譯時用「」標示，不要使用 markdown 的 * 或 ** 語法
 
@@ -70,17 +79,21 @@ TRANSLATION_PROMPT = f"""你是一位專業的英文翻譯，請將以下英文�
 原文：
 {{text}}"""
 
-CODE_PROMPT = """以下是程式碼區塊，請只翻譯其中的註解（# 或 // 開頭的行），保持程式碼本身完全不變。直接輸出結果，不加任何說明。
+CODE_PROMPT = """以下是程式碼區塊，請只翻譯其中的註解行，保持其他每一行完全不變。註解行是去掉行首空白後以 // 開頭，或以 # 開頭且 # 後面是空白、! 或行尾的行（#include 這類行是程式碼，不是註解）；行尾的註解也不要翻譯。直接輸出結果，不加任何說明。
 
 {text}"""
 
 TEXT_HTML_PROMPT = f"""你是一位專業的英文翻譯，請將以下 HTML 內容中的英文文字翻譯成繁體中文。
 
+HTML 標記規則：
+1. 保持所有 HTML 標籤結構完全不變：標籤上的 k 屬性是標記編號，每個帶 k 的標籤都要原樣保留（同一個標籤名、同一個 k 值，各出現一次，留在原來的區塊內）
+2. 不帶 k 的標籤也要全部保留，同一個區塊內每種標籤的數量必須與原文相同；為了中文語序可以在同一個區塊內移動標籤的位置
+3. 不要增加原文沒有的標籤或屬性，也不要刪除標籤
+4. 最外層區塊的數量和順序不可改變，不要合併或拆分段落。<run> 包住的是沒有段落標籤的文字，請保留它，只能出現在最外層；<run> 內若有多行，譯文保持相同的行數
+5. 翻譯標籤內的文字內容；標籤上的 alt、title、aria-label 屬性是給讀者看的文字，也要翻譯（保留屬性本身，原文是空值就保持空值），其他屬性不要改動
+
 翻譯要求：
-1. 保持所有 HTML 標籤結構完全不變
-2. 保持所有 HTML 屬性不變
-3. 只翻譯標籤內的文字內容
-{_SHARED_RULES}
+{_SHARED_RULES.format(restructure=_RESTRUCTURE_HTML)}
 {{glossary_section}}
 {{context_section}}
 {_SHARED_PROHIBITIONS}
@@ -88,6 +101,12 @@ TEXT_HTML_PROMPT = f"""你是一位專業的英文翻譯，請將以下 HTML 內
 - 直接輸出翻譯後的 HTML，第一個字元就是 <
 
 {{html}}"""
+
+# Follow-up message when a reply failed the checks (one retry per request)
+FEEDBACK_PROMPT = """你上一次的輸出沒有通過檢查：
+{problems}
+
+請修正以上問題，重新輸出完整的譯文。只輸出譯文本身，不要加任何說明。"""
 
 # Patterns to clean from Claude's response
 # Patterns applied at the start of the response only (no MULTILINE)
@@ -173,24 +192,30 @@ def get_context(segments, segment_id: str) -> tuple:
 class TranslationError(Exception):
     """Raised when translation fails after all attempts.
 
-    `code` names the last failure (transient, empty_reply, refusal, error);
-    `prompt` is the request sent and `attempts` the raw output of each
-    failed attempt, for failure diagnostics. Rate-limit, auth and cancel
-    errors are not TranslationErrors: they stop or pause a run instead of
-    failing one segment.
+    `code` names the failure (transient, empty_reply, not_html, refusal,
+    error, or a structural rule of src/core/validation.py); `issues` are the
+    segment's issues for it; `prompt` is the first request sent and
+    `attempts` the raw output of each failed call, for failure diagnostics.
+    Rate-limit, auth and cancel errors are not TranslationErrors: they stop
+    or pause a run instead of failing one segment.
     """
 
-    def __init__(self, message: str, *, code: str, prompt: str, attempts: list):
+    def __init__(self, message: str, *, code: str, prompt: str, attempts: list,
+                 issues: list | None = None, usage: Usage | None = None):
         super().__init__(message)
+        self.usage = usage  # the usage of the calls made for the segment
         self.code = code
         self.prompt = prompt
         self.attempts = attempts
+        self.issues = issues if issues is not None else [
+            Issue(kind='backend', code=code, detail=message[:ERROR_MESSAGE_CHARS], blocking=True)]
 
 
 @dataclass
 class Reply:
     text: str
     usage: Usage | None
+    issues: list = field(default_factory=list)  # quality warnings of the accepted text
 
 
 @dataclass
@@ -212,13 +237,154 @@ DIAGNOSTIC_RAW_CHARS = 20000
 # segment's stored issue
 ERROR_MESSAGE_CHARS = 2000
 
+# Model calls per segment at most (plan 4.1): the request, one retry with
+# the errors as feedback, and the two halves of one split. Calls that end
+# in a rate-limit or authentication error raise at once and are not counted.
+MAX_CALLS = 4
+
+
+class _Rejected(Exception):
+    """A reply failed its check (the result's blocking issues)."""
+
+    def __init__(self, result: validation.Result):
+        self.result = result
+
+
+class _Session:
+    """The calls made for one segment: budget, usage and diagnostics."""
+
+    def __init__(self, engine: TranslationEngine, cancel: threading.Event):
+        self.engine = engine
+        self.cancel = cancel
+        self.left = engine.max_calls
+        self.prompt = ''       # the first request, for the diagnostics
+        self.attempts = []     # (message, raw output) of each failed call
+        self.usage = None
+
+    def call(self, messages: list, clean) -> str:
+        """One reply to `messages`, passed through `clean`. A transient
+        error is retried while calls are left; raises TranslationError
+        when none are."""
+        if not self.prompt:
+            self.prompt = messages[0].content
+        engine = self.engine
+        request = LLMRequest(system='', messages=list(messages), model=engine.model,
+                             timeout=engine.timeout)
+        while self.left > 0:
+            self.left -= 1
+            try:
+                response = engine.backend.complete(request, self.cancel)
+            except (RateLimitError, AuthError, BackendUnavailableError, CancelledError):
+                raise
+            except TransientError as e:
+                logger.warning("Translation attempt %d/%d failed: %s", self.used,
+                               engine.max_calls, str(e)[:ERROR_MESSAGE_CHARS])
+                self.attempts.append((str(e), e.raw))
+                continue
+            except LLMError as e:
+                # A refusal or an error that a retry cannot fix
+                self.attempts.append((str(e), e.raw))
+                self.fail('refusal' if isinstance(e, RefusalError) else 'error', str(e))
+            if response.usage is not None:
+                u = self.usage or Usage(0, 0)
+                self.usage = Usage(u.input_tokens + response.usage.input_tokens,
+                                   u.output_tokens + response.usage.output_tokens)
+            self.last_raw = response.text
+            return clean(response.text)
+        self.fail('transient', self.attempts[-1][0])
+
+    @property
+    def used(self) -> int:
+        return self.engine.max_calls - self.left
+
+    def fail(self, code: str, message: str, issues: list | None = None):
+        if code == validation.EMPTY_REPLY:
+            text = f"Empty translation after {self.used} attempts"
+        else:
+            text = f"Translation failed after {self.used} attempts: {message}"
+        raise TranslationError(text, code=code, prompt=self.prompt, attempts=self.attempts,
+                               issues=issues, usage=self.usage)
+
+    def rejected(self, result: validation.Result, raw: str | None = None) -> None:
+        """Record a reply (or, `raw`, a text joined from replies) that failed
+        its check."""
+        blocking = result.blocking
+        if blocking[0].code == validation.EMPTY_REPLY:
+            logger.warning("Empty translation result (attempt %d/%d)",
+                           self.used, self.engine.max_calls)
+        else:
+            logger.warning("Translation reply rejected (attempt %d/%d): %s", self.used,
+                           self.engine.max_calls, ', '.join(i.code for i in blocking))
+        self.attempts.append(('; '.join(f'{i.code}: {i.detail}' for i in blocking)
+                              [:ERROR_MESSAGE_CHARS], self.last_raw if raw is None else raw))
+
+    def attempt(self, prompt: str, check, clean, retries: int = 1) -> tuple:
+        """The request and, while its reply fails `check`, up to `retries`
+        follow-ups with the errors. Returns (text, result); raises
+        _Rejected."""
+        messages = [Message('user', prompt)]
+        while True:
+            reply = self.call(messages, clean)
+            text, result = check(reply)
+            if not result.blocking:
+                return text, result
+            self.rejected(result)
+            if retries == 0 or self.left == 0:
+                raise _Rejected(result)
+            retries -= 1
+            problems = '\n'.join(f'- {i.detail}' for i in result.blocking)
+            messages += [Message('assistant', self.last_raw),
+                         Message('user', FEEDBACK_PROMPT.format(problems=problems))]
+
+
+def _empty(reply: str, source: str):
+    """The result of an empty reply, or None."""
+    if _is_empty_reply(reply, source):
+        return validation.Result([Issue(kind=validation.BACKEND, code=validation.EMPTY_REPLY,
+                                        detail='回覆是空的', blocking=True)])
+    return None
+
+
+def _clean_html(raw: str) -> str:
+    return TranslationEngine._clean_response(raw.strip(), html_mode=True)
+
+
+def _clean_text(raw: str) -> str:
+    return TranslationEngine._clean_response(raw.strip())
+
+
+def _html_check(source: str, fingerprints, protected: validation.Protected, first_block: int = 1):
+    """The check of a reply to the prompt form of `source`: HTML,
+    well-formed, the keys (check_keys), then (restored) the comparison
+    with the source."""
+    def check(reply: str):
+        empty = _empty(reply, source)
+        if empty:
+            return None, empty
+        if not reply.startswith('<'):
+            return None, validation.Result([Issue(
+                kind=validation.BACKEND, code=validation.NOT_HTML,
+                detail='回覆不是 HTML（第一個字元必須是 <）', blocking=True)])
+        try:
+            validation.fragment(reply, validation.declarations(reply))
+        except (etree.XMLSyntaxError, ValueError) as e:
+            return None, validation.Result([Issue(
+                kind=validation.STRUCTURE, code=validation.NOT_WELL_FORMED,
+                detail=validation.xml_error(e), blocking=True)])
+        issues = validation.check_keys(reply, protected)
+        if issues:
+            return None, validation.Result(issues)
+        text = validation.restore(reply, protected)
+        return text, validation.check_html(source, text, fingerprints, first_block=first_block)
+    return check
+
 
 class TranslationEngine:
     """Translates text segments through an LLM backend."""
 
-    def __init__(self, max_retries: int = 3, model: str | None = None,
+    def __init__(self, max_calls: int = MAX_CALLS, model: str | None = None,
                  backend: llm.LLMBackend | None = None, timeout: float = 120):
-        self.max_retries = max_retries
+        self.max_calls = max_calls
         self.backend = backend if backend is not None else llm.default_backend()
         self.model = model if model is not None else self.backend.default_model
         self.timeout = timeout
@@ -233,77 +399,100 @@ class TranslationEngine:
 
     def translate_reply(self, text: str, segment_type: SegmentType, glossary_text: str,
                         context_before: str, context_after: str, html: str,
-                        cancel: threading.Event | None = None) -> Reply:
-        """Translate a text segment through the backend.
+                        cancel: threading.Event | None = None,
+                        fingerprints: list | None = None) -> Reply:
+        """Translate a segment through the backend, validated (plan 4.1).
 
         Args:
-            text: The English text to translate.
+            text: The English text to translate (code: the code).
             segment_type: Type of segment (SegmentType.TEXT or SegmentType.CODE).
             glossary_text: Formatted glossary entries for the prompt.
             context_before: Previous segment text for context.
             context_after: Next segment text for context.
             html: Original HTML content. When provided for non-code types,
-                  the HTML-preserving prompt is used instead of the plain text prompt.
-
+                  the HTML is sent in its protected form and the reply is
+                  restored and validated against it.
             cancel: Set to abandon the call (raises CancelledError).
+            fingerprints: The blocks' fingerprints (schema 2), for the check.
+
+        A reply that fails its check gets one follow-up with the errors.
+        When that fails too and the HTML has two or more top-level blocks,
+        the request is split once at a block boundary; each half is
+        translated and checked, and the joined text is checked again. At
+        most `max_calls` calls in all.
 
         Returns:
-            The translated Traditional Chinese text and the usage the
-            backend reported (None when it reports none).
+            The accepted translation (attributes restored), the usage the
+            backend reported (None when it reports none) and the quality
+            warnings.
 
         Raises:
-            TranslationError: If every attempt failed (timeout, error exit,
-                empty reply) or the model refused.
+            TranslationError: the segment failed (its issues say why).
             RateLimitError, AuthError, BackendUnavailableError, CancelledError:
                 at once, no retry.
         """
+        session = _Session(self, cancel if cancel is not None else threading.Event())
         is_code = segment_type == SegmentType.CODE
-        use_html_mode = bool(html) and not is_code
-        prompt = self._build_prompt(text, segment_type, glossary_text,
-                                    context_before, context_after, html=html)
-        request = LLMRequest(system='', messages=[Message('user', prompt)],
-                             model=self.model, timeout=self.timeout)
-        if cancel is None:
-            cancel = threading.Event()
 
-        attempts = []
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                response = self.backend.complete(request, cancel)
-            except (RateLimitError, AuthError, BackendUnavailableError, CancelledError):
+        def build(source_html: str = '') -> str:
+            return self._build_prompt(text, segment_type, glossary_text,
+                                      context_before, context_after, html=source_html)
+
+        try:
+            if is_code:
+                def check(reply):
+                    return reply, (_empty(reply, text) or validation.check_code(text, reply))
+
+                def clean(raw):  # code keeps its first line's indentation
+                    return self._clean_response(raw, code_mode=True, source=text)
+                accepted, result = session.attempt(build(), check, clean)
+            elif not html:
+                def check(reply):
+                    return reply, (_empty(reply, text) or validation.Result([]))
+                accepted, result = session.attempt(build(), check, _clean_text)
+            else:
+                accepted, result = self._translate_html(session, html, fingerprints, build)
+        except _Rejected as e:
+            issues = e.result.blocking
+            session.fail(issues[0].code, issues[0].detail, issues)
+        return Reply(accepted, session.usage, list(result.issues))
+
+    def _translate_html(self, session: _Session, html: str, fingerprints, build) -> tuple:
+        protected = validation.protect(html)
+        unusable = validation.source_issues(html, fingerprints)
+        if unusable:  # no reply could pass: fail before any call
+            session.prompt = build(protected.html)
+            session.fail(unusable[0].code, unusable[0].detail, unusable)
+        try:
+            return session.attempt(build(protected.html),
+                                   _html_check(html, fingerprints, protected), _clean_html)
+        except _Rejected:
+            units = validation.top_level_units(html)
+            if len(units) < 2 or session.left < 2:
                 raise
-            except TransientError as e:
-                logger.warning("Translation attempt %d/%d failed: %s",
-                               attempt, self.max_retries, str(e)[:ERROR_MESSAGE_CHARS])
-                attempts.append((str(e), e.raw))
-                code = 'transient'
-                continue
-            except LLMError as e:
-                # A refusal or an error that a retry cannot fix
-                attempts.append((str(e), e.raw))
-                code = 'refusal' if isinstance(e, RefusalError) else 'error'
-                break
-
-            # Code keeps its leading whitespace (first-line indentation)
-            raw = response.text if is_code else response.text.strip()
-            translated = self._clean_response(raw, html_mode=use_html_mode,
-                                              code_mode=is_code, source=text)
-            if _is_empty_reply(translated, text):
-                logger.warning(
-                    "Empty translation result (attempt %d/%d)",
-                    attempt, self.max_retries,
-                )
-                attempts.append(('empty reply', response.text))
-                code = 'empty_reply'
-                continue
-
-            return Reply(translated, response.usage)
-
-        if code == 'empty_reply':
-            message = f"Empty translation after {len(attempts)} attempts"
-        else:
-            message = f"Translation failed after {len(attempts)} attempts: {attempts[-1][0]}"
-        raise TranslationError(message, code=code, prompt=prompt, attempts=attempts)
+        # Split once at the middle block boundary; each half once, no retry.
+        # Each half is checked with its share of the fingerprints, its
+        # blocks numbered as in the segment.
+        mid = len(units) // 2
+        cut, resume = units[mid - 1][1], units[mid][0]
+        counts = validation.pieces_per_group(html, fingerprints)  # one per unit
+        before = sum(counts[:mid])
+        shares = (None, None) if fingerprints is None else \
+            (fingerprints[:before], fingerprints[before:])
+        texts = []
+        for half, share, first in ((html[:cut], shares[0], 1),
+                                   (html[resume:], shares[1], before + 1)):
+            half_protected = validation.protect(half)
+            text, _ = session.attempt(build(half_protected.html),
+                                      _html_check(half, share, half_protected, first), _clean_html,
+                                      retries=0)
+            texts.append(text)
+        joined = texts[0] + html[cut:resume] + texts[1]
+        result = validation.check_html(html, joined, fingerprints)
+        if result.blocking:
+            session.rejected(result, joined)  # the joined text is the last attempt
+            raise _Rejected(result)
+        return joined, result
 
     def _build_prompt(self, text: str, segment_type: SegmentType,
                       glossary_text: str = '',
@@ -410,8 +599,9 @@ def translate_segment(engine: TranslationEngine, seg, segments,
     worker, both CLI modes and the re-translate endpoint.
 
     Builds the request (glossary terms, same-chapter context, HTML for text
-    segments), calls the engine and returns the outcome. A failed segment
-    is an outcome with status FAILED and a backend issue, not an exception;
+    segments), calls the engine and returns the outcome: the accepted text
+    with its quality warnings, or a failure. A failed segment is an outcome
+    with status FAILED and its issues (structural or backend), not an exception;
     it carries the error for the diagnostics, which the caller writes with
     record_failure_log once it has accepted and saved the outcome. Any
     other exception also gives a FAILED outcome (issue code `unexpected`).
@@ -436,29 +626,29 @@ def translate_segment(engine: TranslationEngine, seg, segments,
             context_after=context_after,
             html=seg.html,  # ignored for code segments
             cancel=cancel,
+            fingerprints=seg.fingerprints or None,
         )
     except (RateLimitError, AuthError, BackendUnavailableError, CancelledError):
         raise
     except TranslationError as e:
         return TranslationOutcome(
-            text=None, status=SegmentStatus.FAILED, model=model, usage=None,
-            issues=[Issue(kind='backend', code=e.code,
-                          detail=str(e)[:ERROR_MESSAGE_CHARS], blocking=True)],
-            failure=e)
+            text=None, status=SegmentStatus.FAILED, model=model, usage=e.usage,
+            issues=list(e.issues), failure=e)
     except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on
         logger.exception("未預期的錯誤: %s", seg.segment_id)
         prompt = _request_text(engine, seg, glossary_text, context) if context else ''
         return unexpected_error_outcome(model, e, prompt)
     return TranslationOutcome(text=reply.text, status=SegmentStatus.TRANSLATED,
-                              issues=[], model=model, usage=reply.usage)
+                              issues=reply.issues, model=model, usage=reply.usage)
 
 
 def _request_text(engine: TranslationEngine, seg, glossary_text: str, context) -> str:
     """The request of a call that raised, for its diagnostics ('' when it
     cannot be built)."""
     try:
+        # the protected HTML (ignored for code)
         return engine._build_prompt(seg.text, seg.segment_type, glossary_text,
-                                    *context, html=seg.html)
+                                    *context, html=validation.protect(seg.html).html)
     except Exception:  # noqa: BLE001 - diagnostics only
         return ''
 
