@@ -670,3 +670,58 @@ class TestMigrateReview2:
         assert open(os.path.join(project_dir, 'project.json'), 'rb').read() == before
         monkeypatch.undo()
         assert migrate_project(project_dir).written
+
+
+class TestMigrateReview3:
+    """Review round 3: malformed segment fields, the backup copy, a demoted
+    group without text."""
+
+    @pytest.mark.parametrize('index, field, value', [
+        (0, 'translated_text', None), (0, 'html', 7), (0, 'segment_type', 'poem'),
+        (1, 'translated_at', None),
+    ])
+    def test_malformed_segment_field_is_a_migration_error(self, tmp_path, index, field, value):
+        segments = [dict(s) for s in DEFAULT_SEGMENTS]
+        segments[2 + index][field] = value
+        project_dir = _legacy_project(tmp_path, segments=segments)
+        before = _files(project_dir)
+        with pytest.raises(MigrationError, match='^project.json 的段落資料格式不正確：'):
+            migrate_project(project_dir)
+        after = _files(project_dir)
+        after.pop('project.lock')
+        assert after == before
+
+    def test_malformed_segment_through_the_cli(self, tmp_path):
+        from translate import cli
+        segments = [dict(s) for s in DEFAULT_SEGMENTS]
+        segments[2]['translated_text'] = None
+        project_dir = _legacy_project(tmp_path, segments=segments)
+        result = CliRunner().invoke(cli, ['migrate', project_dir])
+        assert result.exit_code == 1
+        assert result.output.startswith('project.json 的段落資料格式不正確：')
+
+    def test_failed_backup_copy_leaves_no_backup(self, tmp_path, monkeypatch):
+        import src.core.migrate as migrate_module
+        project_dir = _legacy_project(tmp_path)
+        real = migrate_module.shutil.copy2
+
+        def copy2(src, dst):
+            if 'project.schema1.json' in str(dst):
+                with open(dst, 'w') as f:
+                    f.write('{"partial')
+                raise OSError('disk full')
+            return real(src, dst)
+        monkeypatch.setattr(migrate_module.shutil, 'copy2', copy2)
+        with pytest.raises(OSError):
+            migrate_project(project_dir)
+        assert sorted(os.listdir(project_dir)) == ['project.json', 'project.lock', 'source.epub']
+        monkeypatch.undo()
+        assert migrate_project(project_dir).written
+
+    def test_demoted_group_without_text_named(self, tmp_path):
+        segments = [_segment('c2', 1, '<p>Intro line.</p>\nFirst bare sentence.', '', 'translated'),
+                    _segment('c2', 2, 'Second bare sentence.', '', 'translated')]
+        project_dir = _legacy_project(tmp_path, {'c2': CHAPTERS['c2']}, segments)
+        report = migrate_project(project_dir, dry_run=True)
+        assert report.notes == ['c2_seg0001：2 個段落的狀態為 translated, translated；'
+                                '合併後為 pending，譯文為空']
