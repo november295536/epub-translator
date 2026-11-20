@@ -3185,3 +3185,132 @@ class TestSegmentationCheck:
                              ['--projects-dir', str(root), '--anonymize'], str(tmp_path))
         assert result.returncode == 0
         assert result.stdout.splitlines() == SEGMENTATION_LINES
+
+
+class TestSegmentationCheckSurvivors:
+    """Mutation testing, Phase 6 run 1: the check script in-process."""
+
+    def _main(self, root):
+        return segmentation_check.main(['--projects-dir', str(root), '--anonymize'])
+
+    def test_help_in_process(self, capsys):
+        with pytest.raises(SystemExit):
+            segmentation_check.main(['--help'])
+        out = ' '.join(capsys.readouterr().out.split())
+        assert ('Phase 6 check: segmentation rules 1 (before Phase 6) and 2 (new projects) '
+                'on the real books.') in out
+        assert ('--projects-dir PROJECTS_DIR Directory that holds the project folders '
+                '(default: projects)') in out
+        assert '--anonymize Print project-N labels; omit names and paths' in out
+        assert 'For every project' not in out  # only the docstring's first line
+
+    def test_default_projects_directory_listed(self, tmp_path, capsys, monkeypatch):
+        _segmentation_projects(tmp_path / 'projects')
+        monkeypatch.chdir(tmp_path)
+        listed = []
+        real = segmentation_check.os.listdir
+
+        def listdir(path):
+            listed.append(path)
+            return real(path)
+        monkeypatch.setattr(segmentation_check.os, 'listdir', listdir)
+        assert segmentation_check.main(['--anonymize']) == 0
+        assert listed == ['projects']
+
+    def test_work_directory_under_the_resolved_temporary_directory(self, tmp_path, capsys,
+                                                                   monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        real_tmp = tmp_path / 'real-tmp'
+        real_tmp.mkdir()
+        link = tmp_path / 'tmp-link'
+        link.symlink_to(real_tmp)
+        made = []
+        real = segmentation_check.tempfile.mkdtemp
+
+        def mkdtemp(**kwargs):
+            made.append(real(**kwargs))
+            return made[-1]
+        monkeypatch.setattr(segmentation_check.tempfile, 'gettempdir', lambda: str(link))
+        monkeypatch.setattr(segmentation_check.tempfile, 'mkdtemp', mkdtemp)
+        assert self._main(root) == 0
+        assert os.path.dirname(made[0]) == os.path.realpath(str(real_tmp))
+
+    def test_looks_for_dot_git(self, tmp_path, monkeypatch):
+        looked = []
+        real = segmentation_check.os.path.lexists
+
+        def lexists(path):
+            looked.append(os.path.basename(path))
+            return real(path)
+        monkeypatch.setattr(segmentation_check.os.path, 'lexists', lexists)
+        segmentation_check.in_work_tree(str(tmp_path))
+        assert looked and set(looked) == {'.git'}
+
+    def test_every_uncovered_segmentation_counted(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        monkeypatch.setattr(segmentation_check, 'covers', lambda blocks, segs: False)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        # alpha: two chapters, each cut twice
+        assert out[0].endswith('; 4 segmentations do not cover their chapter exactly')
+
+    def test_first_snapshot_fails(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        calls = []
+
+        def snapshot(path):
+            calls.append(path)
+            if len(calls) == 1:
+                raise OSError('gone')
+            return []
+        monkeypatch.setattr(segmentation_check, 'snapshot', snapshot)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[0] == 'FAIL project-1: check raised OSError'
+        assert out[1].startswith('PASS project-2: ')  # the loop goes on after a failure
+
+    def test_two_failing_projects_with_two_problems(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+
+        def broken(epub):
+            raise ValueError('no')
+
+        def snapshot(path):
+            snapshot.calls += 1
+            if snapshot.calls % 2 == 0:
+                raise OSError('gone')
+            return []
+        snapshot.calls = 0
+        monkeypatch.setattr(segmentation_check, 'check_source', broken)
+        monkeypatch.setattr(segmentation_check, 'snapshot', snapshot)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines() == [
+            'FAIL project-1: check raised ValueError; project snapshot raised OSError',
+            'FAIL project-2: check raised ValueError; project snapshot raised OSError',
+            'TOTAL projects 2  segments 0 -> 0, calls 0 -> 0 (ratio -), passthrough 0, '
+            'headings merged 0 of 0  failed projects 2']
+
+    def test_counted_project_with_two_problems(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        real = segmentation_check.check_source
+
+        def check(epub):
+            r, problems = real(epub)
+            return r, problems + ['one', 'two']
+        monkeypatch.setattr(segmentation_check, 'check_source', check)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[1] == (
+            'FAIL project-2: segments 1 -> 1, calls 1 -> 1 (ratio 1.000), passthrough 0, '
+            'headings merged 0 of 0; one; two')
+
+    def test_project_file_read_as_utf8(self, tmp_path, monkeypatch):
+        _, _, beta = _segmentation_projects(tmp_path / 'projects')
+        opened = []
+        real = open
+
+        def recording(path, mode='r', **kwargs):
+            opened.append((os.path.basename(path), mode, kwargs))
+            return real(path, mode, **kwargs)
+        monkeypatch.setattr(segmentation_check, 'open', recording, raising=False)
+        segmentation_check.source_of(beta)
+        assert opened == [('project.json', 'r', {'encoding': 'utf-8'})]

@@ -547,3 +547,83 @@ class TestWeb:
         assert pm.data.segmentation == 2
         assert [s.passthrough for s in pm.data.segments] == [False, True, False, False, False,
                                                              True]
+
+
+class TestReaderSeesTheSame:
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_rules_1_and_2_export_alike(self, tmp_path, fmt):
+        """The same translations, cut by rules 1 and by rules 2, give the same
+        chapter in every format: merging a heading changes the requests, not
+        what a reader sees (each block keeps its own original/translation pair)."""
+        rules_1 = {'c_seg0001': '<h1 id="t">潮汐表</h1>', 'c_seg0002': '<p>把表讀兩次。</p>',
+                   'c_seg0004': '<h2 id="s">閱讀</h2>', 'c_seg0005': '<p>讀<em>第一</em>列。</p>',
+                   'c_seg0006': '# 讀它\nload()', 'c_seg0007': '<h2>尾</h2>'}
+        old = _project(tmp_path, _book(tmp_path), rules_1, name='old', rules=1)
+        new = _project(tmp_path, _book(tmp_path), TRANSLATIONS, name='new', rules=2)
+        _, z_old = _export(tmp_path, old, fmt, name='old.epub')
+        _, z_new = _export(tmp_path, new, fmt, name='new.epub')
+        for member in ('OEBPS/Text/c.xhtml', 'OEBPS/Text/k.xhtml', 'OEBPS/nav.xhtml',
+                       'OEBPS/toc.ncx'):
+            assert z_old.read(member) == z_new.read(member)
+
+
+class TestContextOnEveryPath:
+    """Mutation testing, Phase 6 run 1: every caller passes the project's rules."""
+
+    @staticmethod
+    def _prompt_of(fake, mark):
+        return next(p for p in fake.prompts if mark in p)
+
+    def _rules_1(self, tmp_path):
+        return _project(tmp_path, _book(tmp_path), {'c_seg0002': '<p>把表讀兩次。</p>'},
+                        name='old', rules=1)
+
+    def _rules_2(self, tmp_path):
+        return _project(tmp_path, _book(tmp_path), {'c_seg0001': TRANSLATIONS['c_seg0001']},
+                        name='new', rules=2)
+
+    @staticmethod
+    def _reply(request):
+        prompt = request.messages[-1].content
+        if '# read it' in prompt:
+            return '# 讀它\nload()'
+        if 'x = 1\ny = 2' in prompt:  # the code without comments (rules 1 sends it)
+            return 'x = 1\ny = 2'
+        return '<h2 k="1">閱讀</h2>\n<p k="2">讀<em>第一</em>列。</p>' if 'Reading</h2>' in prompt \
+            else '<h2 k="1">標</h2>'
+
+    @pytest.mark.parametrize('workers', ['1', '2'])
+    def test_cli(self, tmp_path, workers):
+        from translate import cli
+        new, old = self._rules_2(tmp_path), self._rules_1(tmp_path)
+        for project_dir, before in ((new, '前文參考（不需翻譯）：\n潮汐表\n把表讀兩次。\n'),
+                                    (old, '前文參考（不需翻譯）：\nRead the tables twice.\n')):
+            fake = FakeBackend(responder=self._reply)
+            with use_fake_backend(fake):
+                CliRunner().invoke(cli, ['start', '--project', project_dir, '-w', workers])
+            assert before in self._prompt_of(fake, 'Reading</h2>')
+
+    def test_web(self, tmp_path):
+        from src.web.tasks import TaskManager
+        projects = tmp_path / 'projects'
+        projects.mkdir()
+        for rules, name, translations, before in (
+                (2, 'new', {'c_seg0001': TRANSLATIONS['c_seg0001']},
+                 '前文參考（不需翻譯）：\n潮汐表\n把表讀兩次。\n'),
+                (1, 'old', {'c_seg0002': '<p>把表讀兩次。</p>'},
+                 '前文參考（不需翻譯）：\nRead the tables twice.\n')):
+            _project(projects, _book(tmp_path), translations, name=name, rules=rules)
+            TaskManager._instance = None
+            tm = TaskManager()
+            fake = FakeBackend(responder=self._reply)
+            with use_fake_backend(fake):
+                task = tm.start_translation(name, str(projects))
+                task._coordinator.join(timeout=30)
+            assert task.state == 'completed'
+            assert before in self._prompt_of(fake, 'Reading</h2>')
+            TaskManager._instance = None
+
+    def test_unknown_rules_message(self):
+        with pytest.raises(ValueError, match='^unknown segmentation rules: 3$'):
+            Segmenter(rules=3)
