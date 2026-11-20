@@ -856,3 +856,34 @@ class TestRound3:
     def test_emptied_and_another_change_is_not_only_emptied(self, translation):
         result = check_html('<p>A <img src="s" alt="x"/><span/></p>', translation)
         assert all('不可為空' not in i.detail for i in result.issues) and result.blocking
+
+
+class TestRound3Survivors:
+    """Survivors of the review round 3 mutation run: the pairing of emptied values."""
+
+    def _details(self, source, translation):
+        return [(i.code, i.detail) for i in check_html(source, translation).issues]
+
+    def test_a_source_element_is_paired_once(self):
+        assert self._details(
+            '<p>A <img src="s" alt="a" title="t"/></p>',
+            '<p>甲<img src="s" alt="" title="t"/><img src="s" alt="a" title=""/></p>') == [
+            ('extra_attributes', '第 1 個區塊的 <img> 的 alt 不可為空；'
+                                 '第 1 個區塊的 <img> 帶有原文沒有的屬性')]
+
+    def test_a_translation_element_is_paired_once(self):
+        assert self._details(
+            '<p>A <img src="s" alt="a" title=""/><img src="s" alt="" title="t"/></p>',
+            '<p>甲<img src="s" alt="" title=""/></p>') == [
+            ('key_mismatch', '第 1 個區塊帶 k 屬性的 <img>：原文 1 個，譯文 0 個'),
+            ('extra_attributes', '第 1 個區塊的 <img> 的 title 不可為空')]
+
+    def test_pairing_adds_to_an_existing_count(self):
+        assert self._details('<p>A <img src="s" alt=""/><img src="s" alt="x"/></p>',
+                             '<p>甲<img src="s" alt=""/><img src="s" alt=""/></p>') == [
+            ('extra_attributes', '第 1 個區塊的 <img> 的 alt 不可為空')]
+
+    def test_block_element_with_two_emptied_values(self):
+        assert self._details('<p title="T" aria-label="L">A</p>',
+                             '<p title="" aria-label=" ">甲</p>') == [
+            ('extra_attributes', '第 1 個區塊的 <p> 的 aria-label、title 不可為空')]

@@ -1941,3 +1941,13 @@ class TestRound2JoinedFailure:
         assert 'Translation reply rejected (attempt 4/4): tag_count' in caplog.messages
         log = open(failure_log_path(str(tmp_path), seg.segment_id), encoding='utf-8').read()
         assert 'joined fails' in log
+
+
+class TestRound3Translator:
+
+    def test_not_well_formed_reply_detail(self):
+        seg = _html_seg('<p>A</p>', text='A')
+        fake = FakeBackend(['<p k="1">甲', '<p k="1">甲'])
+        outcome = translate_segment(_engine(fake, max_calls=2), seg, [seg])
+        assert [(i.code, i.detail) for i in outcome.issues] == [
+            ('not_well_formed', '不是格式正確的 XML：Opening and ending tag mismatch: p and fragment')]
