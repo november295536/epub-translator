@@ -494,9 +494,9 @@ class TestTranslatableAttributes:
             ['屬性與原文不符：<img k="2"> 的 alt 原文是空的']
         assert codes(check_html(source, '<p>甲<img src="s" alt="圖"/></p>')) == \
             ['key_mismatch', 'extra_attributes']
-        assert codes(check_html('<p>A <img src="s" alt="x"/></p>',
-                                '<p>甲<img src="s" alt=""/></p>')) == \
-            ['key_mismatch', 'extra_attributes']
+        assert [(i.code, i.detail) for i in check_html('<p>A <img src="s" alt="x"/></p>',
+                                                       '<p>甲<img src="s" alt=""/></p>').issues] \
+            == [('extra_attributes', '第 1 個區塊的 <img> 的 alt 不可為空')]
 
     @pytest.mark.parametrize('translation', [
         '<p title="提示">甲<img src="m.png" alt="地圖"/><span aria-label="關">乙</span></p>',
@@ -772,7 +772,7 @@ class TestRound2Values:
     def test_whitespace_only_is_empty_in_the_stored_form(self):
         source = '<p>A <img src="s" alt="A"/></p>'
         assert codes(check_html(source, '<p>甲<img src="s" alt="  "/></p>')) == \
-            ['key_mismatch', 'extra_attributes']
+            ['extra_attributes']
         assert check_html('<p>A <img src="s" alt=""/></p>',
                           '<p>甲<img src="s" alt="  "/></p>').issues == []
 
@@ -808,3 +808,51 @@ class TestRound2Segments:
         assert validation.pieces_per_group(source, fps) == [1, 2, 1]
         assert validation.pieces_per_group(source) == [1, 1, 1]
         assert validation.pieces_per_group('<p>A') is None
+
+
+
+# --- Phase 4 review round 3 ------------------------------------------------------
+
+class TestRound3:
+
+    def test_one_letter_blocks_are_not_a_word(self):
+        assert check_html('<p>A</p>\n<p>B</p>', '<p>A</p>\n<p>B</p>').issues == []
+        assert check_html('<p>1</p>\nA\nB', '<p>1</p>\nA\nB',
+                          [fingerprint('1'), fingerprint('A'), fingerprint('B')]).issues == []
+        assert codes(check_html('<p>Ab</p>\n<p>B</p>', '<p>Ab</p>\n<p>B</p>')) == \
+            ['untranslated']
+
+    @pytest.mark.parametrize('translation, reason', [
+        ('<p>甲', 'Opening and ending tag mismatch: p and fragment'),
+        ('<p>&nbsp;</p>', "Entity 'nbsp' not defined"),
+    ])
+    def test_not_well_formed_without_position(self, translation, reason):
+        assert [i.detail for i in check_html('<p>A</p>', translation).issues] == \
+            [f'不是格式正確的 XML：{reason}']
+
+    def test_xml_error_without_msg(self):
+        assert validation.xml_error(ValueError('bad, line 3, column 4')) == '不是格式正確的 XML：bad'
+
+    @pytest.mark.parametrize('source, translation, detail', [
+        ('<p>A <img src="s" alt="x"/></p>', '<p>甲<img src="s" alt=" "/></p>',
+         '第 1 個區塊的 <img> 的 alt 不可為空'),
+        ('<p title="T">A</p>', '<p title="">甲</p>', '第 1 個區塊的 <p> 的 title 不可為空'),
+        ('<p>A <a href="#x" title="T" aria-label="L">b</a></p>',
+         '<p>甲<a href="#x" title="" aria-label="">乙</a></p>',
+         '第 1 個區塊的 <a> 的 aria-label、title 不可為空'),
+        ('<p>A <img src="s" alt="x"/><img src="s" alt="y"/></p>',
+         '<p>甲<img src="s" alt="z"/><img src="s" alt=""/></p>',
+         '第 1 個區塊的 <img> 的 alt 不可為空'),
+    ])
+    def test_emptied_value_is_one_issue(self, source, translation, detail):
+        assert [(i.code, i.detail) for i in check_html(source, translation).issues] == \
+            [('extra_attributes', detail)]
+
+    @pytest.mark.parametrize('translation', [
+        '<p>甲<img src="t" alt=""/></p>',     # another machine value too
+        '<p>甲<img alt=""/></p>',             # an attribute dropped
+        '<p>甲<span src="s" alt=""/></p>',    # another tag
+    ])
+    def test_emptied_and_another_change_is_not_only_emptied(self, translation):
+        result = check_html('<p>A <img src="s" alt="x"/><span/></p>', translation)
+        assert all('不可為空' not in i.detail for i in result.issues) and result.blocking
