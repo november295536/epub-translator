@@ -19,6 +19,13 @@ the migrate command), and then, per project:
     whose source has at least LENGTH_RATIO_MIN_CHARS characters: its 1st,
     5th, 50th, 95th and 99th percentile, and how many of them fall outside
     LENGTH_RATIO_BAND.
+(d) over every stored text segment (translated or not): how many sources
+    cannot be cut into their blocks (ambiguous_source: such a segment
+    fails before any model call), and how many carry an attribute people
+    read (TRANSLATABLE_ATTRIBUTES), which the model now translates.
+(e) of the segments failing the structural check, how many fail only on
+    the tag rules (TAG_RULES: unknown_tag, key_mismatch, extra_attributes,
+    tag_count).
 
 Only counts, rule names and ratios are printed, never book text. Everything
 in the temporary directory is removed at the end. The projects directory
@@ -54,13 +61,17 @@ sys.path.insert(0, ROOT)
 from src.core.migrate import migrate_project  # noqa: E402
 from src.core.project import ProjectManager, SegmentStatus  # noqa: E402
 from src.core.validation import (  # noqa: E402
-    LENGTH_RATIO_BAND, LENGTH_RATIO_MIN_CHARS, check_segment, piece_text, protect, restore,
+    EXTRA_ATTRIBUTES, KEY_MISMATCH, LENGTH_RATIO_BAND, LENGTH_RATIO_MIN_CHARS, TAG_COUNT,
+    UNKNOWN_TAG, check_segment, piece_text, protect, restore, source_issues,
 )
 from src.epub.blocks import normalize  # noqa: E402
 
 PROJECT_FILE = 'project.json'
 COPIED = (PROJECT_FILE, 'source.epub', 'glossary.json')
 PERCENTILES = (1, 5, 50, 95, 99)
+TAG_RULES = frozenset({UNKNOWN_TAG, KEY_MISMATCH, EXTRA_ATTRIBUTES, TAG_COUNT})
+COUNTS = ('segments', 'round_trip_failed', 'translated', 'failing', 'tags_only', 'ambiguous',
+          'with_attributes')
 
 
 def snapshot(project_dir: str) -> list:
@@ -90,12 +101,16 @@ def check_copy(copy_dir: str) -> tuple[dict, list[str]]:
         if migration.unmatched:
             return {}, [f'{len(migration.unmatched)} chapters unmatched by the migration']
         pm.load()
-    r = {'segments': 0, 'round_trip_failed': 0, 'translated': 0, 'failing': 0,
-         'rules': Counter(), 'warnings': Counter(), 'ratios': []}
+    r = dict.fromkeys(COUNTS, 0)
+    r.update(rules=Counter(), warnings=Counter(), ratios=[])
     for seg in pm.data.segments:
         r['segments'] += 1
-        if restore(protect(seg.html).html, protect(seg.html)) != seg.html:
+        protected = protect(seg.html)
+        if restore(protected.html, protected) != seg.html:
             r['round_trip_failed'] += 1
+        if seg.segment_type != 'code':
+            r['ambiguous'] += bool(source_issues(seg.html, seg.fingerprints or None))
+            r['with_attributes'] += any(key.shown for key in protected.keys.values())
         if (seg.status not in (SegmentStatus.TRANSLATED, SegmentStatus.REVIEWED)
                 or not seg.translated_text.strip()):
             continue
@@ -105,6 +120,7 @@ def check_copy(copy_dir: str) -> tuple[dict, list[str]]:
         r['warnings'].update({i.code for i in result.issues if not i.blocking})
         if result.blocking:
             r['failing'] += 1
+            r['tags_only'] += {i.code for i in result.blocking} <= TAG_RULES
         elif seg.segment_type != 'code':
             source = normalize(seg.text)
             if len(source) >= LENGTH_RATIO_MIN_CHARS:
@@ -161,8 +177,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def run(args, names: list[str], work: str) -> int:
-    totals = {'segments': 0, 'round_trip_failed': 0, 'translated': 0, 'failing': 0,
-              'rules': Counter(), 'warnings': Counter(), 'ratios': []}
+    totals = dict.fromkeys(COUNTS, 0)
+    totals.update(rules=Counter(), warnings=Counter(), ratios=[])
     failed = 0
     for index, name in enumerate(names, 1):
         label = f'project-{index}' if args.anonymize else name
@@ -189,13 +205,14 @@ def run(args, names: list[str], work: str) -> int:
             failed += 1
             print(f'FAIL {label}: ' + '; '.join(problems))
             continue
-        for key in ('segments', 'round_trip_failed', 'translated', 'failing', 'rules',
-                    'warnings', 'ratios'):
+        for key in (*COUNTS, 'rules', 'warnings', 'ratios'):
             totals[key] += r[key]
         line = (f"{label}: round trip {r['segments'] - r['round_trip_failed']}/{r['segments']}, "
                 f"translated {r['translated']}, failing the structural check {r['failing']} "
-                f"({counts_text(r['rules'])}), warnings ({counts_text(r['warnings'])}), "
-                + ratio_text(r['ratios']))
+                f"({counts_text(r['rules'])}; only tag rules {r['tags_only']}), "
+                f"warnings ({counts_text(r['warnings'])}), {ratio_text(r['ratios'])}, "
+                f"sources that cannot be cut {r['ambiguous']}, "
+                f"with translatable attributes {r['with_attributes']}")
         if problems:
             failed += 1
             print(f'FAIL {line}; ' + '; '.join(problems))
@@ -204,8 +221,10 @@ def run(args, names: list[str], work: str) -> int:
     print(f"TOTAL projects {len(names)}  round trip "
           f"{totals['segments'] - totals['round_trip_failed']}/{totals['segments']}  "
           f"translated {totals['translated']}  failing the structural check {totals['failing']} "
-          f"({counts_text(totals['rules'])})  warnings ({counts_text(totals['warnings'])})  "
-          f"{ratio_text(totals['ratios'])}  failed projects {failed}")
+          f"({counts_text(totals['rules'])}; only tag rules {totals['tags_only']})  "
+          f"warnings ({counts_text(totals['warnings'])})  {ratio_text(totals['ratios'])}  "
+          f"sources that cannot be cut {totals['ambiguous']}  "
+          f"with translatable attributes {totals['with_attributes']}  failed projects {failed}")
     return 1 if failed else 0
 
 

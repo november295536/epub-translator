@@ -1953,6 +1953,11 @@ def _validate_projects(root):
     return root, project_dir
 
 
+def validation_status(name):
+    from src.core.project import SegmentStatus
+    return SegmentStatus(name)
+
+
 class TestValidateCheck:
 
     def _main(self, root, anonymize=True):
@@ -1966,12 +1971,16 @@ class TestValidateCheck:
         assert self._main(root) == 0
         assert capsys.readouterr().out.splitlines() == [
             'PASS project-1: round trip 3/3, translated 3, failing the structural check 0 '
-            '(none), warnings (none), length ratio: no segment',
+            '(none; only tag rules 0), warnings (none), length ratio: no segment, '
+            'sources that cannot be cut 0, with translatable attributes 0',
             'PASS project-2: round trip 7/7, translated 6, failing the structural check 2 '
-            '(code_changed 1, tag_count 1), warnings (untranslated 1), length ratio: no segment',
+            '(code_changed 1, tag_count 1; only tag rules 1), warnings (untranslated 1), '
+            'length ratio: no segment, sources that cannot be cut 0, '
+            'with translatable attributes 0',
             'TOTAL projects 2  round trip 10/10  translated 9  failing the structural check 2 '
-            '(code_changed 1, tag_count 1)  warnings (untranslated 1)  length ratio: no segment  '
-            'failed projects 0',
+            '(code_changed 1, tag_count 1; only tag rules 1)  warnings (untranslated 1)  '
+            'length ratio: no segment  sources that cannot be cut 0  '
+            'with translatable attributes 0  failed projects 0',
         ]
         assert roundtrip_check.snapshot(str(root)) == before
 
@@ -1988,8 +1997,30 @@ class TestValidateCheck:
         # smallest source counted); the others are shorter, code is left out
         ratio = ('length ratio over 1 segments: p1 0.535 p5 0.535 p50 0.535 '
                  'p95 0.535 p99 0.535; outside 0.25-0.8: 0 (0.0%)')
-        assert out[1].endswith(ratio)
-        assert out[2].endswith(f'{ratio}  failed projects 0')
+        assert out[1].endswith(f'{ratio}, sources that cannot be cut 0, '
+                               'with translatable attributes 0')
+        assert out[2].endswith(f'{ratio}  sources that cannot be cut 0  '
+                               'with translatable attributes 0  failed projects 0')
+
+    def test_sources_and_attributes_counted(self, tmp_path, capsys):
+        root, project_dir = _validate_projects(tmp_path / 'projects')
+        pm = validate_check.ProjectManager(project_dir)
+        pm.load()
+        segs = {s.segment_id: s for s in pm.data.segments}
+        # counted whatever the status: a pending segment with alt, a failed
+        # one whose source no longer matches its fingerprints; code is not
+        segs['d_seg0003'].html = '<p>Tail words.<img src="t.png" alt="words"/></p>'
+        segs['d_seg0003'].status = validation_status('pending')
+        segs['d_seg0001'].fingerprints = ['0' * 16]
+        segs['c_seg0002'].html = segs['c_seg0002'].html.replace('<p>', '<p title="">', 1)
+        segs['d_seg0002'].html = '<pre title="t">x</pre>'
+        pm.save()
+        assert self._main(root) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert out[1].endswith('sources that cannot be cut 1, with translatable attributes 2')
+        assert 'translated 5, ' in out[1]
+        assert out[2].endswith('sources that cannot be cut 1  with translatable attributes 2  '
+                               'failed projects 0')
 
     def test_names_without_anonymize(self, tmp_path, capsys):
         root, _ = _validate_projects(tmp_path / 'projects')
