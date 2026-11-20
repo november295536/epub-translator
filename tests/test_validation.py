@@ -305,9 +305,96 @@ class TestCheckSegment:
         text = SimpleNamespace(segment_type='text', html='<p>A</p>', text='A',
                                fingerprints=[fingerprint('A')])
         assert check_segment(text, '<p>甲</p>').blocking == []
-        assert codes(check_segment(text, '<p>甲</p>', fingerprints=['0' * 16])) == \
-            ['ambiguous_source']
+        text.fingerprints = ['0' * 16]
+        assert codes(check_segment(text, '<p>甲</p>')) == ['ambiguous_source']
+
+    def test_segment_fingerprints_cut_the_runs(self):
+        seg = SimpleNamespace(segment_type='text', html='Line one\nLine two', text='',
+                              fingerprints=[fingerprint('Line one'), fingerprint('Line two')])
+        assert codes(check_segment(seg, '一二')) == ['structure_mismatch']
+        assert check_segment(seg, '一\n二').blocking == []
 
     def test_schema_1_segment_without_fingerprints(self):
         seg = SimpleNamespace(segment_type='text', html='A\nB', text='A B', fingerprints=[])
         assert check_segment(seg, '甲乙').blocking == []
+
+
+class TestSurvivorsRun1:
+    """Mutation testing, Phase 4 run 1."""
+
+    def test_run_at_the_very_start_wrapped_once(self):
+        assert protect('Bare text<p>x</p>').html == '<run k="1">Bare text</run><p k="2">x</p>'
+
+    @pytest.mark.parametrize('html, expected', [
+        ('<div><ul><li>a</li></ul><p>b</p></div>', '<div k="1"><ul><li>a</li></ul><p>b</p></div>'),
+        ('<div><p>a</p><p>b</p></div>', '<div k="1"><p>a</p><p>b</p></div>'),
+    ])
+    def test_only_top_level_blocks_keyed(self, html, expected):
+        assert protect(html).html == expected
+
+    def test_prefixed_block_name(self):
+        assert protect('<h:p>a</h:p>').html == '<h:p k="1">a</h:p>'
+        assert validation._local('svg:g') == 'g'
+
+    def test_run_after_the_last_fingerprint(self):
+        assert codes(check_html('A\n<p>B</p>\nC', '甲\n<p>乙</p>\n丙',
+                                [fingerprint('A'), fingerprint('B')])) == ['ambiguous_source']
+
+    def test_ambiguous_source_issue(self):
+        [issue] = check_html('<p>A', '<p>甲</p>').issues
+        assert (issue.kind, issue.code, issue.detail, issue.blocking) == \
+            ('structure', 'ambiguous_source', '原文無法切成各個區塊', True)
+
+    def test_declarations_of_both_texts_used(self):
+        # the source's prefix: the translation without it still parses
+        source = '<p>A <span epub:type="noteref">1</span></p>'
+        assert codes(check_html(source, '<p>甲<span>1</span></p>')) == \
+            ['key_mismatch', 'tag_count']
+        # the translation's prefix: an added attribute is reported, not a parse error
+        assert codes(check_html('<p>A <span>1</span></p>',
+                                '<p>甲<span epub:type="x">1</span></p>')) == \
+            ['extra_attributes', 'tag_count']
+
+    def test_own_declarations_in_the_html(self):
+        html = '<p>A <svg:svg xmlns:svg="http://www.w3.org/2000/svg"><svg:g/></svg:svg></p>'
+        assert declarations(html) == {None: validation.XHTML_NS, 'svg': 'urn:x-prefix:svg'}
+        assert check_html(html, html.replace('A', '甲')).blocking == []
+
+    def test_pieces_in_the_xhtml_namespace(self):
+        assert check_html('<p>A</p>', '<p>甲</p>').pieces[0].tag == \
+            '{http://www.w3.org/1999/xhtml}p'
+
+    def test_comment_inside_an_inline_element_ignored(self):
+        assert check_html('A <b>b</b>', '甲<b>乙<!-- c --></b>').blocking == []
+
+    def test_details_list_every_item(self):
+        result = check_html('<p>A <b>b</b> <i>c</i></p>\n<p>D</p>\n<p>E</p>',
+                            '<p>甲<s>乙</s><u>丙</u></p>\n<p> </p>\n<p> </p>')
+        assert [i.detail for i in result.issues] == [
+            '第 2、3 個區塊沒有文字',
+            '出現原文沒有的標籤：<s>、<u>',
+            '第 1 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個；'
+            '第 1 個區塊不帶屬性的 <i>：原文 1 個，譯文 0 個',
+        ]
+        assert check_html('<p>A</p>\n<p>B</p>', '<p>甲</p>\n<h2>乙</h2>\n<p>丙</p>').issues[0] \
+            .detail == '頂層區塊與原文不符：原文為 p、p，譯文為 p、h2、p'
+
+    def test_untranslated_detail(self):
+        [issue] = check_html('<p>Some words</p>', '<p>Some words</p>').issues
+        assert issue.detail == '譯文與原文相同'
+
+    def test_quality_over_all_blocks(self):
+        n = validation.LENGTH_RATIO_MIN_CHARS
+        # two blocks, 100 + 100 source characters, 30 + 30 translated: 0.30
+        source = f'<p>{"a" * 100}</p>\n<p>{"b" * 100}</p>'
+        assert n == 200
+        assert check_html(source, f'<p>{"字" * 30}</p>\n<p>{"字" * 30}</p>').issues == []
+        assert check_html(source, f'<p>{"字" * 25}</p>\n<p>{"字" * 25}</p>').issues == []
+        [issue] = check_html(source, f'<p>{"字" * 24}</p>\n<p>{"字" * 24}</p>').issues
+        assert issue.detail == '譯文長度是原文的 0.24 倍（預期 0.25–0.8）'
+        # identical over two blocks
+        assert codes(check_html('<p>Some</p>\n<p>words</p>', '<p>Some</p>\n<p>words</p>')) \
+            == ['untranslated']
+
+    def test_check_code_result(self):
+        assert check_code('x', 'x') == validation.Result([])

@@ -998,7 +998,10 @@ class TestPhase4Validate:
         assert again.exit_code == 0 and again.output == result.output
 
     def test_pending_failed_and_empty_not_checked(self, runner, tmp_path):
-        path = self._project(tmp_path, {'c1_seg0001': '<p>句子。</p>', 'c1_seg0002': '  '},
+        # skipped: an empty text, a failed segment with text, a pending one;
+        # the translated segment after them is still checked
+        path = self._project(tmp_path, {'c1_seg0002': '  ', 'c1_seg0003': '壞',
+                                        'c1_seg0004': '<p>句子。</p>'},
                              {'c1_seg0003': SegmentStatus.FAILED})
         result = runner.invoke(cli, ['validate', path])
         assert result.output.splitlines() == ['已檢查 1 段譯文：0 段未通過結構檢查（匯出時以原文輸出），1 段通過']

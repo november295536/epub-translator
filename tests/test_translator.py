@@ -1722,3 +1722,84 @@ class TestPhase4Code:
         reply = 'x = 1\n```\n\nThis block has no comments, so it stays unchanged.'
         outcome = translate_segment(_engine(FakeBackend([reply, reply])), seg, [seg])
         assert outcome.issues[0].code == 'code_changed'
+
+
+class TestPhase4SurvivorsRun1:
+    """Mutation testing, Phase 4 run 1."""
+
+    def test_reply_well_formed_before_restore(self):
+        # restored, this reply would be well-formed: the wrapper's end tag
+        # takes the place of </run>
+        seg = _html_seg('<p>A.</p>\nB', text='A.\nB')
+        bad = '<p k="1">甲。</p>\n<run k="2">乙</p>'
+        outcome = translate_segment(_engine(FakeBackend([bad, bad]), max_calls=2), seg, [seg])
+        assert [(i.kind, i.code, i.blocking) for i in outcome.issues] == \
+            [('structure', 'not_well_formed', True)]
+        assert outcome.issues[0].detail.startswith('不是格式正確的 XML：')
+
+    def test_prefixed_elements_in_a_reply_parse(self):
+        seg = _html_seg('<p>A <m:math>x</m:math></p>', text='A x')
+        outcome = translate_segment(_engine(FakeBackend(['<p k="1">甲<m:math>x</m:math></p>'])),
+                                    seg, [seg])
+        assert outcome.text == '<p>甲<m:math>x</m:math></p>'
+
+    def test_html_reply_keeps_markdown_characters(self):
+        seg = _html_seg('<p>A.</p>\n<p>B.</p>', text='A.\nB.')
+        reply = '<p k="1">3*5 是**甲**</p>\n<p k="2">_乙_</p>'
+        outcome = translate_segment(_engine(FakeBackend([reply])), seg, [seg])
+        assert outcome.text == '<p>3*5 是**甲**</p>\n<p>_乙_</p>'
+        # also in the halves of a split
+        bad = '<p k="1">甲</p>'
+        fake = FakeBackend([bad, bad, '<p k="1">**甲**</p>', '<p k="1">*乙*</p>'])
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert outcome.text == '<p>**甲**</p>\n<p>*乙*</p>'
+
+    def test_halves_are_not_retried(self):
+        seg = _html_seg('<p>A.</p>\n<p>B.</p>', text='A.\nB.')
+        bad = '<p k="1">甲</p>'
+        fake = FakeBackend([bad, bad, '<p k="1">甲</p><p>多</p>', '<p k="1">乙</p>'])
+        outcome = translate_segment(_engine(fake, max_calls=5), seg, [seg])
+        assert outcome.issues[0].code == 'structure_mismatch'
+        assert len(fake.requests) == 3
+
+    def test_feedback_lists_every_problem(self):
+        seg = _html_seg('<p>A <b>b</b> <i>c</i></p>', text='A b c')
+        bad = '<p k="1">甲</p>'
+        fake = FakeBackend([bad, '<p k="1">甲<b>乙</b><i>丙</i></p>'])
+        translate_segment(_engine(fake), seg, [seg])
+        assert fake.requests[1].messages[2].content == FEEDBACK_PROMPT.format(problems=(
+            '- 第 1 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個；'
+            '第 1 個區塊不帶屬性的 <i>：原文 1 個，譯文 0 個'))
+        seg = _html_seg('<p>A</p>\n<p>B <b>b</b></p>', text='A\nB b')
+        fake = FakeBackend(['<p k="1"> </p>\n<p k="2">乙<s>丙</s></p>',
+                            '<p k="1">甲</p>\n<p k="2">乙<b>丙</b></p>'])
+        translate_segment(_engine(fake), seg, [seg])
+        assert fake.requests[1].messages[2].content == FEEDBACK_PROMPT.format(problems=(
+            '- 第 1 個區塊沒有文字\n- 出現原文沒有的標籤：<s>\n'
+            '- 第 2 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'))
+
+    def test_codes_joined_in_log_and_diagnostics(self, caplog):
+        import logging
+        caplog.set_level(logging.WARNING, logger='src.core.translator')
+        seg = _html_seg('<p>A <b>b</b></p>', text='A b')
+        bad = '<p k="1">甲<s>乙</s></p>'
+        outcome = translate_segment(_engine(FakeBackend([bad, bad])), seg, [seg])
+        assert caplog.records[0].getMessage() == \
+            'Translation reply rejected (attempt 1/4): unknown_tag, tag_count'
+        assert outcome.failure.attempts[0] == (
+            'unknown_tag: 出現原文沒有的標籤：<s>; '
+            'tag_count: 第 1 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個', bad)
+
+    def test_last_transient_error_named(self):
+        errors = [TransientError(f'error {i}') for i in (1, 2, 3, 4)]
+        with pytest.raises(TranslationError) as info:
+            _engine(FakeBackend(errors)).translate('x')
+        assert str(info.value) == 'Translation failed after 4 attempts: error 4'
+
+    def test_diagnostics_request_for_an_unexpected_error_is_protected(self):
+        seg = _html_seg('<p class="a">A.</p>', text='A.')
+        outcome = translate_segment(_engine(FakeBackend([KeyError('k')])), seg, [seg])
+        assert outcome.failure.prompt.endswith('\n\n<p k="1">A.</p>')
+        code = _html_seg('<pre>x = 1</pre>', 'code', 'x = 1')
+        outcome = translate_segment(_engine(FakeBackend([KeyError('k')])), code, [code])
+        assert outcome.failure.prompt == CODE_PROMPT.format(text='x = 1')
