@@ -102,6 +102,17 @@ class TestCLIInit:
         assert unparsed[0].endswith(')')  # the parser's message, nothing appended
         assert '分段完成：共 1 個段落' in result.output
 
+    def test_init_unreadable_epub_gives_a_message(self, runner, tmp_path, monkeypatch):
+        # Review round 1: one clear error, no traceback, no copy left behind
+        monkeypatch.chdir(tmp_path)
+        bad = tmp_path / 'broken.epub'
+        bad.write_bytes(b'not a zip archive')
+        result = runner.invoke(cli, ['init', str(bad)])
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert result.output.splitlines()[-1] == '無法解析 EPUB：無法讀取 EPUB：File is not a zip file'
+        assert os.listdir(tmp_path / _get_project_dir(str(bad))) == []
+
     def test_init_duplicate_project(self, runner, sample_epub, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
 

@@ -12,7 +12,7 @@ from src.core.project import (
     ProjectLock, ProjectLockedError, ProjectManager, project_mutex, sha256_file,
 )
 from src.core.segmenter import Segmenter
-from src.epub.extractor import EPUBExtractor
+from src.epub.extractor import EPUBError, EPUBExtractor
 from src.web.tasks import TaskManager
 
 
@@ -205,6 +205,8 @@ def create_project():
             # Chapters that could not be parsed and were not segmented
             'unparsed_chapters': [chapter_id for chapter_id, _ in extractor.failed],
         })
+    except EPUBError as e:
+        return jsonify({'error': f'無法解析 EPUB：{e}'}), 400
     except Exception as e:
         return jsonify({'error': f'建立專案失敗：{str(e)}'}), 500
 

@@ -1459,6 +1459,19 @@ class TestCreateProjectMarker:
         assert response.get_json()['segments'] == 1
 
 
+    def test_unreadable_epub_gives_a_message(self, tmp_path):
+        # Review round 1: a clear error, not a server error
+        bad = tmp_path / 'broken.epub'
+        bad.write_bytes(b'not a zip archive')
+        app = create_app(projects_dir=str(tmp_path / 'projects'))
+        app.config['TESTING'] = True
+        with app.test_client() as client:
+            response = client.post('/api/projects', json={'epub_path': str(bad)})
+        assert response.status_code == 400
+        assert response.get_json() == {
+            'error': '無法解析 EPUB：無法讀取 EPUB：File is not a zip file'}
+
+
 # --- Phase 1: failed segments, revision, lock, extraction model ----------------
 
 import time as _time

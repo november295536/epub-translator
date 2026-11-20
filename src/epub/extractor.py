@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import posixpath
 import zipfile
+import zlib
 from dataclasses import dataclass
 from urllib.parse import unquote
 
@@ -26,9 +27,40 @@ PARSER = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
 XHTML_MEDIA_TYPE = 'application/xhtml+xml'
 
 
+class EPUBError(Exception):
+    """The archive or its package document cannot be read."""
+
+
 def parse_xml(data: bytes):
     """Parse a member as XML (raises etree.XMLSyntaxError)."""
     return etree.fromstring(data, PARSER)
+
+
+def open_archive(path: str) -> zipfile.ZipFile:
+    """The EPUB at `path` as an in-memory ZIP archive (raises EPUBError)."""
+    try:
+        with open(path, 'rb') as f:
+            return zipfile.ZipFile(io.BytesIO(f.read()))
+    except (OSError, zipfile.BadZipFile) as e:
+        raise EPUBError(f'無法讀取 EPUB：{e}') from e
+
+
+def read_member(zf: zipfile.ZipFile, name: str) -> bytes:
+    """A member's bytes. KeyError when it is missing; EPUBError when it
+    cannot be read (encrypted, unsupported compression, corrupt)."""
+    try:
+        return zf.read(name)
+    except KeyError:
+        raise
+    except (RuntimeError, NotImplementedError, zipfile.BadZipFile, zlib.error, EOFError) as e:
+        raise EPUBError(f'無法讀取 {name}：{e}') from e
+
+
+def unresolved_entities(root) -> list:
+    """Names of the entity references left unexpanded under `root` (entities
+    are never expanded and no DTD is loaded, so `&mdash;` under an XHTML
+    DOCTYPE stays a reference whose text is unknown)."""
+    return sorted({node.name for node in root.iter(etree.Entity)})
 
 
 def _xpath_local(node, *names: str) -> list:
@@ -43,6 +75,7 @@ class SpineItem:
     id: str
     path: str          # member name inside the archive
     is_nav: bool
+    media_type: str = XHTML_MEDIA_TYPE
 
 
 @dataclass
@@ -59,14 +92,25 @@ class Chapter:
 def read_package(zf: zipfile.ZipFile) -> tuple:
     """Return (OPF root element, manifest, spine) of an open archive: the
     manifest maps item id -> (member name, media type, is navigation
-    document); the spine lists its XHTML entries, duplicates removed."""
-    container = parse_xml(zf.read('META-INF/container.xml'))
-    opf_path = _xpath_local(container, 'rootfile')[0].get('full-path')
-    opf = parse_xml(zf.read(opf_path))
+    document); the spine lists its entries, duplicates removed, with their
+    media types. Raises EPUBError when the package cannot be read."""
+    try:
+        container = parse_xml(read_member(zf, 'META-INF/container.xml'))
+        rootfiles = _xpath_local(container, 'rootfile')
+        if not rootfiles or not rootfiles[0].get('full-path'):
+            raise EPUBError('container.xml 沒有指出 OPF（rootfile）')
+        opf_path = unquote(rootfiles[0].get('full-path'))
+        opf = parse_xml(read_member(zf, opf_path))
+    except KeyError as e:
+        raise EPUBError(f'EPUB 缺少檔案：{e}') from e
+    except etree.XMLSyntaxError as e:
+        raise EPUBError(f'EPUB 的套件文件不是格式正確的 XML：{e}') from e
     base = posixpath.dirname(opf_path)
 
     manifest = {}
     for item in _xpath_local(opf, 'manifest', 'item'):
+        if item.get('href') is None:
+            raise EPUBError(f'manifest 項目 {item.get("id")} 沒有 href')
         path = posixpath.normpath(posixpath.join(base, unquote(item.get('href'))))
         manifest[item.get('id')] = (path, item.get('media-type'),
                                     'nav' in (item.get('properties') or '').split())
@@ -79,9 +123,7 @@ def read_package(zf: zipfile.ZipFile) -> tuple:
             continue
         seen.add(item_id)
         path, media_type, is_nav = manifest[item_id]
-        if media_type != XHTML_MEDIA_TYPE:
-            continue
-        spine.append(SpineItem(id=item_id, path=path, is_nav=is_nav))
+        spine.append(SpineItem(id=item_id, path=path, is_nav=is_nav, media_type=media_type))
     return opf, manifest, spine
 
 
@@ -97,16 +139,17 @@ class EPUBExtractor:
     def __init__(self, epub_path: str):
         self.epub_path = epub_path
         self.opf = None
-        self.spine: list[SpineItem] = []
+        self.spine: list[SpineItem] = []     # XHTML entries
+        self.not_xhtml: list[SpineItem] = []
         self.failed: list[tuple] = []     # (chapter id, reason) not segmented: set by extract_chapters
         self._zip: zipfile.ZipFile | None = None
 
     def load(self) -> None:
-        """Open the archive and read its package document."""
-        with open(self.epub_path, 'rb') as f:
-            data = f.read()
-        self._zip = zipfile.ZipFile(io.BytesIO(data))
-        self.opf, _, self.spine = read_package(self._zip)
+        """Open the archive and read its package document (raises EPUBError)."""
+        self._zip = open_archive(self.epub_path)
+        self.opf, _, spine = read_package(self._zip)
+        self.spine = [s for s in spine if s.media_type == XHTML_MEDIA_TYPE]
+        self.not_xhtml = [s for s in spine if s.media_type != XHTML_MEDIA_TYPE]
 
     def get_metadata(self) -> dict:
         """Extract book metadata."""
@@ -128,27 +171,38 @@ class EPUBExtractor:
         """Parse the spine's content documents, in spine order.
 
         The navigation document is skipped, as are chapters without a body or
-        without text. A chapter that is missing from the archive or is not
-        well-formed XML is skipped and recorded in `self.failed`.
+        without text. A spine entry that is not XHTML, and a chapter that is
+        missing from the archive, unreadable, not well-formed XML or holds
+        an unresolved entity reference, is skipped and recorded in
+        `self.failed`.
         """
         if self._zip is None:
             raise RuntimeError("EPUB not loaded. Call load() first.")
 
         chapters = []
-        self.failed = []
+        self.failed = [(item.id, f'media type {item.media_type} is not XHTML')
+                       for item in self.not_xhtml]
         for order, item in enumerate(self.spine):
             if item.is_nav:
                 continue
             try:
-                root = parse_xml(self._zip.read(item.path))
+                root = parse_xml(read_member(self._zip, item.path))
             except KeyError:
                 self.failed.append((item.id, 'missing from the archive'))
+                continue
+            except EPUBError as e:
+                self.failed.append((item.id, f'unreadable: {e}'))
                 continue
             except etree.XMLSyntaxError as e:
                 self.failed.append((item.id, f'not well-formed XML: {e}'))
                 continue
             body = find_body(root)
             if body is None:
+                continue
+            entities = unresolved_entities(body)
+            if entities:
+                self.failed.append((item.id, 'unresolved entity reference: '
+                                    + ', '.join(f'&{n};' for n in entities)))
                 continue
             text = ' '.join(' '.join(b.text.split()) for b in walk_blocks(body))
             if not text:
