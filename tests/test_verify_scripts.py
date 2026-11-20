@@ -2520,3 +2520,194 @@ class TestGlossaryCheck:
         out = ' '.join(capsys.readouterr().out.split())
         assert '--sample-out FILE' in out
         assert 'Write a sample of the warnings, with book text, to FILE' in out
+
+
+class TestGlossaryCheckSurvivors:
+    """Mutation testing, Phase 5 run 1: the check script in-process."""
+
+    def _main(self, root):
+        return glossary_check.main(['--projects-dir', str(root), '--anonymize'])
+
+    def test_help_in_process(self, capsys):
+        with pytest.raises(SystemExit):
+            glossary_check.main(['--help'])
+        out = ' '.join(capsys.readouterr().out.split())
+        assert 'Phase 5 check: glossary compliance of the existing translations.' in out
+        assert ('--projects-dir PROJECTS_DIR Directory that holds the project folders '
+                '(default: projects)') in out
+        assert '--anonymize Print project-N labels; omit names and paths' in out
+        assert ('--sample-out FILE Write a sample of the warnings, with book text, to FILE '
+                '(outside the repository and the projects directory)') in out
+        assert 'Copies every project' not in out  # only the docstring's first line
+
+    def test_default_projects_directory(self, tmp_path, capsys, monkeypatch):
+        _glossary_projects(tmp_path / 'projects')
+        monkeypatch.chdir(tmp_path)
+        listed = []
+        real = glossary_check.os.listdir
+
+        def listdir(path):
+            listed.append(path)
+            return real(path)
+        monkeypatch.setattr(glossary_check.os, 'listdir', listdir)
+        assert glossary_check.main(['--anonymize']) == 0
+        assert listed == ['projects']
+        assert capsys.readouterr().out.splitlines() == GLOSSARY_LINES
+
+    def test_snapshot(self, tmp_path):
+        (tmp_path / 'sub').mkdir()
+        (tmp_path / 'sub' / 'b.txt').write_text('bb')
+        (tmp_path / 'a.txt').write_text('a')
+        snap = glossary_check.snapshot(str(tmp_path))
+        assert [(name, size) for name, size, _ in snap] == [('a.txt', 1), ('sub/b.txt', 2)]
+        assert snap[0][2] == os.stat(tmp_path / 'a.txt').st_mtime_ns
+
+    def test_first_snapshot_fails(self, tmp_path, capsys, monkeypatch):
+        root, _ = _glossary_projects(tmp_path / 'projects')
+
+        def snapshot(path):
+            raise OSError('gone')
+        monkeypatch.setattr(glossary_check, 'snapshot', snapshot)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[0] == 'FAIL project-1: check raised OSError'
+
+    def test_check_and_snapshot_fail(self, tmp_path, capsys, monkeypatch):
+        root, _ = _glossary_projects(tmp_path / 'projects')
+        calls = []
+
+        def snapshot(path):
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError('gone')
+            return []
+
+        def broken(copy_dir):
+            raise ValueError('bad')
+        monkeypatch.setattr(glossary_check, 'snapshot', snapshot)
+        monkeypatch.setattr(glossary_check, 'check_copy', broken)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[0] == \
+            'FAIL project-1: check raised ValueError; project snapshot raised OSError'
+
+    def test_two_failing_projects_with_two_problems(self, tmp_path, capsys, monkeypatch):
+        root, _ = _glossary_projects(tmp_path / 'projects')
+        real = glossary_check.check_copy
+
+        def touch(copy_dir):
+            project = root / ('alpha' if copy_dir.endswith('1') else 'beta')
+            (project / 'extra.txt').write_text('x')
+            r, problems = real(copy_dir)
+            return r, problems + ['first problem']
+        monkeypatch.setattr(glossary_check, 'check_copy', touch)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[0] == 'FAIL ' + GLOSSARY_LINES[0][len('PASS '):] + \
+            '; first problem; files in the project directory changed'
+        assert out[2].endswith('failed projects 2')
+
+    def test_glossary_file_name(self, tmp_path, capsys, monkeypatch):
+        # the file system may ignore case: the name is checked as given
+        root, _ = _glossary_projects(tmp_path / 'projects')
+        paths = []
+        real = glossary_check.GlossaryManager
+
+        def manager(path):
+            paths.append(os.path.basename(path))
+            return real(path)
+        monkeypatch.setattr(glossary_check, 'GlossaryManager', manager)
+        assert self._main(root) == 0
+        assert paths == ['glossary.json', 'glossary.json']
+
+    def test_sample_written_as_utf8(self, tmp_path, capsys, monkeypatch):
+        root, _ = _glossary_projects(tmp_path / 'projects')
+        opened = []
+        real = open
+
+        def recording(path, mode='r', **kwargs):
+            opened.append((mode, kwargs))
+            return real(path, mode, **kwargs)
+        monkeypatch.setattr(glossary_check, 'open', recording, raising=False)
+        assert glossary_check.main(['--projects-dir', str(root), '--anonymize',
+                                    '--sample-out', str(tmp_path / 's.md')]) == 0
+        assert opened == [('w', {'encoding': 'utf-8'})]
+
+    def test_skipped_segments_do_not_end_the_count(self, tmp_path):
+        from tests.conftest import xhtml
+        from tests.test_exporter import _project, _raw_book
+        book_dir = tmp_path / 'books'
+        book_dir.mkdir()
+        chapter = xhtml('<p>One drip line.</p><pre>x = 1</pre><h1>Two drip line.</h1>'
+                        '<h2>Three drip line.</h2><h3>Four drip line.</h3><h4>Five.</h4>')
+        epub = _raw_book(book_dir, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        # pending; failing the structure; translated without text; failed with
+        # text; then two that count
+        project = _project(tmp_path, epub, {
+            'c_seg0002': 'y = 2', 'c_seg0003': ' ', 'c_seg0004': '<h2>三滴線</h2>',
+            'c_seg0005': '<h3>四滴線</h3>', 'c_seg0006': '<h4>五。</h4>'},
+            statuses={'c_seg0004': 'failed'})
+        _write_glossary(project, [('drip line', '滴水線', 'term')])
+        r, problems = glossary_check.check_copy(project)
+        assert problems == []
+        assert (r['translated'], r['passing'], r['with_issue']) == (3, 2, 1)
+        assert [seg.segment_id for seg, _ in r['found']] == ['c_seg0005']
+
+    def test_category_text(self):
+        from src.glossary.glossary_manager import GlossaryEntry
+        found = [(None, GlossaryEntry('Term', '詞', '')), (None, GlossaryEntry('term', '詞', '')),
+                 (None, GlossaryEntry('x', '叉', 'person'))]
+        assert glossary_check.category_text(found) == \
+            'none: 2 warnings, 1 terms, person: 1 warnings, 1 terms'
+        assert glossary_check.category_text([]) == 'none'
+
+    def test_sample_item_term_case_and_no_match(self):
+        from types import SimpleNamespace
+        from src.glossary.glossary_manager import GlossaryEntry
+        entry = GlossaryEntry('term', '詞', 'term')
+        seg = SimpleNamespace(segment_id='x', text='x' * 100 + ' Term ' + 'y' * 94,
+                              translated_text='甲' * 300)
+        lines = glossary_check.sample_item(1, 'p', seg, entry).splitlines()
+        assert lines[4] == '- 原文：…' + 'x' * 59 + ' Term ' + 'y' * 59 + '…'
+        # no match (not produced by the check): both excerpts from the start
+        seg = SimpleNamespace(segment_id='x', text='z' * 100, translated_text='甲' * 300)
+        lines = glossary_check.sample_item(1, 'p', seg, entry).splitlines()
+        assert lines[4:6] == ['- 原文：' + 'z' * 60 + '…', '- 譯文（對應位置附近）：' + '甲' * 60 + '…']
+        seg = SimpleNamespace(segment_id='x', text='', translated_text='甲' * 300)
+        lines = glossary_check.sample_item(1, 'p', seg, entry).splitlines()
+        assert lines[5] == '- 譯文（對應位置附近）：' + '甲' * 60 + '…'
+
+    def test_sample_markdown_head(self):
+        assert glossary_check.sample_markdown([]) == '\n'.join([
+            '# 術語檢查樣本（0 筆）',
+            '',
+            '每一筆是一段譯文被判定「術語未依術語表翻譯」（term_not_applied）。'
+            '樣本以固定亂數種子（5）從各專案輪流抽出。'
+            '比對方式：去掉標籤與括號內的英文原文、忽略空白與大小寫後，檢查譯文是否含有術語表譯名。',
+            '請逐筆判斷是否為真正的問題（應該改譯文），或是誤報（譯文其實可以接受）。',
+            '',
+        ])
+
+
+class TestReviewSurvivors:
+    """Mutation testing, Phase 5 run 1: the review blueprint."""
+
+    def test_glossary_file_name(self, monkeypatch):
+        from types import SimpleNamespace
+        from src.web.blueprints import review
+        paths = []
+        monkeypatch.setattr(review, 'GlossaryManager',
+                            lambda path: paths.append(path) or SimpleNamespace(load=lambda: None))
+        review._glossary(SimpleNamespace(project_dir='/p'))
+        assert paths == [os.path.join('/p', 'glossary.json')]
+
+    def test_review_tab_active(self, tmp_path):
+        from src.core.project import ProjectManager
+        from src.core.segmenter import Segment
+        from src.web.server import create_app
+        pm = ProjectManager(str(tmp_path / 'demo'))
+        pm.create('/x.epub', 'T', 'A', [Segment(id='c_seg0001', html='<p>A.</p>', text='A.',
+                                                word_count=1, segment_type='text')])
+        client = create_app(projects_dir=str(tmp_path)).test_client()
+        for url in ('/project/demo/review', '/project/demo/review/chapter/c',
+                    '/project/demo/review?issues=1'):
+            html = client.get(url).get_data(as_text=True)
+            assert 'class="tab active">審閱</a>' in ' '.join(html.split())
