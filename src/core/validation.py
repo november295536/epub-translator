@@ -29,7 +29,9 @@ quality rules only warn.
 
 from __future__ import annotations
 
+from html import unescape
 import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from xml.sax.saxutils import quoteattr
@@ -39,6 +41,7 @@ from lxml import etree
 from src.core.project import Issue
 from src.epub.blocks import BLOCK_TAGS, NO_TEXT_TAGS, element_text, fingerprint, localname, normalize
 from src.epub.extractor import parse_xml
+from src.glossary.glossary_manager import term_pattern
 
 # --- Tokens --------------------------------------------------------------------
 
@@ -512,7 +515,7 @@ def _describe(group) -> str:
 
 # --- Rules --------------------------------------------------------------------------
 
-STRUCTURE, QUALITY, BACKEND = 'structure', 'quality', 'backend'
+STRUCTURE, QUALITY, GLOSSARY, BACKEND = 'structure', 'quality', 'glossary', 'backend'
 
 # Structural (blocking)
 NOT_WELL_FORMED = 'not_well_formed'        # the translation is not well-formed XML
@@ -527,6 +530,8 @@ CODE_CHANGED = 'code_changed'              # code differs from the source outsid
 # Quality (warning)
 UNTRANSLATED = 'untranslated'              # identical to the source, which has words
 LENGTH_RATIO = 'length_ratio'              # length ratio outside LENGTH_RATIO_BAND
+# Glossary (warning)
+TERM_NOT_APPLIED = 'term_not_applied'      # a glossary term of the source without its translation
 # Backend (the reply is not a translation at all)
 NOT_HTML = 'not_html'
 EMPTY_REPLY = 'empty_reply'
@@ -546,7 +551,7 @@ _WORD = re.compile(r'[A-Za-z]{2,}')
 
 
 def _issue(kind: str, code: str, detail: str) -> Issue:
-    return Issue(kind=kind, code=code, detail=detail, blocking=kind != QUALITY)
+    return Issue(kind=kind, code=code, detail=detail, blocking=kind not in (QUALITY, GLOSSARY))
 
 
 @dataclass
@@ -718,6 +723,51 @@ def _quality(source_text: str, translation_text: str) -> list:
     return issues
 
 
+# --- Glossary -------------------------------------------------------------------------
+
+_MARKUP = re.compile(r'<[^>]*>')
+# A parenthetical without Chinese characters: the original a translation
+# may add after a term (滴水線（drip line）); full-width brackets are ASCII
+# after NFKC
+_ORIGINAL = re.compile(r'\([^()㐀-鿿]*\)')
+# Middle dots in names (艾拉·維恩 / 艾拉・維恩 / 艾拉‧維恩)
+_DOTS = str.maketrans('・‧•', '···')
+
+
+def _comparable(text: str) -> str:
+    """`text` without tags, entities decoded, NFKC, one kind of middle dot,
+    parenthetical originals and whitespace removed, case-folded."""
+    text = unicodedata.normalize('NFKC', unescape(_MARKUP.sub('', text))).translate(_DOTS)
+    return re.sub(r'\s+', '', _ORIGINAL.sub('', text)).casefold()
+
+
+def terms_not_applied(source_text: str, translation: str, glossary) -> list:
+    """The glossary entries the prompt gave for `source_text`
+    (`terms_for_prompt`) that occur in it (the prompt's matching,
+    `term_pattern`) and whose translation is not in `translation` (both
+    compared as `_comparable`). An entry with an empty translation is
+    skipped. A `work` entry is checked only where the prompt's rule for it
+    applies, a title of a work: written in the source exactly as in the
+    glossary (same capitals)."""
+    if glossary is None or not glossary.entries:
+        return []
+    text = _comparable(translation)
+    missing = []
+    for entry in glossary.terms_for_prompt(source_text):
+        expected = _comparable(entry.translation)
+        flags = 0 if entry.category == 'work' else re.IGNORECASE
+        if expected and entry.term.strip() and expected not in text \
+                and re.search(term_pattern(entry.term), source_text, flags):
+            missing.append(entry)
+    return missing
+
+
+def glossary_issues(source_text: str, translation: str, glossary) -> list:
+    """One term_not_applied warning per entry of terms_not_applied."""
+    return [_issue(GLOSSARY, TERM_NOT_APPLIED, f'術語「{e.term}」未譯為「{e.translation}」')
+            for e in terms_not_applied(source_text, translation, glossary)]
+
+
 # --- Code ----------------------------------------------------------------------------
 
 # A comment line: first non-blank characters `//`, or `#` followed by
@@ -751,13 +801,19 @@ def check_code(source: str, translation: str) -> Result:
                           '程式碼在註解行以外與原文不同（只能翻譯 # 或 // 開頭的註解行）')])
 
 
-def check_segment(seg, text: str) -> Result:
+def check_segment(seg, text: str, glossary=None) -> Result:
     """The check for a stored segment (SegmentState) and a translation of
     it: code or HTML by the segment's type; runs cut by the segment's
     fingerprints (none for schema 1). A text segment without HTML (legacy
-    schema 1 data) has no structure to compare: nothing is checked."""
+    schema 1 data) has no structure to compare. A text translation that
+    passes gets the glossary warnings (`glossary`: a GlossaryManager, or
+    None for none); the export does not call this."""
     if seg.segment_type == 'code':
         return check_code(seg.text, text)
     if not seg.html.strip():  # a schema 1 text segment without HTML: nothing to compare
-        return Result([])
-    return check_html(seg.html, text, seg.fingerprints or None)
+        result = Result([])
+    else:
+        result = check_html(seg.html, text, seg.fingerprints or None)
+    if not result.blocking:
+        result.issues += glossary_issues(seg.text, text, glossary)
+    return result

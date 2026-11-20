@@ -892,3 +892,113 @@ class TestRound3Survivors:
         assert self._details('<p>A <img src="s" alt="x"/><img src="s" alt=""/></p>',
                              '<p>甲<img src="s" alt=""/></p>') == [
             ('key_mismatch', '第 1 個區塊帶 k 屬性的 <img>：原文 1 個，譯文 0 個')]
+
+
+# --- Phase 5: glossary compliance --------------------------------------------------
+
+from src.glossary.glossary_manager import FULL_GLOSSARY_MAX_TERMS, GlossaryEntry, GlossaryManager  # noqa: E402
+
+
+def glossary(*items):
+    """A glossary of (term, translation[, category]) held in memory only."""
+    gm = GlossaryManager('/nonexistent/glossary.json')
+    for term, translation, *category in items:
+        gm.entries[term.lower()] = GlossaryEntry(term, translation, *category)
+    return gm
+
+
+def missing(source, translation, gm):
+    return [e.term for e in validation.terms_not_applied(source, translation, gm)]
+
+
+class TestGlossaryCompliance:
+
+    GM = glossary(('drip line', '滴水線', 'term'), ('Velmora', 'Velmora', 'place'))
+
+    def test_other_rendering_gets_an_issue(self):
+        issues = validation.glossary_issues('The drip line moved.', '<p>滴線移動了。</p>', self.GM)
+        assert issues == [validation.Issue(kind='glossary', code='term_not_applied',
+                                           detail='術語「drip line」未譯為「滴水線」',
+                                           blocking=False)]
+
+    def test_glossary_rendering_gets_none(self):
+        assert validation.glossary_issues('The drip line moved.', '<p>滴水線移動了。</p>',
+                                          self.GM) == []
+
+    def test_parenthetical_original_ignored(self):
+        assert missing('The drip line moved.', '滴水線（drip line）移動了。', self.GM) == []
+        # the original in parentheses does not count as the translation
+        assert missing('Near Velmora.', '在某城（Velmora）附近。', self.GM) == ['Velmora']
+        assert missing('Near Velmora.', '在某城(Velmora)附近。', self.GM) == ['Velmora']
+        assert missing('Near Velmora.', '在 Velmora 附近。', self.GM) == []
+        # a parenthetical with Chinese is text, not an original
+        assert missing('The drip line moved.', '線（滴水線）移動了。', self.GM) == []
+
+    def test_only_terms_of_the_source(self):
+        # a small glossary sends every entry; only those in the source are checked
+        assert missing('Nothing here.', '這裡沒有。', self.GM) == []
+        assert missing('Drip lines and VELMORA.', '無。', self.GM) == ['drip line', 'Velmora']
+
+    def test_matching_of_the_prompt(self):
+        gm = glossary(('render', '算繪'), ('AI', '人工智慧'))
+        assert missing('We maintain rendering.', '我們維護。', gm) == ['render']  # AI not in maintain
+
+    def test_large_glossary(self):
+        gm = glossary(*[(f'word{i:03d}', f'詞{i}') for i in range(FULL_GLOSSARY_MAX_TERMS + 1)])
+        assert missing('Only word007 here.', '只有這裡。', gm) == ['word007']
+
+    def test_empty_translation_and_term_skipped(self):
+        gm = glossary(('drip line', ' '), ('  ', '空'), ('', '空'))
+        assert missing('The drip line moved.', '移動了。', gm) == []
+
+    def test_no_glossary(self):
+        assert validation.terms_not_applied('The drip line.', '無。', None) == []
+        assert validation.terms_not_applied('The drip line.', '無。', glossary()) == []
+
+    def test_work_only_as_a_title(self):
+        gm = glossary(('Silver Atlas', '銀色地圖集', 'work'))
+        # the prompt: a work's translation only where it is the work's title
+        assert missing('She owned a silver atlas.', '她有一本銀色的地圖集。', gm) == []
+        assert missing('She read Silver Atlas.', '她讀了一本地圖集。', gm) == ['Silver Atlas']
+        assert missing('She read Silver Atlas.', '她讀了《銀色地圖集》。', gm) == []
+        other = glossary(('Silver Atlas', '銀色地圖集', 'term'))
+        assert missing('She owned a silver atlas.', '她有一本地圖集。', other) == ['Silver Atlas']
+
+    @pytest.mark.parametrize('expected,translation', [
+        ('Velmora 小姐', '<p>Velmora小姐笑了。</p>'),            # whitespace
+        ('API', '<p>api 呼叫</p>'),                               # case
+        ('艾拉·維恩', '<p>艾拉・維恩</p>'),                      # middle dots
+        ('艾拉‧維恩', '<p>艾拉•維恩</p>'),
+        ('Ｘ光', '<p>X光</p>'),                                  # NFKC
+        ('甲&乙', '<p>甲&amp;乙</p>'),                           # entities
+        ('滴水線', '<p><em>滴水</em>線</p>'),                     # tags
+        ('滴水\n線', '<p>滴水 線</p>'),
+    ])
+    def test_normalization(self, expected, translation):
+        gm = glossary(('drip line', expected))
+        assert missing('The drip line.', translation, gm) == []
+
+    def test_comparable(self):
+        assert validation._comparable('<b>A</b> b（Orig）&lt;Ｃ・d') == 'ab<c·d'
+
+    def test_check_segment_adds_glossary_warnings(self):
+        seg = SimpleNamespace(segment_type='text', html='<p>The drip line.</p>',
+                              text='The drip line.', fingerprints=[])
+        result = check_segment(seg, '<p>滴線。</p>', self.GM)
+        assert codes(result) == ['term_not_applied'] and not result.blocking
+        assert check_segment(seg, '<p>滴水線。</p>', self.GM).issues == []
+        assert check_segment(seg, '<p>滴線。</p>').issues == []  # no glossary given
+        # a failing translation gets only its structural issues
+        assert codes(check_segment(seg, '<p>滴線。<b>x</b></p>', self.GM)) == ['unknown_tag']
+
+    def test_check_segment_schema_1_and_code(self):
+        seg = SimpleNamespace(segment_type='text', html='', text='The drip line.', fingerprints=[])
+        assert codes(check_segment(seg, '滴線。', self.GM)) == ['term_not_applied']
+        code = SimpleNamespace(segment_type='code', html='', text='# drip line\nx = 1',
+                               fingerprints=[])
+        assert check_segment(code, '# 滴線\nx = 1', self.GM).issues == []
+
+    def test_glossary_kind_never_blocks(self):
+        assert not validation._issue(validation.GLOSSARY, 'x', 'y').blocking
+        assert not validation._issue(validation.QUALITY, 'x', 'y').blocking
+        assert validation._issue(validation.STRUCTURE, 'x', 'y').blocking
