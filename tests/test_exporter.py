@@ -1854,7 +1854,7 @@ class TestRound2Survivors:
 
     def test_pi_in_a_run_is_no_anchor(self, tmp_path):
         report, _ = self._one(tmp_path, '<div class="v">Line one<?pi id="z"?><br/>Line two</div>',
-                              '第一行\n第二行')
+                              '第一行<?pi id="z"?>\n第二行')
         assert report.translated == 1 and report.reasons() == {}
 
     def test_pi_with_a_lang_pseudo_attribute_kept(self, tmp_path):
