@@ -52,6 +52,7 @@ import sys
 import tempfile
 from collections import Counter
 from html import unescape
+from itertools import zip_longest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 # At index 0, ahead of everything (see phase2_roundtrip.py)
@@ -232,12 +233,8 @@ def pick_sample(per_project: list, size: int = SAMPLE_SIZE, seed: int = SAMPLE_S
         shuffled = list(found)
         rng.shuffle(shuffled)
         queues.append([(label, seg, entry) for seg, entry in shuffled])
-    sample = []
-    while len(sample) < size and any(queues):
-        for queue in queues:
-            if queue and len(sample) < size:
-                sample.append(queue.pop(0))
-    return sample
+    in_turn = [item for row in zip_longest(*queues) for item in row if item is not None]
+    return in_turn[:size]
 
 
 def excerpt(text: str, start: int, end: int, width: int = EXCERPT) -> str:
