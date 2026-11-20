@@ -572,6 +572,17 @@ def _source(source: str, fingerprints, nsmap):
     return None if shaped is None else (src_groups, *shaped)
 
 
+_POSITION = re.compile(r',? line \d+(?:, column \d+)?')
+
+
+def xml_error(e: Exception) -> str:
+    """The detail of a not_well_formed issue: the parser's reason without
+    line and column (they count inside the fragment wrapper, not in the
+    text the person or the model wrote)."""
+    reason = getattr(e, 'msg', None) or str(e)
+    return f'不是格式正確的 XML：{_POSITION.sub("", reason)}'
+
+
 def _ambiguous() -> Issue:
     return _issue(STRUCTURE, AMBIGUOUS_SOURCE, '原文無法切成各個區塊')
 
@@ -606,7 +617,7 @@ def check_html(source: str, translation: str, fingerprints=None, nsmap=None,
     try:
         frag = fragment(translation, nsmap)
     except (etree.XMLSyntaxError, ValueError) as e:
-        return Result([_issue(STRUCTURE, NOT_WELL_FORMED, f'不是格式正確的 XML：{e}')])
+        return Result([_issue(STRUCTURE, NOT_WELL_FORMED, xml_error(e))])
     tr_groups = groups(frag)
     pieces = None if tr_groups is None else translation_pieces(tr_groups, shape)
     if pieces is None:
@@ -626,8 +637,9 @@ def check_html(source: str, translation: str, fingerprints=None, nsmap=None,
     issues += _compare_elements(src_pieces, pieces, first_block)
     if issues:
         return Result(issues)
-    return Result(_quality(''.join(map(piece_text, src_pieces)),
-                           ''.join(map(piece_text, pieces))), pieces)
+    # blocks joined by a line break: two one-letter blocks are not a word
+    return Result(_quality('\n'.join(map(piece_text, src_pieces)),
+                           '\n'.join(map(piece_text, pieces))), pieces)
 
 
 def _compare_elements(src_pieces: list, pieces: list, first_block: int) -> list:
@@ -639,11 +651,21 @@ def _compare_elements(src_pieces: list, pieces: list, first_block: int) -> list:
         inner_s, inner_p = _elements(s), _elements(p)
         if not isinstance(s, list):  # a block element: same tag (translation_pieces)
             inner_s, inner_p = inner_s[1:], inner_p[1:]
-            if _signature(s) != _signature(p):
+            emptied = _emptied(_signature(s), _signature(p))
+            if emptied:
+                extra.append(f'第 {index} 個區塊的 {_shown(s.tag)} 的 {"、".join(emptied)} 不可為空')
+            elif _signature(s) != _signature(p):
                 (missing if s.attrib else extra).append(
                     f'第 {index} 個區塊的 {_shown(s.tag)} 本身的屬性與原文不同')
         want = Counter(_signature(e) for e in inner_s)
         got = Counter(_signature(e) for e in inner_p)
+        for sw in sorted(want - got):  # an element whose readable value was emptied
+            for sg in sorted(got - want):
+                emptied = _emptied(sw, sg)
+                if emptied and want[sw] > got[sw] and got[sg] > want[sg]:
+                    extra.append(f'第 {index} 個區塊的 {_shown(sw[0])} 的 {"、".join(emptied)} 不可為空')
+                    want[sw] -= 1
+                    want[sg] += 1
         for sig in sorted(want.keys() | got.keys()):
             tag, attrs = sig
             if want[sig] == got[sig]:
@@ -666,6 +688,20 @@ def _compare_elements(src_pieces: list, pieces: list, first_block: int) -> list:
         if found:
             issues.append(_issue(STRUCTURE, code, '；'.join(found)))
     return issues
+
+
+def _emptied(want: tuple, got: tuple) -> list:
+    """The translatable attributes that `got` has blank where `want` has a
+    value, when that is the only difference between the two signatures."""
+    if want[0] != got[0] or [n for n, _ in want[1]] != [n for n, _ in got[1]]:
+        return []
+    emptied = []
+    for (name, w), (_, g) in zip(want[1], got[1]):
+        if w == _FREE and g == '' and name in TRANSLATABLE_ATTRIBUTES:
+            emptied.append(name)
+        elif w != g:
+            return []
+    return emptied
 
 
 def _quality(source_text: str, translation_text: str) -> list:

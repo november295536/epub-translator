@@ -370,7 +370,7 @@ def _html_check(source: str, fingerprints, protected: validation.Protected, firs
         except (etree.XMLSyntaxError, ValueError) as e:
             return None, validation.Result([Issue(
                 kind=validation.STRUCTURE, code=validation.NOT_WELL_FORMED,
-                detail=f'不是格式正確的 XML：{e}', blocking=True)])
+                detail=validation.xml_error(e), blocking=True)])
         issues = validation.check_keys(reply, protected)
         if issues:
             return None, validation.Result(issues)
