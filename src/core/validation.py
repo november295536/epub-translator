@@ -2,22 +2,29 @@
 
 Protection. The model sees a segment's HTML with every attribute list
 replaced by a short numeric key: `<p class="a" id="b">` becomes
-`<p k="1">`. Every top-level block gets a key; every other tag that has
-attributes gets one; tags without attributes are sent as they are. A
-top-level run of inline content (text between block elements) is wrapped in
-a keyed `<run>` element. Both directions work on tokens of the string, not
-on a parsed tree, so `restore(protect(html)) == html` exactly.
+`<p k="1">`. Attributes that people read (TRANSLATABLE_ATTRIBUTES: alt,
+title, aria-label) stay visible next to the key, to be translated:
+`<img src="x.png" alt="A map"/>` becomes `<img k="2" alt="A map"/>`. Every
+top-level block gets a key; every other tag that has attributes gets one;
+tags without attributes are sent as they are. A top-level run of inline
+content (text between block elements) is wrapped in a keyed `<run>`
+element. Both directions work on tokens of the string, not on a parsed
+tree, so `restore(protect(html)) == html` exactly.
 
-Validation. One comparison serves the three places that validate: a model
-reply (restored first), a text saved or approved in the review, and the
-export. Both sides are parsed as XML fragments and cut into one piece per
-block (`split_pieces`); the translation must then have, per block, the same
-elements as the source: an element is compared by tag name and attributes,
-so every attribute-bearing element (a keyed tag) appears exactly once in
-its block with its attributes, every tag without attributes appears as many
-times per tag name as in the source, and no other tag or attribute appears.
-The order of elements inside a block is not compared. Structural rules
-block (the translation is not used); quality rules only warn.
+Validation. A model reply is first checked in its keyed form
+(`check_keys`: every key exactly once on its tag, the top-level keys in the
+source's order, `<run>` only at the top level, no attribute but `k` and the
+translatable ones), then restored. From there one comparison serves the
+three places that validate: a model reply, a text saved or approved in the
+review, and the export (`check_html`). Both sides are parsed as XML
+fragments and cut into one piece per block; per block, the block element
+itself must keep its tag and attributes, and the elements inside it must be
+the same multiset of (tag name, attributes), so every attribute-bearing
+element appears exactly once in its block, every tag without attributes as
+often per tag name, and nothing else. The values of translatable attributes
+are free (an empty one stays empty). The order of elements inside a block
+is not compared. Structural rules block (the translation is not used);
+quality rules only warn.
 """
 
 from __future__ import annotations
@@ -35,22 +42,60 @@ from src.epub.extractor import parse_xml
 
 # --- Tokens --------------------------------------------------------------------
 
-_TOKEN = re.compile(r'''
+# An XML name (letters of any script; no leading digit, dot or hyphen)
+_NAME = r'[^\W\d][\w:.\-]*'
+
+_TOKEN = re.compile(rf'''
     <!--.*?-->
   | <!\[CDATA\[.*?\]\]>
   | <\?.*?\?>
   | <![^>]*>
-  | </(?P<end>[^\s/>]+)\s*>
-  | <(?P<name>[A-Za-z_][\w:.\-]*)
+  | </(?P<end>{_NAME})\s*>
+  | <(?P<name>{_NAME})
      (?P<attrs>(?:\s+[^\s=/>]+\s*=\s*(?:"[^"]*"|'[^']*'))*\s*)
      (?P<close>/?)>
 ''', re.S | re.X)
 
-# The attribute list of a protected tag: exactly one attribute, k
-_KEY_ATTRS = re.compile(r'''\s+k\s*=\s*(?:"(\d+)"|'(\d+)')\s*''')
+# One attribute of an attribute text: name, quote, raw value
+_ATTR = re.compile(r'''\s+([^\s=/>]+)\s*=\s*(?:"([^"]*)"|'([^']*)')''')
+
+# Attributes people read: shown to the model and translated; every other
+# attribute is hidden behind the key
+TRANSLATABLE_ATTRIBUTES = frozenset({'alt', 'title', 'aria-label'})
 
 # The neutral element that holds a top-level run of inline content
 WRAPPER = 'run'
+
+
+def _attributes(text: str) -> list:
+    """(name, quote, raw value, start, end of the raw value) of every
+    attribute in an attribute text."""
+    out = []
+    for m in _ATTR.finditer(text):
+        group = 2 if m.group(2) is not None else 3
+        out.append((m.group(1), '"' if group == 2 else "'", m.group(group),
+                    m.start(group), m.end(group)))
+    return out
+
+
+_ENTITY = re.compile(r'&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);')
+_NAMED = {'amp': '&', 'lt': '<', 'gt': '>', 'quot': '"', 'apos': "'"}
+
+
+def _unescape(raw: str) -> str:
+    def one(m):
+        ref = m.group(1)
+        if ref.startswith('#x'):
+            return chr(int(ref[2:], 16))
+        if ref.startswith('#'):
+            return chr(int(ref[1:]))
+        return _NAMED[ref]
+    return _ENTITY.sub(one, raw)
+
+
+def _escape(value: str, quote: str) -> str:
+    out = value.replace('&', '&amp;').replace('<', '&lt;')
+    return out.replace(quote, '&quot;' if quote == '"' else '&apos;')
 
 
 def _tokens(text: str):
@@ -112,23 +157,37 @@ def top_level_units(html: str) -> list:
 
 
 @dataclass
+class Key:
+    """What a key stands for: the tag name, the attribute text (None for the
+    run wrapper) and the translatable attributes in it, as name ->
+    (quote, raw value, start, end within the attribute text)."""
+    name: str
+    attrs: str | None
+    shown: dict = field(default_factory=dict)
+
+
+@dataclass
 class Protected:
     """A segment's HTML in the form the model sees."""
     html: str                                  # the prompt form
-    keys: dict = field(default_factory=dict)   # key -> (tag name, attribute text); WRAPPER: None
+    keys: dict = field(default_factory=dict)   # key (str) -> Key
+    top: list = field(default_factory=list)    # the top-level keys, in order
 
 
-def protect(html: str) -> Protected:
-    """The prompt form of `html` (see the module docstring)."""
+def protect(html: str, first_key: int = 1) -> Protected:
+    """The prompt form of `html` (see the module docstring); keys are
+    numbered from `first_key`."""
     runs = [(s, e) for s, e, is_run in top_level_units(html) if is_run]
     starts = {s for s, _ in runs}
     ends = {e for _, e in runs}
     cuts = sorted(starts | ends)
-    out, keys, depth = [], {}, 0
+    out, keys, top, depth = [], {}, [], 0
 
-    def key_for(name, attrs):
-        k = str(len(keys) + 1)
-        keys[k] = (name, attrs)
+    def key_for(key: Key, at_top: bool) -> str:
+        k = str(first_key + len(keys))
+        keys[k] = key
+        if at_top:
+            top.append(k)
         return k
 
     for start, end, m in _tokens(html):
@@ -139,13 +198,18 @@ def protect(html: str) -> Protected:
             pieces = list(zip(bounds, bounds[1:]))
         for s, e in pieces:
             if s in starts:
-                out.append(f'<{WRAPPER} k="{key_for(WRAPPER, None)}">')
+                out.append(f'<{WRAPPER} k="{key_for(Key(WRAPPER, None), True)}">')
             if m is None:
                 out.append(html[s:e])
             elif m.group('name'):
                 name, attrs, close = m.group('name'), m.group('attrs'), m.group('close')
-                if (depth == 0 and _local(name) in BLOCK_TAGS) or attrs.strip():
-                    out.append(f'<{name} k="{key_for(name, attrs)}"{close}>')
+                block = depth == 0 and _local(name) in BLOCK_TAGS
+                if block or attrs.strip():
+                    shown = {n: (q, raw, a, b) for n, q, raw, a, b in _attributes(attrs)
+                             if n in TRANSLATABLE_ATTRIBUTES}
+                    k = key_for(Key(name, attrs, shown), block)
+                    visible = ''.join(f' {n}={q}{raw}{q}' for n, (q, raw, _, _) in shown.items())
+                    out.append(f'<{name} k="{k}"{visible}{close}>')
                 else:
                     out.append(html[s:e])
                 if not close:
@@ -156,47 +220,131 @@ def protect(html: str) -> Protected:
                 out.append(html[s:e])
             if e in ends:
                 out.append(f'</{WRAPPER}>')
-    return Protected(''.join(out), keys)
+    return Protected(''.join(out), keys, top)
+
+
+def _restored_attrs(key: Key, reply_attrs: list):
+    """The attribute text for a keyed tag of a reply: the stored text, with
+    the values of the translatable attributes taken from the reply
+    (escaped for the stored quote; untouched when the reply repeats the
+    stored value). None when the reply's attributes are not `k` plus
+    translatable attributes of this key, each once."""
+    names = [n for n, *_ in reply_attrs]
+    other = [n for n in names if n != 'k']
+    if names.count('k') != 1 or len(set(other)) != len(other) or \
+            not set(other) <= set(key.shown):
+        return None
+    text = key.attrs
+    replies = {n: (q, raw) for n, q, raw, _, _ in reply_attrs}
+    for name, (quote, raw, a, b) in sorted(key.shown.items(), key=lambda kv: -kv[1][2]):
+        if name not in replies or replies[name] == (quote, raw):
+            continue
+        text = text[:a] + _escape(_unescape(replies[name][1]), quote) + text[b:]
+    return text
 
 
 def restore(text: str, protected: Protected) -> str:
     """`text` (a reply to the prompt form, or the prompt form itself) with
-    each keyed tag given back its attribute text and the run wrappers
-    removed. A tag whose key is unknown, or names another tag, or that has
-    other attributes, is left as it is (validation then refuses it)."""
+    each keyed tag given back its attribute text (translatable values from
+    the reply) and the run wrappers removed. A tag whose key is unknown, or
+    names another tag, or that has other attributes, is left as it is
+    (validation refuses it)."""
     out, stack = [], []
     for start, end, m in _tokens(text):
         token = text[start:end]
-        if m is None:
+        if m is None or not (m.group('name') or m.group('end')):
             out.append(token)
             continue
         if m.group('end'):
-            if stack and stack.pop():
-                continue  # the end of a dropped wrapper
+            if stack and stack[-1][0] == m.group('end'):
+                if stack.pop()[1]:
+                    continue  # the end of a dropped wrapper
             out.append(token)
             continue
         name = m.group('name')
-        if not name:
-            out.append(token)
-            continue
-        km = _KEY_ATTRS.fullmatch(m.group('attrs'))
-        entry = protected.keys.get(km.group(1) or km.group(2)) if km else None
-        if entry is not None and entry[0] != name:
-            entry = None
-        drop = entry is not None and entry[1] is None
-        if entry is not None and not drop:
-            token = f'<{name}{entry[1]}{m.group("close")}>'
+        reply_attrs = _attributes(m.group('attrs'))
+        ks = [raw for n, _, raw, _, _ in reply_attrs if n == 'k']
+        key = protected.keys.get(ks[0]) if len(ks) == 1 else None
+        attrs = None
+        if key is not None and key.name == name:
+            attrs = '' if key.attrs is None else _restored_attrs(key, reply_attrs)
+        drop = attrs is not None and key.attrs is None
+        if attrs is not None and not drop:
+            token = f'<{name}{attrs}{m.group("close")}>'
         if not drop:
             out.append(token)
         if not m.group('close'):
-            stack.append(drop)
+            stack.append((name, drop))
     return ''.join(out)
+
+
+def check_keys(reply: str, protected: Protected) -> list:
+    """The rules of the keyed form, for a well-formed reply: every key
+    exactly once, on the tag it was given to; the top-level keys in the
+    source's order (nothing else at the top level but whitespace); <run>
+    only at the top level; no attribute but `k` and the key's translatable
+    attributes, each present when the source has it, empty when it was
+    empty."""
+    seen, wrong, attrs, misplaced = Counter(), [], [], []
+    top, stray, depth = [], False, 0
+    for start, end, m in _tokens(reply):
+        if m is None:
+            if depth == 0 and reply[start:end].strip():
+                stray = True
+            continue
+        if m.group('end'):
+            depth = max(depth - 1, 0)
+            continue
+        name = m.group('name')
+        if not name:
+            continue
+        reply_attrs = _attributes(m.group('attrs'))
+        ks = [raw for n, _, raw, _, _ in reply_attrs if n == 'k']
+        k = ks[0] if ks else None
+        if depth == 0:
+            top.append(k)
+        key = protected.keys.get(k) if k is not None else None
+        if k is None:
+            if reply_attrs:
+                attrs.append(f'<{name}> 帶有原文沒有的屬性')
+        elif key is None or key.name != name:
+            wrong.append(f'<{name} k="{k}"> 不是原文的標記')
+        else:
+            seen[k] += 1
+            if key.attrs is None and depth:
+                misplaced.append(f'<{WRAPPER} k="{k}"> 不在最外層')
+            given = {n: raw for n, _, raw, _, _ in reply_attrs if n != 'k'}
+            for n in sorted(set(given) - set(key.shown)):
+                attrs.append(f'<{name} k="{k}"> 多了 {n} 屬性')
+            for n in sorted(set(key.shown) - set(given)):
+                attrs.append(f'<{name} k="{k}"> 少了 {n} 屬性')
+            for n in sorted(set(given) & set(key.shown)):
+                if key.shown[n][1] == '' and given[n] != '':
+                    attrs.append(f'<{name} k="{k}"> 的 {n} 原文是空的')
+        if not m.group('close'):
+            depth += 1
+    issues = []
+    if stray or top != protected.top:
+        shown_src = '、'.join(f'k="{k}"' for k in protected.top)
+        shown_tr = '、'.join('（無 k）' if k is None else f'k="{k}"' for k in top) or '（無）'
+        issues.append(_issue(STRUCTURE, STRUCTURE_MISMATCH,
+                             f'最外層的標記與原文不同：原文為 {shown_src}，譯文為 {shown_tr}'
+                             + ('，且最外層有 <run> 以外的文字' if stray else '')))
+    counts = [f'k="{k}"（<{key.name}>）出現 {seen[k]} 次' for k, key in protected.keys.items()
+              if seen[k] != 1]
+    found = wrong + misplaced + counts
+    if found:
+        issues.append(_issue(STRUCTURE, KEY_MISMATCH,
+                             '；'.join(found) + '（每個 k 必須在原來的標籤上出現一次）'))
+    if attrs:
+        issues.append(_issue(STRUCTURE, EXTRA_ATTRIBUTES, '屬性與原文不符：' + '；'.join(attrs)))
+    return issues
 
 
 # --- Fragments and pieces --------------------------------------------------------
 
 XHTML_NS = 'http://www.w3.org/1999/xhtml'
-_PREFIX = re.compile(r'</?([A-Za-z_][\w.\-]*):|\s([A-Za-z_][\w.\-]*):[\w.\-]+\s*=')
+_PREFIX = re.compile(r'</?([A-Za-z_][\w.\-]*):|\s([A-Za-z_][\w.\-]*):[\w.\-]+\s*=', re.ASCII)
 
 
 def declarations(*texts: str) -> dict:
@@ -215,7 +363,8 @@ def declarations(*texts: str) -> dict:
 
 def fragment(html: str, nsmap: dict):
     """`html` parsed as the content of an element declaring `nsmap`
-    (raises etree.XMLSyntaxError)."""
+    (raises etree.XMLSyntaxError, or ValueError when `html` cannot be
+    encoded, e.g. a lone surrogate)."""
     decls = ''.join(f' xmlns={quoteattr(uri)}' if prefix is None
                     else f' xmlns:{prefix}={quoteattr(uri)}' for prefix, uri in nsmap.items())
     return parse_xml(f'<fragment{decls}>{html}</fragment>'.encode())
@@ -331,8 +480,14 @@ def _elements(piece) -> list:
     return list(piece.iter(etree.Element))
 
 
+# The value a translatable attribute is compared by: free, except that an
+# empty value stays empty
+_FREE = '\x00translated'
+
+
 def _signature(el) -> tuple:
-    return (el.tag, tuple(sorted(el.attrib.items())))
+    return (el.tag, tuple(sorted((name, _FREE if name in TRANSLATABLE_ATTRIBUTES and value
+                                  else value) for name, value in el.attrib.items())))
 
 
 def _shown(tag: str) -> str:
@@ -394,25 +549,44 @@ class Result:
         return [i for i in self.issues if i.blocking]
 
 
-def check_html(source: str, translation: str, fingerprints=None, nsmap=None) -> Result:
+def _source(source: str, fingerprints, nsmap):
+    """(groups, pieces, shape) of a source, or None when it cannot be cut
+    into its blocks."""
+    try:
+        src_groups = groups(fragment(source, nsmap))
+    except (etree.XMLSyntaxError, ValueError):
+        return None
+    shaped = None if src_groups is None else source_shape(src_groups, fingerprints)
+    return None if shaped is None else (src_groups, *shaped)
+
+
+def _ambiguous() -> Issue:
+    return _issue(STRUCTURE, AMBIGUOUS_SOURCE, '原文無法切成各個區塊')
+
+
+def source_issues(source: str, fingerprints=None) -> list:
+    """[the ambiguous_source issue] when no translation of `source` can pass
+    check_html, else []."""
+    return [] if _source(source, fingerprints, declarations(source)) else [_ambiguous()]
+
+
+def check_html(source: str, translation: str, fingerprints=None, nsmap=None,
+               first_block: int = 1) -> Result:
     """Compare a translation (with real attributes) to its source HTML.
 
     `fingerprints`: the blocks' fingerprints (schema 2), to cut runs that
     were separated by <br>; `nsmap`: the declarations in scope in the
-    chapter (default: `declarations` of both texts)."""
+    chapter (default: `declarations` of both texts); `first_block`: the
+    number the issues give the first block (a part of a segment)."""
     if nsmap is None:
         nsmap = declarations(source, translation)
-    try:
-        src_groups = groups(fragment(source, nsmap))
-    except etree.XMLSyntaxError:
-        src_groups = None
-    shaped = None if src_groups is None else source_shape(src_groups, fingerprints)
+    shaped = _source(source, fingerprints, nsmap)
     if shaped is None:
-        return Result([_issue(STRUCTURE, AMBIGUOUS_SOURCE, '原文無法切成各個區塊')])
-    src_pieces, shape = shaped
+        return Result([_ambiguous()])
+    src_groups, src_pieces, shape = shaped
     try:
         frag = fragment(translation, nsmap)
-    except etree.XMLSyntaxError as e:
+    except (etree.XMLSyntaxError, ValueError) as e:
         return Result([_issue(STRUCTURE, NOT_WELL_FORMED, f'不是格式正確的 XML：{e}')])
     tr_groups = groups(frag)
     pieces = None if tr_groups is None else translation_pieces(tr_groups, shape)
@@ -426,23 +600,31 @@ def check_html(source: str, translation: str, fingerprints=None, nsmap=None) -> 
             + ('（各行對應原文的各行）' if any(isinstance(w, int) and w > 1 for w in shape) else ''))])
 
     issues = []
-    empty = [str(i) for i, (s, p) in enumerate(zip(src_pieces, pieces), 1)
+    empty = [str(i) for i, (s, p) in enumerate(zip(src_pieces, pieces), first_block)
              if piece_text(s).strip() and not piece_text(p).strip()]
     if empty:
         issues.append(_issue(STRUCTURE, EMPTY_BLOCK, f'第 {"、".join(empty)} 個區塊沒有文字'))
-    issues += _compare_elements(src_pieces, pieces)
+    issues += _compare_elements(src_pieces, pieces, first_block)
     if issues:
         return Result(issues)
     return Result(_quality(''.join(map(piece_text, src_pieces)),
                            ''.join(map(piece_text, pieces))), pieces)
 
 
-def _compare_elements(src_pieces: list, pieces: list) -> list:
+def _compare_elements(src_pieces: list, pieces: list, first_block: int = 1) -> list:
+    """Per block: the block element's own attributes, then the multiset of
+    the elements inside it."""
     known = {e.tag for p in src_pieces for e in _elements(p)}
     unknown, missing, extra, counts = set(), [], [], []
-    for index, (s, p) in enumerate(zip(src_pieces, pieces), 1):
-        want = Counter(_signature(e) for e in _elements(s))
-        got = Counter(_signature(e) for e in _elements(p))
+    for index, (s, p) in enumerate(zip(src_pieces, pieces), first_block):
+        inner_s, inner_p = _elements(s), _elements(p)
+        if not isinstance(s, list):  # a block element: same tag (translation_pieces)
+            inner_s, inner_p = inner_s[1:], inner_p[1:]
+            if _signature(s) != _signature(p):
+                (missing if s.attrib else extra).append(
+                    f'第 {index} 個區塊的 {_shown(s.tag)} 本身的屬性與原文不同')
+        want = Counter(_signature(e) for e in inner_s)
+        got = Counter(_signature(e) for e in inner_p)
         for sig in sorted(want.keys() | got.keys()):
             tag, attrs = sig
             if want[sig] == got[sig]:
@@ -470,7 +652,7 @@ def _compare_elements(src_pieces: list, pieces: list) -> list:
 def _quality(source_text: str, translation_text: str) -> list:
     src, tr = normalize(source_text), normalize(translation_text)
     issues = []
-    if src == tr and _WORD.search(src):
+    if src == tr and _WORD.search(source_text):
         issues.append(_issue(QUALITY, UNTRANSLATED, '譯文與原文相同'))
     elif len(src) >= LENGTH_RATIO_MIN_CHARS:
         ratio = len(tr) / len(src)
@@ -499,9 +681,15 @@ def code_lines(code: str) -> list:
     return kept
 
 
+# Characters XML text cannot hold (control characters, lone surrogates)
+_NOT_XML_TEXT = re.compile('[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]')
+
+
 def check_code(source: str, translation: str) -> Result:
-    """A code translation is accepted only when it equals the source after
-    comment lines are removed from both."""
+    """A code translation is accepted only when it can be XML text and
+    equals the source after comment lines are removed from both."""
+    if _NOT_XML_TEXT.search(translation):
+        return Result([_issue(STRUCTURE, NOT_WELL_FORMED, '譯文含有 XML 不允許的字元')])
     if code_lines(source) == code_lines(translation):
         return Result([])
     return Result([_issue(STRUCTURE, CODE_CHANGED,

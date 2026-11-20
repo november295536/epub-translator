@@ -108,6 +108,13 @@ prompt   <p k="1">See <a k="2"><sup>3</sup></a> for the <em k="3">core idea</em>
 
 - Every top-level block gets a key, with or without attributes, so block order can be checked.
 - Every other tag that has attributes gets a key. Tags without attributes are sent bare.
+- What a person reads is translated; what a machine reads is not. Class names, ids, links and
+  every other attribute stay hidden behind the key. `alt`, `title` and `aria-label` are read
+  by people: they are shown next to the key and translated
+  (`<img src="m.png" alt="A map"/>` becomes `<img k="4" alt="A map"/>`). On restore the reply's
+  value replaces the value inside the stored attribute text, escaped for its original quote;
+  everything else of the stored attribute text is put back untouched. An element with only such
+  attributes still gets a key.
 - Inline tags are preserved: every key is required, and every tag without a key must occur as
   often per tag name as in the source. Only the order of inline tags may change (Chinese word
   order moves them).
@@ -121,17 +128,23 @@ prompt   <p k="1">See <a k="2"><sup>3</sup></a> for the <em k="3">core idea</em>
 
 | Class | Rules | On failure |
 |---|---|---|
-| Structural (blocking) | Output is well-formed. The sequence of top-level keys equals the source's. Each key appears exactly once, on the same tag name. For tags without a key, the count per tag name equals the source's. No attribute other than `k`. No tag name absent from the source segment. | Retry; if still failing, the segment is `failed` and is exported in the original language. |
+| Structural (blocking) | Output is well-formed. The sequence of top-level keys equals the source's, with no text between them. Each key appears exactly once, on the same tag name; the run wrapper only at the top level. For tags without a key, the count per tag name in each block equals the source's. No attribute other than `k` and the key's translatable attributes; those are all present, and one empty in the source stays empty (their values are free). No tag name absent from the source segment. | Retry; if still failing, the segment is `failed` and is exported in the original language. |
 | Quality (warning) | Identical to source although the source has translatable words. Length ratio outside the default band. Glossary term not applied. | Stored as translated, with a typed issue shown in review. |
 
 Quality rules never block, because legitimate exceptions are common: headings that are only a
 name, formulas, acronyms, URLs.
 
-The same comparison checks a model reply, a text saved or approved in the review, and a stored
-translation at export. A stored translation has real attributes instead of keys, so the check
-works on the restored form: a model reply is restored first, then source and translation are
-parsed and compared block by block, each element taken as its tag name plus its attributes.
-Per block the two multisets must be equal; that is the key rules above in restored form.
+A model reply is first checked in its keyed form: every key once on its tag, the top-level
+keys in order, the wrapper only at the top level, no other attribute. Restoring cannot see
+these violations (two blocks with equal attributes swapped, a key used twice, a missing key
+replaced by a bare tag of the same attributes), so they are checked before it.
+Then the same comparison checks a model reply, a text saved or approved in the review, and a
+stored translation at export. A stored translation has real attributes instead of keys, so this
+check works on the restored form: source and translation are parsed and compared block by
+block. The block element itself must keep its tag and attributes; the elements inside it, each
+taken as its tag name plus its attributes, must form the same multiset. The values of
+translatable attributes are free (an empty one stays empty). That is the key rules above in
+restored form. A source that cannot be cut into its blocks fails at once, without a model call.
 
 **Retry.** One retry with the specific error as feedback, sent as a follow-up message. If that
 fails and the segment has two or more top-level blocks, split the request once at a block
@@ -588,7 +601,7 @@ failing segment, and export of a project with failed segments.
 | Question | Decision |
 |---|---|
 | Parser | `lxml.etree`, XML mode, for walker and writer. Unparseable chapters pass through unchanged and are reported. |
-| What to protect | Every tag with attributes gets a key; top-level blocks always. Every key is required and tags without a key keep their count per tag name (4.1). |
+| What to protect | Every tag with attributes gets a key; top-level blocks always. Every key is required and tags without a key keep their count per tag name (4.1). `alt`, `title` and `aria-label` are shown and translated; every other attribute stays hidden. |
 | Split on failure | Yes, once, inside the call only. No new segments or anchors. |
 | Language for bilingual | Package and root stay in the source language; translated copies carry `lang="zh-TW"`. |
 | Thresholds | Structural rules fixed in code. Quality heuristics have defaults and never block. |

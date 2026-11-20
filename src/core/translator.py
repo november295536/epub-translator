@@ -44,7 +44,7 @@ _SHARED_RULES = """1. 使用台灣慣用的繁體中文用語
 8. 翻譯名稱時不要出現什麼乖乖等錯誤翻譯的字眼
 
 中英文句型差異——翻譯時請特別注意：
-- 不要逐句對譯，先理解整段語意，再用自然的中文重新表達；必要時可合併、拆分或調整語序
+{restructure}
 - 英文被動句（was done by...）應盡量轉為中文主動句，除非「被」在中文語境中自然（如被騙、被開除）
 - 英文每句都需要主詞，中文在主詞不變時應省略，避免反覆出現「他」「它」「這」
 - 英文的名詞化表達（the implementation of...）應轉為中文動詞句（實作……）
@@ -53,6 +53,12 @@ _SHARED_RULES = """1. 使用台灣慣用的繁體中文用語
 - 英文的 this/that/it 等回指代詞，中文應視情況重複關鍵詞或直接省略，避免指代不明
 - 英文介系詞片語可以層層堆疊（the increase in the rate of errors in...），中文必須拆開重組"""
 
+# The first sentence-structure rule: the plain-text prompt may merge and
+# split sentences; the HTML prompt keeps its blocks (the check compares them)
+_RESTRUCTURE_TEXT = '- 不要逐句對譯，先理解整段語意，再用自然的中文重新表達；必要時可合併、拆分或調整語序'
+_RESTRUCTURE_HTML = ('- 不要逐句對譯，先理解整段語意，再用自然的中文重新表達；'
+                     '可以在同一個區塊內合併、拆分句子或調整語序，但不可合併或拆分區塊')
+
 _SHARED_PROHIBITIONS = """嚴格禁止：
 - 不要加任何說明、前綴或後綴（例如「以下是翻譯」「翻譯如下」等）
 - 不要使用 markdown 語法"""
@@ -60,7 +66,7 @@ _SHARED_PROHIBITIONS = """嚴格禁止：
 TRANSLATION_PROMPT = f"""你是一位專業的英文翻譯，請將以下英文內容翻譯成繁體中文。
 
 翻譯要求：
-{_SHARED_RULES}
+{_SHARED_RULES.format(restructure=_RESTRUCTURE_TEXT)}
 9. 保持原文的段落結構和格式
 10. 英文中的斜體或粗體強調，翻譯時用「」標示，不要使用 markdown 的 * 或 ** 語法
 
@@ -73,21 +79,21 @@ TRANSLATION_PROMPT = f"""你是一位專業的英文翻譯，請將以下英文�
 原文：
 {{text}}"""
 
-CODE_PROMPT = """以下是程式碼區塊，請只翻譯其中的註解（# 或 // 開頭的行），保持程式碼本身完全不變。直接輸出結果，不加任何說明。
+CODE_PROMPT = """以下是程式碼區塊，請只翻譯其中的註解行，保持其他每一行完全不變。註解行是去掉行首空白後以 // 開頭，或以 # 開頭且 # 後面是空白、! 或行尾的行（#include 這類行是程式碼，不是註解）；行尾的註解也不要翻譯。直接輸出結果，不加任何說明。
 
 {text}"""
 
 TEXT_HTML_PROMPT = f"""你是一位專業的英文翻譯，請將以下 HTML 內容中的英文文字翻譯成繁體中文。
 
 HTML 標記規則：
-1. 保持所有 HTML 標籤結構完全不變：標籤上的 k 屬性是標記編號，每個帶 k 的標籤都要原樣保留（同一個標籤名、同一個 k 值，各出現一次）
-2. 不帶 k 的標籤也要全部保留，每種標籤的數量必須與原文相同；為了中文語序可以移動標籤的位置
+1. 保持所有 HTML 標籤結構完全不變：標籤上的 k 屬性是標記編號，每個帶 k 的標籤都要原樣保留（同一個標籤名、同一個 k 值，各出現一次，留在原來的區塊內）
+2. 不帶 k 的標籤也要全部保留，同一個區塊內每種標籤的數量必須與原文相同；為了中文語序可以在同一個區塊內移動標籤的位置
 3. 不要增加原文沒有的標籤或屬性，也不要刪除標籤
-4. 最外層區塊的數量和順序不可改變，不要合併或拆分段落。<run> 包住的是沒有段落標籤的文字，請保留它；<run> 內若有多行，譯文保持相同的行數
-5. 只翻譯標籤內的文字內容
+4. 最外層區塊的數量和順序不可改變，不要合併或拆分段落。<run> 包住的是沒有段落標籤的文字，請保留它，只能出現在最外層；<run> 內若有多行，譯文保持相同的行數
+5. 翻譯標籤內的文字內容；標籤上的 alt、title、aria-label 屬性是給讀者看的文字，也要翻譯（保留屬性本身，原文是空值就保持空值），其他屬性不要改動
 
 翻譯要求：
-{_SHARED_RULES}
+{_SHARED_RULES.format(restructure=_RESTRUCTURE_HTML)}
 {{glossary_section}}
 {{context_section}}
 {_SHARED_PROHIBITIONS}
@@ -195,8 +201,9 @@ class TranslationError(Exception):
     """
 
     def __init__(self, message: str, *, code: str, prompt: str, attempts: list,
-                 issues: list | None = None):
+                 issues: list | None = None, usage: Usage | None = None):
         super().__init__(message)
+        self.usage = usage  # the usage of the calls made for the segment
         self.code = code
         self.prompt = prompt
         self.attempts = attempts
@@ -296,7 +303,7 @@ class _Session:
         else:
             text = f"Translation failed after {len(self.attempts)} attempts: {message}"
         raise TranslationError(text, code=code, prompt=self.prompt, attempts=self.attempts,
-                               issues=issues)
+                               issues=issues, usage=self.usage)
 
     def rejected(self, result: validation.Result) -> None:
         """Record a reply that failed its check."""
@@ -345,9 +352,10 @@ def _clean_text(raw: str) -> str:
     return TranslationEngine._clean_response(raw.strip())
 
 
-def _html_check(source: str, fingerprints, protected: validation.Protected):
+def _html_check(source: str, fingerprints, protected: validation.Protected, first_block: int = 1):
     """The check of a reply to the prompt form of `source`: HTML,
-    well-formed, then (restored) the comparison with the source."""
+    well-formed, the keys (check_keys), then (restored) the comparison
+    with the source."""
     def check(reply: str):
         empty = _empty(reply, source)
         if empty:
@@ -358,12 +366,15 @@ def _html_check(source: str, fingerprints, protected: validation.Protected):
                 detail='回覆不是 HTML（第一個字元必須是 <）', blocking=True)])
         try:
             validation.fragment(reply, validation.declarations(reply))
-        except etree.XMLSyntaxError as e:
+        except (etree.XMLSyntaxError, ValueError) as e:
             return None, validation.Result([Issue(
                 kind=validation.STRUCTURE, code=validation.NOT_WELL_FORMED,
                 detail=f'不是格式正確的 XML：{e}', blocking=True)])
+        issues = validation.check_keys(reply, protected)
+        if issues:
+            return None, validation.Result(issues)
         text = validation.restore(reply, protected)
-        return text, validation.check_html(source, text, fingerprints)
+        return text, validation.check_html(source, text, fingerprints, first_block=first_block)
     return check
 
 
@@ -447,6 +458,10 @@ class TranslationEngine:
 
     def _translate_html(self, session: _Session, html: str, fingerprints, build) -> tuple:
         protected = validation.protect(html)
+        unusable = validation.source_issues(html, fingerprints)
+        if unusable:  # no reply could pass: fail before any call
+            session.prompt = build(protected.html)
+            session.fail(unusable[0].code, unusable[0].detail, unusable)
         try:
             return session.attempt(build(protected.html),
                                    _html_check(html, fingerprints, protected), _clean_html)
@@ -458,10 +473,10 @@ class TranslationEngine:
         mid = len(units) // 2
         cut, resume = units[mid - 1][1], units[mid][0]
         texts = []
-        for half in (html[:cut], html[resume:]):
+        for half, first in ((html[:cut], 1), (html[resume:], mid + 1)):
             half_protected = validation.protect(half)
             text, _ = session.attempt(build(half_protected.html),
-                                      _html_check(half, None, half_protected), _clean_html,
+                                      _html_check(half, None, half_protected, first), _clean_html,
                                       retries=0)
             texts.append(text)
         joined = texts[0] + html[cut:resume] + texts[1]
@@ -608,7 +623,7 @@ def translate_segment(engine: TranslationEngine, seg, segments,
         raise
     except TranslationError as e:
         return TranslationOutcome(
-            text=None, status=SegmentStatus.FAILED, model=model, usage=None,
+            text=None, status=SegmentStatus.FAILED, model=model, usage=e.usage,
             issues=list(e.issues), failure=e)
     except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on
         logger.exception("未預期的錯誤: %s", seg.segment_id)

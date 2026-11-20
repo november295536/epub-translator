@@ -275,7 +275,7 @@ class TestSegmentTypePrompts:
         engine = TranslationEngine()
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = '<h1>標題</h1>'
+        mock_result.stdout = '<h1 k="1">標題</h1>'
 
         html = '<h1>Introduction</h1>'
         with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
@@ -323,7 +323,7 @@ class TestHTMLMode:
         engine = TranslationEngine()
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = '<p>翻譯結果</p>'
+        mock_result.stdout = '<p k="1">翻譯結果</p>'
 
         html = '<p>Source text</p>'
         with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
@@ -380,7 +380,7 @@ class TestHTMLMode:
         engine = TranslationEngine()
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = '<p>翻譯</p>'
+        mock_result.stdout = '<p k="1">翻譯</p>'
 
         glossary = 'machine learning → 機器學習'
         html = '<p>Machine learning is important.</p>'
@@ -581,8 +581,8 @@ class TestCodeResponseCleaning:
         assert self._translate('**粗體**與*斜體*') == '粗體與斜體'
 
     def test_text_with_html_keeps_markdown_like_characters(self):
-        reply = '<p>*重要*與**強調**</p>'
-        assert self._translate(reply, html='<p>x</p>') == reply
+        reply = '<p k="1">*重要*與**強調**</p>'
+        assert self._translate(reply, html='<p>x</p>') == '<p>*重要*與**強調**</p>'
 
     def test_code_with_html_argument_still_code_mode(self):
         assert self._translate('    **kwargs\n', text='    **kwargs',
@@ -670,11 +670,12 @@ class TestCodeResponseCleaning:
         empty.returncode = good.returncode = 0
         empty.stderr = good.stderr = ''
         empty.stdout = reply
-        good.stdout = '<p>一些文字。</p>\n' if html else '一些文字。\n'
+        good.stdout = '<p k="1">一些文字。</p>\n' if html else '一些文字。\n'
 
         with patch('src.llm.cli.run_process',
                    side_effect=[empty, good]) as mock_run:
-            assert engine.translate('Some text.', html=html) == good.stdout.strip()
+            assert engine.translate('Some text.', html=html) == \
+                ('<p>一些文字。</p>' if html else '一些文字。')
         assert mock_run.call_count == 2
 
     def test_text_reply_only_fence_exhausts(self):
@@ -879,7 +880,7 @@ def _translated(engine, seg, segments, log_dir):
 class TestTranslateSegment:
 
     def test_success(self, tmp_path):
-        fake = FakeBackend([LLMResponse('<p>一句話。</p>', 'complete', Usage(5, 7), 'haiku')])
+        fake = FakeBackend([LLMResponse('<p k="1">一句話。</p>', 'complete', Usage(5, 7), 'haiku')])
         seg = _seg()
         outcome = _translated(_engine(fake), seg, [seg], str(tmp_path))
         assert outcome == TranslationOutcome(text='<p>一句話。</p>',
@@ -892,7 +893,7 @@ class TestTranslateSegment:
 
     def test_usage_none_when_backend_reports_none(self):
         seg = _seg()
-        outcome = translate_segment(_engine(FakeBackend(['<p>譯文</p>'])), seg, [seg])
+        outcome = translate_segment(_engine(FakeBackend(['<p k="1">譯文</p>'])), seg, [seg])
         assert outcome.usage is None
 
     def test_glossary_and_context(self):
@@ -907,7 +908,7 @@ class TestTranslateSegment:
 
         segs = [_seg('c1_seg0001', 'Before it.'), _seg('c1_seg0002', 'One here.'),
                 _seg('c1_seg0003', 'After it.')]
-        fake = FakeBackend(['<p>譯文</p>'])
+        fake = FakeBackend(['<p k="1">譯文</p>'])
         translate_segment(_engine(fake), segs[1], segs, Glossary())
         prompt = fake.prompts[0]
         assert 'GLOSSMARK → 詞彙' in prompt
@@ -942,7 +943,7 @@ class TestTranslateSegment:
         assert len(fake.requests) == calls
 
     def test_transient_then_success_retries(self):
-        fake = FakeBackend([TransientError('exit 1'), '<p>譯文</p>'])
+        fake = FakeBackend([TransientError('exit 1'), '<p k="1">譯文</p>'])
         seg = _seg()
         outcome = translate_segment(_engine(fake), seg, [seg])
         assert outcome.status == SegmentStatus.TRANSLATED
@@ -951,7 +952,7 @@ class TestTranslateSegment:
     @pytest.mark.parametrize('error', [RateLimitError('limit'), AuthError('login'),
                                        CancelledError('cancelled')])
     def test_run_level_errors_raised_without_retry(self, error, tmp_path):
-        fake = FakeBackend([error, '<p>譯文</p>'])
+        fake = FakeBackend([error, '<p k="1">譯文</p>'])
         seg = _seg()
         with pytest.raises(type(error)):
             _translated(_engine(fake), seg, [seg], str(tmp_path))
@@ -962,7 +963,7 @@ class TestTranslateSegment:
         seen = []
 
         def responder(request):
-            return '<p>譯文</p>'
+            return '<p k="1">譯文</p>'
 
         class Recording(FakeBackend):
             def complete(self, request, cancel):
@@ -982,12 +983,12 @@ class TestTranslateSegment:
                 seen.append(cancel)
                 return super().complete(request, cancel)
 
-        _engine(Recording(['<p>譯文</p>'])).translate('x')
+        _engine(Recording(['<p k="1">譯文</p>'])).translate('x')
         assert isinstance(seen[0], threading.Event) and not seen[0].is_set()
 
     def test_engine_uses_default_backend(self):
         from tests.conftest import use_fake_backend
-        fake = FakeBackend(['<p>譯文</p>'])
+        fake = FakeBackend(['<p k="1">譯文</p>'])
         with use_fake_backend(fake):
             engine = TranslationEngine(model='opus')
         assert engine.backend is fake
@@ -1026,7 +1027,7 @@ class TestFailureDiagnostics:
     def test_success_writes_nothing_and_removes_old_record(self, tmp_path):
         self._fail(tmp_path, [RefusalError('no')])
         assert os.listdir(tmp_path / 'failed') == ['c1_seg0001-1f098b794d.txt']
-        self._fail(tmp_path, ['<p>譯文</p>'])
+        self._fail(tmp_path, ['<p k="1">譯文</p>'])
         assert os.listdir(tmp_path / 'failed') == []
 
     def test_unsafe_characters_in_id(self, tmp_path):
@@ -1046,7 +1047,7 @@ class TestRequestAndMessages:
 
     def test_request_is_one_user_message_without_system(self):
         from src.llm import Message
-        fake = FakeBackend(['<p>譯文</p>'])
+        fake = FakeBackend(['<p k="1">譯文</p>'])
         engine = _engine(fake)
         engine.translate('Some text.', SegmentType.TEXT, '', '', '', '<p>Some text.</p>')
         request = fake.requests[0]
@@ -1055,7 +1056,7 @@ class TestRequestAndMessages:
         assert request.messages == [Message('user', prompt)]
 
     def test_prompt_passed_to_cli_unchanged(self):
-        mock_result = MagicMock(returncode=0, stdout='<p>譯文</p>', stderr='')
+        mock_result = MagicMock(returncode=0, stdout='<p k="1">譯文</p>', stderr='')
         engine = TranslationEngine()
         with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             engine.translate('Some text.')
@@ -1087,7 +1088,7 @@ class TestRequestAndMessages:
         ]
 
     def test_no_glossary_section_without_glossary(self):
-        fake = FakeBackend(['<p>譯文</p>'])
+        fake = FakeBackend(['<p k="1">譯文</p>'])
         seg = _seg()
         translate_segment(_engine(fake), seg, [seg])
         assert '術語表' not in fake.prompts[0]
@@ -1131,7 +1132,7 @@ class TestFailureLogNames:
         seg_a, seg_b = _seg('a/b_seg0001'), _seg('a_b_seg0001')
         _translated(_engine(FakeBackend([RefusalError('no')])), seg_a, [seg_a],
                           str(tmp_path))
-        _translated(_engine(FakeBackend(['<p>譯文</p>'])), seg_b, [seg_b], str(tmp_path))
+        _translated(_engine(FakeBackend(['<p k="1">譯文</p>'])), seg_b, [seg_b], str(tmp_path))
         assert os.path.exists(failure_log_path(str(tmp_path), 'a/b_seg0001'))
 
     def test_long_id_bounded(self, tmp_path):
@@ -1155,7 +1156,7 @@ class TestDiagnosticWriteFailure:
         os.makedirs(failure_log_path(str(tmp_path), 'c1_seg0001'))  # a directory: cannot remove
         seg = _seg()
         with caplog.at_level('ERROR', logger='src.core.translator'):
-            outcome = _translated(_engine(FakeBackend(['<p>譯文</p>'])), seg, [seg], str(tmp_path))
+            outcome = _translated(_engine(FakeBackend(['<p k="1">譯文</p>'])), seg, [seg], str(tmp_path))
         assert outcome.status == SegmentStatus.TRANSLATED
         assert any('無法移除失敗紀錄 c1_seg0001' in r.getMessage() for r in caplog.records)
 
@@ -1175,7 +1176,7 @@ class TestBoundedErrorText:
         assert outcome.status == SegmentStatus.FAILED
         assert len(outcome.issues[0].detail) <= 2000
         size = os.path.getsize(failure_log_path(str(tmp_path), 'c1_seg0001'))
-        assert size < 3 * (20000 + 2000) + 20000
+        assert size < 4 * (20000 + 2000) + 20000  # four calls
 
     def test_huge_error_message_from_any_backend(self, tmp_path):
         seg = _seg()
@@ -1230,7 +1231,7 @@ class TestRound1Exact:
         os.remove(tmp_path / 'failed')
         os.makedirs(failure_log_path(str(tmp_path), 'c1_seg0001'))
         with caplog.at_level('ERROR', logger='src.core.translator'):
-            _translated(_engine(FakeBackend(['<p>譯文</p>'])), seg, [seg], str(tmp_path))
+            _translated(_engine(FakeBackend(['<p k="1">譯文</p>'])), seg, [seg], str(tmp_path))
         assert caplog.records[-1].getMessage().startswith('無法移除失敗紀錄 c1_seg0001: ')
 
     def test_second_failure_replaces_the_log(self, tmp_path):
@@ -1322,7 +1323,7 @@ class TestRound2EntryPointWritesNoFile:
     def test_success_keeps_an_existing_log(self, tmp_path):
         seg = _seg()
         _translated(_engine(FakeBackend([RefusalError('no')])), seg, [seg], str(tmp_path))
-        outcome = translate_segment(_engine(FakeBackend(['<p>譯文</p>'])), seg, [seg])
+        outcome = translate_segment(_engine(FakeBackend(['<p k="1">譯文</p>'])), seg, [seg])
         assert outcome.status == SegmentStatus.TRANSLATED and outcome.failure is None
         assert os.path.exists(failure_log_path(str(tmp_path), 'c1_seg0001'))
 
@@ -1433,7 +1434,7 @@ class TestRound3UnexpectedFailureLog:
 
         def run(cmd, **kwargs):
             return _real_run_process(
-                [sys.executable, '-c', 'import sys; sys.stdout.buffer.write(b"<p>\\xff\\xe8\\xad\\xaf</p>")'],
+                [sys.executable, '-c', 'import sys; sys.stdout.buffer.write(b\'<p k="1">\\xff\\xe8\\xad\\xaf</p>\')'],
                 **kwargs)
 
         seg = _seg()
@@ -1575,14 +1576,13 @@ class TestPhase4Retry:
         assert outcome.status == SegmentStatus.FAILED and outcome.text is None
         assert [(i.kind, i.code, i.blocking) for i in outcome.issues] == \
             [('structure', 'tag_count', True)]
-        assert outcome.issues[0].detail == '第 1 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'
+        assert outcome.issues[0].detail == '第 2 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'
         assert len(fake.requests) == 4
         assert outcome.failure.code == 'tag_count'
         assert [a[0] for a in outcome.failure.attempts] == [
-            'tag_count: 第 2 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'] * 2 + [
-            'tag_count: 第 1 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個']
+            'tag_count: 第 2 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'] * 3  # half 2 counts on
         assert str(outcome.failure) == \
-            'Translation failed after 3 attempts: 第 1 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'
+            'Translation failed after 3 attempts: 第 2 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'
 
     def test_first_half_failing_stops_before_the_second(self):
         fake = FakeBackend([DROPPED_B, DROPPED_B, '<p k="1">壞'])
@@ -1803,3 +1803,74 @@ class TestPhase4SurvivorsRun1:
         code = _html_seg('<pre>x = 1</pre>', 'code', 'x = 1')
         outcome = translate_segment(_engine(FakeBackend([KeyError('k')])), code, [code])
         assert outcome.failure.prompt == CODE_PROMPT.format(text='x = 1')
+
+
+# --- Phase 4 review round 1 ----------------------------------------------------------
+
+class TestRound1Translator:
+
+    def test_prompts(self):
+        assert '可合併、拆分或調整語序' in TRANSLATION_PROMPT
+        assert '必要時可合併、拆分或調整語序' not in TEXT_HTML_PROMPT
+        assert '可以在同一個區塊內合併、拆分句子或調整語序，但不可合併或拆分區塊' in TEXT_HTML_PROMPT
+        assert '同一個區塊內每種標籤的數量必須與原文相同' in TEXT_HTML_PROMPT
+        assert 'alt、title、aria-label 屬性是給讀者看的文字，也要翻譯' in TEXT_HTML_PROMPT
+        assert '{' not in TEXT_HTML_PROMPT.replace('{glossary_section}', '').replace(
+            '{context_section}', '').replace('{html}', '')
+        assert ('註解行是去掉行首空白後以 // 開頭，或以 # 開頭且 # 後面是空白、! 或行尾的行'
+                in CODE_PROMPT)
+
+    def test_swapped_blocks_rejected_before_restore(self):
+        source = '<p class="a">First.</p>\n<p class="a">Second.</p>'
+        seg = _html_seg(source, text='First.\nSecond.')
+        swapped = '<p k="2">第二。</p>\n<p k="1">第一。</p>'
+        fake = FakeBackend([swapped, '<p k="1">第一。</p>\n<p k="2">第二。</p>'])
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert outcome.text == '<p class="a">第一。</p>\n<p class="a">第二。</p>'
+        assert fake.requests[1].messages[-1].content.startswith(
+            '你上一次的輸出沒有通過檢查：\n- 最外層的標記與原文不同：原文為 k="1"、k="2"，譯文為 k="2"、k="1"')
+
+    def test_alt_sent_and_translated(self):
+        source = '<p>See <img src="m.png" alt="A map"/> here.</p>'
+        seg = _html_seg(source, text='See here.')
+        fake = FakeBackend(['<p k="1">見<img k="2" alt="地圖 &amp; 圖例"/>此處。</p>'])
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert fake.prompts[0].endswith('\n\n<p k="1">See <img k="2" alt="A map"/> here.</p>')
+        assert 'src=' not in fake.prompts[0]
+        assert outcome.text == '<p>見<img src="m.png" alt="地圖 &amp; 圖例"/>此處。</p>'
+
+    def test_ambiguous_source_fails_without_a_call(self):
+        seg = _html_seg('<p>A</p>', text='A')
+        seg.fingerprints = ['0' * 16]
+        fake = FakeBackend(['<p k="1">甲</p>'])
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert fake.requests == []
+        assert outcome.status == SegmentStatus.FAILED
+        assert [(i.code, i.detail) for i in outcome.issues] == \
+            [('ambiguous_source', '原文無法切成各個區塊')]
+        assert str(outcome.failure) == 'Translation failed after 0 attempts: 原文無法切成各個區塊'
+        assert outcome.failure.prompt.endswith('\n\n<p k="1">A</p>')
+        assert outcome.failure.attempts == []
+
+    def test_failed_outcome_carries_usage(self):
+        fake = FakeBackend([LLMResponse(DROPPED_B, 'complete', Usage(10, 3), 'haiku')] * 2)
+        seg = _html_seg()
+        outcome = translate_segment(_engine(fake, max_calls=2), seg, [seg])
+        assert outcome.status == SegmentStatus.FAILED
+        assert outcome.usage == Usage(20, 6) and outcome.failure.usage == Usage(20, 6)
+
+    def test_second_half_issues_numbered_in_the_segment(self):
+        source = '<p>One <b>b</b>.</p>\n<p>Two <b>b</b>.</p>\n<p>Three <b>b</b>.</p>'
+        seg = _html_seg(source, text='One b.\nTwo b.\nThree b.')
+        bad = '<p k="1">一<b>乙</b>。</p>\n<p k="2">二乙。</p>\n<p k="3">三<b>乙</b>。</p>'
+        fake = FakeBackend([bad, bad, '<p k="1">一<b>乙</b>。</p>',
+                            '<p k="1">二乙。</p>\n<p k="2">三<b>乙</b>。</p>'])
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert outcome.issues[0].detail == '第 2 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'
+        assert [a[0] for a in outcome.failure.attempts][-1] == \
+            'tag_count: 第 2 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'
+        bad3 = bad.replace('二乙', '二<b>乙</b>').replace('三<b>乙</b>', '三乙')
+        fake = FakeBackend([bad3, bad3, '<p k="1">一<b>乙</b>。</p>',
+                            '<p k="1">二<b>乙</b>。</p>\n<p k="2">三乙。</p>'])
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert outcome.issues[0].detail == '第 3 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'
