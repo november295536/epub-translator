@@ -12,7 +12,7 @@ from bs4.element import PreformattedString
 
 from src.core.project import ProjectManager, SegmentState
 from src.core.segmenter import SegmentType, _is_container
-from src.epub.blocks import BLOCK_TAGS, DESCEND_TAGS, fingerprint, normalize
+from src.epub.blocks import BLOCK_TAGS, DESCEND_TAGS, NO_TEXT_TAGS, fingerprint, normalize
 
 BILINGUAL_CSS = """
 .bilingual-container {
@@ -143,16 +143,19 @@ class EPUBBuilder:
             if placed is None:
                 return  # the chapter stays in the original language
         else:
-            placed = self._place_by_count(body, segments)
+            placed = [(seg, covered, covered)
+                      for seg, covered in self._place_by_count(body, segments)]
 
-        for seg, covered in placed:
+        for seg, covered, span in placed:
             if covered and seg.translated_text:
                 if fmt == 'chinese-only':
-                    self._apply_chinese_only(seg, covered, soup)
+                    self._apply_chinese_only(seg, covered, soup, span)
                 elif fmt == 'bilingual-vertical':
-                    self._apply_bilingual_vertical(seg, covered, soup)
+                    self._apply_bilingual_vertical(seg, covered, soup, span)
                 elif fmt == 'bilingual-horizontal':
-                    self._apply_bilingual_horizontal(seg, covered, soup)
+                    self._apply_bilingual_horizontal(seg, covered, soup, span)
+        for wrapper in body.find_all(RUN_TAG):
+            wrapper.unwrap()
 
         item.set_content(str(soup).encode('utf-8'))
 
@@ -170,18 +173,51 @@ class EPUBBuilder:
 
     @staticmethod
     def _place_by_blocks(body, segments: list[SegmentState]):
-        """Schema 2: (segment, nodes) pairs from the segment's block range,
-        or None when the chapter's blocks do not match the stored
-        fingerprints. The nodes are those of its blocks that hold text."""
-        blocks = []
-        _soup_blocks(body, blocks)
-        blocks = [b for b in blocks if normalize(_nodes_text(b))]
+        """Schema 2: (segment, units, span) triples, or None when the chapter
+        does not match what was stored: every segment's range must be valid,
+        the ranges must cover the chapter's blocks exactly once, and every
+        block's fingerprint must match. A unit is one block: its element,
+        or the run's nodes wrapped in a RUN_TAG element (unwrapped after
+        placement). The span is every node from the first unit to the last,
+        <br> and blocks without text included, which a replacement consumes.
+        When the translation's top-level node count differs from the units'
+        and the span is the whole content of one element below <body>, that
+        element is the one unit."""
+        entries = []
+        _soup_blocks(body, entries)
+        blocks = [i for i, entry in enumerate(entries) if normalize(_nodes_text(entry))]
+        ranges = []
+        for seg in segments:
+            start, end = seg.block_start, seg.block_end
+            if not (type(start) is int and type(end) is int and 0 <= start < end <= len(blocks)):
+                return None
+            if [fingerprint(_nodes_text(entries[i])) for i in blocks[start:end]] \
+                    != seg.fingerprints:
+                return None
+            ranges.append((start, end))
+        ranges.sort()
+        if [r[0] for r in ranges] != [0] + [r[1] for r in ranges[:-1]] \
+                or ranges[-1][1] != len(blocks):
+            return None
+
         placed = []
         for seg in segments:
-            span = blocks[seg.block_start:seg.block_end]
-            if [fingerprint(_nodes_text(b)) for b in span] != seg.fingerprints:
-                return None
-            placed.append((seg, [n for b in span for n in b if _nodes_text([n]).strip()]))
+            indexes = blocks[seg.block_start:seg.block_end]
+            units = {i: _unit(entries[i]) for i in indexes}
+            span = []
+            for i in range(indexes[0], indexes[-1] + 1):
+                span.extend([units[i]] if i in units else entries[i])
+            parent = span[0].parent
+            in_span = {id(n) for n in span}
+            if (seg.segment_type != SegmentType.CODE
+                    and _top_level_count(seg.translated_text) != len(units)
+                    and parent is not body and all(n.parent is parent for n in span)
+                    and all(id(c) in in_span or isinstance(c, PreformattedString)
+                            or not (isinstance(c, Tag) or c.strip())
+                            for c in parent.children)):
+                placed.append((seg, [parent], [parent]))
+            else:
+                placed.append((seg, list(units.values()), span))
         return placed
 
     def _legacy_walk(self) -> bool:
@@ -237,12 +273,17 @@ class EPUBBuilder:
         )
         return block_count if block_count > 0 else 1
 
-    def _apply_chinese_only(self, seg: SegmentState, elements: list, soup) -> None:
-        """Replace element content with translated text, preserving tag and attributes."""
+    def _apply_chinese_only(self, seg: SegmentState, elements: list, soup,
+                            span: list | None = None) -> None:
+        """Replace element content with translated text, preserving tag and attributes.
+
+        `span` (default: the elements) is every node the segment covers;
+        a replacement of the whole segment removes all of them."""
         if not elements:
             return
 
         first = elements[0]
+        rest = [n for n in (elements if span is None else span) if n is not first]
         translated = seg.translated_text
 
         if seg.segment_type == SegmentType.CODE:
@@ -256,11 +297,7 @@ class EPUBBuilder:
                 else:
                     first.clear()
                     first.append(translated)
-            for elem in elements[1:]:
-                if isinstance(elem, NavigableString):
-                    elem.extract()
-                else:
-                    elem.decompose()
+            _remove(rest)
             return
 
         # Try HTML-aware replacement for text segments
@@ -287,11 +324,7 @@ class EPUBBuilder:
             # Translation has HTML but count doesn't match — replace all with parsed HTML
             for child in list(trans_frag.children):
                 first.insert_before(child.extract())
-            for elem in elements:
-                if isinstance(elem, NavigableString):
-                    elem.extract()
-                else:
-                    elem.decompose()
+            _remove([first] + rest)
             return
 
         # Fallback: plain text replacement (backward compatible with old translations)
@@ -302,13 +335,10 @@ class EPUBBuilder:
             first.append(translated)
 
         # Remove remaining elements (they were merged into this segment)
-        for elem in elements[1:]:
-            if isinstance(elem, NavigableString):
-                elem.extract()
-            else:
-                elem.decompose()
+        _remove(rest)
 
-    def _apply_bilingual_vertical(self, seg: SegmentState, elements: list, soup) -> None:
+    def _apply_bilingual_vertical(self, seg: SegmentState, elements: list, soup,
+                                  span: list | None = None) -> None:
         """Keep original elements, add translation block after them."""
         if not elements:
             return
@@ -340,7 +370,7 @@ class EPUBBuilder:
         first.insert_before(wrapper)
 
         original_div = soup.new_tag('div', attrs={'class': 'original'})
-        for elem in elements:
+        for elem in (elements if span is None else span):
             original_div.append(elem.extract())
         wrapper.append(original_div)
 
@@ -348,7 +378,8 @@ class EPUBBuilder:
         self._fill_translation(trans_div, seg, elements, soup)
         wrapper.append(trans_div)
 
-    def _apply_bilingual_horizontal(self, seg: SegmentState, elements: list, soup) -> None:
+    def _apply_bilingual_horizontal(self, seg: SegmentState, elements: list, soup,
+                                    span: list | None = None) -> None:
         """Wrap original + translation in a flex container."""
         if not elements:
             return
@@ -380,7 +411,7 @@ class EPUBBuilder:
         first.insert_before(container)
 
         original_div = soup.new_tag('div', attrs={'class': 'original'})
-        for elem in elements:
+        for elem in (elements if span is None else span):
             original_div.append(elem.extract())
         container.append(original_div)
 
@@ -502,19 +533,59 @@ class EPUBBuilder:
 
 
 
+# Temporary element around a run's nodes while a schema 2 chapter is placed
+RUN_TAG = 'epub-translator-run'
+
+
+def _remove(nodes: list) -> None:
+    for node in nodes:
+        if isinstance(node, Tag):
+            node.decompose()
+        else:
+            node.extract()
+
+
+def _top_level_count(html: str) -> int:
+    frag = BeautifulSoup(html, 'html.parser')
+    return sum(1 for c in frag.children
+               if isinstance(c, Tag) or (isinstance(c, NavigableString) and c.strip()))
+
+
+def _unit(entry: list):
+    """A block as one node: its element, or its run's nodes wrapped."""
+    if len(entry) == 1:
+        return entry[0]
+    wrapper = Tag(name=RUN_TAG)
+    entry[0].insert_before(wrapper)
+    for node in entry:
+        wrapper.append(node.extract())
+    return wrapper
+
+
 def _nodes_text(nodes: list) -> str:
-    return ''.join(n.get_text() if isinstance(n, Tag) else str(n) for n in nodes)
+    """Text as the XML walker counts it: no comments, processing
+    instructions or CDATA, nothing inside script or style."""
+    out = []
+    for node in nodes:
+        if isinstance(node, Tag):
+            if node.name not in NO_TEXT_TAGS:
+                out.append(_nodes_text(list(node.children)))
+        elif not isinstance(node, PreformattedString):
+            out.append(str(node))
+    return ''.join(out)
 
 
 def _soup_blocks(parent, out: list) -> None:
     """The block walk of src/epub/blocks.py on a BeautifulSoup tree: appends
-    each block (a list of nodes) under `parent`, empty ones included."""
+    each block (a list of nodes) under `parent`, empty ones included, and
+    each <br> as an entry of its own."""
     run: list = []
-    for child in parent.children:
+    for child in list(parent.children):
         if isinstance(child, PreformattedString):
             continue  # comment, processing instruction
         if isinstance(child, Tag) and child.name == 'br':
             out.append(run)
+            out.append([child])
             run = []
         elif isinstance(child, Tag) and child.name in BLOCK_TAGS:
             out.append(run)
