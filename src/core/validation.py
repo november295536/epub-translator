@@ -179,15 +179,13 @@ def restore(text: str, protected: Protected) -> str:
         if not name:
             out.append(token)
             continue
-        drop = False
         km = _KEY_ATTRS.fullmatch(m.group('attrs'))
-        if km:
-            entry = protected.keys.get(km.group(1) or km.group(2))
-            if entry is not None and entry[0] == name:
-                if entry[1] is None:
-                    drop = True
-                else:
-                    token = f'<{name}{entry[1]}{m.group("close")}>'
+        entry = protected.keys.get(km.group(1) or km.group(2)) if km else None
+        if entry is not None and entry[0] != name:
+            entry = None
+        drop = entry is not None and entry[1] is None
+        if entry is not None and not drop:
+            token = f'<{name}{entry[1]}{m.group("close")}>'
         if not drop:
             out.append(token)
         if not m.group('close'):
@@ -220,7 +218,7 @@ def fragment(html: str, nsmap: dict):
     (raises etree.XMLSyntaxError)."""
     decls = ''.join(f' xmlns={quoteattr(uri)}' if prefix is None
                     else f' xmlns:{prefix}={quoteattr(uri)}' for prefix, uri in nsmap.items())
-    return parse_xml(f'<fragment{decls}>{html}</fragment>'.encode('utf-8'))
+    return parse_xml(f'<fragment{decls}>{html}</fragment>'.encode())
 
 
 def _has_content(items: list) -> bool:
@@ -445,7 +443,7 @@ def _compare_elements(src_pieces: list, pieces: list) -> list:
     for index, (s, p) in enumerate(zip(src_pieces, pieces), 1):
         want = Counter(_signature(e) for e in _elements(s))
         got = Counter(_signature(e) for e in _elements(p))
-        for sig in sorted(want.keys() | got.keys(), key=repr):
+        for sig in sorted(want.keys() | got.keys()):
             tag, attrs = sig
             if want[sig] == got[sig]:
                 continue
@@ -505,15 +503,15 @@ def check_code(source: str, translation: str) -> Result:
     """A code translation is accepted only when it equals the source after
     comment lines are removed from both."""
     if code_lines(source) == code_lines(translation):
-        return Result([], [])
+        return Result([])
     return Result([_issue(STRUCTURE, CODE_CHANGED,
                           '程式碼在註解行以外與原文不同（只能翻譯 # 或 // 開頭的註解行）')])
 
 
-def check_segment(seg, text: str, fingerprints=None, nsmap=None) -> Result:
+def check_segment(seg, text: str) -> Result:
     """The check for a stored segment (SegmentState) and a translation of
-    it: code or HTML by the segment's type."""
+    it: code or HTML by the segment's type; runs cut by the segment's
+    fingerprints (none for schema 1)."""
     if seg.segment_type == 'code':
         return check_code(seg.text, text)
-    return check_html(seg.html, text, fingerprints if fingerprints is not None
-                      else (seg.fingerprints or None), nsmap)
+    return check_html(seg.html, text, seg.fingerprints or None)

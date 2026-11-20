@@ -3711,3 +3711,10 @@ class TestPhase4HeaderProgress:
         # the header the selectors point at
         assert '<div class="project-header">' in html
         assert '<div class="progress-fill" style="width:' in html
+
+    def test_refusal_lists_every_problem(self, client):
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002',
+                               json={'text': '<p> <b/></p>'})
+        assert response.status_code == 422
+        assert response.get_json()['error'] == \
+            '譯文未通過結構檢查：第 1 個區塊沒有文字；出現原文沒有的標籤：<b>'

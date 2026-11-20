@@ -1920,7 +1920,8 @@ class TestMutationScript:
 
 validate_check = _load('phase4_validate_check')
 
-LONG_EN = 'Words of the long paragraph go on here. ' * 6       # 192 characters without spaces
+LONG_EN = 'abcdefghi ' * 20 + 'abcdefg'                       # 187 characters without spaces
+LONG_CODE = 'value = compute(alpha, beta)\n' * 9                # 225 characters without spaces
 
 
 def _validate_projects(root):
@@ -1936,12 +1937,19 @@ def _validate_projects(root):
     book_dir.mkdir()
     chapter = xhtml(f'<h1>Head words</h1><p>A <em>b</em> c.</p><p>Plain one.</p>'
                     f'<p>{LONG_EN}</p><pre># note\nx = 1</pre><p>Same words.</p>')
-    epub = _raw_book(book_dir, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+    # a failed segment with text, then a long code segment and a paragraph
+    # that are checked: none of them goes into the length ratio
+    other = xhtml(f'<p>Skipped words.</p><pre>{LONG_CODE}</pre><p>Tail words.</p>')
+    epub = _raw_book(book_dir, {'c': ('c.xhtml', chapter), 'd': ('d.xhtml', other)},
+                     nav=None, ncx=None)
     project_dir = _project(root, epub, {
         'c_seg0001': '<h1>標題</h1>',
         'c_seg0002': '<p>甲乙丙。</p>\n<p>普通。</p>\n<p>' + '長' * 100 + '</p>',
         'c_seg0003': '# 註\nx = 2',
-        'c_seg0004': '<p>Same words.</p>'}, name='beta')
+        'c_seg0004': '<p>Same words.</p>',
+        'd_seg0001': '<p>壞',
+        'd_seg0002': LONG_CODE,
+        'd_seg0003': '<p>尾字。</p>'}, statuses={'d_seg0001': 'failed'}, name='beta')
     return root, project_dir
 
 
@@ -1959,9 +1967,9 @@ class TestValidateCheck:
         assert capsys.readouterr().out.splitlines() == [
             'PASS project-1: round trip 3/3, translated 3, failing the structural check 0 '
             '(none), warnings (none), length ratio: no segment',
-            'PASS project-2: round trip 4/4, translated 4, failing the structural check 2 '
+            'PASS project-2: round trip 7/7, translated 6, failing the structural check 2 '
             '(code_changed 1, tag_count 1), warnings (untranslated 1), length ratio: no segment',
-            'TOTAL projects 2  round trip 7/7  translated 7  failing the structural check 2 '
+            'TOTAL projects 2  round trip 10/10  translated 9  failing the structural check 2 '
             '(code_changed 1, tag_count 1)  warnings (untranslated 1)  length ratio: no segment  '
             'failed projects 0',
         ]
@@ -1976,9 +1984,12 @@ class TestValidateCheck:
         pm.save()
         assert self._main(root) == 0
         out = capsys.readouterr().out.splitlines()
-        # the second segment: 3 paragraphs, 107 / 205 characters; the others are short
-        assert out[1].endswith('length ratio over 1 segments: p1 0.522 p5 0.522 p50 0.522 '
-                               'p95 0.522 p99 0.522; outside 0.25-0.8: 0 (0.0%)')
+        # the second segment: 3 paragraphs, 107 / 200 characters (the
+        # smallest source counted); the others are shorter, code is left out
+        ratio = ('length ratio over 1 segments: p1 0.535 p5 0.535 p50 0.535 '
+                 'p95 0.535 p99 0.535; outside 0.25-0.8: 0 (0.0%)')
+        assert out[1].endswith(ratio)
+        assert out[2].endswith(f'{ratio}  failed projects 0')
 
     def test_names_without_anonymize(self, tmp_path, capsys):
         root, _ = _validate_projects(tmp_path / 'projects')
@@ -1993,7 +2004,7 @@ class TestValidateCheck:
         out = capsys.readouterr().out.splitlines()
         assert out[0].startswith('FAIL project-1: round trip 0/3, ')
         assert out[0].endswith('; round trip fails for 3 segments')
-        assert out[2].startswith('TOTAL projects 2  round trip 0/7  ')
+        assert out[2].startswith('TOTAL projects 2  round trip 0/10  ')
         assert out[2].endswith('failed projects 2')
 
     def test_unmatched_migration_fails(self, tmp_path, capsys, monkeypatch):
@@ -2016,6 +2027,8 @@ class TestValidateCheck:
         assert self._main(root) == 1
         out = capsys.readouterr().out
         assert 'FAIL project-1: check raised KeyError' in out and 'secret' not in out
+        assert 'FAIL project-2: check raised KeyError' in out
+        assert out.splitlines()[-1].endswith('failed projects 2')
 
     def test_changed_project_directory_fails(self, tmp_path, capsys, monkeypatch):
         root, project_dir = _validate_projects(tmp_path / 'projects')
@@ -2107,3 +2120,92 @@ class TestValidateCheck:
         result = _run_script('phase4_validate_check', ['--help'], str(tmp_path))
         assert result.returncode == 0
         assert 'Phase 4 check: protection round trip' in result.stdout
+
+
+class TestValidateCheckSurvivors:
+    """Mutation testing, Phase 4 run 1: the check script in-process."""
+
+    def test_help_in_process(self, capsys):
+        with pytest.raises(SystemExit):
+            validate_check.main(['--help'])
+        out = ' '.join(capsys.readouterr().out.split())
+        assert ('Phase 4 check: protection round trip and the full check over existing '
+                'translations.') in out
+        assert ('--projects-dir PROJECTS_DIR Directory that holds the project folders '
+                '(default: projects)') in out
+        assert '--anonymize Print project-N labels; omit names and paths' in out
+
+    def test_default_projects_directory(self, tmp_path, capsys, monkeypatch):
+        _validate_projects(tmp_path / 'projects')
+        monkeypatch.chdir(tmp_path)
+        assert validate_check.main(['--anonymize']) == 0
+        assert capsys.readouterr().out.splitlines()[0].startswith('PASS project-1: ')
+
+    def test_work_directory_under_the_resolved_temporary_directory(self, tmp_path, capsys,
+                                                                   monkeypatch):
+        root, _ = _validate_projects(tmp_path / 'projects')
+        real_tmp = tmp_path / 'real-tmp'
+        real_tmp.mkdir()
+        link = tmp_path / 'tmp-link'
+        link.symlink_to(real_tmp)
+        made = []
+        real = validate_check.tempfile.mkdtemp
+
+        def mkdtemp(**kwargs):
+            made.append(real(**kwargs))
+            return made[-1]
+        monkeypatch.setattr(validate_check.tempfile, 'gettempdir', lambda: str(link))
+        monkeypatch.setattr(validate_check.tempfile, 'mkdtemp', mkdtemp)
+        assert validate_check.main(['--projects-dir', str(root), '--anonymize']) == 0
+        assert os.path.dirname(made[0]) == os.path.realpath(str(real_tmp))
+
+    def test_percentile_rank(self):
+        assert validate_check.percentile(list(range(1, 102)), 100) == 101
+        assert validate_check.percentile(list(range(1, 201)), 99) == 198
+
+    def test_two_problems_joined(self, tmp_path, capsys, monkeypatch):
+        root, project_dir = _validate_projects(tmp_path / 'projects')
+        real = validate_check.check_copy
+
+        def touch(copy_dir):
+            with open(os.path.join(project_dir, 'extra.txt'), 'w') as f:
+                f.write('x')
+            r, problems = real(copy_dir)
+            return r, problems + ['first problem']
+        monkeypatch.setattr(validate_check, 'check_copy', touch)
+        assert validate_check.main(['--projects-dir', str(root), '--anonymize']) == 1
+        assert capsys.readouterr().out.splitlines()[1].endswith(
+            '; first problem; files in the project directory changed')
+
+    def test_two_problems_joined_without_counts(self, tmp_path, capsys, monkeypatch):
+        root, project_dir = _validate_projects(tmp_path / 'projects')
+
+        def check(copy_dir):
+            with open(os.path.join(project_dir, 'extra.txt'), 'w') as f:
+                f.write('x')
+            return {}, ['no counts']
+        monkeypatch.setattr(validate_check, 'check_copy', check)
+        assert validate_check.main(['--projects-dir', str(root), '--anonymize']) == 1
+        assert capsys.readouterr().out.splitlines()[1] == \
+            'FAIL project-2: no counts; files in the project directory changed'
+
+    def test_first_snapshot_failing_is_not_a_change(self, tmp_path, capsys, monkeypatch):
+        root, _ = _validate_projects(tmp_path / 'projects')
+        calls = []
+
+        def snapshot(path):
+            calls.append(path)
+            if len(calls) == 1:
+                raise OSError('gone')
+            return []
+        monkeypatch.setattr(validate_check, 'snapshot', snapshot)
+        assert validate_check.main(['--projects-dir', str(root), '--anonymize']) == 1
+        assert capsys.readouterr().out.splitlines()[0] == \
+            'FAIL project-1: check raised OSError'
+
+    def test_snapshot_names_relative(self, tmp_path):
+        (tmp_path / 'p' / 'log').mkdir(parents=True)
+        (tmp_path / 'p' / 'project.json').write_text('{}')
+        (tmp_path / 'p' / 'log' / 'a.txt').write_text('ab')
+        assert [(n, size) for n, size, _ in validate_check.snapshot(str(tmp_path / 'p'))] == \
+            [('project.json', 2), (os.path.join('log', 'a.txt'), 2)]

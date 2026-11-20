@@ -254,10 +254,10 @@ class _Session:
         self.attempts = []     # (message, raw output) of each failed call
         self.usage = None
 
-    def call(self, messages: list, mode: str, source: str) -> str:
-        """One reply to `messages`, cleaned for `mode` (code, html or
-        text). A transient error is retried while calls are left; raises
-        TranslationError when none are."""
+    def call(self, messages: list, clean) -> str:
+        """One reply to `messages`, passed through `clean`. A transient
+        error is retried while calls are left; raises TranslationError
+        when none are."""
         if not self.prompt:
             self.prompt = messages[0].content
         engine = self.engine
@@ -282,11 +282,8 @@ class _Session:
                 u = self.usage or Usage(0, 0)
                 self.usage = Usage(u.input_tokens + response.usage.input_tokens,
                                    u.output_tokens + response.usage.output_tokens)
-            # Code keeps its leading whitespace (first-line indentation)
-            raw = response.text if mode == 'code' else response.text.strip()
             self.last_raw = response.text
-            return engine._clean_response(raw, html_mode=mode == 'html',
-                                          code_mode=mode == 'code', source=source)
+            return clean(response.text)
         self.fail('transient', self.attempts[-1][0])
 
     @property
@@ -313,20 +310,20 @@ class _Session:
         self.attempts.append(('; '.join(f'{i.code}: {i.detail}' for i in blocking)
                               [:ERROR_MESSAGE_CHARS], self.last_raw))
 
-    def attempt(self, prompt: str, check, mode: str, source: str,
-                retry: bool = True) -> tuple:
-        """The request and, when its reply fails `check`, one follow-up with
-        the errors. Returns (text, result); raises _Rejected."""
+    def attempt(self, prompt: str, check, clean, retries: int = 1) -> tuple:
+        """The request and, while its reply fails `check`, up to `retries`
+        follow-ups with the errors. Returns (text, result); raises
+        _Rejected."""
         messages = [Message('user', prompt)]
         while True:
-            reply = self.call(messages, mode, source)
+            reply = self.call(messages, clean)
             text, result = check(reply)
             if not result.blocking:
                 return text, result
             self.rejected(result)
-            if not retry or self.left == 0:
+            if retries == 0 or self.left == 0:
                 raise _Rejected(result)
-            retry = False
+            retries -= 1
             problems = '\n'.join(f'- {i.detail}' for i in result.blocking)
             messages += [Message('assistant', self.last_raw),
                          Message('user', FEEDBACK_PROMPT.format(problems=problems))]
@@ -338,6 +335,14 @@ def _empty(reply: str, source: str):
         return validation.Result([Issue(kind=validation.BACKEND, code=validation.EMPTY_REPLY,
                                         detail='回覆是空的', blocking=True)])
     return None
+
+
+def _clean_html(raw: str) -> str:
+    return TranslationEngine._clean_response(raw.strip(), html_mode=True)
+
+
+def _clean_text(raw: str) -> str:
+    return TranslationEngine._clean_response(raw.strip())
 
 
 def _html_check(source: str, fingerprints, protected: validation.Protected):
@@ -352,7 +357,7 @@ def _html_check(source: str, fingerprints, protected: validation.Protected):
                 kind=validation.BACKEND, code=validation.NOT_HTML,
                 detail='回覆不是 HTML（第一個字元必須是 <）', blocking=True)])
         try:
-            validation.fragment(reply, validation.declarations(protected.html, reply))
+            validation.fragment(reply, validation.declarations(reply))
         except etree.XMLSyntaxError as e:
             return None, validation.Result([Issue(
                 kind=validation.STRUCTURE, code=validation.NOT_WELL_FORMED,
@@ -425,11 +430,14 @@ class TranslationEngine:
             if is_code:
                 def check(reply):
                     return reply, (_empty(reply, text) or validation.check_code(text, reply))
-                accepted, result = session.attempt(build(), check, 'code', text)
+
+                def clean(raw):  # code keeps its first line's indentation
+                    return self._clean_response(raw, code_mode=True, source=text)
+                accepted, result = session.attempt(build(), check, clean)
             elif not html:
                 def check(reply):
                     return reply, (_empty(reply, text) or validation.Result([]))
-                accepted, result = session.attempt(build(), check, 'text', text)
+                accepted, result = session.attempt(build(), check, _clean_text)
             else:
                 accepted, result = self._translate_html(session, html, fingerprints, build)
         except _Rejected as e:
@@ -441,7 +449,7 @@ class TranslationEngine:
         protected = validation.protect(html)
         try:
             return session.attempt(build(protected.html),
-                                   _html_check(html, fingerprints, protected), 'html', html)
+                                   _html_check(html, fingerprints, protected), _clean_html)
         except _Rejected:
             units = validation.top_level_units(html)
             if len(units) < 2 or session.left < 2:
@@ -453,15 +461,14 @@ class TranslationEngine:
         for half in (html[:cut], html[resume:]):
             half_protected = validation.protect(half)
             text, _ = session.attempt(build(half_protected.html),
-                                      _html_check(half, None, half_protected), 'html', half,
-                                      retry=False)
+                                      _html_check(half, None, half_protected), _clean_html,
+                                      retries=0)
             texts.append(text)
         joined = texts[0] + html[cut:resume] + texts[1]
         result = validation.check_html(html, joined, fingerprints)
         if result.blocking:
             raise _Rejected(result)
         return joined, result
-
 
     def _build_prompt(self, text: str, segment_type: SegmentType,
                       glossary_text: str = '',
@@ -615,9 +622,9 @@ def _request_text(engine: TranslationEngine, seg, glossary_text: str, context) -
     """The request of a call that raised, for its diagnostics ('' when it
     cannot be built)."""
     try:
-        html = '' if seg.segment_type == SegmentType.CODE else seg.html
+        # the protected HTML (ignored for code)
         return engine._build_prompt(seg.text, seg.segment_type, glossary_text,
-                                    *context, html=validation.protect(html).html if html else '')
+                                    *context, html=validation.protect(seg.html).html)
     except Exception:  # noqa: BLE001 - diagnostics only
         return ''
 
