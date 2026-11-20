@@ -10,8 +10,9 @@ and checks per project:
 - the total number of characters of translated text is unchanged;
 - the export's block placement (EPUBBuilder._place_by_blocks on the chapters
   as ebooklib serves them) accepts every chapter that has segments;
-  translated text segments whose translation has a different number of
-  top-level nodes than the blocks the placement gives them are counted as
+  translated text segments that the placement does not pair node by node
+  (a segment with an inline run, or a translation whose number of
+  top-level nodes differs from the segment's blocks) are counted as
   "export fallback" (they are replaced or wrapped as a whole);
 - the migrated project loads through the web app (Flask test client on the
   copies: home page, project JSON with the migrated segment count, review
@@ -83,7 +84,7 @@ def read_segments(project_file: str) -> tuple[int, int]:
 def placed_chapters(project_dir: str) -> tuple[int, int, int]:
     """(chapters with segments, chapters the export's block placement
     accepts, translated text segments of those that take the whole-segment
-    path because their node count differs from the placement's)."""
+    path)."""
     builder = EPUBBuilder(project_dir)
     builder.pm.load()
     with warnings.catch_warnings():
@@ -101,9 +102,10 @@ def placed_chapters(project_dir: str) -> tuple[int, int, int]:
         result = None if body is None else builder._place_by_blocks(body, segments)
         if result is not None:
             placed += 1
-            fallback += sum(1 for seg, units, _ in result
+            fallback += sum(1 for seg, covered, _, _, pair in result
                             if seg.translated_text and seg.segment_type == SegmentType.TEXT
-                            and _top_level_count(seg.translated_text) != len(units))
+                            and (not pair
+                                 or _top_level_count(seg.translated_text) != len(covered)))
     return len(by_chapter), placed, fallback
 
 
