@@ -702,7 +702,7 @@ def _fill(block, piece, fmt: str, src_lang: str, epub3: bool, ns):
             _replace_children(el, piece)
             _relang(el, src_lang)
             return el
-        translated = copy.deepcopy(el)
+        translated = copy.deepcopy(el)  # the original keeps the source's values
         translated.tail = None
         _replace_children(translated, piece)
         _mark_translated(translated, src_lang, epub3)
@@ -743,7 +743,12 @@ def _bilingual(fmt: str, ns):
 
 
 def _replace_children(el, source) -> None:
-    """`el` gets the text and children of `source` (its attributes stay)."""
+    """`el` gets the text and children of `source`, and the values of the
+    attributes people read (alt, title, aria-label) that both carry; its
+    other attributes stay."""
+    for name in validation.TRANSLATABLE_ATTRIBUTES:
+        if el.get(name) is not None and source.get(name) is not None:
+            el.set(name, source.get(name))
     for child in list(el):
         el.remove(child)
     el.text = source.text

@@ -115,8 +115,10 @@ def _refused(result):
 @review_bp.route('/api/projects/<project_name>/segments/<segment_id>/approve', methods=['POST'])
 def approve_segment(project_name: str, segment_id: str):
     """Mark a segment as reviewed."""
-    data = request.get_json(silent=True) or {}
-    text = data.get('text', '') if isinstance(data, dict) else ''
+    data = request.get_json(silent=True) if request.get_data() else {}
+    if not isinstance(data, dict):  # a body that is not a JSON object
+        return jsonify({'error': 'Body must be a JSON object'}), 400
+    text = data.get('text', '')
     if text is None:
         text = ''
     if not isinstance(text, str):

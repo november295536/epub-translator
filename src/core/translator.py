@@ -299,14 +299,15 @@ class _Session:
 
     def fail(self, code: str, message: str, issues: list | None = None):
         if code == validation.EMPTY_REPLY:
-            text = f"Empty translation after {len(self.attempts)} attempts"
+            text = f"Empty translation after {self.used} attempts"
         else:
-            text = f"Translation failed after {len(self.attempts)} attempts: {message}"
+            text = f"Translation failed after {self.used} attempts: {message}"
         raise TranslationError(text, code=code, prompt=self.prompt, attempts=self.attempts,
                                issues=issues, usage=self.usage)
 
-    def rejected(self, result: validation.Result) -> None:
-        """Record a reply that failed its check."""
+    def rejected(self, result: validation.Result, raw: str | None = None) -> None:
+        """Record a reply (or, `raw`, a text joined from replies) that failed
+        its check."""
         blocking = result.blocking
         if blocking[0].code == validation.EMPTY_REPLY:
             logger.warning("Empty translation result (attempt %d/%d)",
@@ -315,7 +316,7 @@ class _Session:
             logger.warning("Translation reply rejected (attempt %d/%d): %s", self.used,
                            self.engine.max_calls, ', '.join(i.code for i in blocking))
         self.attempts.append(('; '.join(f'{i.code}: {i.detail}' for i in blocking)
-                              [:ERROR_MESSAGE_CHARS], self.last_raw))
+                              [:ERROR_MESSAGE_CHARS], self.last_raw if raw is None else raw))
 
     def attempt(self, prompt: str, check, clean, retries: int = 1) -> tuple:
         """The request and, while its reply fails `check`, up to `retries`
@@ -469,19 +470,29 @@ class TranslationEngine:
             units = validation.top_level_units(html)
             if len(units) < 2 or session.left < 2:
                 raise
-        # Split once at the middle block boundary; each half once, no retry
+        # Split once at the middle block boundary; each half once, no retry.
+        # Each half is checked with its share of the fingerprints, its
+        # blocks numbered as in the segment.
         mid = len(units) // 2
         cut, resume = units[mid - 1][1], units[mid][0]
+        counts = validation.pieces_per_group(html, fingerprints)
+        if counts is None or len(counts) != len(units):  # cannot happen for a cuttable source
+            counts = [1] * len(units)
+        before = sum(counts[:mid])
+        shares = (None, None) if fingerprints is None else \
+            (fingerprints[:before], fingerprints[before:])
         texts = []
-        for half, first in ((html[:cut], 1), (html[resume:], mid + 1)):
+        for half, share, first in ((html[:cut], shares[0], 1),
+                                   (html[resume:], shares[1], before + 1)):
             half_protected = validation.protect(half)
             text, _ = session.attempt(build(half_protected.html),
-                                      _html_check(half, None, half_protected, first), _clean_html,
+                                      _html_check(half, share, half_protected, first), _clean_html,
                                       retries=0)
             texts.append(text)
         joined = texts[0] + html[cut:resume] + texts[1]
         result = validation.check_html(html, joined, fingerprints)
         if result.blocking:
+            session.rejected(result, joined)  # the joined text is the last attempt
             raise _Rejected(result)
         return joined, result
 

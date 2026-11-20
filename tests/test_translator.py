@@ -1880,3 +1880,64 @@ class TestRound1Translator:
         outcome = translate_segment(_engine(fake), seg, [seg])
         assert outcome.issues[0].detail == '第 1 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'
         assert len(fake.requests) == 3
+
+
+class TestRound2Split:
+
+    def test_second_half_numbered_after_a_cut_run(self):
+        # blocks: A, L1, L2, B (the run is two blocks separated by <br> in
+        # the chapter); units: p, run, p -> the second half is run + p
+        source = '<p>A <b>x</b></p>\nL1\nL2\n<p>B <b>y</b></p>'
+        seg = _html_seg(source, text='A x\nL1\nL2\nB y')
+        seg.fingerprints = [fingerprint(t) for t in ('A x', 'L1', 'L2', 'B y')]
+        bad = '<p k="1">甲<b>乙</b></p>\n<run k="2">一\n二</run>\n<p k="3">丙乙</p>'
+        fake = FakeBackend([bad, bad, '<p k="1">甲<b>乙</b></p>',
+                            '<run k="1">一\n二</run>\n<p k="2">丙乙</p>'])
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert outcome.status == SegmentStatus.FAILED
+        assert outcome.issues[0].detail == '第 4 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'
+
+    def test_first_half_checked_with_its_fingerprints(self):
+        source = '<p>A</p>\nL1\nL2\n<p>B</p>\n<p>C</p>'
+        seg = _html_seg(source, text='A\nL1\nL2\nB\nC')
+        seg.fingerprints = [fingerprint(t) for t in ('A', 'L1', 'L2', 'B', 'C')]
+        bad = '<p k="1">甲</p>\n<run k="2">一二</run>\n<p k="3">乙</p>\n<p k="4">丙</p>'
+        # the first half's run joined into one line: refused like the whole
+        fake = FakeBackend([bad, bad, '<p k="1">甲</p>\n<run k="2">一二</run>', ''])
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert outcome.status == SegmentStatus.FAILED
+        assert outcome.issues[0].code == 'structure_mismatch'
+        assert len(fake.requests) == 3
+        fake = FakeBackend([bad, bad, '<p k="1">甲</p>\n<run k="2">一\n二</run>',
+                            '<p k="1">乙</p>\n<p k="2">丙</p>'])
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert outcome.text == '<p>甲</p>\n一\n二\n<p>乙</p>\n<p>丙</p>'
+
+
+class TestRound2JoinedFailure:
+    """Both halves pass but the joined text fails: recorded as an attempt."""
+
+    def test_joined_failure_recorded(self, monkeypatch, tmp_path, caplog):
+        import logging
+        from src.core import validation as v
+        real = v.check_html
+        joined = RESTORED
+
+        def check(source, translation, *args, **kwargs):
+            if translation == joined:  # only the whole, joined text fails
+                return v.Result([v._issue(v.STRUCTURE, v.TAG_COUNT, 'joined fails')])
+            return real(source, translation, *args, **kwargs)
+        monkeypatch.setattr(v, 'check_html', check)
+        halves = ['<p k="1">見 <a k="2"><sup>3</sup></a> 的<em k="3">核心概念</em>。</p>',
+                  '<p k="1">第二個<b>粗體</b>。</p>']
+        fake = FakeBackend([DROPPED_B, DROPPED_B] + halves)
+        seg = _html_seg()
+        caplog.set_level(logging.WARNING, logger='src.core.translator')
+        outcome = _translated(_engine(fake), seg, [seg], str(tmp_path))
+        assert outcome.status == SegmentStatus.FAILED and len(fake.requests) == 4
+        assert str(outcome.failure) == 'Translation failed after 4 attempts: joined fails'
+        assert [a[0] for a in outcome.failure.attempts][-1] == 'tag_count: joined fails'
+        assert outcome.failure.attempts[-1][1] == joined
+        assert 'Translation reply rejected (attempt 4/4): tag_count' in caplog.messages
+        log = open(failure_log_path(str(tmp_path), seg.segment_id), encoding='utf-8').read()
+        assert 'joined fails' in log

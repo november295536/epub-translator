@@ -454,6 +454,10 @@ def migrate(project_dir, dry_run):
         sys.exit(1)
 
 
+VALIDATE_SCHEMA_1_MESSAGE = ('此專案是舊格式（schema 1），無法檢查譯文。'
+                             '請先執行 python3 translate.py migrate <專案目錄> 再檢查。')
+
+
 @cli.command()
 @click.argument('project_dir', type=click.Path(exists=True, file_okay=False))
 @click.option('--mark-failed', is_flag=True, default=False,
@@ -482,7 +486,7 @@ def validate(project_dir, mark_failed):
     finally:
         lock.release()
     if report is None:
-        click.echo(SCHEMA_1_MESSAGE)
+        click.echo(VALIDATE_SCHEMA_1_MESSAGE)
         sys.exit(1)
     for line in report:
         click.echo(line)
