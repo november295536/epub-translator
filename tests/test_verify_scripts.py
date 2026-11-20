@@ -1755,3 +1755,24 @@ class TestExportCheckRound1Survivors(_ExportCheckBase):
         assert self._main(root) == 1
         assert capsys.readouterr().out.splitlines()[1] == (
             'FAIL project-1: export check raised PermissionError')
+
+
+class TestExportCheckReviewRound2(_ExportCheckBase):
+
+    def test_final_snapshot_failure_reported_and_others_checked(self, tmp_path, capsys,
+                                                                 monkeypatch):
+        root = _export_projects(tmp_path / 'projects')
+        real, calls = export_check.snapshot, []
+
+        def snapshot(path):
+            calls.append(path)
+            if len(calls) == 2:  # the first project's final snapshot
+                raise PermissionError(f'invented failure on {path}')
+            return real(path)
+        monkeypatch.setattr(export_check, 'snapshot', snapshot)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[1].startswith('FAIL project-1: ') and out[1].endswith(
+            'project snapshot raised PermissionError')
+        assert out[2].startswith('PASS project-2: ')
+        assert 'alpha' not in '\n'.join(out) and 'invented failure' not in '\n'.join(out)

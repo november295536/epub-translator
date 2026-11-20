@@ -479,8 +479,11 @@ def run(args, names: list[str], work: str) -> int:
         except Exception as e:  # any failure is a FAIL, never a crash
             r, problems = {}, [f'export check raised {type(e).__name__}']
         finally:
-            if before is not None and snapshot(project_dir) != before:
-                problems.append('files in the project directory changed')
+            try:
+                if before is not None and snapshot(project_dir) != before:
+                    problems.append('files in the project directory changed')
+            except Exception as e:  # reported like any failure, by type only
+                r, problems = {}, problems + [f'project snapshot raised {type(e).__name__}']
         if not r:
             failed += 1
             print(f'FAIL {label}: ' + '; '.join(problems))
