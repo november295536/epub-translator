@@ -334,7 +334,8 @@ def member_problems(source: Archive, out: Archive, allowed: set) -> list[str]:
             continue
         stored = [getattr(info, f) for f in fields] + [info.flag_bits & 0x800]
         expect = [getattr(src, f) for f in fields] + [src.flag_bits & 0x800]
-        expect[6] = _without_zip64(expect[6])  # the exporter drops the source's ZIP64 record
+        # the exporter drops the source's ZIP64 record; zipfile may add its own
+        stored[6], expect[6] = _without_zip64(stored[6]), _without_zip64(expect[6])
         if info.filename == 'mimetype':  # stored, no extra field (OCF)
             expect[1], expect[6] = zipfile.ZIP_STORED, b''
         differ += stored != expect

@@ -241,11 +241,13 @@ def main(base: str) -> int:
         print(f'stopped ({e or "SIGINT"})', file=sys.stderr)
         return 2
     finally:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # a second signal must not cut this short
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
-        if proc is not None:
-            stop_group(proc)
-        shutil.rmtree(work, ignore_errors=True)
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(sig, signal.SIG_IGN)  # a second signal must not cut this short
+        try:
+            if proc is not None:
+                stop_group(proc)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == '__main__':

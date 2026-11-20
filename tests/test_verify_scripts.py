@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -1586,8 +1587,6 @@ class TestExportCheckReviewRound1(_ExportCheckBase):
                          'chinese-only: 1 untouched members stored differently')
 
     def test_untouched_member_compression_changed(self, tmp_path, capsys, monkeypatch):
-        import zipfile
-
         def change(members):
             for info, _ in members:
                 if info.filename == 'OEBPS/Styles/book.css':
@@ -1836,6 +1835,18 @@ class TestExportCheckRound2Survivors(_ExportCheckBase):
 
 class TestExportCheckReviewRound3(_ExportCheckBase):
 
+    def test_export_member_with_a_zip64_record_passes(self, tmp_path, capsys, monkeypatch):
+        # review round 4: a ZIP64 record in the export's extra field (as zipfile
+        # writes for large members) is no difference either
+        def change(members):
+            for info, _ in members:
+                if info.filename == 'OEBPS/Styles/book.css':
+                    info.extra = b'\x01\x00\x08\x00' + (8).to_bytes(8, 'little')
+            return members
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+        _tamper(monkeypatch, change)
+        assert self._main(root) == 0, capsys.readouterr().out
+
     def test_source_member_with_a_zip64_record_passes(self, tmp_path, capsys):
         import zipfile
         from tests.test_exporter import RAW_TRANSLATIONS, _project, _raw_book
@@ -1890,6 +1901,14 @@ class TestMutationScript:
         child = int(proc.stdout.readline())
         proc.wait()
         os.kill(child, 0)  # still running, in the leader's group
+        proc.stdout.close()
         mutation.stop_group(proc)
+        deadline = time.monotonic() + 10  # the reaper may take a moment
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
         with pytest.raises(ProcessLookupError):
             os.killpg(proc.pid, 0)
