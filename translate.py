@@ -465,8 +465,12 @@ def validate(project_dir, mark_failed):
     segments break it. With --mark-failed the segments that fail a
     structural rule become failed, with their issues; their text is kept,
     so start --retry-failed translates them again and a retry that fails
-    leaves the old text in place.
+    leaves the old text in place. A schema 1 project is refused (run
+    migrate first), with or without the flag.
     """
+    if not os.path.isfile(os.path.join(project_dir, 'project.json')):
+        click.echo(f"找不到專案：{project_dir} 裡沒有 project.json。")
+        sys.exit(1)
     lock = ProjectLock(project_dir)
     try:
         if mark_failed:
@@ -477,13 +481,21 @@ def validate(project_dir, mark_failed):
         sys.exit(1)
     finally:
         lock.release()
+    if report is None:
+        click.echo(SCHEMA_1_MESSAGE)
+        sys.exit(1)
     for line in report:
         click.echo(line)
 
 
-def _validate(project_dir: str, mark_failed: bool) -> list[str]:
+def _validate(project_dir: str, mark_failed: bool) -> list[str] | None:
+    """The report lines; None for a schema 1 project (its segments have no
+    block ranges: marking one failed and then migrating would clear the
+    translations of its whole merge group)."""
     pm = ProjectManager(project_dir)
     pm.load()
+    if pm.data.schema != 2:
+        return None
     checked, failing = 0, []
     blocking, warnings = Counter(), Counter()
     for seg in pm.data.segments:

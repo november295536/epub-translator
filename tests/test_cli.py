@@ -367,7 +367,7 @@ def _responder(fail_marks=(), error=TransientError('exit 1', raw='RAW')):
             # The segment's own HTML; neighbours appear as plain-text context
             if f'Sentence {mark}.</p>' in prompt:
                 raise error
-        return '<p>譯文</p>'
+        return '<p k="1">譯文</p>'
     return respond
 
 
@@ -468,7 +468,7 @@ class TestCLILock:
 
         def respond(request):
             seen.append(lock_free_for_other_process(path))
-            return '<p>譯文</p>'
+            return '<p k="1">譯文</p>'
 
         with use_fake_backend(FakeBackend(responder=respond)):
             result = runner.invoke(cli, ['start', '--project', path])
@@ -619,7 +619,7 @@ class TestCLISupervisorFailure:
             threads.append(threading.current_thread())
             if 'Sentence MARK4.</p>' in request.messages[-1].content:
                 _time.sleep(1)  # still in flight when the save fails
-            return '<p>譯文</p>'
+            return '<p k="1">譯文</p>'
 
         # Without --model the run's first save is the supervisor's
         with use_fake_backend(FakeBackend(responder=respond)), \
@@ -736,7 +736,7 @@ class TestCLIRound1Exact:
 
         def respond(request):
             daemons.append(threading.current_thread().daemon)
-            return '<p>譯文</p>'
+            return '<p k="1">譯文</p>'
 
         with use_fake_backend(FakeBackend(responder=respond)):
             runner.invoke(cli, ['start', '--project', path, '--workers', '2'])
@@ -748,7 +748,7 @@ class TestCLIRound1Exact:
 
         def respond(request):
             _time.sleep(0.8)
-            return '<p>譯文</p>'
+            return '<p k="1">譯文</p>'
 
         with use_fake_backend(FakeBackend(responder=respond)):
             result = runner.invoke(cli, ['start', '--project', path, '--workers', '2'])
@@ -761,7 +761,7 @@ class TestCLIRound1Exact:
 
         def respond(request):
             both.wait(10)
-            return '<p>譯文</p>'
+            return '<p k="1">譯文</p>'
 
         with use_fake_backend(FakeBackend(responder=respond)), \
                 patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
@@ -807,7 +807,7 @@ class TestRound2WorkerStartup:
             workers.append(threading.current_thread())
             in_flight.set()
             _time.sleep(0.3)  # still in flight when the second start fails
-            return '<p>譯文</p>'
+            return '<p k="1">譯文</p>'
 
         monkeypatch.setattr(threading.Thread, 'start', start)
         with use_fake_backend(FakeBackend(responder=respond)):
@@ -848,7 +848,7 @@ class TestCLIRound3UnexpectedStreak:
 
         def respond(request):
             if '<p k="1">Sentence MARK5.</p>' in request.messages[-1].content:
-                return '<p>譯文</p>'
+                return '<p k="1">譯文</p>'
             return {}['missing']
 
         with use_fake_backend(FakeBackend(responder=respond)):
@@ -1068,3 +1068,48 @@ class TestPhase4Validate:
     def test_help(self, runner):
         output = ' '.join(runner.invoke(cli, ['validate', '--help']).output.split())
         assert '--mark-failed Set the segments that fail the structural check to failed' in output
+
+
+class TestRound1Validate:
+    """Phase 4 review round 1: validate refuses schema 1 and a missing project."""
+
+    @pytest.mark.parametrize('flag', [[], ['--mark-failed']])
+    def test_schema_1_refused(self, runner, tmp_path, flag):
+        from src.epub.exporter import SCHEMA_1_MESSAGE
+        from tests.test_migrate import _legacy_project
+        project_dir = _legacy_project(tmp_path)
+        before = open(os.path.join(project_dir, 'project.json'), encoding='utf-8').read()
+        files = sorted(os.listdir(project_dir))
+        result = runner.invoke(cli, ['validate', str(project_dir), *flag])
+        assert result.exit_code == 1
+        assert result.output == SCHEMA_1_MESSAGE + '\n'
+        assert open(os.path.join(project_dir, 'project.json'), encoding='utf-8').read() == before
+        assert sorted(os.listdir(project_dir)) == sorted(files + (['project.lock'] if flag else []))
+
+    @pytest.mark.parametrize('flag', [[], ['--mark-failed']])
+    def test_directory_without_project(self, runner, tmp_path, flag):
+        empty = tmp_path / 'empty'
+        empty.mkdir()
+        result = runner.invoke(cli, ['validate', str(empty), *flag])
+        assert result.exit_code == 1
+        assert result.output == f'找不到專案：{empty} 裡沒有 project.json。\n'
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert os.listdir(empty) == []
+
+    def test_lone_surrogate_is_not_well_formed(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=2)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.mark_translated('c1_seg0001', '<p>句子。</p>')
+        pm.mark_translated('c1_seg0002', 'SURROGATE')
+        pm.save()
+        project_json = os.path.join(path, 'project.json')
+        with open(project_json, encoding='utf-8') as f:
+            text = f.read()
+        with open(project_json, 'w', encoding='utf-8') as f:
+            f.write(text.replace('SURROGATE', '<p>\\ud800</p>'))
+        result = runner.invoke(cli, ['validate', path])
+        assert result.exit_code == 0, result.output
+        assert result.output.splitlines()[:2] == [
+            '已檢查 2 段譯文：1 段未通過結構檢查（匯出時以原文輸出），1 段通過',
+            '  not_well_formed：1']

@@ -247,6 +247,8 @@ function translationController() {
 
                 if (this.state === 'running' || this.state === 'paused') {
                     this.connectSSE();
+                } else if (['completed', 'failed', 'stopped'].includes(this.state)) {
+                    this.refreshFailedCount();  // a run that ended since the page was rendered
                 }
             } catch (e) {
                 console.error('Failed to fetch status:', e);
@@ -276,6 +278,7 @@ function translationController() {
 
                 if (this.state === 'completed') {
                     this.starting = false;
+                    this.refreshFailedCount();
                     return;
                 }
 
@@ -386,18 +389,21 @@ function translationController() {
                 const data = JSON.parse(e.data);
                 this.state = 'paused';
                 this.error = data.error || 'API 使用量已達上限，請稍後再繼續';
+                this.refreshFailedCount();
             });
 
             this.eventSource.addEventListener('auth_error', (e) => {
                 const data = JSON.parse(e.data);
                 this.state = 'paused';
                 this.error = data.error || {{ auth_hint|tojson }};
+                this.refreshFailedCount();
             });
 
             this.eventSource.addEventListener('backend_error', (e) => {
                 const data = JSON.parse(e.data);
                 this.state = 'paused';
                 this.error = data.error;
+                this.refreshFailedCount();
             });
 
             this.eventSource.addEventListener('stopped', (e) => {

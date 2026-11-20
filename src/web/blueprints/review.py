@@ -81,9 +81,11 @@ def _log_dir(pm: ProjectManager) -> str:
 @review_bp.route('/api/projects/<project_name>/segments/<segment_id>', methods=['POST'])
 def update_segment(project_name: str, segment_id: str):
     """Update translation text for a segment."""
-    data = request.get_json()
-    if not data or 'text' not in data:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or 'text' not in data:
         return jsonify({'error': 'Missing text field'}), 400
+    if not isinstance(data['text'], str):
+        return jsonify({'error': 'text must be a string'}), 400
 
     try:
         with transaction(project_name) as pm:
@@ -113,17 +115,24 @@ def _refused(result):
 @review_bp.route('/api/projects/<project_name>/segments/<segment_id>/approve', methods=['POST'])
 def approve_segment(project_name: str, segment_id: str):
     """Mark a segment as reviewed."""
-    data = request.get_json() or {}
-    text = data.get('text', '')
+    data = request.get_json(silent=True) or {}
+    text = data.get('text', '') if isinstance(data, dict) else ''
+    if text is None:
+        text = ''
+    if not isinstance(text, str):
+        return jsonify({'error': 'text must be a string'}), 400
+    if not text.strip():
+        text = ''  # whitespace only: no text supplied, the stored one is approved
 
     try:
         with transaction(project_name) as pm:
             seg = pm._find(segment_id)
             approved = text or seg.translated_text
-            if approved.strip():
-                result = check_segment(seg, approved)
-                if result.blocking:
-                    return _refused(result)
+            if not approved.strip():
+                return jsonify({'error': '沒有譯文可以核可'}), 422
+            result = check_segment(seg, approved)
+            if result.blocking:
+                return _refused(result)
             pm.mark_reviewed(segment_id, text=text)
             pm.save()
             remove_failure_log(_log_dir(pm), segment_id)
