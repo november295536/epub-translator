@@ -16,7 +16,7 @@ from src.epub import exporter
 from src.epub.blocks import serialize
 from src.epub.exporter import (
     AMBIGUOUS_SOURCE, BILINGUAL_CSS, CHAPTER_MISMATCH, CHAPTER_UNREADABLE, CODE_MARKUP,
-    FORMATS, NOT_WELL_FORMED, SCHEMA_1_MESSAGE, STRUCTURE_MISMATCH, ExportError,
+    FORMATS, MISSING_ANCHOR, NOT_WELL_FORMED, SCHEMA_1_MESSAGE, STRUCTURE_MISMATCH, ExportError,
     export_project,
 )
 from src.epub.extractor import EPUBExtractor, parse_xml
@@ -710,7 +710,7 @@ class TestToc:
     TWO = xhtml('<h2>Other File</h2>')
     ONE_TRANSLATED = {'one_seg0001': '<h1>第一部</h1>',
                       'one_seg0002': '<p>普通的字。</p>',
-                      'one_seg0003': '<h2>第二<em>部</em></h2>',
+                      'one_seg0003': '<h2><a id="inner"/>第二<em>部</em></h2>',
                       'one_seg0004': '<p>更多。</p>\n<header><h3>第三部</h3></header>'}
 
     def _toc(self, tmp_path, translations, fmt='chinese-only'):
@@ -728,9 +728,10 @@ class TestToc:
     def test_labels_from_translated_headings(self, tmp_path, fmt):
         nav, ncx, _, _ = self._toc(tmp_path, self.ONE_TRANSLATED, fmt)
         # One: first heading; Two: target is the heading; Three: a <p> block
-        # has no heading; Four: no such id; Five: the target contains blocks;
-        # Six: external; Seven: chapter not translated; Eight: no href
-        assert nav == ['第一部', '第二部', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight',
+        # has no heading; Four: no such id; Five: the target contains blocks,
+        # the first a filled heading; Six: external; Seven: chapter not
+        # translated; Eight: no href
+        assert nav == ['第一部', '第二部', 'Three', 'Four', '第二部', 'Six', 'Seven', 'Eight',
                        'Outside a nav']
         assert ncx == ['第一部', '第二部', 'Three', 'Seven', '第二部']
 
@@ -741,7 +742,9 @@ class TestToc:
         one = self.ONE.replace('<h3>', '<h3 id="h3">')
         epub = _raw_book(tmp_path, {'one': ('one.xhtml', one), 'two': ('two.xhtml', self.TWO)},
                          nav=nav, ncx=None)
-        project_dir = _project(tmp_path, epub, self.ONE_TRANSLATED)
+        translations = dict(self.ONE_TRANSLATED,
+                            one_seg0004='<p>更多。</p>\n<header><h3 id="h3">第三部</h3></header>')
+        project_dir = _project(tmp_path, epub, translations)
         _, z = _export(tmp_path, project_dir, 'chinese-only')
         labels = [_inner(a) for a in _root(z, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a')]
         assert labels[1] == '第二部' and labels[3] == '第三部'
@@ -886,7 +889,7 @@ class TestProjectLevel:
     def test_reason_texts_cover_every_reason(self):
         assert set(exporter.REASON_TEXT) == {
             CHAPTER_UNREADABLE, CHAPTER_MISMATCH, NOT_WELL_FORMED, STRUCTURE_MISMATCH,
-            AMBIGUOUS_SOURCE, CODE_MARKUP}
+            AMBIGUOUS_SOURCE, CODE_MARKUP, MISSING_ANCHOR}
 
     def test_no_duplicate_ids_in_raw_fixture(self, tmp_path, raw_project):
         for fmt in FORMATS:
@@ -972,9 +975,9 @@ class TestSurvivors:
 
     def test_report_codes_texts_and_messages(self, tmp_path, raw_project):
         assert (CHAPTER_UNREADABLE, CHAPTER_MISMATCH, NOT_WELL_FORMED, STRUCTURE_MISMATCH,
-                AMBIGUOUS_SOURCE, CODE_MARKUP) == (
+                AMBIGUOUS_SOURCE, CODE_MARKUP, MISSING_ANCHOR) == (
             'chapter_unreadable', 'chapter_mismatch', 'not_well_formed', 'structure_mismatch',
-            'ambiguous_source', 'code_markup')
+            'ambiguous_source', 'code_markup', 'missing_anchor')
         assert exporter.REASON_TEXT == {
             'chapter_unreadable': '章節無法讀取',
             'chapter_mismatch': '章節內容與分段紀錄不符',
@@ -982,6 +985,7 @@ class TestSurvivors:
             'structure_mismatch': '譯文的頂層結構與原文區塊不符',
             'ambiguous_source': '原文區塊無法明確對應',
             'code_markup': '程式碼區塊含標記',
+            'missing_anchor': '譯文缺少原文區塊內的錨點（id 或 a 的 name）',
         }
         assert SCHEMA_1_MESSAGE == ('此專案是舊格式（schema 1），無法匯出。'
                                     '請先執行 python3 translate.py migrate <專案目錄> 再匯出。')
@@ -1162,3 +1166,104 @@ class TestSurvivors:
         _, z = _export(tmp_path, project_dir, fmt)
         original = _body(z, 'OEBPS/Text/c.xhtml')[0][0][0]
         assert _inner(original) == '<em>Line</em> one'
+
+
+class TestAnchorsInTheGate:
+    """Fix round: ids (and names of <a>) inside a block must survive."""
+
+    def _report(self, tmp_path, chapter, translation, fmt='chinese-only'):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml(chapter))}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': translation})
+        report, z = _export(tmp_path, project_dir, fmt)
+        return report, z, epub
+
+    @pytest.mark.parametrize('chapter, translation', [
+        ('<p>See <a id="r1" href="#n1">note</a>.</p><p id="n1">Text.</p>',
+         '<p>見<a href="#n1">註</a>。</p>\n<p>文。</p>'),                       # inner id lost
+        ('<p><a name="fn"/>Note text.</p>', '<p>註文。</p>'),                     # a@name lost
+        ('<p><a id="x" name="y"/>Words.</p>', '<p><b name="x"/><a id="y"/>字。</p>'),  # b@name no anchor
+        ('<p>Plain <span id="s">words</span>.</p>', '<p>普通<span id="t">字</span>。</p>'),
+        ('<div class="v"><a id="l1"/>Line one<br/>Line two</div>', '第一行\n第二行'),  # in a run
+        ('<div class="v">Line one<br/><a id="l2"/>Line two</div>',
+         '<a id="l2"/>第一行\n第二行'),                                         # wrong line
+    ])
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_missing_anchor_kept_original(self, tmp_path, chapter, translation, fmt):
+        report, z, epub = self._report(tmp_path, chapter, translation, fmt)
+        assert report.chapters[0].kept == [('c_seg0001', MISSING_ANCHOR)]
+        src = zipfile.ZipFile(epub)
+        assert z.read('OEBPS/Text/c.xhtml') == src.read('OEBPS/Text/c.xhtml')
+
+    @pytest.mark.parametrize('chapter, translation', [
+        ('<p>See <a id="r1" href="#n1">note</a>.</p><p id="n1">Text.</p>',
+         '<p>見<a id="r1" href="#n1">註</a>。</p>\n<p>文。</p>'),                # block's own id from the source
+        ('<p><a name="fn"/>Note text.</p>', '<p><a name="fn"/>註文。</p>'),
+        ('<p><span name="x"/>Words.</p>', '<p>字。</p>'),                        # name only counts on <a>
+        ('<p><a name="fn"/>Note text.</p>', '<p><a id="fn"/>註文。</p>'),         # the value counts
+        ('<p>Words.</p>', '<p><a id="new"/>字。</p>'),                           # extra ids allowed
+        ('<div class="v">Line one<br/><a id="l2"/>Line two</div>', '第一行\n<a id="l2"/>第二行'),
+    ])
+    def test_anchor_present_accepted(self, tmp_path, chapter, translation):
+        report, _, _ = self._report(tmp_path, chapter, translation)
+        assert report.translated == 1 and report.reasons() == {}
+
+    def test_code_not_checked(self, tmp_path):
+        report, _, _ = self._report(tmp_path, '<pre id="k"><code>x = 1  # one</code></pre>',
+                                    'x = 1  # 一')
+        assert report.translated == 1
+
+
+class TestTocContainerTarget:
+    """Fix round: a target that contains blocks takes its first block's
+    label when that block is a filled heading."""
+
+    NAV = xhtml('<nav><ol>'
+                '<li><a href="Text/c.xhtml#sec">A</a></li>'
+                '<li><a href="Text/c.xhtml#body">B</a></li>'
+                '<li><a href="Text/c.xhtml#lead">C</a></li>'
+                '<li><a href="Text/c.xhtml#outer">D</a></li>'
+                '<li><a href="Text/c.xhtml#runbox">E</a></li>'
+                '</ol></nav>')
+    CHAPTER = ('<?xml version="1.0" encoding="utf-8"?>\n<html xmlns="http://www.w3.org/1999/'
+               'xhtml"><head><title>T</title></head><body id="body">'
+               '<div id="outer"><div id="sec"><h2>Part words</h2><p>Body words.</p></div>'
+               '<div id="lead"><p>Lead words.</p><h3>Late heading</h3></div></div>'
+               '<div id="runbox">Bare text<br/>More text</div></body></html>')
+
+    def _labels(self, tmp_path, translations, fmt='chinese-only'):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', self.CHAPTER)}, nav=self.NAV, ncx=None)
+        project_dir = _project(tmp_path, epub, translations)
+        _, z = _export(tmp_path, project_dir, fmt)
+        return [_inner(a) for a in _root(z, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a')]
+
+    def test_segments(self, tmp_path):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', self.CHAPTER)}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {})
+        assert [s.html for s in ProjectManager(project_dir).load().segments] == [
+            '<h2>Part words</h2>', '<p>Body words.</p>\n<p>Lead words.</p>',
+            '<h3>Late heading</h3>', 'Bare text\nMore text']
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_first_block_heading(self, tmp_path, fmt):
+        labels = self._labels(tmp_path, {'c_seg0001': '<h2>部分</h2>',
+                                         'c_seg0002': '<p>內文。</p>\n<p>引言。</p>',
+                                         'c_seg0003': '<h3>後標題</h3>',
+                                         'c_seg0004': '裸文\n更多'}, fmt)
+        # A, B (the body) and D: first block is the filled h2; C: first block
+        # is a <p>; E: first block is a run
+        assert labels == ['部分', '部分', 'C', '部分', 'E']
+
+    def test_unfilled_heading_leaves_labels(self, tmp_path):
+        labels = self._labels(tmp_path, {'c_seg0001': '<h2>部分',
+                                         'c_seg0003': '<h3>後標題</h3>'})
+        assert labels == ['A', 'B', 'C', 'D', 'E']
+
+    def test_target_inside_a_block_wins(self, tmp_path):
+        chapter = xhtml('<div id="d"><h2 id="h">Part words</h2></div>')
+        nav = xhtml('<nav><ol><li><a href="Text/c.xhtml#d">D</a></li>'
+                    '<li><a href="Text/c.xhtml#h">H</a></li></ol></nav>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=nav, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<h2>部分</h2>'})
+        _, z = _export(tmp_path, project_dir, 'bilingual-vertical')
+        assert [_inner(a) for a in _root(z, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a')] == [
+            '部分', '部分']
