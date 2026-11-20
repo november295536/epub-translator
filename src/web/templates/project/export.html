@@ -47,11 +47,8 @@
             <div x-show="exportSummary" class="export-summary" style="margin-top: 1rem;">
                 <template x-if="exportSummary">
                     <div>
-                        <div>以譯文匯出 <span x-text="exportSummary.translated"></span> 段，保留原文
-                            <span x-text="exportSummary.kept"></span> 段（未翻譯
-                            <span x-text="exportSummary.untranslated"></span> 段）</div>
-                        <template x-for="(count, reason) in exportSummary.reasons" :key="reason">
-                            <div class="text-muted"><span x-text="reason"></span>：<span x-text="count"></span></div>
+                        <template x-for="(line, i) in exportSummary.lines" :key="i">
+                            <div :class="i ? 'text-muted' : ''" style="white-space: pre-wrap;" x-text="line"></div>
                         </template>
                     </div>
                 </template>
@@ -132,6 +129,8 @@ function exportController() {
                 if (data.state === 'running') {
                     this.exporting = true;
                     this.startPolling();
+                } else {
+                    this.showResult(data);
                 }
             } catch (e) {
                 console.error('Failed to check export status:', e);
@@ -164,6 +163,15 @@ function exportController() {
             }
         },
 
+        // The report of a finished export (also when the tab is opened later)
+        showResult(data) {
+            if (data.state === 'completed') {
+                this.exportSummary = data.summary;
+            } else if (data.state === 'failed') {
+                this.exportError = data.error || '匯出失敗';
+            }
+        },
+
         startPolling() {
             if (this.pollTimer) clearInterval(this.pollTimer);
             this.pollTimer = setInterval(async () => {
@@ -172,17 +180,12 @@ function exportController() {
                     const data = await res.json();
                     this.exportState = data.state;
 
-                    if (data.state === 'completed') {
+                    if (data.state === 'completed' || data.state === 'failed') {
                         this.exporting = false;
-                        this.exportSummary = data.summary;
+                        this.showResult(data);
                         clearInterval(this.pollTimer);
                         this.pollTimer = null;
                         this.refreshFiles();
-                    } else if (data.state === 'failed') {
-                        this.exporting = false;
-                        this.exportError = data.error || '匯出失敗';
-                        clearInterval(this.pollTimer);
-                        this.pollTimer = null;
                     }
                 } catch (e) {
                     console.error('Poll error:', e);
