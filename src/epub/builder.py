@@ -281,17 +281,17 @@ class EPUBBuilder:
         return block_count if block_count > 0 else 1
 
     def _apply_chinese_only(self, seg: SegmentState, elements: list, soup,
-                            remove: list | None = None, pair: bool = True) -> None:
+                            remove: list, pair: bool) -> None:
         """Replace element content with translated text, preserving tag and attributes.
 
-        `remove` (default: the elements) is what a replacement of the whole
-        segment removes; with `pair` false the elements are never paired
-        1:1 with the translation's nodes."""
+        `remove` is what a replacement of the whole segment removes (for
+        schema 1: the elements); with `pair` false the elements are never
+        paired 1:1 with the translation's nodes."""
         if not elements:
             return
 
         first = elements[0]
-        rest = [n for n in (elements if remove is None else remove) if n is not first]
+        rest = [n for n in remove if n is not first]
         translated = seg.translated_text
 
         if seg.segment_type == SegmentType.CODE:
@@ -346,11 +346,11 @@ class EPUBBuilder:
         _remove(rest)
 
     def _apply_bilingual_vertical(self, seg: SegmentState, elements: list, soup,
-                                  span: list | None = None, pair: bool = True) -> None:
+                                  span: list, pair: bool) -> None:
         """Keep original elements, add translation block after them.
 
-        `span` (default: the elements) is moved into the original as a
-        whole when the translation is not paired 1:1 (never with `pair`
+        `span` (for schema 1: the elements) is moved into the original as
+        a whole when the translation is not paired 1:1 (never with `pair`
         false)."""
         if not elements:
             return
@@ -376,13 +376,13 @@ class EPUBBuilder:
                 wrapper.append(trans_div)
             return
 
-        first = (elements if span is None else span)[0]
+        first = span[0]
 
         wrapper = soup.new_tag('div', attrs={'class': 'bilingual-vertical'})
         first.insert_before(wrapper)
 
         original_div = soup.new_tag('div', attrs={'class': 'original'})
-        for elem in (elements if span is None else span):
+        for elem in span:
             original_div.append(elem.extract())
         wrapper.append(original_div)
 
@@ -391,7 +391,7 @@ class EPUBBuilder:
         wrapper.append(trans_div)
 
     def _apply_bilingual_horizontal(self, seg: SegmentState, elements: list, soup,
-                                    span: list | None = None, pair: bool = True) -> None:
+                                    span: list, pair: bool) -> None:
         """Wrap original + translation in a flex container (`span` and
         `pair` as for the vertical format)."""
         if not elements:
@@ -418,13 +418,13 @@ class EPUBBuilder:
                 container.append(trans_div)
             return
 
-        first = (elements if span is None else span)[0]
+        first = span[0]
 
         container = soup.new_tag('div', attrs={'class': 'bilingual-container'})
         first.insert_before(container)
 
         original_div = soup.new_tag('div', attrs={'class': 'original'})
-        for elem in (elements if span is None else span):
+        for elem in span:
             original_div.append(elem.extract())
         container.append(original_div)
 

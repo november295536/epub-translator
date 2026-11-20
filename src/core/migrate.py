@@ -165,14 +165,13 @@ def _match_chapter(chapter_id: str, segs: list[SegmentState], body, report: Migr
             # one with an empty translation, which the review editor can
             # save) keeps no partial translation: export would place it as
             # the whole group's text
-            if any(s.status in (SegmentStatus.PENDING, SegmentStatus.FAILED)
-                   or not s.translated_text.strip() for s in olds):
-                cleared = merged.translated_text != ''
+            incomplete = any(s.status in (SegmentStatus.PENDING, SegmentStatus.FAILED)
+                             or not s.translated_text.strip() for s in olds)
+            cleared = incomplete and merged.translated_text != ''
+            if incomplete:
                 merged.translated_text = ''
                 if merged.status in (SegmentStatus.TRANSLATED, SegmentStatus.REVIEWED):
                     merged.status = SegmentStatus.PENDING
-            else:
-                cleared = False
             if cleared or len({s.status for s in olds}) > 1:
                 report.notes.append(
                     f'{merged.segment_id}：{len(olds)} 個段落的狀態為 '
