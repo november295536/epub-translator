@@ -7,9 +7,12 @@ are direct children of walked elements (segmenters before Phase 0 stored
 them as text). Legacy segments are then grouped: the smallest groups that
 start and end on block boundaries. A group of one segment keeps it; a larger
 group becomes one segment (translations joined in order, first ID kept,
-status the lowest of the group).
+status the lowest of the group). A larger group that is not wholly
+translated (lowest status pending or failed) keeps no translation, and a
+group that mixes code and text segments makes its chapter unmatched.
 
-Fail-closed: if any chapter cannot be matched nothing is written. On success
+Fail-closed: if any chapter cannot be matched nothing is written, and an
+existing `project.schema1.json` is never overwritten. On success
 the previous project.json is kept next to it as `project.schema1.json`, the
 project gets its own copy of the source EPUB when it has none, and the new
 project.json is written atomically. Never run from load().
@@ -17,10 +20,9 @@ project.json is written atomically. Never run from load().
 
 from __future__ import annotations
 
-import io
 import os
 import shutil
-import zipfile
+import uuid
 from dataclasses import dataclass, field
 
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -31,7 +33,10 @@ from src.core.project import (
 )
 from src.core.segmenter import SegmentType, segment_from_blocks
 from src.epub.blocks import normalize, walk_blocks
-from src.epub.extractor import find_body, parse_xml, read_package
+from src.epub.extractor import (
+    XHTML_MEDIA_TYPE, EPUBError, find_body, open_archive, parse_xml, read_member,
+    read_package, unresolved_entities,
+)
 
 SOURCE_FILE = 'source.epub'
 BACKUP_FILE = 'project.schema1.json'
@@ -53,7 +58,7 @@ class MigrationReport:
     chapters_with_comment_text: int = 0
     segments_matched: int = 0
     merged: list = field(default_factory=list)       # [legacy segment ids] per merge group
-    notes: list = field(default_factory=list)        # groups not uniformly translated
+    notes: list = field(default_factory=list)        # groups of mixed status or cleared
     unmatched: list = field(default_factory=list)    # (chapter id, reason)
     count_differs: int = 0
     written: bool = False
@@ -150,12 +155,23 @@ def _match_chapter(chapter_id: str, segs: list[SegmentState], body, report: Migr
             return None
         merged = _merge(olds, blocks)
         if len(olds) > 1:
+            if len({s.segment_type for s in olds}) > 1:
+                report.unmatched.append(
+                    (chapter_id, f'{olds[0].segment_id} merges code and text segments'))
+                return None
             report.merged.append([s.segment_id for s in olds])
-            if len({s.status for s in olds}) > 1:
+            # A group not wholly translated keeps no partial translation:
+            # export would place it as the whole group's text
+            cleared = (merged.status in (SegmentStatus.PENDING, SegmentStatus.FAILED)
+                       and merged.translated_text != '')
+            if cleared:
+                merged.translated_text = ''
+            if cleared or len({s.status for s in olds}) > 1:
                 report.notes.append(
                     f'{merged.segment_id}：{len(olds)} 個段落的狀態為 '
                     f'{", ".join(str(s.status) for s in olds)}；合併後為 {merged.status}，'
-                    f'譯文依序接合保留')
+                    + ('部分譯文已清除（保留於 project.schema1.json）' if cleared
+                       else '譯文依序接合保留'))
         new.append(merged)
     if not new:
         report.unmatched.append((chapter_id, 'no text'))
@@ -164,11 +180,11 @@ def _match_chapter(chapter_id: str, segs: list[SegmentState], body, report: Migr
 
 
 def plan_migration(pm: ProjectManager, source: str):
-    """(new segment list, report) for a loaded schema 1 project; reads only."""
-    with open(source, 'rb') as f:
-        zf = zipfile.ZipFile(io.BytesIO(f.read()))
+    """(new segment list, report) for a loaded schema 1 project; reads only.
+    Raises EPUBError when the source cannot be read."""
+    zf = open_archive(source)
     _, _, spine = read_package(zf)
-    paths = {item.id: item.path for item in spine}
+    paths = {item.id: item.path for item in spine if item.media_type == XHTML_MEDIA_TYPE}
 
     by_chapter: dict[str, list[SegmentState]] = {}
     for seg in pm.data.segments:
@@ -181,12 +197,15 @@ def plan_migration(pm: ProjectManager, source: str):
             report.unmatched.append((chapter_id, 'not in the spine'))
             continue
         try:
-            body = find_body(parse_xml(zf.read(paths[chapter_id])))
+            body = find_body(parse_xml(read_member(zf, paths[chapter_id])))
         except (KeyError, etree.XMLSyntaxError):
             report.unmatched.append((chapter_id, 'missing or not well-formed XML'))
             continue
         if body is None:
             report.unmatched.append((chapter_id, 'no body'))
+            continue
+        if unresolved_entities(body):
+            report.unmatched.append((chapter_id, 'unresolved entity reference'))
             continue
         new = _match_chapter(chapter_id, segs, body, report)
         if new is None:
@@ -205,26 +224,44 @@ def migrate_project(project_dir: str, dry_run: bool = False) -> MigrationReport:
     """Migrate one project. Raises MigrationError (or ProjectLockedError) when
     it cannot start; returns the report otherwise. Writes nothing on a dry
     run or when a chapter is unmatched."""
+    pm = ProjectManager(project_dir)
+    if not pm.exists():  # before the lock: no lock file in a non-project
+        raise MigrationError(f'不是專案目錄（沒有 project.json）：{project_dir}')
     lock = ProjectLock(project_dir)
     if not dry_run:
         lock.acquire()  # refuses while another process (a web task) holds it
     try:
-        pm = ProjectManager(project_dir)
-        pm.load()
+        try:
+            pm.load()
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            raise MigrationError(f'無法讀取 project.json：{e}') from e
         if pm.data.schema != 1:
             raise MigrationError(f'專案已是 schema {pm.data.schema}')
+        backup = os.path.join(project_dir, BACKUP_FILE)
+        if os.path.exists(backup):
+            raise MigrationError(f'{BACKUP_FILE} 已存在，不會覆寫；請先移走它')
         own = os.path.join(project_dir, SOURCE_FILE)
         source = own if os.path.isfile(own) else pm.data.epub_path
         if not os.path.isfile(source):
             raise MigrationError(f'找不到來源 EPUB：{source}')
 
-        new_segments, report = plan_migration(pm, source)
+        try:
+            new_segments, report = plan_migration(pm, source)
+        except EPUBError as e:
+            raise MigrationError(f'來源 EPUB 無法讀取：{e}') from e
         if dry_run or report.unmatched:
             return report
 
         if source != own:
-            shutil.copy2(source, own)
-        shutil.copy2(pm.project_file, os.path.join(project_dir, BACKUP_FILE))
+            # A partial copy never takes the name a later run would prefer
+            tmp = f'{own}.{uuid.uuid4().hex}.tmp'
+            try:
+                shutil.copy2(source, tmp)
+                os.replace(tmp, own)
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+        shutil.copy2(pm.project_file, backup)
         with pm.mutex:
             pm.data.segments = new_segments
             pm.data.schema = 2
