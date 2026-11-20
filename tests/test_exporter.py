@@ -2156,3 +2156,53 @@ class TestPhase4FullCheck:
     def test_reason_lines(self, tmp_path):
         report, _ = self._report(tmp_path, '<p>A <em>b</em>.</p>', '<p>甲乙。</p>')
         assert report.lines()[1] == '  譯文的標籤數量與原文不同（tag_count）：1'
+
+
+class TestRound1Export:
+    """Phase 4 review round 1: translated alt/title in every format; a block
+    root's attributes compared on their own."""
+
+    CHAPTER = ('<p>See <img src="i.png" alt="A map &amp; key"/> '
+               '<a href="#x" title="Go">here</a>.</p>')
+    TRANSLATION = ('<p>見<img src="i.png" alt="地圖 &amp; &quot;圖例&quot;"/>'
+                   '<a href="#x" title="前往">此處</a>。</p>')
+
+    @pytest.mark.parametrize('fmt', ['chinese-only', *BILINGUAL])
+    def test_translated_alt_in_every_format(self, tmp_path, fmt):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml(self.CHAPTER))}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': self.TRANSLATION})
+        report, z = _export(tmp_path, project_dir, fmt)
+        assert report.translated == 1
+        body = _body(z, 'OEBPS/Text/c.xhtml')
+        alts = [img.get('alt') for img in body.iter(f'{XHTML_NS}img')]
+        titles = [a.get('title') for a in body.iter(f'{XHTML_NS}a')]
+        if fmt == 'chinese-only':
+            assert (alts, titles) == (['地圖 & "圖例"'], ['前往'])
+        else:  # the original keeps the source values
+            assert sorted(alts) == sorted(['A map & key', '地圖 & "圖例"'])
+            assert sorted(titles) == sorted(['Go', '前往'])
+
+    @pytest.mark.parametrize('source, translation', [
+        ('<blockquote id="q"><blockquote>A b.</blockquote></blockquote>',
+         '<blockquote><blockquote id="q">甲乙。</blockquote></blockquote>'),
+        ('<blockquote><blockquote id="q">A b.</blockquote></blockquote>',
+         '<blockquote id="q"><blockquote>甲乙。</blockquote></blockquote>'),
+    ])
+    def test_block_root_attributes_cannot_move(self, tmp_path, source, translation):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml(source))}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': translation})
+        report, z = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.translated == 0 and len(report.chapters[0].kept) == 1
+        assert report.chapters[0].kept[0][1] in ('key_mismatch', 'extra_attributes')
+        assert _inner(_body(z, 'OEBPS/Text/c.xhtml')) == source
+
+    def test_lone_surrogate_kept_as_not_well_formed(self, tmp_path):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml('<p>A b.</p>'))}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': 'SURROGATE'})
+        path = os.path.join(project_dir, 'project.json')
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text.replace('SURROGATE', '<p>\\ud800</p>'))
+        report, _ = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.chapters[0].kept == [('c_seg0001', 'not_well_formed')]
