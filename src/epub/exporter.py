@@ -115,8 +115,8 @@ class ChapterReport:
 @dataclass
 class ExportReport:
     output_path: str
+    untranslated: int                              # segments without an accepted translation
     chapters: list = field(default_factory=list)  # ChapterReport per chapter with translations
-    untranslated: int = 0                          # segments without an accepted translation
 
     @property
     def translated(self) -> int:
@@ -156,7 +156,7 @@ def accepted(seg) -> bool:
             and bool(seg.translated_text.strip()))
 
 
-def export_project(project_dir: str, output_path: str, fmt: str = 'chinese-only') -> ExportReport:
+def export_project(project_dir: str, output_path: str, fmt: str) -> ExportReport:
     """Export the project as an EPUB at `output_path` (written atomically).
 
     Raises ValueError for an unknown format and ExportError when the project
@@ -180,7 +180,7 @@ def export_project(project_dir: str, output_path: str, fmt: str = 'chinese-only'
     except EPUBError as e:
         raise ExportError(str(e)) from e
 
-    epub3 = (opf.get('version') or '').startswith('3')
+    epub3 = str(opf.get('version')).startswith('3')
     languages = [e for e in opf.iter() if localname(e) == 'language']
     src_lang = (languages[0].text or '').strip() if languages else ''
     names = {info.filename for info in zf.infolist()}
@@ -193,7 +193,7 @@ def export_project(project_dir: str, output_path: str, fmt: str = 'chinese-only'
         by_chapter.setdefault(seg.chapter_id, []).append(seg)
     chapters = {item.id: item for item in spine
                 if item.media_type == XHTML_MEDIA_TYPE and not item.is_nav}
-    report = ExportReport(output_path, untranslated=sum(not accepted(s) for s in data.segments))
+    report = ExportReport(output_path, sum(not accepted(s) for s in data.segments))
     replaced: dict = {}   # member -> new bytes
     labels: dict = {}     # chapter member -> {fragment or None: TOC label}
     for chapter_id, segments in by_chapter.items():
@@ -204,21 +204,16 @@ def export_project(project_dir: str, output_path: str, fmt: str = 'chinese-only'
         report.chapters.append(chapter)
         item = chapters.get(chapter_id)
         if item is None:
-            chapter.kept += [(s.segment_id, CHAPTER_UNREADABLE) for s in todo]
+            chapter.kept = [(s.segment_id, CHAPTER_UNREADABLE) for s in todo]
             continue
-        css_href = None
-        if css_path:
-            css_href = quote(posixpath.relpath(css_path, posixpath.dirname(item.path) or '.'))
         out = _export_chapter(zf, item.path, segments, todo, fmt, src_lang, epub3,
-                              css_href, chapter)
+                              css_path, chapter)
         if out is not None:
             replaced[item.path], labels[item.path] = out
 
     css_used = bool(css_path) and bool(replaced)
     for path, media_type, is_nav in manifest.values():
-        if path in replaced or path not in names:
-            continue
-        if is_nav or media_type == NCX_MEDIA_TYPE:
+        if is_nav or media_type == NCX_MEDIA_TYPE:  # never a chapter; read errors leave it
             toc = _relabel(zf, path, labels, ncx=not is_nav)
             if toc is not None:
                 replaced[path] = toc
@@ -325,7 +320,7 @@ def _relabel(zf, path: str, labels: dict, ncx: bool):
         root = parse_xml(read_member(zf, path))
     except (KeyError, EPUBError, etree.XMLSyntaxError):
         return None
-    changed = False
+    changed = 0
     if ncx:
         for point in root.iter():
             if localname(point) not in ('navPoint', 'navTarget', 'pageTarget'):
@@ -339,20 +334,20 @@ def _relabel(zf, path: str, labels: dict, ncx: bool):
             label = _label_for(path, content.get('src'), labels)
             if label is not None and text.text != label:
                 text.text = label
-                changed = True
+                changed += 1
     else:
         for nav in root.iter():
             if localname(nav) != 'nav':
                 continue
             for a in list(nav.iter()):  # a list: labels are changed while walking
-                if localname(a) != 'a' or a.get('href') is None:
+                if localname(a) != 'a':
                     continue
                 label = _label_for(path, a.get('href'), labels)
                 if label is not None and (len(a) or a.text != label):
                     for child in list(a):
                         a.remove(child)
                     a.text = label
-                    changed = True
+                    changed += 1
     return _serialize(root) if changed else None
 
 
@@ -374,7 +369,7 @@ def _label_for(base: str, href, labels: dict):
 # --- Chapters -----------------------------------------------------------------
 
 def _export_chapter(zf, path: str, segments: list, todo: list, fmt: str, src_lang: str,
-                    epub3: bool, css_href, chapter: ChapterReport):
+                    epub3: bool, css_path, chapter: ChapterReport):
     """(new bytes, TOC labels) of a chapter, or None when it stays as it is."""
     try:
         root = parse_xml(read_member(zf, path))
@@ -382,11 +377,11 @@ def _export_chapter(zf, path: str, segments: list, todo: list, fmt: str, src_lan
         root = None
     body = None if root is None else find_body(root)
     if body is None or unresolved_entities(body):
-        chapter.kept += [(s.segment_id, CHAPTER_UNREADABLE) for s in todo]
+        chapter.kept = [(s.segment_id, CHAPTER_UNREADABLE) for s in todo]
         return None
     blocks = walk_blocks(body)
     if not _matches(blocks, segments):
-        chapter.kept += [(s.segment_id, CHAPTER_MISMATCH) for s in todo]
+        chapter.kept = [(s.segment_id, CHAPTER_MISMATCH) for s in todo]
         return None
 
     fills = []
@@ -415,7 +410,7 @@ def _export_chapter(zf, path: str, segments: list, todo: list, fmt: str, src_lan
     labels = {}
     for block, piece in sorted(fills, key=lambda f: f[0].index, reverse=True):
         result = _fill(block, piece, fmt, src_lang, epub3, ns)
-        if result is None or not block.tag:
+        if not block.tag:  # a run holds no heading
             continue
         heading = next((e for e in result.iter() if localname(e) in HEADINGS), None)
         label = '' if heading is None else ' '.join(element_text(heading).split())
@@ -427,8 +422,9 @@ def _export_chapter(zf, path: str, segments: list, todo: list, fmt: str, src_lan
         root.set(XML_LANG, TARGET_LANG)
         if epub3 or root.get('lang') is not None:
             root.set('lang', TARGET_LANG)
-    elif css_href:
-        _link_stylesheet(root, ns, css_href)
+    elif css_path:
+        _link_stylesheet(root, ns, quote(posixpath.relpath(
+            css_path, posixpath.dirname(path) or '.')))
     return _serialize(root), labels
 
 
@@ -486,11 +482,11 @@ def _pieces(seg, blocks: list) -> list:
     """
     if seg.segment_type == SegmentType.CODE:
         return [_code_piece(seg, blocks)]
-    nsmap = _parent(blocks[0]).nsmap
+    nsmap = blocks[0].parent.nsmap
     try:
         source = _split(_fragment(seg.html, nsmap), blocks)
     except etree.XMLSyntaxError:
-        source = None
+        raise _Kept(AMBIGUOUS_SOURCE)
     if source is None or [fingerprint(_text(p)) for p in source] != [b.fingerprint for b in blocks]:
         raise _Kept(AMBIGUOUS_SOURCE)
     try:
@@ -501,10 +497,6 @@ def _pieces(seg, blocks: list) -> list:
     if pieces is None:
         raise _Kept(STRUCTURE_MISMATCH)
     return pieces
-
-
-def _parent(block):
-    return block.parent if not block.tag else block.nodes[0].getparent()
 
 
 def _fragment(html: str, nsmap: dict):

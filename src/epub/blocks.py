@@ -88,10 +88,10 @@ class Block:
     legacy_text: str    # normalized text with the walked elements' direct comments
     html: str
     nodes: list         # the element, or the strings and nodes of the run
-    # A run only: the walked element that holds it, and the child whose
-    # tail begins it (None: it begins with the parent's text)
-    parent: object = None
-    prev: object = None
+    parent: object      # the walked element that holds the block
+    # A run: the child whose tail begins it (None: it begins with the
+    # parent's text). A block element: None
+    prev: object
 
     @property
     def fingerprint(self) -> str:
@@ -135,7 +135,8 @@ def _walk(el, out: list) -> None:
                 _walk(child, out)
             else:
                 text = element_text(child)
-                out.append(Block(None, name, text, normalize(text), serialize(child), [child]))
+                out.append(Block(None, name, text, normalize(text), serialize(child), [child],
+                                 el, None))
         else:
             run.append(child)
         run.append(child.tail or '')
