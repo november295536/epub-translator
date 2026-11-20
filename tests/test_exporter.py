@@ -288,7 +288,8 @@ class TestBilingual:
     @pytest.mark.parametrize('fmt', BILINGUAL)
     def test_rows_per_block(self, tmp_path, raw_project, fmt):
         _, z = _export(tmp_path, raw_project, fmt)
-        cls = exporter.WRAPPER_CLASS[fmt]
+        cls = {'bilingual-horizontal': 'bilingual-container',
+               'bilingual-vertical': 'bilingual-vertical'}[fmt]
         body = _body(z, 'OEBPS/Text/one.xhtml')
 
         def row(original, translation, lang=' xml:lang="zh-TW" lang="zh-TW"'):
@@ -964,3 +965,200 @@ class TestCLIAndWeb:
         client = create_app(projects_dir=os.path.dirname(raw_project)).test_client()
         page = client.get('/project/proj/export').get_data(as_text=True)
         assert 'exportSummary.translated' in page and 'exportSummary = data.summary' in page
+
+
+class TestSurvivors:
+    """Mutation testing, run 1: rules spelled out."""
+
+    def test_report_codes_texts_and_messages(self, tmp_path, raw_project):
+        assert (CHAPTER_UNREADABLE, CHAPTER_MISMATCH, NOT_WELL_FORMED, STRUCTURE_MISMATCH,
+                AMBIGUOUS_SOURCE, CODE_MARKUP) == (
+            'chapter_unreadable', 'chapter_mismatch', 'not_well_formed', 'structure_mismatch',
+            'ambiguous_source', 'code_markup')
+        assert exporter.REASON_TEXT == {
+            'chapter_unreadable': '章節無法讀取',
+            'chapter_mismatch': '章節內容與分段紀錄不符',
+            'not_well_formed': '譯文不是格式正確的 XML',
+            'structure_mismatch': '譯文的頂層結構與原文區塊不符',
+            'ambiguous_source': '原文區塊無法明確對應',
+            'code_markup': '程式碼區塊含標記',
+        }
+        assert SCHEMA_1_MESSAGE == ('此專案是舊格式（schema 1），無法匯出。'
+                                    '請先執行 python3 translate.py migrate <專案目錄> 再匯出。')
+        with pytest.raises(ValueError) as e:
+            export_project(raw_project, str(tmp_path / 'o.epub'), 'x')
+        assert str(e.value) == ("Invalid format: x. Must be one of ('chinese-only', "
+                                "'bilingual-horizontal', 'bilingual-vertical')")
+        with open(ProjectManager(raw_project).load().epub_path, 'ab') as f:
+            f.write(b'\0')
+        with pytest.raises(ExportError) as e:
+            export_project(raw_project, str(tmp_path / 'o.epub'), 'chinese-only')
+        assert str(e.value) == '來源 EPUB 與專案記錄的雜湊值不符，無法匯出'
+
+    @pytest.mark.parametrize('tag', ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+    def test_every_heading_level_labels(self, tmp_path, tag):
+        nav = xhtml('<nav><ol><li><a href="Text/c.xhtml">C</a></li></ol></nav>')
+        chapter = xhtml(f'<p>Lead words.</p><{tag}>Heading words</{tag}>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=nav, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<p>引。</p>',
+                                                'c_seg0002': f'<{tag}>標題</{tag}>'})
+        _, z = _export(tmp_path, project_dir, 'chinese-only')
+        assert '<a href="Text/c.xhtml">標題</a>' in z.read('OEBPS/nav.xhtml').decode()
+
+    def test_source_language_with_region(self, tmp_path):
+        chapter = xhtml('<p lang="en" class="k">Plain words.</p>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        with zipfile.ZipFile(epub) as src:
+            members = [(i, src.read(i)) for i in src.infolist()]
+        with zipfile.ZipFile(epub, 'w') as dst:
+            for info, data in members:
+                if info.filename == 'OEBPS/content.opf':
+                    data = data.replace(b'<dc:language>en</dc:language>',
+                                        b'<dc:language>en-US</dc:language>'
+                                        b'<dc:language>fr</dc:language>')
+                dst.writestr(info, data)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<p>字。</p>'})
+        _, z = _export(tmp_path, project_dir, 'chinese-only')
+        assert _body(z, 'OEBPS/Text/c.xhtml')[0].get('lang') == 'zh-TW'
+        opf = z.read('OEBPS/content.opf').decode()
+        assert '<dc:language>zh-TW</dc:language><dc:language>fr</dc:language>' in opf
+
+    @pytest.mark.parametrize('chapter_id', ['nav', 'css'])
+    def test_segments_of_a_navigation_or_non_xhtml_item(self, tmp_path, chapter_id):
+        epub = _raw_book(tmp_path)
+        project_dir = _project(tmp_path, epub, RAW_TRANSLATIONS)
+        path = os.path.join(project_dir, 'project.json')
+        raw = json.load(open(path, encoding='utf-8'))
+        for s in raw['segments'][:2]:
+            s['chapter_id'] = chapter_id
+        json.dump(raw, open(path, 'w', encoding='utf-8'))
+        report, _ = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.chapters[0].kept == [('one_seg0001', CHAPTER_UNREADABLE),
+                                           ('one_seg0002', CHAPTER_UNREADABLE)]
+
+    def test_chapter_without_translation_before_a_translated_one(self, tmp_path):
+        epub = _raw_book(tmp_path)
+        project_dir = _project(tmp_path, epub, {k: v for k, v in RAW_TRANSLATIONS.items()
+                                                if k.startswith('two')})
+        report, z = _export(tmp_path, project_dir, 'chinese-only')
+        assert [(c.chapter_id, c.translated) for c in report.chapters] == [('two', 2)]
+        assert '第二晚' in z.read('OEBPS/Text/chapter two.xhtml').decode()
+
+    def test_package_and_chapter_at_the_archive_root(self, tmp_path):
+        epub = write_raw_epub(tmp_path / 'b.epub',
+                              [('c', 'c.xhtml', 'application/xhtml+xml', None)], ['c'],
+                              {'c.xhtml': xhtml('<p>Words here.</p>')}, opf_path='content.opf')
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<p>字。</p>'})
+        _, z = _export(tmp_path, project_dir, 'bilingual-horizontal')
+        assert _root(z, 'c.xhtml')[0][-1].get('href') == 'bilingual.css'
+        assert 'href="bilingual.css" media-type="text/css"' in z.read('content.opf').decode()
+        assert z.read('bilingual.css').decode() == BILINGUAL_CSS
+
+    def test_first_free_names(self, tmp_path):
+        extra = {'OEBPS/bilingual.css': (('bilingual-css', 'bilingual.css', 'text/css', None),
+                                         'p {}')}
+        epub = _raw_book(tmp_path, extra=extra)
+        project_dir = _project(tmp_path, epub, RAW_TRANSLATIONS)
+        _, z = _export(tmp_path, project_dir, 'bilingual-vertical')
+        assert z.read('OEBPS/bilingual-2.css').decode() == BILINGUAL_CSS
+        assert ('<item id="bilingual-css-2" href="bilingual-2.css" media-type="text/css"/>'
+                in z.read('OEBPS/content.opf').decode())
+
+    def test_mimetype_bytes_and_member_attributes_copied(self, tmp_path):
+        epub = _raw_book(tmp_path)
+        path = str(tmp_path / 'attrs.epub')
+        with zipfile.ZipFile(epub) as src, zipfile.ZipFile(path, 'w') as dst:
+            for info in src.infolist():
+                info.external_attr = 0o100640 << 16
+                data = b'application/epub+zip ' if info.filename == 'mimetype' \
+                    else src.read(info.filename)
+                dst.writestr(info, data)
+        project_dir = _project(tmp_path, path, RAW_TRANSLATIONS)
+        _, z = _export(tmp_path, project_dir, 'chinese-only')
+        assert z.read('mimetype') == b'application/epub+zip '
+        assert {i.external_attr for i in z.infolist() if i.filename != 'mimetype'} == {
+            0o100640 << 16}
+
+    def test_nav_list_targets_relabelled(self, tmp_path):
+        ncx = ('<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"><navList>'
+               '<navTarget id="t"><navLabel><text>X</text></navLabel>'
+               '<content src="Text/c.xhtml"/></navTarget></navList></ncx>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml('<h1>Cee</h1>'))}, nav=None, ncx=ncx)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<h1>西</h1>'})
+        _, z = _export(tmp_path, project_dir, 'chinese-only')
+        assert '<text>西</text>' in z.read('OEBPS/toc.ncx').decode()
+
+    def test_nav_labels_only_on_links(self, tmp_path):
+        nav = xhtml('<nav><ol><li><span href="Text/c.xhtml">Keep</span>'
+                    '<a href="Text/c.xhtml">C</a></li></ol></nav>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml('<h1>Cee</h1>'))}, nav=nav, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<h1>西</h1>'})
+        _, z = _export(tmp_path, project_dir, 'chinese-only')
+        assert ('<span href="Text/c.xhtml">Keep</span><a href="Text/c.xhtml">西</a>'
+                in z.read('OEBPS/nav.xhtml').decode())
+
+    @pytest.mark.parametrize('fmt', BILINGUAL)
+    def test_prefixed_xhtml_namespace(self, tmp_path, fmt):
+        chapter = ('<?xml version="1.0" encoding="utf-8"?>\n<h:html xmlns:h="http://www.w3.org/'
+                   '1999/xhtml"><h:head><h:title>T</h:title></h:head><h:body><h:p>Words here.'
+                   '</h:p></h:body></h:html>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<h:p>字。</h:p>'})
+        _, z = _export(tmp_path, project_dir, fmt)
+        out = z.read('OEBPS/Text/c.xhtml').decode()
+        assert '<h:div class="original"><h:p>Words here.</h:p></h:div>' in out
+        assert '<h:link rel="stylesheet" type="text/css" href="../bilingual.css"/>' in out
+
+    def test_empty_range_is_a_mismatch(self, tmp_path):
+        epub = _raw_book(tmp_path)
+        project_dir = _project(tmp_path, epub, RAW_TRANSLATIONS)
+        path = os.path.join(project_dir, 'project.json')
+        raw = json.load(open(path, encoding='utf-8'))
+        empty = dict(raw['segments'][1], segment_id='one_seg0003', block_start=1, block_end=1,
+                     fingerprints=[])
+        raw['segments'].insert(2, empty)
+        json.dump(raw, open(path, 'w', encoding='utf-8'))
+        report, _ = _export(tmp_path, project_dir, 'chinese-only')
+        assert {r for _, r in report.chapters[0].kept} == {CHAPTER_MISMATCH}
+
+    def test_br_in_a_single_run_refused(self, tmp_path):
+        chapter = xhtml('<p>Lead.</p>Bare text.')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<p>引。</p>\n裸<br/>文。'})
+        report, _ = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.reasons() == {STRUCTURE_MISMATCH: 1}
+
+    def test_run_with_inline_script(self, tmp_path):
+        chapter = xhtml('<div class="v">Line <script>var x;</script>one<br/>Line two</div>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '第一行\n第二行'})
+        report, _ = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.translated == 1
+
+    def test_malformed_stored_html_cannot_be_mapped(self, tmp_path):
+        epub = _raw_book(tmp_path)
+        project_dir = _project(tmp_path, epub, RAW_TRANSLATIONS)
+        path = os.path.join(project_dir, 'project.json')
+        raw = json.load(open(path, encoding='utf-8'))
+        raw['segments'][3]['html'] = '<p>The harbour bells rang twice.'
+        json.dump(raw, open(path, 'w', encoding='utf-8'))
+        report, _ = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.chapters[1].kept == [('two_seg0002', AMBIGUOUS_SOURCE)]
+
+    @pytest.mark.parametrize('fmt', BILINGUAL)
+    def test_text_after_a_bilingual_element_stays(self, tmp_path, fmt):
+        chapter = xhtml('<h1>Title words</h1>Tail text after it.')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<h1>標題</h1>'})
+        _, z = _export(tmp_path, project_dir, fmt)
+        body = _body(z, 'OEBPS/Text/c.xhtml')
+        assert body[0].tail == 'Tail text after it.'
+
+    @pytest.mark.parametrize('fmt', BILINGUAL)
+    def test_run_starting_with_an_element(self, tmp_path, fmt):
+        chapter = xhtml('<div class="v"><em>Line</em> one<br/>Line two</div>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<em>第一</em>行\n第二行'})
+        _, z = _export(tmp_path, project_dir, fmt)
+        original = _body(z, 'OEBPS/Text/c.xhtml')[0][0][0]
+        assert _inner(original) == '<em>Line</em> one'
