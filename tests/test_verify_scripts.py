@@ -2441,7 +2441,11 @@ class TestGlossaryCheck:
     @pytest.mark.parametrize('where', ['repository', 'projects'])
     def test_refuses_temporary_directory_inside(self, tmp_path, capsys, monkeypatch, where):
         root, _ = _glossary_projects(tmp_path / 'projects')
-        place = os.path.join(ROOT, 'src') if where == 'repository' else str(root / 'beta')
+        # a checkout of its own: the mutation run's copy of this one has no .git
+        (tmp_path / 'checkout' / '.git').mkdir(parents=True)
+        (tmp_path / 'checkout' / 'src').mkdir()
+        place = str(tmp_path / 'checkout' / 'src') if where == 'repository' \
+            else str(root / 'beta')
         monkeypatch.setattr(glossary_check.tempfile, 'gettempdir', lambda: place)
         assert self._main(root) == 2
         what = 'a git work tree' if where == 'repository' else 'the projects directory'
@@ -2452,7 +2456,8 @@ class TestGlossaryCheck:
     @pytest.mark.parametrize('where', ['repository', 'projects'])
     def test_refuses_sample_file_inside(self, tmp_path, capsys, where):
         root, _ = _glossary_projects(tmp_path / 'projects')
-        target = os.path.join(ROOT, 'sample-x.md') if where == 'repository' \
+        (tmp_path / 'checkout' / '.git').mkdir(parents=True)
+        target = str(tmp_path / 'checkout' / 'sample-x.md') if where == 'repository' \
             else str(root / 'sample-x.md')
         assert self._main(root, '--sample-out', target) == 2
         what = 'a git work tree' if where == 'repository' else 'the projects directory'
