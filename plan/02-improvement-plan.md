@@ -108,9 +108,9 @@ prompt   <p k="1">See <a k="2"><sup>3</sup></a> for the <em k="3">core idea</em>
 
 - Every top-level block gets a key, with or without attributes, so block order can be checked.
 - Every other tag that has attributes gets a key. Tags without attributes are sent bare.
-- Keys are *required* for top-level blocks and for tags carrying `id`, `href`, `src`, `name`,
-  or `epub:type`. Keys are *optional* for inline tags whose attributes are only `class`,
-  `style`, or `lang`.
+- Inline tags are preserved: every key is required, and every tag without a key must occur as
+  often per tag name as in the source. Only the order of inline tags may change (Chinese word
+  order moves them).
 - Protection and restoration operate on tokens of the stored string. They do not parse and
   re-serialize, so `restore(protect(html)) == html` holds exactly.
 - A block that is a run of bare inline content is wrapped in a neutral keyed element for the
@@ -121,11 +121,17 @@ prompt   <p k="1">See <a k="2"><sup>3</sup></a> for the <em k="3">core idea</em>
 
 | Class | Rules | On failure |
 |---|---|---|
-| Structural (blocking) | Output is well-formed. The sequence of top-level keys equals the source's. Each required key appears exactly once, on the same tag name. No optional key appears twice. No attribute other than `k`. No tag name absent from the source segment. | Retry; if still failing, the segment is `failed` and is exported in the original language. |
-| Quality (warning) | Identical to source although the source has translatable words. Length ratio outside the default band. Optional key dropped. Glossary term not applied. | Stored as translated, with a typed issue shown in review. |
+| Structural (blocking) | Output is well-formed. The sequence of top-level keys equals the source's. Each key appears exactly once, on the same tag name. For tags without a key, the count per tag name equals the source's. No attribute other than `k`. No tag name absent from the source segment. | Retry; if still failing, the segment is `failed` and is exported in the original language. |
+| Quality (warning) | Identical to source although the source has translatable words. Length ratio outside the default band. Glossary term not applied. | Stored as translated, with a typed issue shown in review. |
 
 Quality rules never block, because legitimate exceptions are common: headings that are only a
 name, formulas, acronyms, URLs.
+
+The same comparison checks a model reply, a text saved or approved in the review, and a stored
+translation at export. A stored translation has real attributes instead of keys, so the check
+works on the restored form: a model reply is restored first, then source and translation are
+parsed and compared block by block, each element taken as its tag name plus its attributes.
+Per block the two multisets must be equal; that is the key rules above in restored form.
 
 **Retry.** One retry with the specific error as feedback, sent as a follow-up message. If that
 fails and the segment has two or more top-level blocks, split the request once at a block
@@ -448,13 +454,18 @@ Fixes Bugs 1 and 2.
 ### Phase 4 — Protection, validation, retry
 
 Depends on Phases 1 and 2. Implements 4.1. Replaces the reduced export check with the full one.
+Inline tag counts are blocking (4.1): an existing translation that dropped or added an inline
+tag fails the check and is exported in the original language until it is translated again.
+`translate.py validate <project>` reports the existing translations that fail, per rule, and
+with `--mark-failed` sets them to `failed` (their text kept) so that `start --retry-failed`
+translates them again.
 
 Acceptance:
 
 - `restore(protect(html)) == html` for every stored segment.
-- Running the validator over the 4156 existing translations flags the known count mismatches
-  and required-attribute losses; the length-ratio band is tuned on the same data so that it
-  flags a small, reviewable fraction.
+- Running the validator over the 4162 existing translations reports, per rule, how many
+  dropped or added tags and attributes; the length-ratio band is tuned on the same data so that
+  it flags a small, reviewable fraction.
 - A reply that is a refusal or is not HTML is recorded as a backend issue, not stored as text.
 
 ### Phase 5 — Glossary compliance and review surfacing
@@ -577,10 +588,10 @@ failing segment, and export of a project with failed segments.
 | Question | Decision |
 |---|---|
 | Parser | `lxml.etree`, XML mode, for walker and writer. Unparseable chapters pass through unchanged and are reported. |
-| What to protect | Every tag with attributes gets a key; top-level blocks always. Required versus optional as in 4.1. |
+| What to protect | Every tag with attributes gets a key; top-level blocks always. Every key is required and tags without a key keep their count per tag name (4.1). |
 | Split on failure | Yes, once, inside the call only. No new segments or anchors. |
 | Language for bilingual | Package and root stay in the source language; translated copies carry `lang="zh-TW"`. |
-| Thresholds | Structural rules fixed in code. Quality heuristics have defaults, optional per-project overrides, and never block. |
+| Thresholds | Structural rules fixed in code. Quality heuristics have defaults and never block. |
 
 ## 9. Review record
 
