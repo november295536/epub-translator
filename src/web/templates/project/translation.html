@@ -217,7 +217,16 @@ function translationController() {
             try {
                 const res = await fetch('/api/projects/{{ project_name }}/progress');
                 const data = await res.json();
-                if (res.ok) this.failedCount = data.failed;
+                if (res.ok) {
+                    this.failedCount = data.failed;
+                    // The page header's bar was rendered when the page loaded
+                    const header = document.querySelector('.project-header .progress-bar');
+                    if (header) {
+                        header.querySelector('.progress-fill').style.width = data.percent + '%';
+                        header.querySelector('.progress-text').textContent =
+                            `${data.translated + data.reviewed}/${data.total} (${data.percent}%)`;
+                    }
+                }
             } catch (e) {
                 console.error('Failed to fetch progress:', e);
             }
