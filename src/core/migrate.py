@@ -8,7 +8,8 @@ them as text). Legacy segments are then grouped: the smallest groups that
 start and end on block boundaries. A group of one segment keeps it; a larger
 group becomes one segment (translations joined in order, first ID kept,
 status the lowest of the group). A larger group that is not wholly
-translated (lowest status pending or failed) keeps no translation, and a
+translated (a member pending or failed, or with an empty translation)
+keeps no translation (and is pending if its status said otherwise), and a
 group that mixes code and text segments makes its chapter unmatched.
 
 Fail-closed: if any chapter cannot be matched nothing is written, and an
@@ -160,12 +161,18 @@ def _match_chapter(chapter_id: str, segs: list[SegmentState], body, report: Migr
                     (chapter_id, f'{olds[0].segment_id} merges code and text segments'))
                 return None
             report.merged.append([s.segment_id for s in olds])
-            # A group not wholly translated keeps no partial translation:
-            # export would place it as the whole group's text
-            cleared = (merged.status in (SegmentStatus.PENDING, SegmentStatus.FAILED)
-                       and merged.translated_text != '')
-            if cleared:
+            # A group not wholly translated (a member pending or failed, or
+            # one with an empty translation, which the review editor can
+            # save) keeps no partial translation: export would place it as
+            # the whole group's text
+            if any(s.status in (SegmentStatus.PENDING, SegmentStatus.FAILED)
+                   or not s.translated_text.strip() for s in olds):
+                cleared = merged.translated_text != ''
                 merged.translated_text = ''
+                if merged.status in (SegmentStatus.TRANSLATED, SegmentStatus.REVIEWED):
+                    merged.status = SegmentStatus.PENDING
+            else:
+                cleared = False
             if cleared or len({s.status for s in olds}) > 1:
                 report.notes.append(
                     f'{merged.segment_id}：{len(olds)} 個段落的狀態為 '
@@ -231,18 +238,19 @@ def migrate_project(project_dir: str, dry_run: bool = False) -> MigrationReport:
     if not dry_run:
         lock.acquire()  # refuses while another process (a web task) holds it
     try:
-        try:
+        own = os.path.join(project_dir, SOURCE_FILE)
+        try:  # a malformed file (wrong JSON shape included) is a message
             pm.load()
-        except (OSError, ValueError, TypeError, KeyError) as e:
+            source = own if os.path.isfile(own) else pm.data.epub_path
+            found = os.path.isfile(source)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
             raise MigrationError(f'無法讀取 project.json：{e}') from e
         if pm.data.schema != 1:
             raise MigrationError(f'專案已是 schema {pm.data.schema}')
         backup = os.path.join(project_dir, BACKUP_FILE)
         if os.path.exists(backup):
             raise MigrationError(f'{BACKUP_FILE} 已存在，不會覆寫；請先移走它')
-        own = os.path.join(project_dir, SOURCE_FILE)
-        source = own if os.path.isfile(own) else pm.data.epub_path
-        if not os.path.isfile(source):
+        if not found:
             raise MigrationError(f'找不到來源 EPUB：{source}')
 
         try:
@@ -262,12 +270,18 @@ def migrate_project(project_dir: str, dry_run: bool = False) -> MigrationReport:
                 if os.path.exists(tmp):
                     os.remove(tmp)
         shutil.copy2(pm.project_file, backup)
-        with pm.mutex:
-            pm.data.segments = new_segments
-            pm.data.schema = 2
-            pm.data.epub_path = os.path.abspath(own)
-            pm.data.source_sha256 = sha256_file(own)
-        pm.save()
+        try:
+            with pm.mutex:
+                pm.data.segments = new_segments
+                pm.data.schema = 2
+                pm.data.epub_path = os.path.abspath(own)
+                pm.data.source_sha256 = sha256_file(own)
+            pm.save()
+        except BaseException:
+            # project.json is unchanged (the save is atomic): a next run
+            # must not be refused because of this backup
+            os.remove(backup)
+            raise
         report.written = True
         return report
     finally:

@@ -592,3 +592,81 @@ class TestMigrateSurvivors:
                     _segment('c2', 2, 'Second bare sentence.', '<p>乙</p><p>丙</p>', 'translated')]
         project_dir = _legacy_project(tmp_path, segments=segments)
         assert migrate_project(project_dir, dry_run=True).count_differs == 2
+
+
+class TestMigrateReview2:
+    """Review round 2: an empty member translation, wrong JSON shapes, a
+    failing save."""
+
+    def test_translation_cleared_in_the_review_editor(self, tmp_path):
+        from src.web.server import create_app
+        segments = [_segment('c2', 1, '<p>Intro line.</p>\nFirst bare sentence.', '甲',
+                             'reviewed'),
+                    _segment('c2', 2, 'Second bare sentence.', '乙', 'translated')]
+        project_dir = _legacy_project(tmp_path, {'c2': CHAPTERS['c2']}, segments)
+        app = create_app(projects_dir=str(tmp_path))
+        app.config['TESTING'] = True
+        with app.test_client() as client:
+            response = client.post('/api/projects/proj/segments/c2_seg0002', json={'text': ''})
+        assert response.status_code == 200
+        with open(os.path.join(project_dir, 'project.json'), encoding='utf-8') as f:
+            stored = json.load(f)['segments'][1]
+        assert (stored['status'], stored['translated_text']) == ('translated', '')
+
+        report = migrate_project(project_dir)
+        assert report.notes == ['c2_seg0001：2 個段落的狀態為 reviewed, translated；'
+                                '合併後為 pending，部分譯文已清除（保留於 project.schema1.json）']
+        pm = ProjectManager(project_dir)
+        pm.load()
+        seg = pm.data.segments[0]
+        assert (seg.status, seg.translated_text) == (SegmentStatus.PENDING, '')
+
+    def test_empty_member_of_one_status_named(self, tmp_path):
+        segments = [_segment('c2', 1, '<p>Intro line.</p>\nFirst bare sentence.', '甲',
+                             'translated'),
+                    _segment('c2', 2, 'Second bare sentence.', ' ', 'translated')]
+        project_dir = _legacy_project(tmp_path, {'c2': CHAPTERS['c2']}, segments)
+        report = migrate_project(project_dir, dry_run=True)
+        assert report.notes == ['c2_seg0001：2 個段落的狀態為 translated, translated；'
+                                '合併後為 pending，部分譯文已清除（保留於 project.schema1.json）']
+
+    @pytest.mark.parametrize('content', [
+        'null', '[]', '{"epub_path": "x.epub", "segments": [null]}',
+        '{"epub_path": "x.epub", "segments": ["text"]}',
+    ])
+    def test_wrong_json_shape_is_a_migration_error(self, tmp_path, content):
+        (tmp_path / 'project.json').write_text(content, encoding='utf-8')
+        with pytest.raises(MigrationError, match='^無法讀取 project.json：'):
+            migrate_project(str(tmp_path))
+        assert sorted(os.listdir(tmp_path)) == ['project.json', 'project.lock']
+        assert (tmp_path / 'project.json').read_text(encoding='utf-8') == content
+
+    def test_null_epub_path_is_a_migration_error(self, tmp_path):
+        project_dir = _legacy_project(tmp_path, source_inside=False, extra={'epub_path': None})
+        before = _files(project_dir)
+        with pytest.raises(MigrationError, match='^無法讀取 project.json：'):
+            migrate_project(project_dir)
+        after = _files(project_dir)
+        after.pop('project.lock')
+        assert after == before
+
+    def test_wrong_shape_through_the_cli(self, tmp_path):
+        from translate import cli
+        (tmp_path / 'project.json').write_text('null', encoding='utf-8')
+        result = CliRunner().invoke(cli, ['migrate', str(tmp_path)])
+        assert result.exit_code == 1
+        assert result.output.startswith('無法讀取 project.json：')
+
+    def test_failed_save_removes_the_backup(self, tmp_path, monkeypatch):
+        project_dir = _legacy_project(tmp_path)
+        before = open(os.path.join(project_dir, 'project.json'), 'rb').read()
+
+        def failing_save(self):
+            raise OSError('disk full')
+        monkeypatch.setattr(ProjectManager, 'save', failing_save)
+        with pytest.raises(OSError):
+            migrate_project(project_dir)
+        assert not os.path.exists(os.path.join(project_dir, 'project.schema1.json'))
+        assert open(os.path.join(project_dir, 'project.json'), 'rb').read() == before
+        monkeypatch.undo()
+        assert migrate_project(project_dir).written
