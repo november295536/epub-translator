@@ -87,6 +87,7 @@ NOT_WELL_FORMED = 'not_well_formed'        # the translation is not well-formed 
 STRUCTURE_MISMATCH = 'structure_mismatch'  # its top-level structure differs from the blocks
 AMBIGUOUS_SOURCE = 'ambiguous_source'      # the mapping rule cannot split the source itself
 CODE_MARKUP = 'code_markup'                # the code element holds markup (e.g. highlighting)
+MISSING_ANCHOR = 'missing_anchor'          # an id (or a@name) inside a block is not in its translation
 
 REASON_TEXT = {
     CHAPTER_UNREADABLE: '章節無法讀取',
@@ -95,6 +96,7 @@ REASON_TEXT = {
     STRUCTURE_MISMATCH: '譯文的頂層結構與原文區塊不符',
     AMBIGUOUS_SOURCE: '原文區塊無法明確對應',
     CODE_MARKUP: '程式碼區塊含標記',
+    MISSING_ANCHOR: '譯文缺少原文區塊內的錨點（id 或 a 的 name）',
 }
 
 SCHEMA_1_MESSAGE = ('此專案是舊格式（schema 1），無法匯出。'
@@ -397,7 +399,10 @@ def _export_chapter(zf, path: str, segments: list, todo: list, fmt: str, src_lan
     if not fills:
         return None
 
-    # TOC targets are found on the source tree, before it changes
+    # TOC targets are found on the source tree, before it changes: the ids
+    # inside each filled block element (and None for the block holding the
+    # file's first heading), and, for an id on an element that contains
+    # blocks, its first block
     first_heading = next((e for e in body.iter() if localname(e) in HEADINGS), None)
     keys = {}
     for block, _ in fills:
@@ -405,9 +410,14 @@ def _export_chapter(zf, path: str, segments: list, todo: list, fmt: str, src_lan
             subtree = list(block.nodes[0].iter(etree.Element))
             keys[id(block)] = ([e.get('id') for e in subtree if e.get('id')]
                                + ([None] if first_heading in subtree else []))
+    first_block = {}
+    for block in blocks:
+        for el in [block.parent, *block.parent.iterancestors()]:
+            if el.get('id'):
+                first_block.setdefault(el.get('id'), block)
 
     ns = etree.QName(body).namespace
-    labels = {}
+    labels, headings = {}, {}
     for block, piece in sorted(fills, key=lambda f: f[0].index, reverse=True):
         result = _fill(block, piece, fmt, src_lang, epub3, ns)
         if not block.tag:  # a run holds no heading
@@ -415,8 +425,12 @@ def _export_chapter(zf, path: str, segments: list, todo: list, fmt: str, src_lan
         heading = next((e for e in result.iter() if localname(e) in HEADINGS), None)
         label = '' if heading is None else ' '.join(element_text(heading).split())
         if label:
+            headings[id(block)] = label
             for key in keys[id(block)]:
                 labels.setdefault(key, label)
+    for key, block in first_block.items():
+        if block.tag in HEADINGS and id(block) in headings:
+            labels.setdefault(key, headings[id(block)])
 
     if fmt == 'chinese-only':
         root.set(XML_LANG, TARGET_LANG)
@@ -474,7 +488,10 @@ def _pieces(seg, blocks: list) -> list:
     <br> in the source) takes the group split at the newlines in its
     top-level text, which must give exactly k pieces with content. The
     stored HTML must itself split into its blocks by the same rule
-    (checked by fingerprint), else the segment cannot be mapped.
+    (checked by fingerprint), else the segment cannot be mapped. Finally
+    every id (and name of an <a>) inside a source block, below the block
+    element itself, must occur in that block's translation; inner tags and
+    other attributes are not checked (Phase 4).
 
     A code segment's translation is plain text, filled into the code
     element; a translation equal to the source code leaves the block as
@@ -496,7 +513,21 @@ def _pieces(seg, blocks: list) -> list:
     pieces = _split(fragment, blocks)
     if pieces is None:
         raise _Kept(STRUCTURE_MISMATCH)
+    if any(not _anchors(s) <= _anchors(p) for s, p in zip(source, pieces)):
+        raise _Kept(MISSING_ANCHOR)
     return pieces
+
+
+def _anchors(piece) -> set:
+    """The id values, and the name values of <a>, inside one block's piece:
+    below a block element (its own attributes come from the source) or in
+    a run's nodes."""
+    if isinstance(piece, list):
+        elements = [e for n in piece if not isinstance(n, str) for e in n.iter(etree.Element)]
+    else:
+        elements = piece.iterdescendants(etree.Element)
+    return {v for e in elements
+            for v in (e.get('id'), e.get('name') if localname(e) == 'a' else None) if v}
 
 
 def _fragment(html: str, nsmap: dict):
