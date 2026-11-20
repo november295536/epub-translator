@@ -3862,3 +3862,113 @@ Remaining survivors (run 3), each equivalent and listed above: `_translate_html`
 
 - No real `claude` call; the follow-up message's not_well_formed wording was not seen by the
   model.
+
+## Phase 5 — part A
+
+Date: 2026-11-21. Branch: `phase-5/glossary-compliance`, worktree `<repo>/.worktree/phase-5`,
+shared virtualenv. Part A only: the compliance check, its measurement, and the review surfacing.
+The targeted fix (part B) is decided after the user has judged the sample (plan, Phase 5).
+
+### What was built
+
+| Item | Where |
+|---|---|
+| `glossary` / `term_not_applied` warning, one per term: an entry the prompt gives (`terms_for_prompt`) that occurs in the source text (the prompt's matching, `term_pattern`, now public) and whose translation is not a substring of the translation. Compared without tags, entities decoded, NFKC, one kind of middle dot, no whitespace, case-folded, without parentheticals that hold no Chinese character. Empty translations and code segments skipped. A `work` entry only where written with the glossary's capitals (the prompt applies it only to a title). Never blocking. | `validation.terms_not_applied`, `glossary_issues`, `check_segment(seg, text, glossary=None)` |
+| After a model call (all paths through `translate_segment`), at review save and approve, in `translate.py validate` (heading `品質與術語警告（不影響匯出）`). Only on translations that pass the structural check. The export does not run it. | `translator.translate_segment`, `review.update_segment` / `approve_segment`, `translate._validate` |
+| Save, approve and re-translate return `issues` (approve: the warnings of the approved text; the stored issues are still cleared, as before). | `review.py` |
+| Review page: an issue badge and the issue list (kind label and detail) per segment, updated from the responses; "有問題的段落 (N)" lists all segments with stored issues; per chapter, "只顯示有問題的段落". | `project/review.html`, `style.css`, `review.with_issues` |
+| Search already returned `FAILED` segments (Phase 1); only its hint text said otherwise and now names them. | `project/search.html` |
+| Check script, sample file. | `scripts/verify/phase5_glossary_check.py` |
+
+### Checks
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase5_glossary_check.py --projects-dir <repo>/projects --anonymize --sample-out <file outside the repository>
+PASS project-1: glossary entries 0, translated 220, passing the structural check 211, with term_not_applied 0, terms 0, by category (none)
+PASS project-2: glossary entries 0, translated 278, passing the structural check 224, with term_not_applied 0, terms 0, by category (none)
+PASS project-3: glossary entries 0, translated 36, passing the structural check 34, with term_not_applied 0, terms 0, by category (none)
+PASS project-4: glossary entries 2, translated 1333, passing the structural check 1276, with term_not_applied 6, terms 2, by category (person: 9 warnings, 2 terms)
+PASS project-5: glossary entries 5, translated 832, passing the structural check 794, with term_not_applied 0, terms 0, by category (none)
+PASS project-6: glossary entries 0, translated 581, passing the structural check 578, with term_not_applied 0, terms 0, by category (none)
+PASS project-7: glossary entries 6, translated 551, passing the structural check 524, with term_not_applied 6, terms 2, by category (term: 6 warnings, 2 terms)
+PASS project-8: glossary entries 2, translated 331, passing the structural check 315, with term_not_applied 0, terms 0, by category (none)
+TOTAL projects 8  glossary entries 15, translated 4162, passing the structural check 3956, with term_not_applied 12, terms 4, by category (person: 9 warnings, 2 terms, term: 6 warnings, 2 terms)  failed projects 0
+sample written: 15 warnings
+$ echo $?
+0
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+The "passing" counts equal Phase 4's "as translation" per project. 12 of 3956 checked
+segments (0.3%) get a warning; 4 of the 8 projects have no glossary entries at all and project-5
+and project-8 have entries that the translations follow. Only 15 warnings exist, so the sample
+holds 15, not the 20 the plan asks for. The sample file holds book text; it was written outside
+the repository and is not committed. No `phase5-glossary-*` directory left.
+
+First reading of the sample by the implementer (categories only; the user's judgement decides):
+10 of 15 look like real problems (a name transliterated against the glossary; a name kept in
+English word order, `Miss X` instead of `X 小姐`, in 7 items of one book; a part title in a table
+of contents translated differently), 5 look like false alarms (a polysemous term where the
+context needs another rendering, 2; a shorter form of the glossary rendering, 1; a work title
+kept in English in a bibliography, 2).
+
+Review UI, by hand on an invented project served on a local port: the issue list
+(`?issues=1`) shows exactly the segments with issues, each with its chapter link, kind label
+and detail; saving a text without the glossary term shows the badge and the detail without
+reload, saving the compliant text hides them.
+
+### Tests
+
+1817 passed (main: 1748). New: `TestGlossaryCompliance` (`test_validation.py`),
+`TestTranslateSegmentGlossary` (`test_translator.py`), `TestReviewIssues` (`test_web.py`),
+`TestPhase5ValidateGlossary` (`test_cli.py`), `TestGlossaryCheck`, `TestGlossaryCheckSurvivors`,
+`TestReviewSurvivors` (`test_verify_scripts.py`).
+
+Tests changed, none removed:
+
+| Test | Change | Reason |
+|---|---|---|
+| `TestTranslateSegment::test_glossary_and_context` | the stub glossary returns a `GlossaryEntry` instead of a string | the check reads the entries the prompt got |
+| `TestRound1Exact::test_review_responses_exact` | save and approve responses have `issues: []` | the endpoints return the check's issues |
+| `TestPhase4Validate::test_read_only_report` | heading `品質與術語警告（不影響匯出）：` | glossary warnings are listed under it |
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, mutmut 3.8.1, parallel, about 7 minutes per run.
+
+| Run | Mutants | Killed | Survived | Timeout |
+|---|---|---|---|---|
+| 1 | 594 | 538 | 54 | 2 |
+| 2 (final) | 587 | 586 | 1 | 0 |
+
+All survivors of run 1 were in the check script and in two lines of `review.py`; the core code
+(`validation`, `translator`, `glossary_manager`, `translate.py`) had none.
+
+| mutant(s) | done |
+|---|---|
+| `main` 2–5, 7, 8, 10, 11, 14–18, 21, 24, 29–31, 42, 45, 46 (description, defaults, help texts) | killed: `TestGlossaryCheckSurvivors::test_help_in_process`, `test_default_projects_directory` |
+| `run` 31, 69, 89, 95 (first snapshot fails; joined problems; failed count) | killed: `test_first_snapshot_fails`, `test_check_and_snapshot_fail`, `test_two_failing_projects_with_two_problems` |
+| `run` 106, 109, 113 (sample file encoding) | killed: `test_sample_written_as_utf8` |
+| `check_copy` 14, `review._glossary` 8 (`GLOSSARY.JSON`: the same file on a case-insensitive file system) | killed: `test_glossary_file_name` (both classes) |
+| `check_copy` 25, 28, 38 (skipped segments) | killed: `test_skipped_segments_do_not_end_the_count` |
+| `snapshot` 8, 11, 13–15 | killed: `test_snapshot` |
+| `sample_item` 8, 13, 14, 23; `sample_markdown` 2–8; `category_text` 4, 5 | killed: `test_sample_item_term_case_and_no_match`, `test_sample_markdown_head`, `test_category_text` |
+| `review._render` 1, 2 (`active_tab`) | killed: `TestReviewSurvivors::test_review_tab_active` |
+| `pick_sample` 9, 10 (timeouts: the round-robin loop became endless) | code changed: `zip_longest` instead of the loop; same order |
+| `category_text` 14 (`term.upper()` for `term.lower()` when counting distinct terms) | equivalent: the glossary keys its entries by `term.lower()`, so two entries never share a lower-case form; `upper()` could merge two of them only for characters whose upper case collides (e.g. `ß` and `ss`), which no counted term has |
+
+### Not done
+
+- Part B (targeted fix), by decision: it waits for the user's judgement of the sample.
+- Warnings are not stored on existing translations: `validate` and the check script report
+  them without writing. The review filter therefore shows glossary warnings only for segments
+  translated or saved after this change.
+
+### Not verified
+
+- No real `claude` call; the warning after a model call is tested with the fake backend.
+- `translate.py validate` was not run on the real projects: they are schema 1 and the command
+  refuses them (migration needed); the check script migrates copies instead.
