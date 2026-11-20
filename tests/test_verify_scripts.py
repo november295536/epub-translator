@@ -1701,3 +1701,57 @@ class TestExportCheckReviewRound1(_ExportCheckBase):
         assert self._main(root) == 1
         out = capsys.readouterr().out
         assert 'FAIL project-1: export check raised OSError' in out and 'beta' not in out
+
+
+class TestExportCheckRound1Survivors(_ExportCheckBase):
+    """Mutation run 5: the check script's new rules spelled out."""
+
+    def _mimetype_last_book(self, root, books):
+        """A project whose source has mimetype last, deflated, with an extra field."""
+        import zipfile
+        from tests.test_exporter import RAW_TRANSLATIONS, _project, _raw_book
+        epub = _raw_book(books)
+        with zipfile.ZipFile(epub) as z:
+            rest = [(i, z.read(i)) for i in z.infolist() if i.filename != 'mimetype']
+        info = zipfile.ZipInfo('mimetype', date_time=(2002, 3, 4, 5, 6, 8))
+        info.extra = b'\xfe\xca\x00\x00'
+        with zipfile.ZipFile(epub, 'w') as z:
+            for i, d in rest:
+                z.writestr(i, d)
+            z.writestr(info, 'application/epub+zip', compress_type=zipfile.ZIP_DEFLATED)
+        _project(root, epub, RAW_TRANSLATIONS, name='p')
+
+    def test_source_mimetype_last_deflated_with_extra_passes(self, tmp_path, capsys):
+        root = tmp_path / 'projects'
+        root.mkdir()
+        (tmp_path / 'b').mkdir()
+        self._mimetype_last_book(root, tmp_path / 'b')
+        assert self._main(root) == 0, capsys.readouterr().out
+        assert capsys.readouterr().out.splitlines()[1].startswith('PASS project-1: ')
+
+    def test_toc_entries_differ(self, tmp_path, capsys, monkeypatch):
+        self._fails_with(tmp_path, capsys, monkeypatch,
+                         _edit('OEBPS/nav.xhtml', b'</li></ol>',
+                               b'</li><li><a href="Text/one.xhtml">X</a></li></ol>'),
+                         'chinese-only: table of contents entries differ')
+
+    def test_nav_point_outside_the_nav_map_not_counted(self, tmp_path):
+        from tests.conftest import write_raw_epub
+        ncx = ('<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/">'
+               '<navMap><navPoint><navLabel><text>One</text></navLabel></navPoint></navMap>'
+               '<navList><navPoint><navLabel><text>Odd</text></navLabel></navPoint></navList></ncx>')
+        epub = write_raw_epub(tmp_path / 'b.epub', [('ncx', 'toc.ncx', 'application/x-dtbncx+xml', None)],
+                              [], {'OEBPS/toc.ncx': ncx})
+        archive = export_check.Archive(epub)
+        assert [e[2] for e in export_check.toc_labels(archive)] == ['One']
+        assert export_check.other_labels(archive) == [('OEBPS/toc.ncx', 'Odd')]
+
+    def test_snapshot_failure_reported_once(self, tmp_path, capsys, monkeypatch):
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+
+        def snapshot(path):
+            raise PermissionError('invented')
+        monkeypatch.setattr(export_check, 'snapshot', snapshot)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[1] == (
+            'FAIL project-1: export check raised PermissionError')
