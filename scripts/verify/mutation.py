@@ -23,15 +23,23 @@ Three adjustments make mutmut 3 fit this repository; all live in the copy:
   code with a test's temporary directory as working directory, where
   mutmut finds no configuration: a sitecustomize loads it from the copy.
 
-Known gap: a test links to a function only when the function runs in the
-test's own process. Code a test reaches only through a subprocess (the
-check scripts' --help and command-line tests) is not linked to that test,
-so such mutants are run without it and survive unless an in-process test
-kills them (mutmut 2 ran every test of the group and killed them).
+Scope (what mutmut 3.8.1 does, recorded rather than worked around):
+- only functions and methods are mutated: module-level statements and
+  decorated functions (Flask routes, click commands, properties) are not,
+  even on changed lines;
+- the changed-line filter selects the node mutmut mutates, so a mutated
+  call may change an argument on an unchanged continuation line;
+- a test is linked to a function only when the function runs in the test's
+  own process: code reached only through a subprocess (the check scripts'
+  --help and command-line tests) is not, so such mutants run without that
+  test and survive unless an in-process test kills them.
 
-Prints every surviving, timed-out, suspicious or untested mutant with its
-diff, then a TOTAL line. Exit code: 0 when every mutant was killed, 1 when
-some were not, 2 when mutmut failed or generated no mutants.
+Prints every mutant that was not killed (survived, timeout, suspicious, no
+tests, segfault, not checked, interrupted, or any other status) with its
+diff, then a TOTAL line. Exit code: 0 only when every mutant was killed,
+1 otherwise, 2 when mutmut failed, was stopped or generated no mutants.
+On SIGTERM or SIGHUP (and Ctrl-C) mutmut's process group is stopped and the
+copy removed.
 """
 from __future__ import annotations
 
@@ -39,6 +47,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -61,7 +70,7 @@ FILES = [
     'scripts/verify/phase3_export_check.py',
 ]
 MODULE_REF = re.compile(r'\bsrc\.(core|epub|web|glossary|llm)\b')
-BAD = ('survived', 'timeout', 'suspicious', 'no tests')
+OK = ('killed',)  # any other status, known or not, fails the run
 
 RUNNER = '''
 import json, os, sys
@@ -94,13 +103,21 @@ def git(*args: str) -> str:
     return subprocess.run(['git', *args], capture_output=True, text=True, check=True).stdout
 
 
+class Stopped(Exception):
+    """SIGTERM or SIGHUP."""
+
+
+def _stop(signum, frame):
+    raise Stopped(signal.Signals(signum).name)
+
+
 def changed_lines(merge_base: str) -> dict:
     """{file: [line numbers]} of the working tree's lines added or changed
     versus the merge base."""
     out = {}
     for f in FILES:
         lines = set()
-        for m in re.finditer(r'^@@ -\S+ \+(\d+)(?:,(\d+))? @@', git('diff', '-U0', merge_base, '--', f), re.M):
+        for m in re.finditer(r'^@@ -\S+ \+(\d+)(?:,(\d+))? @@', git('diff', '--no-color', '--no-ext-diff', '-U0', merge_base, '--', f), re.M):
             start, n = int(m.group(1)), int(m.group(2) or 1)
             lines.update(range(start, start + n))
         if lines:
@@ -160,7 +177,10 @@ def main(base: str) -> int:
     if not changed:
         print('no changed lines')
         return 2
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGHUP, _stop)
     work = tempfile.mkdtemp(prefix='mutation-')
+    proc = None
     try:
         copy = os.path.join(work, 'repo')
         prepare(copy, changed)
@@ -169,9 +189,11 @@ def main(base: str) -> int:
                    TMPDIR=os.path.join(work, 'tmp'), PYTHONDONTWRITEBYTECODE='1')
         print('mutating the changed lines of ' + ', '.join(changed), flush=True)
         with open(os.path.join(work, 'run.log'), 'w') as log:
-            run = subprocess.run([sys.executable, '-c', RUNNER], cwd=copy, env=env,
-                                 stdout=log, stderr=subprocess.STDOUT)
-        if run.returncode != 0:
+            # its own process group, stopped as a whole on any exit
+            proc = subprocess.Popen([sys.executable, '-c', RUNNER], cwd=copy, env=env,
+                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            returncode = proc.wait()
+        if returncode != 0:
             with open(os.path.join(work, 'run.log'), encoding='utf-8', errors='replace') as log:
                 print(back(log.read()[-4000:]))
             print('ERROR mutmut failed', file=sys.stderr)
@@ -181,7 +203,7 @@ def main(base: str) -> int:
                                  capture_output=True, text=True, check=True).stdout
         statuses = dict(line.strip().rsplit(': ', 1) for line in listing.splitlines()
                         if ': ' in line)
-        for status in BAD:
+        for status in sorted(set(statuses.values()) - set(OK)):
             for name, st in sorted(statuses.items()):
                 if st == status:
                     diff = subprocess.run(mutmut + ['show', name], cwd=copy, env=env,
@@ -190,14 +212,29 @@ def main(base: str) -> int:
                     print(''.join('    ' + back(line) + '\n' for line in diff.splitlines()
                                   if not line.startswith('#')))
         counts = Counter(statuses.values())
+        others = ''.join(f'  {st} {n}' for st, n in sorted(counts.items())
+                         if st not in ('killed', 'survived', 'timeout', 'suspicious', 'no tests'))
         print(f"TOTAL mutants {len(statuses)}  killed {counts['killed']}  "
               f"survived {counts['survived']}  timeout {counts['timeout']}  "
-              f"suspicious {counts['suspicious']}  untested {counts['no tests']}")
+              f"suspicious {counts['suspicious']}  untested {counts['no tests']}{others}")
         if not statuses:
             print('ERROR no mutants were generated')
             return 2
-        return 1 if any(counts[s] for s in BAD) else 0
+        return 0 if set(counts) <= set(OK) else 1
+    except (Stopped, KeyboardInterrupt) as e:
+        print(f'stopped ({e or "SIGINT"})', file=sys.stderr)
+        return 2
     finally:
+        if proc is not None and proc.poll() is None:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(proc.pid, sig)
+                    proc.wait(timeout=10)
+                    break
+                except ProcessLookupError:
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         shutil.rmtree(work, ignore_errors=True)
 
 
