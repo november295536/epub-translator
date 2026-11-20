@@ -294,7 +294,9 @@ class TaskManager:
                 if segment_ids is not None:
                     # Retranslate mode: queue specified segments regardless of status
                     id_set = set(segment_ids)
-                    to_translate = [s for s in pm.data.segments if s.segment_id in id_set]
+                    # (a passthrough segment never: it needs no model call)
+                    to_translate = [s for s in pm.data.segments
+                                    if s.segment_id in id_set and not s.passthrough]
                 else:
                     to_translate = pm.get_pending_segments(include_failed=retry_failed)
 
@@ -591,6 +593,7 @@ class TaskManager:
         gm = task._gm
         engine = TranslationEngine(model=pm.data.model)
         all_segments = pm.data.segments
+        translations = pm.data.segmentation == 2  # context from translations
         reduced_exit = False
 
         try:
@@ -641,7 +644,8 @@ class TaskManager:
                 try:
                     # A failed segment, also one with an unexpected error, is
                     # an outcome: recorded as FAILED
-                    outcome = translate_segment(engine, seg, all_segments, gm)
+                    outcome = translate_segment(engine, seg, all_segments, gm,
+                                                translations=translations, mutex=pm.mutex)
                     task.result_queue.put(TranslationResult(
                         segment_id=seg.segment_id, outcome=outcome, revision=revision))
 

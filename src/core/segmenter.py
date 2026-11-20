@@ -3,9 +3,21 @@
 A segment is a contiguous half-open range of blocks in one chapter
 (`block_start`, `block_end`) and stores the fingerprints of those blocks. A
 block is never divided; segment HTML is the serialization of its blocks,
-one per line. Headings, tables and code are segments of their own; other
+one per line. Code blocks and tables are segments of their own; other
 blocks are grouped until a segment reaches MIN_WORDS, without passing
 MAX_WORDS unless a single block is larger.
+
+Headings and code depend on the rules (`rules`, stored as the project's
+`segmentation`):
+
+1. (projects created before Phase 6) a heading is a segment of its own.
+2. (new projects) a heading starts a new segment and the blocks after it
+   join that segment under the usual size rules, except that the first
+   text block after a heading always joins, whatever its size: a heading
+   is left alone only when a code block, a table or the end of the chapter
+   follows it. Consecutive headings share one segment. A code block
+   without a comment line (validation.has_comment_line) is `passthrough`: it
+   needs no model call and is left as it is.
 """
 
 from __future__ import annotations
@@ -13,6 +25,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
+from src.core.project import check_rules
+from src.core.validation import has_comment_line
 from src.epub.blocks import Block, element_text, localname, walk_blocks
 
 
@@ -37,20 +51,30 @@ class Segment:
     block_start: int | None = None
     block_end: int | None = None
     fingerprints: list[str] = field(default_factory=list)
+    # A code block without a comment line (rules 2): no model call needed
+    passthrough: bool = False
 
 
 MIN_WORDS = 300
 MAX_WORDS = 500
-STANDALONE_TAGS = frozenset({'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table'})
+HEADING_TAGS = frozenset({'h1', 'h2', 'h3', 'h4', 'h5', 'h6'})
+STANDALONE_TAGS = HEADING_TAGS | {'table'}
+# The segmentation rules of projects created now (see the module docstring)
+SEGMENTATION = 2
 
 
 class Segmenter:
-    """Groups a chapter's blocks into segments of 300-500 words."""
+    """Groups a chapter's blocks into segments of 300-500 words, by the
+    segmentation rules `rules` (1 or 2, see the module docstring)."""
+
+    def __init__(self, rules: int = SEGMENTATION):
+        self.rules = check_rules(rules)  # the integer 1 or 2, else ValueError
 
     def segment_chapter(self, chapter_id: str, body) -> list[Segment]:
         """Segment the parsed <body> element of a chapter."""
         segments: list[Segment] = []
         pending: list[Block] = []
+        new_rules = self.rules == 2
 
         def add(blocks: list[Block], segment_type: SegmentType, standalone: bool) -> None:
             segments.append(segment_from_blocks(
@@ -58,19 +82,28 @@ class Segmenter:
 
         def flush() -> None:
             if pending:
-                add(pending[:], SegmentType.TEXT, False)
+                # headings left alone are standalone, as under rules 1
+                add(pending[:], SegmentType.TEXT, all(b.tag in HEADING_TAGS for b in pending))
                 pending.clear()
 
         for block in walk_blocks(body):
-            if _code_text(block) is not None:
+            code = _code_text(block)
+            if code is not None:
                 flush()
                 add([block], SegmentType.CODE, True)
+                segments[-1].passthrough = new_rules and not has_comment_line(code)
+            elif new_rules and block.tag in HEADING_TAGS:
+                if any(b.tag not in HEADING_TAGS for b in pending):
+                    flush()  # a heading starts a segment
+                pending.append(block)
             elif block.tag in STANDALONE_TAGS:
                 flush()
                 add([block], SegmentType.TEXT, True)
             else:
                 words = len(block.text.split())
-                if sum(len(b.text.split()) for b in pending) + words > MAX_WORDS:
+                after_heading = bool(pending) and pending[-1].tag in HEADING_TAGS
+                if (not after_heading
+                        and sum(len(b.text.split()) for b in pending) + words > MAX_WORDS):
                     flush()
                 pending.append(block)
                 if sum(len(b.text.split()) for b in pending) >= MIN_WORDS:

@@ -149,6 +149,8 @@ header .subtitle {
 .status-translated { background: #3498db; color: white; }
 .status-reviewed { background: #27ae60; color: white; }
 .status-failed { background: #c0392b; color: white; }
+.status-passthrough { background: #7f8c8d; color: white; }
+.passthrough-note p { color: #666; font-size: 0.9em; }
 
 .issue-badge {
     background: #fdebd0;

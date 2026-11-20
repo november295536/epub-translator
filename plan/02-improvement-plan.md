@@ -156,7 +156,8 @@ are capped at four. Rate-limit and authentication errors are not structural fail
 consume this budget.
 
 **Code segments.** Code is plain text, not HTML. A code block with no comment marker is marked
-`passthrough`: no model call, and the exporter leaves its DOM untouched in every format. A
+`passthrough` (new projects, Phase 6: a segment flag, stored translated with its own code):
+no model call, and the exporter leaves its DOM untouched in every format. A
 translated code block is accepted only if it equals the source after comment lines are removed
 from both.
 
@@ -542,10 +543,47 @@ Depends on Phases 3 and 4. New projects only.
 - Context: previous segment's translation when available, tags stripped, last 200 characters;
   otherwise source text.
 
+As built (2026-11-21), where it differs from or adds to the above:
+
+- The rules are numbered. `project.json` gets `segmentation: 2` for projects created now;
+  projects without the field are rules 1 and are saved without it (their stored segments are
+  never re-cut); an explicit value is kept as it is. Only the integers 1 and 2 are accepted
+  (load, create, `Segmenter(rules=...)`, default 2); anything else is a `ValueError`.
+- Headings (rules 2): a heading block (`h1`–`h6`) ends the segment being built, unless that
+  segment holds only headings, and starts a new one. The first text block after a heading
+  always joins it, even when the two together pass `MAX_WORDS`; later blocks follow the usual
+  size rules. Consecutive headings share a segment. A code block, a table or the end of the
+  chapter after a heading leaves the heading (or the run of headings) as a segment of its own.
+  Tables are still segments of their own.
+- Passthrough: a code segment with no comment line (`validation.has_comment_line`, the line rule
+  of the code check; a trailing comment, `#include` or a first non-blank line that starts with
+  `#!` after its indentation (a shebang) is no comment line, and the code check keeps that
+  line unchanged, in every project) gets the segment flag
+  `passthrough` and is created `TRANSLATED` with its own code as text and no model. No new
+  status: it is never queued (also not by an explicit list of segment IDs), counts as done in
+  the progress numbers (which also report it as `passthrough`), and is skipped by `validate`
+  and by the export, which leaves its chapter untouched (a chapter holding only passthrough
+  code is copied byte for byte). The review page shows it as `passthrough`, without editor;
+  save, approve and re-translate answer 409, and the project manager itself refuses to change
+  it. Search marks it and does not select it for re-translation. It is not a translation for
+  the "nothing translated yet" export guards, the translated word count, the project list
+  status or the export report's untranslated count.
+- Context (rules 2 only): the text before is the previous text segment's translation when it
+  is `TRANSLATED` or `REVIEWED`, as a reader sees it (`validation.plain_text`) with whitespace
+  collapsed; otherwise its source text. Status and text are read together under the project
+  mutex, which is released before the model call.
+  Rules 1 projects keep the source text as context. Their prompts are unchanged except for the
+  code prompt's sentence that the shebang is not a comment, which applies to every project.
+- TOC labels already came from the translated heading element of the block (Phase 3); a
+  heading inside a larger segment is a block of its own, so nothing changed there.
+
 Acceptance:
 
 - Check script: segmenting project-3 with the new rules needs fewer than half of the
   4385 calls the current segmentation needs (count of non-passthrough segments).
+  (As built: `scripts/verify/phase6_segmentation_check.py` re-cuts the source with both
+  rules; the old rules give 4383 segments for project-3, the stored segmentation has 4385
+  because it was migrated from the legacy cut.)
 - Tests: a code block without a comment marker is exported byte-identical to the source in all
   three formats and appears once in bilingual output; a merged heading still produces the right
   TOC label.

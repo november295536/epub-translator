@@ -99,6 +99,9 @@ def init(epub_file):
         all_segments.extend(segs)
 
     click.echo(f"分段完成：共 {len(all_segments)} 個段落")
+    passthrough = sum(s.passthrough for s in all_segments)
+    if passthrough:
+        click.echo(f"其中 {passthrough} 個是沒有註解的程式碼，原樣保留，不需翻譯")
 
     pm.create(
         epub_path=epub_path,
@@ -106,6 +109,7 @@ def init(epub_file):
         author=metadata['author'],
         segments=all_segments,
         source_sha256=sha256_file(epub_path),
+        segmentation=segmenter.rules,
     )
 
     click.echo(f"專案已建立：{project_dir}")
@@ -215,7 +219,8 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
     for i, seg in enumerate(pending, 1):
         click.echo(f"[{progress['translated'] + i}/{progress['total']}] 翻譯段落 {seg.segment_id}...")
         try:
-            outcome = translate_segment(engine, seg, all_segments, gm)
+            outcome = translate_segment(engine, seg, all_segments, gm,
+                                        translations=pm.data.segmentation == 2)
         except RUN_ERRORS as e:
             _stop_run(e)
         pm.apply_outcome(seg.segment_id, outcome)
@@ -258,7 +263,9 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
                 break
 
             try:
-                outcome = translate_segment(engine, seg, all_segments, gm)
+                outcome = translate_segment(engine, seg, all_segments, gm,
+                                            translations=pm.data.segmentation == 2,
+                                            mutex=pm.mutex)
             except RUN_ERRORS as e:
                 stop_errors.append(e)
                 error_event.set()
@@ -363,6 +370,8 @@ def status(project):
     click.echo()
     click.echo(f"總段落數：{progress['total']}")
     click.echo(f"已翻譯：  {progress['translated']}")
+    if progress['passthrough']:
+        click.echo(f"  其中原樣保留的程式碼（沒有註解，不需翻譯）：{progress['passthrough']}")
     click.echo(f"已審閱：  {progress['reviewed']}")
     click.echo(f"待翻譯：  {progress['pending']}")
     click.echo(f"失敗：    {progress['failed']}")
@@ -413,7 +422,8 @@ def export(project, fmt):
         sys.exit(1)
 
     progress = pm.get_progress()
-    if progress['translated'] + progress['reviewed'] == 0:
+    # passthrough code is translated without a model: it is no translation
+    if progress['translated'] + progress['reviewed'] - progress['passthrough'] == 0:
         click.echo("尚未翻譯任何段落。請先執行 start 指令。")
         sys.exit(1)
 
@@ -505,8 +515,8 @@ def _validate(project_dir: str, mark_failed: bool) -> list[str] | None:
     blocking, warnings = Counter(), Counter()
     for seg in pm.data.segments:
         if seg.status not in (SegmentStatus.TRANSLATED, SegmentStatus.REVIEWED) \
-                or not seg.translated_text.strip():
-            continue
+                or not seg.translated_text.strip() or seg.passthrough:
+            continue  # (passthrough: code left as it is, nothing to check)
         checked += 1
         result = check_segment(seg, seg.translated_text, gm)
         blocking.update({i.code for i in result.blocking})
