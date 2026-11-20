@@ -854,13 +854,14 @@ COMMENT_LINE = re.compile(r'^\s*(?://|#(?:\s|!|$))')
 def comment_flags(code: str) -> list:
     """(line, is a comment line) for each line of a code block; comment
     lines are the only lines a model may translate. The first non-blank
-    line is code when it starts with `#!` (a shebang): leading blank lines
+    line is code when it starts with `#!` after its indentation (a
+    shebang; a block may be indented as a whole): leading blank lines
     are not counted, since the source keeps a newline after `<pre>` that a
     cleaned reply has lost."""
     lines = code.splitlines()
     first = next((i for i, line in enumerate(lines) if line.strip()), None)
     return [(line, bool(COMMENT_LINE.match(line))
-             and not (i == first and line.startswith('#!')))
+             and not (i == first and line.lstrip().startswith('#!')))
             for i, line in enumerate(lines)]
 
 
