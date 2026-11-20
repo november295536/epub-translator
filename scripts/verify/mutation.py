@@ -51,6 +51,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
 from importlib.metadata import version
 
@@ -167,6 +168,21 @@ def prepare(copy: str, changed: dict) -> None:
         fh.write(SITECUSTOMIZE)
 
 
+def stop_group(proc) -> None:
+    """Stop mutmut's process group (the group id is the leader's pid, also
+    after the leader exited): SIGTERM, then SIGKILL for what is left."""
+    for sig, grace in ((signal.SIGTERM, 10), (signal.SIGKILL, 0)):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:  # no process left in the group
+            return
+        try:
+            proc.wait(timeout=grace or None)
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(1)  # let the other members act on the signal
+
+
 def main(base: str) -> int:
     if version('mutmut') != MUTMUT_VERSION:
         print(f'mutmut {MUTMUT_VERSION} required (found {version("mutmut")}): '
@@ -225,16 +241,10 @@ def main(base: str) -> int:
         print(f'stopped ({e or "SIGINT"})', file=sys.stderr)
         return 2
     finally:
-        if proc is not None and proc.poll() is None:
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.killpg(proc.pid, sig)
-                    proc.wait(timeout=10)
-                    break
-                except ProcessLookupError:
-                    break
-                except subprocess.TimeoutExpired:
-                    continue
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # a second signal must not cut this short
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        if proc is not None:
+            stop_group(proc)
         shutil.rmtree(work, ignore_errors=True)
 
 

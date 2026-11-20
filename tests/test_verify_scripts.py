@@ -1832,3 +1832,64 @@ class TestExportCheckRound2Survivors(_ExportCheckBase):
         assert self._main(missing, anonymize=False) == 2
         assert capsys.readouterr().out == (
             f'ERROR cannot list projects directory {missing} (FileNotFoundError)\n')
+
+
+class TestExportCheckReviewRound3(_ExportCheckBase):
+
+    def test_source_member_with_a_zip64_record_passes(self, tmp_path, capsys):
+        import zipfile
+        from tests.test_exporter import RAW_TRANSLATIONS, _project, _raw_book
+        root = tmp_path / 'projects'
+        root.mkdir()
+        (tmp_path / 'b').mkdir()
+        epub = _raw_book(tmp_path / 'b')
+        info = zipfile.ZipInfo('OEBPS/Images/pic.png')
+        info.extra = b'\x01\x00\x08\x00' + (8).to_bytes(8, 'little') + b'\xfe\xca\x02\x00xy'
+        with zipfile.ZipFile(epub, 'a') as z:
+            z.writestr(info, b'invented')
+        _project(root, epub, RAW_TRANSLATIONS, name='p')
+        assert self._main(root) == 0, capsys.readouterr().out
+        assert capsys.readouterr().out.splitlines()[1].startswith('PASS project-1: ')
+
+    # processing instructions have pseudo-attributes: never classes, ids or anchors
+    def _root(self, body):
+        from lxml import etree
+        return etree.fromstring(f'<html><body>{body}</body></html>')
+
+    def test_pi_class_is_no_bilingual_row(self):
+        assert not export_check.uses_bilingual(self._root('<?pi class="bilingual-container"?>'))
+
+    def test_pi_id_is_not_counted(self):
+        root = self._root('<p id="d"/><?pi id="d"?><?pi id="e"?>')
+        assert export_check.id_counts(root) == {'d': 1}
+
+    def test_pi_id_is_no_anchor(self, tmp_path):
+        from tests.conftest import write_raw_epub, xhtml
+        epub = write_raw_epub(
+            tmp_path / 'b.epub', [('c', 'c.xhtml', 'application/xhtml+xml', None)], ['c'],
+            {'OEBPS/c.xhtml': xhtml('<p id="i"><?pi id="z" name="y"?></p>')})
+        assert export_check.Archive(epub).anchors('OEBPS/c.xhtml') == {'i'}
+
+    def test_pi_href_is_no_link(self, tmp_path):
+        from tests.conftest import write_raw_epub, xhtml
+        epub = write_raw_epub(
+            tmp_path / 'b.epub', [('c', 'c.xhtml', 'application/xhtml+xml', None)], ['c'],
+            {'OEBPS/c.xhtml': xhtml('<p><?pi href="#nowhere"?></p>')})
+        archive = export_check.Archive(epub)
+        assert export_check.broken_links(archive, []) == set()
+
+
+class TestMutationScript:
+    """Review round 3: the mutation run's cleanup."""
+
+    def test_stop_group_after_the_leader_exited(self):
+        import subprocess
+        mutation = _load('mutation')
+        proc = subprocess.Popen(['/bin/sh', '-c', 'sleep 60 & echo $!; exit 0'],
+                                stdout=subprocess.PIPE, text=True, start_new_session=True)
+        child = int(proc.stdout.readline())
+        proc.wait()
+        os.kill(child, 0)  # still running, in the leader's group
+        mutation.stop_group(proc)
+        with pytest.raises(ProcessLookupError):
+            os.killpg(proc.pid, 0)
