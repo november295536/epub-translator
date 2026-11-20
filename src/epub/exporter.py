@@ -28,7 +28,7 @@ import copy
 import os
 import posixpath
 import re
-import tempfile
+import secrets
 import zipfile
 from collections import Counter
 from dataclasses import dataclass, field
@@ -198,7 +198,7 @@ def _export(project_dir: str, output_path: str, fmt: str) -> ExportReport:
         zf = open_archive(data.epub_path)
         opf_path = package_path(zf)
         opf, manifest, spine = read_package(zf)
-        opf_subset = has_internal_subset(read_member(zf, opf_path))
+        opf_subset = has_internal_subset(opf, read_member(zf, opf_path))
     except EPUBError as e:
         raise ExportError(str(e)) from e
 
@@ -262,13 +262,21 @@ def _free_name(names: set, wanted: str) -> str:
     return candidate
 
 
-_INTERNAL_SUBSET = re.compile(rb'<!DOCTYPE[^>\[]*\[')
+_PROLOG_NODE = re.compile(r'<!--.*?-->|<\?.*?\?>', re.S)
+_SUBSET = re.compile(r'\s*<!DOCTYPE[^\[>]*\[')
 
 
-def has_internal_subset(data: bytes) -> bool:
-    """True when the document's DOCTYPE has an internal subset, which
-    `_serialize` cannot write back."""
-    return _INTERNAL_SUBSET.search(data) is not None
+def has_internal_subset(root, data: bytes) -> bool:
+    """True when the document `data`, parsed as `root`, has a DOCTYPE with
+    an internal subset, which `_serialize` cannot write back. lxml exposes
+    no subset content (`docinfo.internalDTD` exists for any DOCTYPE), so
+    the source is decoded with the encoding the parser found and its prolog
+    read, skipping comments and processing instructions."""
+    info = root.getroottree().docinfo
+    if info.internalDTD is None:
+        return False
+    text = data.decode(info.encoding or 'utf-8', 'replace').lstrip('\ufeff')
+    return _SUBSET.match(_PROLOG_NODE.sub('', text)) is not None
 
 
 def _serialize(root) -> bytes:
@@ -306,6 +314,18 @@ class _NoAttributes(int):
         return True
 
 
+def _without_zip64(extra: bytes) -> bytes:
+    """The extra field without its ZIP64 record (tag 1): its sizes and
+    offset are the source archive's; zipfile adds a new one when needed."""
+    out, i = [], 0
+    while i + 4 <= len(extra):
+        size = int.from_bytes(extra[i + 2:i + 4], 'little')
+        if int.from_bytes(extra[i:i + 2], 'little') != 1:
+            out.append(extra[i:i + 4 + size])
+        i += 4 + size
+    return b''.join(out) + extra[i:]
+
+
 def _member_info(info, compress_type: int):
     """A ZipInfo for writing `info` again: name bytes (UTF-8 when the source
     flags it, else code page 437, as zipfile decoded it), date, attributes,
@@ -318,8 +338,9 @@ def _member_info(info, compress_type: int):
     out.name_flag = info.flag_bits & 0x800
     out.compress_type = compress_type
     for attr in ('internal_attr', 'create_system', 'create_version',
-                 'extract_version', 'extra', 'comment'):
+                 'extract_version', 'comment'):
         setattr(out, attr, getattr(info, attr))
+    out.extra = _without_zip64(info.extra)
     out.external_attr = info.external_attr or _NoAttributes(0)
     return out
 
@@ -330,11 +351,11 @@ def _write_archive(zf, output_path: str, replaced: dict, css_path) -> None:
     entry's data and metadata (the entry the chapter reader uses)."""
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=out_dir, prefix='.export-', suffix='.tmp')
-    umask = os.umask(0)
-    os.umask(umask)
+    # created with mode 0o666 so the kernel applies the umask, as for any
+    # new file (no os.umask call: it is process-wide)
+    tmp = os.path.join(out_dir, f'.export-{secrets.token_hex(8)}.tmp')
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
     try:
-        os.fchmod(fd, 0o666 & ~umask)
         last = {info.filename: info for info in zf.infolist()}
         with os.fdopen(fd, 'wb') as f, zipfile.ZipFile(f, 'w') as out:
             if 'mimetype' in last:
@@ -405,7 +426,7 @@ def _relabel(zf, path: str, labels: dict, ncx: bool):
         root = parse_xml(data)
     except (KeyError, EPUBError, etree.XMLSyntaxError):
         return None
-    if has_internal_subset(data):
+    if has_internal_subset(root, data):
         return None
     entries = []  # (element holding the label, href)
     if ncx:
@@ -486,7 +507,7 @@ def _export_chapter(zf, path: str, segments: list, todo: list, fmt: str, src_lan
     if not _matches(blocks, segments):
         chapter.kept = [(s.segment_id, CHAPTER_MISMATCH) for s in todo]
         return None
-    if has_internal_subset(data):
+    if has_internal_subset(root, data):
         chapter.kept = [(s.segment_id, CHAPTER_DOCTYPE) for s in todo]
         return None
 
@@ -892,8 +913,9 @@ def _relang(el, src_lang: str) -> None:
 
 
 def _mark_translated(el, src_lang: str, epub3: bool) -> None:
-    """A bilingual translated copy: no id or name in its subtree, marked
-    zh-TW (lang only in EPUB 3; XHTML 1.1 has only xml:lang)."""
+    """A bilingual translated copy: no id or name and no note type in its
+    subtree, marked zh-TW (lang only in EPUB 3; XHTML 1.1 has only
+    xml:lang)."""
     for e in el.iter(etree.Element):
         for attr in ('id', 'name'):
             if attr in e.attrib:
@@ -903,10 +925,11 @@ def _mark_translated(el, src_lang: str, epub3: bool) -> None:
     if epub3:
         el.set('lang', TARGET_LANG)
     # Readers may hide notes: the translated row of a note stays visible
-    kinds = (el.get(EPUB_TYPE) or '').split()
-    kept = [k for k in kinds if k not in NOTE_TYPES]
-    if kept != kinds:
-        if kept:
-            el.set(EPUB_TYPE, ' '.join(kept))
-        else:
-            del el.attrib[EPUB_TYPE]
+    for e in el.iter(etree.Element):
+        kinds = (e.get(EPUB_TYPE) or '').split()
+        kept = [k for k in kinds if k not in NOTE_TYPES]
+        if kept != kinds:
+            if kept:
+                e.set(EPUB_TYPE, ' '.join(kept))
+            else:
+                del e.attrib[EPUB_TYPE]
