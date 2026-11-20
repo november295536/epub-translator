@@ -24,7 +24,7 @@ CATEGORY_LABELS = {
 FULL_GLOSSARY_MAX_TERMS = 150
 
 
-def _term_pattern(term: str) -> str:
+def term_pattern(term: str) -> str:
     """Regex for a glossary term: it starts at a word boundary, with any
     continuation, case-insensitive.
 
@@ -124,12 +124,12 @@ class GlossaryManager:
         return sorted(self.entries.values(), key=lambda e: e.term.lower())
 
     def find_terms_in_text(self, text: str) -> list[GlossaryEntry]:
-        """Find all glossary terms that appear in the given text (see _term_pattern).
+        """Find all glossary terms that appear in the given text (see term_pattern).
 
         An empty or whitespace-only term never matches."""
         found = []
         for entry in self.entries.values():
-            if entry.term.strip() and re.search(_term_pattern(entry.term), text, re.IGNORECASE):
+            if entry.term.strip() and re.search(term_pattern(entry.term), text, re.IGNORECASE):
                 found.append(entry)
         return sorted(found, key=lambda e: e.term.lower())
 

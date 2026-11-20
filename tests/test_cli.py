@@ -984,7 +984,7 @@ class TestPhase4Validate:
             '已檢查 4 段譯文：2 段未通過結構檢查（匯出時以原文輸出），2 段通過',
             '  structure_mismatch：1',
             '  unknown_tag：1',
-            '品質警告（不影響匯出）：',
+            '品質與術語警告（不影響匯出）：',
             '  untranslated：1',
         ]
         assert open(os.path.join(path, 'project.json'), encoding='utf-8').read() == before
@@ -1113,3 +1113,26 @@ class TestRound1Validate:
         assert result.output.splitlines()[:2] == [
             '已檢查 2 段譯文：1 段未通過結構檢查（匯出時以原文輸出），1 段通過',
             '  not_well_formed：1']
+
+
+class TestPhase5ValidateGlossary:
+    """translate.py validate counts the glossary warnings with the quality ones."""
+
+    def test_term_not_applied_counted(self, runner, tmp_path):
+        from src.glossary.glossary_manager import GlossaryManager
+        path = _make_project(str(tmp_path / 'p'), n=3)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.mark_translated('c1_seg0001', '<p>句子 MARK1。</p>')
+        pm.mark_translated('c1_seg0002', '<p>語句 MARK2。</p>')
+        pm.mark_translated('c1_seg0003', '<p>句子 MARK3.<b>x</b></p>')  # fails: not counted
+        pm.save()
+        GlossaryManager(os.path.join(path, 'glossary.json')).add_term('sentence', '語句', 'term')
+        result = runner.invoke(cli, ['validate', path])
+        assert result.exit_code == 0, result.output
+        assert result.output.splitlines() == [
+            '已檢查 3 段譯文：1 段未通過結構檢查（匯出時以原文輸出），2 段通過',
+            '  unknown_tag：1',
+            '品質與術語警告（不影響匯出）：',
+            '  term_not_applied：1',
+        ]

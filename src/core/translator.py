@@ -600,7 +600,7 @@ def translate_segment(engine: TranslationEngine, seg, segments,
 
     Builds the request (glossary terms, same-chapter context, HTML for text
     segments), calls the engine and returns the outcome: the accepted text
-    with its quality warnings, or a failure. A failed segment is an outcome
+    with its quality and glossary warnings, or a failure. A failed segment is an outcome
     with status FAILED and its issues (structural or backend), not an exception;
     it carries the error for the diagnostics, which the caller writes with
     record_failure_log once it has accepted and saved the outcome. Any
@@ -638,8 +638,11 @@ def translate_segment(engine: TranslationEngine, seg, segments,
         logger.exception("未預期的錯誤: %s", seg.segment_id)
         prompt = _request_text(engine, seg, glossary_text, context) if context else ''
         return unexpected_error_outcome(model, e, prompt)
+    issues = list(reply.issues)
+    if seg.segment_type != SegmentType.CODE:  # code gets no glossary
+        issues += validation.glossary_issues(seg.text, reply.text, glossary)
     return TranslationOutcome(text=reply.text, status=SegmentStatus.TRANSLATED,
-                              issues=reply.issues, model=model, usage=reply.usage)
+                              issues=issues, model=model, usage=reply.usage)
 
 
 def _request_text(engine: TranslationEngine, seg, glossary_text: str, context) -> str:
