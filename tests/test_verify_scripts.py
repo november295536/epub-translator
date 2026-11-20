@@ -921,3 +921,390 @@ class TestPhase2ScriptSurvivors:
         assert migrate_check.main(['--projects-dir', str(root), '--anonymize']) == 1
         assert capsys.readouterr().out.splitlines()[0].endswith(
             'export places 1/2, web load ok; 1 chapters not placed by the export')
+
+
+# --- Phase 3: export check ------------------------------------------------------
+
+export_check = _load('phase3_export_check')
+
+
+def _export_projects(root, schema_1=True):
+    """A projects directory with a schema 1 project (migrated by the check)
+    and a schema 2 project of the raw fixture."""
+    from tests.test_exporter import RAW_TRANSLATIONS, _project, _raw_book
+    from tests.test_migrate import _legacy_project
+    root.mkdir()
+    if schema_1:
+        _legacy_project(root, name='alpha')
+    book_dir = root.parent / 'books'
+    book_dir.mkdir()
+    _project(root, _raw_book(book_dir), RAW_TRANSLATIONS, name='beta')
+    return root
+
+
+def _tamper(monkeypatch, change, formats=('chinese-only',)):
+    """Make every export of the given formats pass through change(members)."""
+    import zipfile
+    real = export_check.export_project
+
+    def export(project_dir, output, fmt):
+        report = real(project_dir, output, fmt)
+        if fmt in formats:
+            with zipfile.ZipFile(output) as z:
+                members = [(i, z.read(i.filename)) for i in z.infolist()]
+            members = change(members)
+            with zipfile.ZipFile(output, 'w') as z:
+                for info, data in members:
+                    z.writestr(info, data)
+        return report
+    monkeypatch.setattr(export_check, 'export_project', export)
+
+
+def _edit(name, old, new):
+    def change(members):
+        return [(i, d.replace(old, new) if i.filename == name else d) for i, d in members]
+    return change
+
+
+class TestExportCheck:
+
+    @pytest.fixture(autouse=True)
+    def no_epubcheck(self, monkeypatch):
+        real = export_check.shutil.which
+        monkeypatch.setattr(export_check.shutil, 'which',
+                            lambda name: None if name == 'epubcheck' else real(name))
+
+    PASS = [
+        'epubcheck not available (not on PATH): not run',
+        'PASS project-1: exports 3, translated segments 3: as translation 3, kept original 0, '
+        'toc labels changed 0/0',
+        'PASS project-2: exports 3, translated segments 4: as translation 4, kept original 0, '
+        'toc labels changed 2/2',
+        'TOTAL projects 2  exports 6  translated segments 7  as translation 7  kept original 0  '
+        'toc labels changed 2/2  epubcheck not run  failed projects 0',
+    ]
+
+    def _main(self, root, anonymize=True):
+        return export_check.main(['--projects-dir', str(root)]
+                                 + (['--anonymize'] if anonymize else []))
+
+    def test_pass_lines_and_originals_untouched(self, tmp_path, capsys):
+        root = _export_projects(tmp_path / 'projects')
+        (root / 'not-a-project').mkdir()
+        before = roundtrip_check.snapshot(str(root))
+        assert self._main(root) == 0
+        assert capsys.readouterr().out.splitlines() == self.PASS
+        assert roundtrip_check.snapshot(str(root)) == before
+
+    def test_names_without_anonymize(self, tmp_path, capsys):
+        root = _export_projects(tmp_path / 'projects')
+        assert self._main(root, anonymize=False) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert out[1].startswith('PASS alpha: ') and out[2].startswith('PASS beta: ')
+
+    def test_kept_segments_counted_per_reason(self, tmp_path, capsys):
+        from tests.test_exporter import RAW_TRANSLATIONS, _project, _raw_book
+        root = tmp_path / 'projects'
+        root.mkdir()
+        (tmp_path / 'b').mkdir()
+        _project(root, _raw_book(tmp_path / 'b'),
+                 dict(RAW_TRANSLATIONS, two_seg0001='<h2>晚', two_seg0002='字'), name='p')
+        assert self._main(root) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert out[1] == ('PASS project-1: exports 3, translated segments 4: as translation 2, '
+                          'kept original 2 (not_well_formed 1, structure_mismatch 1), '
+                          'toc labels changed 2/2')
+        assert out[2] == ('TOTAL projects 1  exports 3  translated segments 4  '
+                          'as translation 2  kept original 2 (not_well_formed 1, '
+                          'structure_mismatch 1)  toc labels changed 2/2  epubcheck not run  '
+                          'failed projects 0')
+
+    def test_work_directory_removed_and_outside_repository(self, tmp_path, capsys, monkeypatch):
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+        made = []
+        real = export_check.tempfile.mkdtemp
+
+        def mkdtemp(**kwargs):
+            made.append(real(**kwargs))
+            return made[-1]
+        monkeypatch.setattr(export_check.tempfile, 'mkdtemp', mkdtemp)
+        outputs = []
+        real_export = export_check.export_project
+
+        def export(project_dir, output, fmt):
+            outputs.append(output)
+            return real_export(project_dir, output, fmt)
+        monkeypatch.setattr(export_check, 'export_project', export)
+        assert self._main(root) == 0
+        assert len(made) == 1 and not os.path.exists(made[0])
+        assert os.path.basename(made[0]).startswith('phase3-export-')
+        assert not os.path.realpath(made[0]).startswith(ROOT)
+        assert len(outputs) == 3 and all(o.startswith(made[0] + os.sep) for o in outputs)
+
+    @pytest.mark.parametrize('where', ['repository', 'projects'])
+    def test_refuses_temporary_directory_inside(self, tmp_path, capsys, monkeypatch, where):
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+        before = roundtrip_check.snapshot(str(root))
+        place = os.path.join(ROOT, 'src') if where == 'repository' else str(root / 'beta')
+        monkeypatch.setattr(export_check.tempfile, 'gettempdir', lambda: place)
+        assert self._main(root) == 2
+        what = 'the repository' if where == 'repository' else 'the projects directory'
+        assert capsys.readouterr().out == f'ERROR the temporary directory would be inside {what}\n'
+        assert roundtrip_check.snapshot(str(root)) == before
+        assert not any(n.startswith('phase3-export-') for n in os.listdir(place))
+
+    def test_missing_directory(self, tmp_path, capsys):
+        assert self._main(tmp_path / 'nope') == 2
+        assert capsys.readouterr().out == (
+            'ERROR cannot list projects directory <projects-dir> (FileNotFoundError)\n')
+
+    def test_exception_is_a_fail(self, tmp_path, capsys, monkeypatch):
+        root = _export_projects(tmp_path / 'projects')
+
+        def boom(*a):
+            raise RuntimeError('x')
+        monkeypatch.setattr(export_check, 'export_project', boom)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[1:3] == ['FAIL project-1: export check raised RuntimeError',
+                            'FAIL project-2: export check raised RuntimeError']
+        assert out[3].endswith('failed projects 2')
+
+    def test_unmatched_migration_is_a_fail(self, tmp_path, capsys):
+        from tests.test_migrate import DEFAULT_SEGMENTS, _legacy_project, _segment
+        root = tmp_path / 'projects'
+        root.mkdir()
+        segments = list(DEFAULT_SEGMENTS)
+        segments[3] = _segment('c2', 2, 'Another sentence.', '另。', 'translated')
+        _legacy_project(root, segments=segments, name='alpha')
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[1] == (
+            'FAIL project-1: 1 chapters unmatched by the migration')
+
+    def test_changed_project_directory_fails(self, tmp_path, capsys, monkeypatch):
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+        real = export_check.check_copy
+
+        def check_copy(copy_dir, out_dir):
+            result = real(copy_dir, out_dir)
+            with open(root / 'beta' / 'extra.txt', 'w') as f:
+                f.write('x')
+            return result
+        monkeypatch.setattr(export_check, 'check_copy', check_copy)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[1].endswith(
+            '; files in the project directory changed')
+
+    def _fails_with(self, tmp_path, capsys, monkeypatch, change, problem,
+                    formats=('chinese-only',)):
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+        _tamper(monkeypatch, change, formats)
+        assert self._main(root) == 1
+        line = capsys.readouterr().out.splitlines()[1]
+        assert line.startswith('FAIL project-1: ')
+        assert line.split('; ', 1)[1] == problem
+
+    def test_mimetype_not_first(self, tmp_path, capsys, monkeypatch):
+        self._fails_with(tmp_path, capsys, monkeypatch, lambda m: m[1:] + m[:1],
+                         'chinese-only: mimetype not first and stored')
+
+    def test_mimetype_compressed(self, tmp_path, capsys, monkeypatch):
+        import zipfile
+
+        def change(members):
+            info = zipfile.ZipInfo('mimetype')
+            info.compress_type = zipfile.ZIP_DEFLATED
+            return [(info, members[0][1])] + members[1:]
+        self._fails_with(tmp_path, capsys, monkeypatch, change,
+                         'chinese-only: mimetype not first and stored')
+
+    def test_member_twice(self, tmp_path, capsys, monkeypatch):
+        import warnings
+        warnings.simplefilter('ignore', UserWarning)
+        self._fails_with(tmp_path, capsys, monkeypatch, lambda m: m + m[-1:],
+                         'chinese-only: a member is written twice')
+
+    def test_member_added(self, tmp_path, capsys, monkeypatch):
+        import zipfile
+        self._fails_with(tmp_path, capsys, monkeypatch,
+                         lambda m: m + [(zipfile.ZipInfo('OEBPS/x.txt'), b'x')],
+                         'chinese-only: 1 members added')
+
+    @pytest.mark.parametrize('drop', [False, True])
+    def test_member_outside_the_allowed_set_differs(self, tmp_path, capsys, monkeypatch, drop):
+        if drop:
+            def change(members):
+                return [(i, d) for i, d in members if i.filename != 'OEBPS/Styles/book.css']
+        else:
+            change = _edit('OEBPS/Styles/book.css', b'0', b'1')
+        self._fails_with(tmp_path, capsys, monkeypatch, change,
+                         'chinese-only: 1 members outside the allowed set differ')
+
+    def test_chapter_not_well_formed(self, tmp_path, capsys, monkeypatch):
+        self._fails_with(tmp_path, capsys, monkeypatch,
+                         _edit('OEBPS/Text/one.xhtml', b'</body>', b''),
+                         'chinese-only: 1 chapters: not well-formed')
+
+    @pytest.mark.parametrize('old, new', [
+        (b'<style>p.first { text-indent: 0; }</style>', b''),
+        (b'href="../Styles/book.css"', b'href="../Styles/other.css"'),
+        (b'</head>', b'<style>p {}</style></head>'),
+    ])
+    def test_head_changed(self, tmp_path, capsys, monkeypatch, old, new):
+        self._fails_with(tmp_path, capsys, monkeypatch, _edit('OEBPS/Text/one.xhtml', old, new),
+                         'chinese-only: 1 chapters: head links or styles differ')
+
+    def test_added_link_must_be_the_bilingual_stylesheet(self, tmp_path, capsys, monkeypatch):
+        self._fails_with(
+            tmp_path, capsys, monkeypatch,
+            _edit('OEBPS/Text/one.xhtml', b'href="../bilingual.css"', b'href="../Styles/book.css"'),
+            'bilingual-vertical: 1 chapters: bilingual chapter without its stylesheet; '
+            'bilingual-vertical: 1 chapters: head links or styles differ',
+            formats=('bilingual-vertical',))
+
+    def test_duplicate_id(self, tmp_path, capsys, monkeypatch):
+        self._fails_with(tmp_path, capsys, monkeypatch,
+                         _edit('OEBPS/Text/one.xhtml', b'<p class="first">',
+                               b'<p class="first" id="c1">'),
+                         'chinese-only: 1 chapters: duplicate id')
+
+    def test_svg_attribute_case(self, tmp_path, capsys, monkeypatch):
+        self._fails_with(tmp_path, capsys, monkeypatch,
+                         _edit('OEBPS/Text/one.xhtml', b'viewBox', b'viewbox'),
+                         'chinese-only: 1 chapters: SVG attribute case changed')
+
+    @pytest.mark.parametrize('old, new', [
+        (b'href="../bilingual.css"', b'href="../missing.css"'),
+        (b'href="../bilingual.css"', b'href="../Styles/book.css"'),
+        (b'rel="stylesheet" type="text/css" href="../bilingual.css"',
+         b'rel="alternate" type="text/css" href="../bilingual.css"'),
+    ])
+    def test_bilingual_chapter_without_its_stylesheet(self, tmp_path, capsys, monkeypatch,
+                                                      old, new):
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+        _tamper(monkeypatch, _edit('OEBPS/Text/one.xhtml', old, new),
+                ('bilingual-horizontal',))
+        assert self._main(root) == 1
+        line = capsys.readouterr().out.splitlines()[1]
+        assert 'bilingual-horizontal: 1 chapters: bilingual chapter without its stylesheet' in line
+
+    def test_stylesheet_not_in_the_manifest(self, tmp_path, capsys, monkeypatch):
+        self._fails_with(
+            tmp_path, capsys, monkeypatch,
+            _edit('OEBPS/content.opf', b'<item id="bilingual-css" href="bilingual.css" '
+                                       b'media-type="text/css"/>', b''),
+            'bilingual-horizontal: 1 members added; bilingual-horizontal: 2 chapters: '
+            'bilingual chapter without its stylesheet; bilingual-horizontal: 2 chapters: '
+            'head links or styles differ', formats=('bilingual-horizontal',))
+
+    def test_broken_fragment_link(self, tmp_path, capsys, monkeypatch):
+        self._fails_with(tmp_path, capsys, monkeypatch,
+                         _edit('OEBPS/toc.ncx', b'src="Text/one.xhtml"',
+                               b'src="Text/one.xhtml#nowhere"'),
+                         'chinese-only: 1 fragment links do not resolve')
+
+    def test_links_broken_in_the_source_too_not_reported(self, tmp_path, capsys):
+        from tests.test_exporter import _project, _raw_book
+        from tests.conftest import xhtml
+        root = tmp_path / 'projects'
+        root.mkdir()
+        (tmp_path / 'b').mkdir()
+        chapter = xhtml('<p id="a">See <a href="#gone">here</a> and <a href="#a">there</a>, '
+                        '<a href="c.xhtml#a">self</a>, <a href="http://x.invalid/#a">web</a>.'
+                        '</p><p><a href="missing.xhtml#a">far</a> <a href="#">top</a></p>')
+        epub = _raw_book(tmp_path / 'b', {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        _project(root, epub, {'c_seg0001': '<p>見<a href="#gone">此</a>與<a href="#a">彼</a>、'
+                              '<a href="c.xhtml#a">自</a>、<a href="http://x.invalid/#a">網</a>。'
+                              '</p>\n<p><a href="missing.xhtml#a">遠</a><a href="#">頂</a></p>'},
+                 name='p')
+        assert self._main(root) == 0
+
+    def test_counts_differ_between_formats(self, tmp_path, capsys, monkeypatch):
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+        real = export_check.export_project
+
+        def export(project_dir, output, fmt):
+            report = real(project_dir, output, fmt)
+            if fmt == 'bilingual-vertical':
+                report.chapters[0].translated += 1
+            return report
+        monkeypatch.setattr(export_check, 'export_project', export)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[1].endswith(
+            '; bilingual-vertical: segment counts differ from chinese-only')
+
+    def test_runs_as_script_with_help(self, tmp_path):
+        result = _run_script('phase3_export_check', ['--help'], str(tmp_path))
+        assert result.returncode == 0
+        _assert_help(result.stdout,
+                     'Phase 3 check: exports of copies of the existing projects keep the '
+                     'source intact.', 'Print project-N labels; omit names and paths')
+
+
+class TestExportCheckEpubcheck:
+    """epubcheck runs are replaced by canned JSON reports."""
+
+    def _fake(self, monkeypatch, by_kind):
+        """by_kind: 'source' or a format -> list of (ID, severity, locations)."""
+        seen = []
+
+        def run(cmd, **kwargs):
+            path, report = cmd[1], cmd[3]
+            kind = os.path.basename(path)[:-5]
+            kind = kind if kind in export_check.FORMATS else 'source'
+            seen.append(kind)
+            messages = [{'ID': i, 'severity': sev, 'message': 'quoted book text',
+                         'locations': [{}] * n} for i, sev, n in by_kind.get(kind, [])]
+            with open(report, 'w') as f:
+                json.dump({'messages': messages}, f)
+        monkeypatch.setattr(export_check.shutil, 'which',
+                            lambda name: '/fake/epubcheck' if name == 'epubcheck' else None)
+        monkeypatch.setattr(export_check.subprocess, 'run', run)
+        return seen
+
+    def test_counts_and_new_errors(self, tmp_path, capsys, monkeypatch):
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+        seen = self._fake(monkeypatch, {
+            'source': [('RSC-005', 'ERROR', 2), ('OPF-1', 'WARNING', 9)],
+            'chinese-only': [('RSC-005', 'ERROR', 2), ('X-1', 'USAGE', 3)],
+            'bilingual-horizontal': [('RSC-005', 'ERROR', 3), ('RSC-012', 'FATAL', 0)],
+            'bilingual-vertical': [('RSC-005', 'ERROR', 1)]})
+        assert export_check.main(['--projects-dir', str(root), '--anonymize']) == 1
+        out = capsys.readouterr().out
+        assert out.splitlines() == [
+            'epubcheck found; errors compared by message ID '
+            '(chinese-only, bilingual-horizontal, bilingual-vertical)',
+            'FAIL project-1: exports 3, translated segments 4: as translation 4, '
+            'kept original 0, toc labels changed 2/2, epubcheck errors source 2 (RSC-005:2), '
+            'exports 2/4/1; bilingual-horizontal: epubcheck new errors RSC-005 1, RSC-012 1',
+            'TOTAL projects 1  exports 3  translated segments 4  as translation 4  '
+            'kept original 0  toc labels changed 2/2  exports with new epubcheck errors 1  '
+            'failed projects 1']
+        assert 'quoted book text' not in out
+        assert seen == ['source', 'chinese-only', 'bilingual-horizontal', 'bilingual-vertical']
+
+    def test_no_errors(self, tmp_path, capsys, monkeypatch):
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+        self._fake(monkeypatch, {})
+        assert export_check.main(['--projects-dir', str(root), '--anonymize']) == 0
+        assert capsys.readouterr().out.splitlines()[1].endswith(
+            'epubcheck errors source 0, exports 0/0/0')
+
+    def test_report_file_removed_and_not_next_to_the_book(self, tmp_path, monkeypatch):
+        reports = []
+
+        def run(cmd, **kwargs):
+            reports.append(cmd[3])
+            with open(cmd[3], 'w') as f:
+                json.dump({'messages': []}, f)
+        monkeypatch.setattr(export_check.shutil, 'which', lambda name: '/fake/epubcheck')
+        monkeypatch.setattr(export_check.subprocess, 'run', run)
+        book = tmp_path / 'b' / 'book.epub'
+        assert export_check.epubcheck_errors(str(book)) == {}
+        assert not os.path.exists(reports[0])
+        assert os.path.dirname(reports[0]) != str(book.parent)
+
+    def test_new_errors(self):
+        from collections import Counter
+        assert export_check.new_errors(Counter(a=2, b=1), Counter(a=3, b=1, c=2)) == {
+            'a': 1, 'c': 2}
