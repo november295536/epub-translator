@@ -746,9 +746,10 @@ def _replace_children(el, source) -> None:
     """`el` gets the text and children of `source`, and the values of the
     attributes people read (alt, title, aria-label) that both carry; its
     other attributes stay."""
-    for name in validation.TRANSLATABLE_ATTRIBUTES:
-        if el.get(name) is not None and source.get(name) is not None:
-            el.set(name, source.get(name))
+    for name in validation.TRANSLATABLE_ATTRIBUTES:  # the check: both carry the same names
+        value = source.get(name)
+        if value is not None:
+            el.set(name, value)
     for child in list(el):
         el.remove(child)
     el.text = source.text

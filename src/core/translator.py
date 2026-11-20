@@ -475,9 +475,7 @@ class TranslationEngine:
         # blocks numbered as in the segment.
         mid = len(units) // 2
         cut, resume = units[mid - 1][1], units[mid][0]
-        counts = validation.pieces_per_group(html, fingerprints)
-        if counts is None or len(counts) != len(units):  # cannot happen for a cuttable source
-            counts = [1] * len(units)
+        counts = validation.pieces_per_group(html, fingerprints)  # one per unit
         before = sum(counts[:mid])
         shares = (None, None) if fingerprints is None else \
             (fingerprints[:before], fingerprints[before:])
