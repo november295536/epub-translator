@@ -2399,8 +2399,10 @@ counts as exported.
 
 ```
 $ python3 -m pytest tests/ -q -p no:cacheprovider
-1341 passed in 137.73s (0:02:17)
+1386 passed in 133.93s (0:02:13)
 ```
+
+(After review round 2; 1341 after review round 1.)
 
 1176 before the phase (1210 at the first hand-back; the fix round added 33; review round 1 and
 its mutation runs 98: `TestReviewRound1Archive`, `TestReviewRound1Chapters`,
@@ -2480,7 +2482,8 @@ also FAILs when any file under its real directory changed. The TOC count is foll
 number of entries that point into a chapter with at least one segment exported as
 translation (the meaningful denominator).
 
-The output above is after review round 1 (section 10); after the fix round the totals were
+The output above is after review round 1 (section 10); after review round 2 (section 11)
+the same command printed the identical lines and exited 0; after the fix round the totals were
 `as translation 4072  kept original 90 (missing_anchor 5, not_well_formed 20, structure_mismatch
 65)  toc labels changed 406/1895 (527 into translated chapters)`. Since review round 1 the
 check also requires every source member, the raw name, order, compression, date and
@@ -2716,11 +2719,85 @@ survivor tests:
 | 5 | mutmut 2.5.1, groups in sequence | 1259 | 1215 | 42 | 2 | 0 | about 2 h 30 min |
 | 6 | mutmut 3.8.1, one run | 2535 | 2403 | 129 | 3 | 0 | about 7 min |
 
-Run 6's 129 survivors (exporter 75, check script 54) are not triaged yet. They include the
-run 5 equivalents, new-operator equivalents (`'utf-8'` → `'UTF-8'`, a dropped default
-argument) and a known gap of the new tool: code that tests reach only through a subprocess
-(the check scripts' `--help` and command-line tests) is not linked to those tests, so e.g. the
-`--help` texts of `phase3_export_check.py` survive, although mutmut 2 killed them.
+Run 6's survivors were triaged in review round 2 (runs 7–10 below). Scope of the tool
+(review round 2, F6; recorded, not worked around): mutmut 3.8.1 mutates only functions and
+methods — module-level statements and decorated functions (Flask routes, click commands such as
+`translate.py export`, properties) are not mutated even on changed lines; the changed-line
+filter selects the node mutmut mutates, so a mutated call may change an argument on an
+unchanged continuation line; and a test is linked to a function only when the function runs
+in the test's own process, so code reached only through a subprocess is run without that test.
+The run fails closed: exit 0 only when every mutant is killed (any other status, known or not,
+fails it); `git diff --no-color --no-ext-diff`; on SIGTERM, SIGHUP or Ctrl-C mutmut's process
+group is stopped and the copy removed (checked by sending SIGTERM to a run: no process and no
+temporary directory left).
+
+Runs 7–10 (review round 2, mutmut 3 through `mutation.sh main`; about 8 minutes each):
+
+| run | after | mutants | killed | survived | timeout | suspicious | untested |
+|---|---|---|---|---|---|---|---|
+| 7 | "fix: make the mutation run fail closed and stop cleanly on signals" | 2601 | 2460 | 135 | 6 | 0 | 0 |
+| 8 | "test: kill the mutmut 3 survivors of run 7" | 2613 | 2505 | 103 | 5 | 0 | 0 |
+| 9 | "test: a big-endian UTF-16 chapter with an internal subset" | 2613 | 2507 | 101 | 5 | 0 | 0 |
+| 10 | "test: a processing instruction in a translated run is no anchor" (final) | 2613 | 2507 | 100 | 6 | 0 | 0 |
+
+```
+$ scripts/verify/mutation.sh main
+...
+TOTAL mutants 2613  killed 2507  survived 100  timeout 6  suspicious 0  untested 0
+$ echo $?
+1
+```
+
+Killed after run 7 (`TestRound2Survivors` in `tests/test_exporter.py`,
+`TestExportCheckRound2Survivors` in `tests/test_verify_scripts.py`): processing
+instructions, whose pseudo-attributes lxml returns from `.get()`, are never anchors, TOC
+targets or languages (`iter(None)` mutants of `_anchors`, `_relang`, `_toc_targets`'s body
+walk, `_relabel`'s id test); a `<pre>` with one non-code child; a package without
+`dc:language`; source-language `lang` inside bilingual copies and runs; NCX navPoints without
+`content` or `navLabel`; `_without_zip64` (six inputs); the stylesheet deflated; the temporary
+file next to the output; another compression becomes deflated; UTF-8 BOM and UTF-16 (BOM
+either order, no BOM either order) chapters with an internal subset; no warnings during an
+export (catches a `ZipInfo` without name); in the check script two broken links counted,
+labels only from the NCX and nav files (an SVG `text` is no label; a `text` directly under the
+NCX root), `head_items` without head, a changed or renamed file in the project directory, the
+listing error with the path.
+
+Run 10's 100 survivors and 6 timeouts, all with a disposition:
+
+| survivors (run 10 ids) | mutation | disposition |
+|---|---|---|
+| exporter `_fragment` 12, `_member_info` 11, 15, `_serialize` 21, 32, 43, 49, `has_internal_subset` 28–31 (codec names) | codec or `encoding` name in another case (`'UTF-8'`, `'CP437'`, `'UNICODE'`, `'UTF-16-LE'`) | equivalent: Python and lxml look encodings up without case |
+| exporter `_serialize` 16, 19, 22, 38, 41, 44 | `with_tail` of the nodes before and after the root | equivalent: lxml keeps no text outside the root element |
+| exporter `_serialize` 30, `_code_piece` 25, `_fill` 16 | `copy.deepcopy` → `copy.copy` | equivalent: lxml's `__copy__` copies the subtree |
+| exporter `_code_piece` 26, `_fill` 17, `_take_run` 13 | `tail = None` → `""` | equivalent: no tail and an empty tail serialize the same |
+| exporter `_fill` 78, 86 | `_put(div, 1, …)` | equivalent: the div is new and empty; inserting past the end appends |
+| exporter `_put` 14, 22, 33 | `''.join` → `'XXXX'.join` | equivalent: the lists alternate strings and nodes, so at most one string is joined |
+| exporter `_relabel` 106–108 | `changed += 1` variants | equivalent: only its truth value is used |
+| exporter `_export` 58, 59 | source language `XXXX` | equivalent unless an element has `lang="XXXX"` |
+| exporter `_export` 61, 162 | `css_path = ""`; `css_path if css_used or True` | equivalent: only its truth value is used; the OPF is rewritten only when a chapter was filled, so `css_used` is then true whenever `css_path` is set |
+| exporter `_fill` 68, `_link_stylesheet` 12, 14, `_package` 47, 49 | the new `div` / `head` / `item` without namespace | equivalent in the output: lxml serializes a no-namespace child of a default-namespace parent without `xmlns=""`, so the bytes are the same (checked) |
+| exporter `_mark_translated` 1, 21, `_toc_targets` 7 | `iter(etree.Element)` → `iter(None)` where processing instructions only add keys or are read for `id` / `epub:type` | equivalent: a PI's `attrib` is a copy (deleting from it changes nothing); a PI with an `epub:type` pseudo-attribute does not exist in XHTML; `owner` gets unused PI keys |
+| exporter `_mark_translated` 25, `_relabel` 69 | missing `epub:type` read as `XXXX` | equivalent: `XXXX` is neither a note type nor `toc` |
+| exporter `_toc_targets` 25 | `first_heading = False` → `None` | equivalent: truth value |
+| exporter `_member_info` 13, 19 | name flag mask `0x800` → `2049` | equivalent: the extra bit is "encrypted"; an encrypted member cannot be read, so the export fails before |
+| exporter `_write_archive` 14, 15 | length of the random temporary name | equivalent |
+| exporter `has_internal_subset` 11, 14, 15, 17, 20 | the `'<\x00'` key renamed (falls back to the declared `UTF-16`, which Python decodes little-endian on this host); `decode` error handler changed or dropped; `lstrip('XX\ufeffXX')` | equivalent: little-endian host; libxml2 has already decoded the bytes, so no decoding error occurs; the BOM is still stripped |
+| check script `main` 2–5, 8, 11, 16–18, 21, 24, 29–31 (the `--help` and description texts) | texts changed or dropped | subprocess gap: `TestExportCheck::test_runs_as_script_with_help` runs the script as a subprocess and checks these texts; mutmut 3 does not link it to `main`. Confirmed by hand for 29 (help text) and 5 (description): applied to a copy, that test fails |
+| check script `main` 15 | default `PROJECTS` | equivalent on this machine's case-insensitive file system (`test_default_projects_dir` passes); killed on a case-sensitive one |
+| check script `main` 66, 68 | `mkdtemp(dir=parent)` → default | equivalent: the default is `gettempdir()`, of which `parent` is the real path |
+| check script `_entries` 10, 22, 27, 37, `broken_links` 7, `id_counts` 5, `uses_bilingual` 8, `Archive.anchors` 4 | `iter(None)`: processing instructions also walked | equivalent for the checks: PIs have no local name, and an `id`/`href`/`class` pseudo-attribute of a PI would be the same in source and export, which are compared |
+| check script `_entries` 21, `_links_bilingual_css` 15, 27, `chapter_problems` 25, `uses_bilingual` 7 | missing attribute read as `XXXX` | equivalent unless a value is `XXXX` (see run 2) |
+| check script `_entries` 45 | `point` computed for a root `text` element | equivalent unless a document's root element is `text` |
+| check script `_links_bilingual_css` 29, `toc_labels` 14 | the dummy fragment `#x` → `#X` | equivalent: only the member part is used |
+| check script `_links_bilingual_css` 45, `epubcheck_errors` 22, 24, 26 | `'UTF-8'`, or the locale's encoding for the JSON report | equivalent (case; the locale is UTF-8) |
+| check script `broken_links` 23 | `_resolve(name, None)` for elements without `href` | equivalent: `urlsplit(None)` gives no fragment, so `None` is returned as before |
+| check script `epubcheck_errors` 7–9 | report file suffix | equivalent (run 2) |
+| check script `member_problems` 47, 55 | flag mask `2049` | equivalent (encrypted, as above) |
+| check script `snapshot` 13, 15 | paths relative to the working directory instead of the project | equivalent: still unique and the same before and after |
+| timeouts: exporter `_free_name` 8, `_package` 28, `_without_zip64` 31–33, check script `epubcheck_errors` 4 | infinite loops (`not in`, `i = 4 + size`, …); `which('EPUBCHECK')` finds the tool on this case-insensitive file system and the run exceeds the timeout | detected |
+
+The run 4 table's mutant 214 (`os.umask(1)`) no longer exists: review round 2 (F2) removed the
+`os.umask` calls.
 
 ### 7. Known consequences
 
@@ -2835,6 +2912,24 @@ Known limitations (A11, recorded without code):
 - chinese-only: inline spans the model left in the source language inside a filled block are
   retagged `zh-TW` when they carry a source-language `lang`;
 - the language of the navigation document and NCX roots is unchanged.
+
+### 11. Review round 2
+
+Opus approved with minors; GPT requested changes (one major). Each fix has a test that fails
+without it.
+
+| # | finding | action | tests |
+|---|---|---|---|
+| F1 (major) | note types were dropped only from the copy's root (`<td epub:type="footnote">` inside a copied table stayed hidden) | dropped from every element of the bilingual copy's subtree; originals untouched; other tokens kept | `TestReviewRound2::test_note_types_dropped_throughout_the_copy[*]` |
+| F2 | `os.umask` called at export time (process-wide, the web server is threaded) | the temporary file is created with `os.open(…, O_CREAT \| O_EXCL \| O_WRONLY, 0o666)` under a random sibling name, so the kernel applies the umask; the run 4 justification of mutant 214 is obsolete (section 6) | `test_umask_not_called`, `test_output_file_mode_follows_the_umask[*]` |
+| F3 | subset detection by a byte regex (misses UTF-16, false positives in comments) | the suggested `docinfo.internalDTD is not None` is true for every DOCTYPE (checked: lxml creates it also without a subset and exposes no subset content), so it cannot be used. Instead: the source is decoded (UTF-16 by byte order mark or first character, else the encoding the parser reports) and its prolog read with comments and processing instructions skipped | `test_utf16_internal_subset_kept`, `test_doctype_text_in_comments_is_no_subset`, `TestRound2Survivors::test_internal_subset_found_in_any_encoding[*]` |
+| F4 | a copied extra field kept the source's ZIP64 record | the record (tag 1) is dropped, other records kept | `test_zip64_record_dropped_from_the_extra_field`, `TestRound2Survivors::test_without_zip64[*]` |
+| F5 | a failing final snapshot escaped the check script | caught: the project FAILs with `project snapshot raised <type>`, the others are still checked | `TestExportCheckReviewRound2::test_final_snapshot_failure_reported_and_others_checked` |
+| F6 | `mutation.py` exited 0 on unknown statuses; `git diff` options; signals | exit 0 only when every mutant is killed; `--no-color --no-ext-diff`; SIGTERM/SIGHUP/Ctrl-C stop mutmut's process group and remove the copy; the tool's scope is recorded in its docstring and in section 6 | checked by hand: SIGTERM during a run leaves no process and no temporary directory |
+| F7 | triage the mutmut 3 survivors | runs 7–10 and the table in section 6: every survivor killed or justified; the subprocess-gap group is justified by `test_runs_as_script_with_help`, confirmed by hand for two of them | section 6 |
+
+Also changed while triaging: `_Kept` no longer passes its reason to `Exception` (unused); the
+unused `compress_type` for a missing `mimetype` is gone (a new `ZipInfo` is stored).
 
 ### Not done
 
