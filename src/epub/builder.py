@@ -143,19 +143,17 @@ class EPUBBuilder:
             if placed is None:
                 return  # the chapter stays in the original language
         else:
-            placed = [(seg, covered, covered)
+            placed = [(seg, covered, covered, covered, True)
                       for seg, covered in self._place_by_count(body, segments)]
 
-        for seg, covered, span in placed:
+        for seg, covered, span, remove, pair in placed:
             if covered and seg.translated_text:
                 if fmt == 'chinese-only':
-                    self._apply_chinese_only(seg, covered, soup, span)
+                    self._apply_chinese_only(seg, covered, soup, remove, pair)
                 elif fmt == 'bilingual-vertical':
-                    self._apply_bilingual_vertical(seg, covered, soup, span)
+                    self._apply_bilingual_vertical(seg, covered, soup, span, pair)
                 elif fmt == 'bilingual-horizontal':
-                    self._apply_bilingual_horizontal(seg, covered, soup, span)
-        for wrapper in body.find_all(RUN_TAG):
-            wrapper.unwrap()
+                    self._apply_bilingual_horizontal(seg, covered, soup, span, pair)
 
         item.set_content(str(soup).encode('utf-8'))
 
@@ -173,16 +171,21 @@ class EPUBBuilder:
 
     @staticmethod
     def _place_by_blocks(body, segments: list[SegmentState]):
-        """Schema 2: (segment, units, span) triples, or None when the chapter
-        does not match what was stored: every segment's range must be valid,
-        the ranges must cover the chapter's blocks exactly once, and every
-        block's fingerprint must match. A unit is one block: its element,
-        or the run's nodes wrapped in a RUN_TAG element (unwrapped after
-        placement). The span is every node from the first unit to the last,
-        <br> and blocks without text included, which a replacement consumes.
-        When the translation's top-level node count differs from the units'
-        and the span is the whole content of one element below <body>, that
-        element is the one unit."""
+        """Schema 2: (segment, covered, span, remove, pair) per segment, or
+        None when the chapter does not match what was stored: every
+        segment's range must be valid, the ranges must cover the chapter's
+        blocks exactly once, and every block's fingerprint must match.
+
+        covered: the nodes with text of the segment's blocks. span: every
+        node from its first block to its last (blocks without text
+        included); bilingual output moves it into the original. remove: what
+        a chinese-only replacement of the whole segment removes: the nodes
+        of its blocks, and the <br> and whitespace between them; other
+        blocks without text (images, anchors, <hr/>) stay. pair: the
+        translation may be placed node by node, only when every block is a
+        block element (as on main). A segment with an inline run whose
+        translation is one node and whose blocks are the whole content of
+        one element below <body> is placed on that element."""
         entries = []
         _soup_blocks(body, entries)
         blocks = [i for i, entry in enumerate(entries) if normalize(_nodes_text(entry))]
@@ -203,21 +206,25 @@ class EPUBBuilder:
         placed = []
         for seg in segments:
             indexes = blocks[seg.block_start:seg.block_end]
-            units = {i: _unit(entries[i]) for i in indexes}
-            span = []
+            span, remove = [], []
             for i in range(indexes[0], indexes[-1] + 1):
-                span.extend([units[i]] if i in units else entries[i])
+                span.extend(entries[i])
+                remove.extend(n for n in entries[i] if i in indexes or _is_separator(n))
+            covered = [n for i in indexes for n in entries[i] if _nodes_text([n]).strip()]
+            pair = all(len(entries[i]) == 1 and isinstance(entries[i][0], Tag)
+                       and entries[i][0].name in BLOCK_TAGS for i in indexes)
             parent = span[0].parent
             in_span = {id(n) for n in span}
-            if (seg.segment_type != SegmentType.CODE
-                    and _top_level_count(seg.translated_text) != len(units)
-                    and parent is not body and all(n.parent is parent for n in span)
+            if (not pair and seg.segment_type != SegmentType.CODE
+                    and _top_level_count(seg.translated_text) == 1
+                    and len(remove) == len(span) and parent is not body
+                    and all(n.parent is parent for n in span)
                     and all(id(c) in in_span or isinstance(c, PreformattedString)
                             or not (isinstance(c, Tag) or c.strip())
                             for c in parent.children)):
-                placed.append((seg, [parent], [parent]))
+                placed.append((seg, [parent], [parent], [parent], True))
             else:
-                placed.append((seg, list(units.values()), span))
+                placed.append((seg, covered, span, remove, pair))
         return placed
 
     def _legacy_walk(self) -> bool:
@@ -274,16 +281,17 @@ class EPUBBuilder:
         return block_count if block_count > 0 else 1
 
     def _apply_chinese_only(self, seg: SegmentState, elements: list, soup,
-                            span: list | None = None) -> None:
+                            remove: list | None = None, pair: bool = True) -> None:
         """Replace element content with translated text, preserving tag and attributes.
 
-        `span` (default: the elements) is every node the segment covers;
-        a replacement of the whole segment removes all of them."""
+        `remove` (default: the elements) is what a replacement of the whole
+        segment removes; with `pair` false the elements are never paired
+        1:1 with the translation's nodes."""
         if not elements:
             return
 
         first = elements[0]
-        rest = [n for n in (elements if span is None else span) if n is not first]
+        rest = [n for n in (elements if remove is None else remove) if n is not first]
         translated = seg.translated_text
 
         if seg.segment_type == SegmentType.CODE:
@@ -305,7 +313,7 @@ class EPUBBuilder:
         trans_tags = [c for c in trans_frag.children
                       if isinstance(c, Tag) or (isinstance(c, NavigableString) and c.strip())]
 
-        if trans_tags and len(trans_tags) == len(elements):
+        if pair and trans_tags and len(trans_tags) == len(elements):
             # HTML structure matches — replace content 1:1
             for orig_elem, trans_elem in zip(elements, trans_tags):
                 if isinstance(orig_elem, NavigableString):
@@ -338,13 +346,17 @@ class EPUBBuilder:
         _remove(rest)
 
     def _apply_bilingual_vertical(self, seg: SegmentState, elements: list, soup,
-                                  span: list | None = None) -> None:
-        """Keep original elements, add translation block after them."""
+                                  span: list | None = None, pair: bool = True) -> None:
+        """Keep original elements, add translation block after them.
+
+        `span` (default: the elements) is moved into the original as a
+        whole when the translation is not paired 1:1 (never with `pair`
+        false)."""
         if not elements:
             return
 
         # When translation has matching element count, pair them 1:1
-        paired = self._try_pair_translations(seg, elements)
+        paired = self._try_pair_translations(seg, elements) if pair else None
         if paired is not None:
             for orig_elem, trans_elem in zip(elements, paired):
                 wrapper = soup.new_tag('div', attrs={'class': 'bilingual-vertical'})
@@ -364,7 +376,7 @@ class EPUBBuilder:
                 wrapper.append(trans_div)
             return
 
-        first = elements[0]
+        first = (elements if span is None else span)[0]
 
         wrapper = soup.new_tag('div', attrs={'class': 'bilingual-vertical'})
         first.insert_before(wrapper)
@@ -379,13 +391,14 @@ class EPUBBuilder:
         wrapper.append(trans_div)
 
     def _apply_bilingual_horizontal(self, seg: SegmentState, elements: list, soup,
-                                    span: list | None = None) -> None:
-        """Wrap original + translation in a flex container."""
+                                    span: list | None = None, pair: bool = True) -> None:
+        """Wrap original + translation in a flex container (`span` and
+        `pair` as for the vertical format)."""
         if not elements:
             return
 
         # When translation has matching element count, pair them 1:1
-        paired = self._try_pair_translations(seg, elements)
+        paired = self._try_pair_translations(seg, elements) if pair else None
         if paired is not None:
             for orig_elem, trans_elem in zip(elements, paired):
                 container = soup.new_tag('div', attrs={'class': 'bilingual-container'})
@@ -405,7 +418,7 @@ class EPUBBuilder:
                 container.append(trans_div)
             return
 
-        first = elements[0]
+        first = (elements if span is None else span)[0]
 
         container = soup.new_tag('div', attrs={'class': 'bilingual-container'})
         first.insert_before(container)
@@ -533,10 +546,6 @@ class EPUBBuilder:
 
 
 
-# Temporary element around a run's nodes while a schema 2 chapter is placed
-RUN_TAG = 'epub-translator-run'
-
-
 def _remove(nodes: list) -> None:
     for node in nodes:
         if isinstance(node, Tag):
@@ -551,15 +560,11 @@ def _top_level_count(html: str) -> int:
                if isinstance(c, Tag) or (isinstance(c, NavigableString) and c.strip()))
 
 
-def _unit(entry: list):
-    """A block as one node: its element, or its run's nodes wrapped."""
-    if len(entry) == 1:
-        return entry[0]
-    wrapper = Tag(name=RUN_TAG)
-    entry[0].insert_before(wrapper)
-    for node in entry:
-        wrapper.append(node.extract())
-    return wrapper
+def _is_separator(node) -> bool:
+    """A <br> or a whitespace string."""
+    if isinstance(node, Tag):
+        return node.name == 'br'
+    return not node.strip()
 
 
 def _nodes_text(nodes: list) -> str:

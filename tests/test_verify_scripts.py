@@ -827,7 +827,7 @@ def _migratable(root, name, unmatched=False):
 class TestMigrateCopiesCheck:
 
     PASS_LINE = ('PASS project-1: chapters 2/2, segments 4/4, merge groups 1 (2 segments), '
-                 'count differs 0, export fallback 0, translated chars 54 -> 54, '
+                 'count differs 0, export fallback 1, translated chars 54 -> 54, '
                  'export places 2/2, web load ok')
 
     def _main(self, root, anonymize=True):
@@ -851,7 +851,7 @@ class TestMigrateCopiesCheck:
             'export places 0/2, web load ok; '
             '1 chapters unmatched, nothing written; 2 chapters not placed by the export',
             'TOTAL projects 2  chapters 3/4  segments 6/8  merge groups 1 (2 segments)  '
-            'count differs 0  export fallback 0  translated chars unchanged 2  '
+            'count differs 0  export fallback 1  translated chars unchanged 2  '
             'export places 2/4  web loads 2  failed projects 1',
         ]
         # the originals were only read
@@ -904,23 +904,30 @@ class TestMigrateCopiesCheck:
         assert roundtrip_check.snapshot(str(root)) == before
 
     def test_export_fallback_counted(self, tmp_path, capsys):
-        # A <br> run translated line by line is placed node by node (no
-        # fallback) though its top-level count differs from the run HTML;
-        # a joined translation of two paragraphs takes the fallback
+        # Review round 2: a segment with an inline run always takes the
+        # whole-segment path, whatever its node counts (c1, c4); a joined
+        # translation of two paragraphs does too (c2); paragraphs translated
+        # one by one do not (c3)
         from tests.test_migrate import _legacy_project, _segment
         root = tmp_path / 'projects'
         root.mkdir()
         chapters = {'c1': '<div class="verse">Line one<br/>Line two</div>',
-                    'c2': '<p>Para one.</p><p>Para two.</p>'}
+                    'c2': '<p>Para one.</p><p>Para two.</p>',
+                    'c3': '<p>X one.</p><p>Y two.</p>',
+                    'c4': '<p>Lead.</p>Bare text.'}
         segments = [_segment('c1', 1, '<div class="verse">Line one<br/>Line two</div>',
                              '<p>一</p><p>二</p>', 'translated'),
                     _segment('c2', 1, '<p>Para one.</p>\n<p>Para two.</p>',
-                             '<p>一二。</p>', 'translated')]
+                             '<p>一二。</p>', 'translated'),
+                    _segment('c3', 1, '<p>X one.</p>\n<p>Y two.</p>',
+                             '<p>甲</p><p>乙</p>', 'translated'),
+                    _segment('c4', 1, '<p>Lead.</p>\nBare text.', '<p>引。</p>\n裸。',
+                             'translated')]
         _legacy_project(root, chapters, segments, name='alpha')
         assert self._main(root) == 0
         out = capsys.readouterr().out.splitlines()
-        assert 'count differs 2, export fallback 1,' in out[0]
-        assert 'count differs 2  export fallback 1  ' in out[1]
+        assert 'count differs 2, export fallback 3,' in out[0]
+        assert 'count differs 2  export fallback 3  ' in out[1]
 
     def test_glossary_copied_and_names_shown(self, tmp_path, capsys, monkeypatch):
         root = tmp_path / 'projects'
@@ -959,7 +966,7 @@ class TestMigrateCopiesCheck:
         out = capsys.readouterr().out.splitlines()
         # the appended '!' is a second top-level node: one more fallback
         assert out[0] == (self.PASS_LINE.replace('PASS', 'FAIL').replace('54 -> 54', '54 -> 55')
-                          .replace('fallback 0', 'fallback 1')
+                          .replace('fallback 1', 'fallback 2')
                           + '; translated characters changed')
         assert 'translated chars unchanged 0' in out[1]
 
@@ -973,6 +980,7 @@ class TestMigrateCopiesCheck:
         out = capsys.readouterr().out.splitlines()
         assert out[0] == (self.PASS_LINE.replace('PASS', 'FAIL')
                           .replace('export places 2/2', 'export places 0/2')
+                          .replace('fallback 1', 'fallback 0')   # nothing placed
                           + '; 2 chapters not placed by the export')
         assert 'export places 0/2' in out[1]
 
@@ -988,7 +996,8 @@ class TestMigrateCopiesCheck:
             book.items = [i for i in book.items if i.get_id() != 'c1']
             return book
         monkeypatch.setattr(migrate_check.epub, 'read_epub', read_epub)
-        assert migrate_check.placed_chapters(directory) == (2, 1, 0)
+        # c2 (left) holds the merged segment with a run: the one fallback
+        assert migrate_check.placed_chapters(directory) == (2, 1, 1)
 
     def test_web_load_checked(self, tmp_path, capsys, monkeypatch):
         root = tmp_path / 'projects'
