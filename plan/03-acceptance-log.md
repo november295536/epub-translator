@@ -4381,3 +4381,70 @@ segments, then picks the text), so its former `None`-for-`False` survivor no lon
 - No real `claude` call.
 - The ordering "text before status" in `apply_outcome` / `mark_translated` is not observable
   in a single-threaded test; the mutex test covers the reader side.
+
+## Phase 6 — review round 2
+
+Date: 2026-11-21. Same branch and worktree.
+
+### Changes
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| 1 | the round 1 shebang rule used absolute line 0, but the source (`element_text(pre)`) keeps the newline after `<pre>` and a cleaned reply loses it: `<pre>\n#!/bin/sh\nls</pre>` failed `code_changed` on every attempt, was not passthrough, and stored rules 1 translations of such blocks would have been kept original | `validation.comment_flags`: the shebang is the first non-blank line starting with `#!`; `has_comment_line` and `code_lines` use it (`is_comment_line` is gone). The code prompt says "第一個非空白行的 #!" | `TestRound2Shebang` (leading newline is passthrough; `check_code('\n#!/bin/sh\n# c\nls', '#!/bin/sh\n# 譯\nls')` passes; a changed shebang fails; a later `#!` is a comment line; blank-only code; the real reply-cleaning path with the fake backend, plain, with blank lines and fenced, and a changed shebang rejected there) |
+| 1 | reproducible claim about stored translations | `phase4_validate_check.py` (f): `translated code starting with a shebang N` per project and in TOTAL | `TestValidateCheckShebang` |
+| 2 | the web export guard loaded the project outside any `try` (unhandled 500 HTML) | a project gone since the check → 404 JSON; any other load error → 500 JSON `無法讀取專案：…` | `TestRound2WebExportGuard` (not JSON, invalid `segmentation`, gone) |
+| 3 | a spine document without a body was skipped silently and the book printed PASS | the check counts spine documents neither returned nor recorded as failed by the extractor that have no body, and FAILs with `N spine documents without a body`. Legitimate skips: the navigation document, and a body without text (nothing to translate, e.g. a cover image) | `TestSegmentationCheckRound2` (mixed readable/bodyless book, legitimate skips pass, the counting helper) |
+
+Other places where source and a cleaned reply can disagree on leading or trailing blank lines:
+`check_code` compares `code_lines`, which drop blank lines at both ends, and the commentary
+check of `_clean_response` compares the source's first non-blank line: both fine. One remains,
+unchanged from `main` and not fixed here: the export fills a code translation unless it equals
+the stored source exactly (`exporter._code_piece`), so a reply identical to the source except
+for the leading newline the cleaning removed is written as a translation. In `chinese-only` that
+block loses its leading blank line; in the bilingual formats it appears twice (original and an
+identical-looking copy). This touches only code with comment lines (passthrough code is never
+filled) and existing projects as on `main`.
+
+### Checks
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase6_segmentation_check.py --projects-dir <repo>/projects --anonymize
+(the same nine lines as in the Phase 6 entry; diffed, identical)
+TOTAL projects 8  segments 9520 -> 7870, calls 9520 -> 6432 (ratio 0.676), passthrough 1438, headings merged 1655 of 1770  failed projects 0
+$ python3 scripts/verify/phase3_export_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  exports 24  translated segments 4162  as translation 3956  kept original 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 53)  toc labels changed 405/1885 (527 into translated chapters)  exports with new epubcheck errors 0  failed projects 0
+$ python3 scripts/verify/phase4_validate_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  round trip 9491/9491  translated 4162  failing the structural check 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 54; only tag rules 88)  warnings (length_ratio 36, untranslated 8)  length ratio over 2925 segments: p1 0.312 p5 0.333 p50 0.404 p95 0.547 p99 0.976; outside 0.25-0.8: 38 (1.3%)  sources that cannot be cut 0  with translatable attributes 22  translated code starting with a shebang 0  failed projects 0
+$ python3 scripts/verify/phase5_glossary_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  glossary entries 15, translated 4162, passing the structural check 3956, with term_not_applied 12, terms 4, by category (person: 9 warnings, 2 terms, term: 6 warnings, 2 terms)  failed projects 0
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+All exited 0. The Phase 4 line differs only by the new field: no stored code translation of
+the 8 books has a shebang as its first non-blank line (0 in every project), so the shebang rule
+changes no stored result. All 8 books still PASS the Phase 6 check: none has a bodyless spine
+document. No temporary directory left.
+
+### Tests
+
+2148 passed (before this round: 2133). Changed: the Phase 4 check's expected lines gain the new
+field (`TestValidateCheck`, 5 places); the code prompt test reads "第一個非空白行". None removed.
+
+### Mutation testing
+
+| Run | Mutants | Killed | Survived | Timeout |
+|---|---|---|---|---|
+| round 2, 1 | 602 | 598 | 4 | 0 |
+| round 2, 2 (final) | 601 | 599 | 2 | 0 |
+
+Run 1: `comment_flags` 5 (no default for `next`: blank-only code would raise) killed by
+`test_code_of_blank_lines_only`; `starts_with_shebang` 6 (`'XXXX'` default, equivalent) removed by
+rewriting the function without a default. Remaining: `check_source` 15 and 22, equivalent as in
+the Phase 6 entry.
+
+### Not verified
+
+- No real `claude` call.
