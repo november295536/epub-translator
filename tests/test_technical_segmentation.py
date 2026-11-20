@@ -992,6 +992,12 @@ class TestRound2Shebang:
         assert outcome.status == SegmentStatus.FAILED
         assert outcome.issues[0].code == 'code_changed'
 
+    def test_code_of_blank_lines_only(self):
+        from src.core.validation import check_code, code_lines, comment_flags
+        assert comment_flags('') == [] and comment_flags('\n \n') == [('', False), (' ', False)]
+        assert not has_comment_line('\n\n') and code_lines('\n \n') == []
+        assert not check_code('\n', '').blocking
+
 
 class TestRound2WebExportGuard:
 

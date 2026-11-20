@@ -139,7 +139,8 @@ def check_copy(copy_dir: str) -> tuple[dict, list[str]]:
 def starts_with_shebang(code: str) -> bool:
     """Whether the first non-blank line of the code starts with `#!` (a
     shebang: code since Phase 6, review round 1)."""
-    return next((line for line in code.splitlines() if line.strip()), '').startswith('#!')
+    lines = [line for line in code.splitlines() if line.strip()]
+    return bool(lines) and lines[0].startswith('#!')
 
 
 def counts_text(counts: Counter) -> str:
