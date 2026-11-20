@@ -3,6 +3,11 @@
 {% block tab_content %}
 <div class="review-layout">
     <nav class="review-sidebar">
+        <a href="/project/{{ project_name }}/review?issues=1"
+           class="issues-link{% if issues_only and not current_chapter %} active{% endif %}">
+            有問題的段落
+            <span class="badge">{{ issue_count }}</span>
+        </a>
         <h3>章節</h3>
         <ul>
         {% for ch in chapters %}
@@ -18,14 +23,30 @@
     </nav>
 
     <div class="review-content">
+    {% if current_chapter %}
+        <div class="issue-filter">
+        {% if issues_only %}
+            只顯示有問題的段落 · <a href="/project/{{ project_name }}/review/chapter/{{ current_chapter }}">顯示全部</a>
+        {% else %}
+            <a href="/project/{{ project_name }}/review/chapter/{{ current_chapter }}?issues=1">只顯示有問題的段落</a>
+        {% endif %}
+        </div>
+    {% endif %}
     {% if segments %}
         {% for seg in segments %}
         <div class="segment" id="seg-{{ seg.segment_id }}" data-id="{{ seg.segment_id }}">
             <div class="segment-header">
                 <span class="segment-id">{{ seg.segment_id }}</span>
                 {% if seg.segment_type == 'code' %}<span class="segment-type">code</span>{% endif %}
+                {% if issues_only and not current_chapter %}<a class="segment-chapter" href="/project/{{ project_name }}/review/chapter/{{ seg.chapter_id }}#seg-{{ seg.segment_id }}">{{ seg.chapter_id }}</a>{% endif %}
                 <span class="segment-status status-{{ seg.status }}"{% if seg.issues %} title="{{ seg.issues | map(attribute='detail') | join('; ') }}"{% endif %}>{{ seg.status }}</span>
+                <span class="issue-badge"{% if not seg.issues %} hidden{% endif %}>{{ seg.issues | length }} 個問題</span>
             </div>
+            <ul class="segment-issues"{% if not seg.issues %} hidden{% endif %}>
+            {% for issue in seg.issues %}
+                <li class="issue-{{ issue.kind }}"><span class="issue-kind">{{ issue_kinds.get(issue.kind, issue.kind) }}</span>{{ issue.detail }}</li>
+            {% endfor %}
+            </ul>
             <div class="segment-body">
                 <div class="original" x-data="{ view: 'text' }">
                     <div class="original-header">
@@ -64,7 +85,11 @@
         {% endfor %}
     {% else %}
         <div class="empty-state">
+        {% if issues_only %}
+            <p>沒有有問題的段落。</p>
+        {% else %}
             <p>請從左側選擇一個章節開始審閱。</p>
+        {% endif %}
         </div>
     {% endif %}
     </div>
@@ -74,6 +99,27 @@
 {% block scripts %}
 <script>
 const projectName = '{{ project_name }}';
+const issueKinds = {{ issue_kinds|tojson }};
+
+// Show a segment's issues as the server returned them (save, approve,
+// re-translate, refused save)
+function showIssues(segId, issues) {
+    if (!Array.isArray(issues)) return;
+    const el = document.getElementById(`seg-${segId}`);
+    const badge = el.querySelector('.issue-badge');
+    const list = el.querySelector('.segment-issues');
+    badge.textContent = `${issues.length} 個問題`;
+    badge.hidden = list.hidden = issues.length === 0;
+    list.replaceChildren(...issues.map(issue => {
+        const li = document.createElement('li');
+        li.className = `issue-${issue.kind}`;
+        const kind = document.createElement('span');
+        kind.className = 'issue-kind';
+        kind.textContent = issueKinds[issue.kind] || issue.kind;
+        li.append(kind, issue.detail);
+        return li;
+    }));
+}
 
 // A save the server refused (e.g. 409: the project is locked): say so, and
 // keep the edit visibly unsaved
@@ -82,6 +128,7 @@ function showSaveError(segId, r, data) {
     status.textContent = '未儲存';
     status.className = 'segment-status status-failed';
     status.title = (data && data.error) || `HTTP ${r ? r.status : '?'}`;
+    if (data) showIssues(segId, data.issues);
     alert('未儲存：' + status.title);
 }
 
@@ -97,6 +144,7 @@ function saveSegment(segId) {
             const el = document.getElementById(`seg-${segId}`);
             el.querySelector('.segment-status').textContent = 'saved';
             el.querySelector('.segment-status').className = 'segment-status status-translated';
+            showIssues(segId, data.issues);
         } else {
             showSaveError(segId, r, data);
         }
@@ -116,6 +164,7 @@ function approveSegment(segId) {
             const el = document.getElementById(`seg-${segId}`);
             el.querySelector('.segment-status').textContent = 'reviewed';
             el.querySelector('.segment-status').className = 'segment-status status-reviewed';
+            showIssues(segId, data.issues);
         } else {
             showSaveError(segId, r, data);
         }
@@ -142,6 +191,7 @@ function retranslateSegment(segId) {
             textarea.value = data.translated_text;
             el.querySelector('.segment-status').textContent = 'translated';
             el.querySelector('.segment-status').className = 'segment-status status-translated';
+            showIssues(segId, data.issues);
         } else {
             const errMsg = data.error
                 || (data.auth_error ? {{ auth_hint|tojson }} : '翻譯失敗');
