@@ -7,7 +7,9 @@ import pytest
 
 from src.core.segmenter import Segmenter, SegmentType, MAX_WORDS
 from src.epub.blocks import fingerprint, normalize, serialize, walk_blocks
-from src.epub.extractor import EPUBExtractor, find_body, parse_xml
+from src.epub.extractor import (
+    EPUBError, EPUBExtractor, find_body, parse_xml, unresolved_entities,
+)
 from tests.conftest import body_of, write_raw_epub, xhtml
 
 
@@ -227,7 +229,9 @@ class TestRawPackage:
         ex = EPUBExtractor(path)
         ex.load()
         assert [c.id for c in ex.extract_chapters()] == ['a']
+        # review round 1: the image in the spine is reported, not dropped
         assert [(cid, why.split(':')[0]) for cid, why in ex.failed] == [
+            ('img', 'media type image/png is not XHTML'),
             ('b', 'not well-formed XML'), ('c', 'missing from the archive')]
 
     def test_chapter_without_body_or_text_skipped(self, tmp_path):
@@ -324,9 +328,12 @@ class TestRules:
         assert [s.word_count for s in segs] == [MAX_WORDS]
 
     def test_entities_not_expanded(self):
+        # Review round 1: the reference stays an unexpanded node, which the
+        # extractor reports (TestEntities) instead of segmenting without it
         doc = parse_xml(b'<?xml version="1.0"?><!DOCTYPE html [<!ENTITY x "EXPANDED">]>'
                         b'<html><body><p>a &x; b</p></body></html>')
-        assert [b.text for b in walk_blocks(find_body(doc))] == ['a  b']
+        assert unresolved_entities(doc) == ['x']
+        assert 'EXPANDED' not in ''.join(doc.itertext())
 
     def test_text_content_and_title(self, tmp_path):
         items = [('a', 'a.xhtml', 'application/xhtml+xml', None)]
@@ -354,3 +361,161 @@ class TestRules:
     def test_fresh_extractor(self):
         ex = EPUBExtractor('unused.epub')
         assert (ex.spine, ex.failed) == ([], [])
+
+
+# --- Review round 1 -------------------------------------------------------------
+
+ENTITY_DOCS = {
+    'internal subset': ('<?xml version="1.0" encoding="utf-8"?>\n'
+                        '<!DOCTYPE html [<!ENTITY term "harbour">]>\n'
+                        '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>c</title></head>'
+                        '<body><p>Fine.</p>The &term; opened.</body></html>'),
+    'xhtml 1.1 doctype': ('<?xml version="1.0" encoding="utf-8"?>\n'
+                          '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
+                          '"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">\n'
+                          '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>c</title></head>'
+                          '<body><p>a&mdash;b and &rsquo;c</p></body></html>'),
+}
+
+
+class TestEntities:
+    """An unresolved entity reference anywhere in the body: the chapter is
+    not segmented and is reported (entities are never expanded)."""
+
+    @pytest.mark.parametrize('case, names', [('internal subset', '&term;'),
+                                             ('xhtml 1.1 doctype', '&mdash;, &rsquo;')])
+    def test_chapter_reported(self, tmp_path, case, names):
+        items = [('a', 'a.xhtml', 'application/xhtml+xml', None),
+                 ('b', 'b.xhtml', 'application/xhtml+xml', None)]
+        members = {'OEBPS/a.xhtml': xhtml('<p>Clean.</p>'), 'OEBPS/b.xhtml': ENTITY_DOCS[case]}
+        path = write_raw_epub(tmp_path / 'e.epub', items, ['a', 'b'], members)
+        ex = EPUBExtractor(path)
+        ex.load()
+        assert [c.id for c in ex.extract_chapters()] == ['a']
+        assert ex.failed == [('b', f'unresolved entity reference: {names}')]
+
+    def test_entity_outside_body_ignored(self, tmp_path):
+        doc = ('<?xml version="1.0"?>\n<!DOCTYPE html [<!ENTITY t "x">]>\n'
+               '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>&t;</title></head>'
+               '<body><p>Clean.</p></body></html>')
+        items = [('a', 'a.xhtml', 'application/xhtml+xml', None)]
+        path = write_raw_epub(tmp_path / 'e.epub', items, ['a'], {'OEBPS/a.xhtml': doc})
+        ex = EPUBExtractor(path)
+        ex.load()
+        assert [c.id for c in ex.extract_chapters()] == ['a'] and ex.failed == []
+
+
+def _encrypted(path):
+    """Mark every member of a ZIP as encrypted (general purpose bit 0)."""
+    data = bytearray(open(path, 'rb').read())
+    for sig, offset in ((b'PK\x03\x04', 6), (b'PK\x01\x02', 8)):
+        start = 0
+        while (start := data.find(sig, start)) != -1:
+            data[start + offset] |= 1
+            start += 4
+    open(path, 'wb').write(bytes(data))
+    return path
+
+
+class TestPackageErrors:
+    """A package that cannot be read gives one EPUBError with a message."""
+
+    def _write(self, tmp_path, **kw):
+        items = kw.pop('items', [('a', 'a.xhtml', 'application/xhtml+xml', None)])
+        members = kw.pop('members', {'OEBPS/a.xhtml': xhtml('<p>A.</p>')})
+        return write_raw_epub(tmp_path / 'p.epub', items, ['a'], members, **kw)
+
+    def _error(self, path):
+        with pytest.raises(EPUBError) as e:
+            EPUBExtractor(str(path)).load()
+        return str(e.value)
+
+    def test_not_a_zip(self, tmp_path):
+        path = tmp_path / 'x.epub'
+        path.write_bytes(b'not a zip')
+        assert self._error(path).startswith('無法讀取 EPUB：')
+
+    def test_unreadable_file(self, tmp_path):
+        assert self._error(tmp_path / 'missing.epub').startswith('無法讀取 EPUB：')
+
+    def test_no_container(self, tmp_path):
+        path = tmp_path / 'x.epub'
+        with zipfile.ZipFile(path, 'w') as z:
+            z.writestr('mimetype', 'application/epub+zip')
+        assert self._error(path) == "EPUB 缺少檔案：\"There is no item named " \
+            "'META-INF/container.xml' in the archive\""
+
+    def test_no_rootfile(self, tmp_path):
+        path = tmp_path / 'x.epub'
+        with zipfile.ZipFile(path, 'w') as z:
+            z.writestr('META-INF/container.xml', '<container xmlns="urn:x"><rootfiles/></container>')
+        assert self._error(path) == 'container.xml 沒有指出 OPF（rootfile）'
+
+    def test_rootfile_without_path(self, tmp_path):
+        path = tmp_path / 'x.epub'
+        with zipfile.ZipFile(path, 'w') as z:
+            z.writestr('META-INF/container.xml',
+                       '<container xmlns="urn:x"><rootfiles><rootfile/></rootfiles></container>')
+        assert self._error(path) == 'container.xml 沒有指出 OPF（rootfile）'
+
+    def test_package_not_well_formed(self, tmp_path):
+        path = tmp_path / 'x.epub'
+        with zipfile.ZipFile(path, 'w') as z:
+            z.writestr('META-INF/container.xml', '<container><rootfiles>')
+        assert self._error(path).startswith('EPUB 的套件文件不是格式正確的 XML：')
+
+    def test_item_without_href(self, tmp_path):
+        path = self._write(tmp_path)
+        with zipfile.ZipFile(path) as z:
+            opf = z.read('OEBPS/content.opf').decode()
+        opf = opf.replace('href="a.xhtml"', '')
+        rewritten = tmp_path / 'y.epub'
+        with zipfile.ZipFile(path) as src, zipfile.ZipFile(rewritten, 'w') as dst:
+            for name in src.namelist():
+                dst.writestr(name, opf if name == 'OEBPS/content.opf' else src.read(name))
+        assert self._error(rewritten) == 'manifest 項目 a 沒有 href'
+
+    def test_encrypted_archive(self, tmp_path):
+        path = _encrypted(self._write(tmp_path))
+        message = self._error(path)
+        assert message.startswith('無法讀取 META-INF/container.xml：') and 'encrypted' in message
+
+    def test_encrypted_chapter_reported(self, tmp_path):
+        items = [('a', 'a.xhtml', 'application/xhtml+xml', None),
+                 ('b', 'b.xhtml', 'application/xhtml+xml', None)]
+        path = write_raw_epub(tmp_path / 'p.epub', items, ['a', 'b'],
+                              {'OEBPS/a.xhtml': xhtml('<p>A.</p>'),
+                               'OEBPS/b.xhtml': xhtml('<p>B.</p>')})
+        ex = EPUBExtractor(path)
+        ex.load()
+        ex._zip.getinfo('OEBPS/b.xhtml').flag_bits |= 1
+        assert [c.id for c in ex.extract_chapters()] == ['a']
+        assert [(cid, why.split('：')[0]) for cid, why in ex.failed] == [
+            ('b', 'unreadable: 無法讀取 OEBPS/b.xhtml')]
+
+    def test_percent_encoded_opf_path(self, tmp_path):
+        items = [('a', 'a.xhtml', 'application/xhtml+xml', None)]
+        path = write_raw_epub(tmp_path / 'p.epub', items, ['a'],
+                              {'My Book/a.xhtml': xhtml('<p>A.</p>')},
+                              opf_path='My Book/content.opf')
+        rewritten = tmp_path / 'q.epub'
+        with zipfile.ZipFile(path) as src, zipfile.ZipFile(rewritten, 'w') as dst:
+            for name in src.namelist():
+                data = src.read(name)
+                if name == 'META-INF/container.xml':
+                    data = data.replace(b'full-path="My Book/', b'full-path="My%20Book/')
+                dst.writestr(name, data)
+        ex = EPUBExtractor(str(rewritten))
+        ex.load()
+        assert [c.path for c in ex.extract_chapters()] == ['My Book/a.xhtml']
+
+    def test_non_xhtml_spine_entry_reported(self, tmp_path):
+        items = [('a', 'a.xhtml', 'application/xhtml+xml', None),
+                 ('h', 'h.html', 'text/html', None)]
+        path = write_raw_epub(tmp_path / 'p.epub', items, ['h', 'a'],
+                              {'OEBPS/a.xhtml': xhtml('<p>A.</p>'),
+                               'OEBPS/h.html': '<html><body><p>H.</p></body></html>'})
+        ex = EPUBExtractor(path)
+        ex.load()
+        assert [c.id for c in ex.extract_chapters()] == ['a']
+        assert ex.failed == [('h', 'media type text/html is not XHTML')]

@@ -8,7 +8,7 @@ import sys
 import click
 
 from src import __version__
-from src.epub.extractor import EPUBExtractor
+from src.epub.extractor import EPUBError, EPUBExtractor
 from src.core.segmenter import Segmenter, SegmentType
 from src.core.project import (
     ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus, sha256_file,
@@ -73,7 +73,12 @@ def init(epub_file):
 
     click.echo(f"正在解析 EPUB：{epub_file}")
     extractor = EPUBExtractor(epub_path)
-    extractor.load()
+    try:
+        extractor.load()
+    except EPUBError as e:
+        os.remove(epub_path)
+        click.echo(f"無法解析 EPUB：{e}")
+        sys.exit(1)
     metadata = extractor.get_metadata()
 
     click.echo(f"書名：{metadata['title']}")
