@@ -556,8 +556,9 @@ As built (2026-11-21), where it differs from or adds to the above:
   chapter after a heading leaves the heading (or the run of headings) as a segment of its own.
   Tables are still segments of their own.
 - Passthrough: a code segment with no comment line (`validation.has_comment_line`, the line rule
-  of the code check; a trailing comment, `#include` or a `#!` first line is no comment line, and
-  the code check keeps a `#!` first line unchanged) gets the segment flag
+  of the code check; a trailing comment, `#include` or a first non-blank line that starts with
+  `#!` after its indentation (a shebang) is no comment line, and the code check keeps that
+  line unchanged, in every project) gets the segment flag
   `passthrough` and is created `TRANSLATED` with its own code as text and no model. No new
   status: it is never queued (also not by an explicit list of segment IDs), counts as done in
   the progress numbers (which also report it as `passthrough`), and is skipped by `validate`
@@ -571,7 +572,8 @@ As built (2026-11-21), where it differs from or adds to the above:
   is `TRANSLATED` or `REVIEWED`, as a reader sees it (`validation.plain_text`) with whitespace
   collapsed; otherwise its source text. Status and text are read together under the project
   mutex, which is released before the model call.
-  Rules 1 projects keep the source text, so their prompts are unchanged.
+  Rules 1 projects keep the source text as context. Their prompts are unchanged except for the
+  code prompt's sentence that the shebang is not a comment, which applies to every project.
 - TOC labels already came from the translated heading element of the block (Phase 3); a
   heading inside a larger segment is a block of its own, so nothing changed there.
 

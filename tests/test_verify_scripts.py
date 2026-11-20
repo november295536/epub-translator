@@ -3403,7 +3403,7 @@ class TestValidateCheckShebang:
         pm = validate_check.ProjectManager(project_dir)
         pm.load()
         segs = {s.segment_id: s for s in pm.data.segments}
-        segs['c_seg0003'].text = '\n\n#!/bin/sh\n# note\nx = 1'   # blank lines first: counted
+        segs['c_seg0003'].text = '\n\n  #!/bin/sh\n# note\nx = 1'  # blank lines, indented: counted
         segs['d_seg0002'].text = '#!/usr/bin/env python\n' + segs['d_seg0002'].text
         segs['c_seg0001'].text = '#! not code'                   # a text segment: not counted
         pm.save()
@@ -3415,7 +3415,8 @@ class TestValidateCheckShebang:
     def test_starts_with_shebang(self):
         f = validate_check.starts_with_shebang
         assert f('#!/bin/sh') and f('\n  \n#!x\ny')
-        assert not f('') and not f(' #!x') and not f('x\n#!y') and not f('# !x')
+        assert f(' #!x') and f('\n    #!/bin/sh\n    ls')  # round 3: indented
+        assert not f('') and not f('x\n#!y') and not f('# !x')
 
 
 class TestSegmentationCheckRound2:

@@ -887,7 +887,7 @@ class TestRound1Shebang:
             'code_changed']
         assert code_lines(source) == ['#!/bin/sh', 'echo hi']
         assert code_lines('echo\n#!x') == ['echo']      # not on the first line: a comment
-        assert code_lines('  #!x\ny') == ['y']           # indented: no shebang
+        assert code_lines('  #!x\ny') == ['  #!x', 'y']  # round 3: indented is a shebang too
 
     def test_prompt_says_so(self):
         from src.core.translator import CODE_PROMPT
@@ -1037,3 +1037,18 @@ class TestRound2WebExportGuard:
         r = client.post('/api/projects/p/export', json={'format': 'chinese-only'})
         assert r.status_code == 404 and r.get_json() == {'error': '專案不存在'}
         TaskManager._instance = None
+
+
+class TestRound3IndentedShebang:
+
+    def test_indented_block(self):
+        from src.core.validation import check_code, code_lines
+        segs = _segments('<pre>\n    #!/bin/sh\n    ls -l</pre>')
+        assert segs[0].passthrough
+        assert not _segments('<pre>\n    #!/bin/sh\n    # list\n    ls -l</pre>')[0].passthrough
+        source = '\n    #!/bin/sh\n    # list\n    ls -l'
+        assert not check_code(source, '    #!/bin/sh\n    # 列出\n    ls -l').blocking
+        assert [i.code for i in check_code(source, '    #!/bin/zsh\n    # 列出\n    ls -l')
+                .blocking] == ['code_changed']
+        assert code_lines(source) == ['    #!/bin/sh', '    ls -l']
+        assert code_lines('    x\n    #!y') == ['    x']  # not the first non-blank line
