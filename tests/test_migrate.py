@@ -135,24 +135,147 @@ class TestMigrate:
         pm = ProjectManager(project_dir)
         pm.load()
         assert [s.status for s in pm.data.segments] == [merged]
+        # Review round 1: a group not wholly translated keeps no translation
+        cleared = merged in (SegmentStatus.PENDING, SegmentStatus.FAILED)
+        assert pm.data.segments[0].translated_text == ('' if cleared else
+                                                       ''.join(s['translated_text'] for s in segments))
         if len(set(statuses)) > 1:
             note = (f'c2_seg0001：2 個段落的狀態為 {statuses[0]}, {statuses[1]}；'
-                    f'合併後為 {merged}，譯文依序接合保留')
+                    f'合併後為 {merged}，'
+                    + ('部分譯文已清除（保留於 project.schema1.json）' if cleared
+                       else '譯文依序接合保留'))
             assert report.notes == [note]
             assert f'  注意 {note}' in report.lines()
         else:
             assert report.notes == []
 
-    def test_partial_group_keeps_its_translation(self, tmp_path):
+    def test_partial_group_loses_its_translation(self, tmp_path):
+        # Review round 1 (was ..._keeps_its_translation): export applies any
+        # non-empty translation, so a partial one would replace the group
         segments = [_segment('c2', 1, '<p>Intro line.</p>\nFirst bare sentence.', '甲',
                              'translated'),
                     _segment('c2', 2, 'Second bare sentence.')]
         project_dir = _legacy_project(tmp_path, {'c2': CHAPTERS['c2']}, segments)
-        migrate_project(project_dir)
+        report = migrate_project(project_dir)
+        assert report.notes == ['c2_seg0001：2 個段落的狀態為 translated, pending；'
+                                '合併後為 pending，部分譯文已清除（保留於 project.schema1.json）']
         pm = ProjectManager(project_dir)
         pm.load()
         seg = pm.data.segments[0]
-        assert (seg.status, seg.translated_text) == (SegmentStatus.PENDING, '甲')
+        assert (seg.status, seg.translated_text) == (SegmentStatus.PENDING, '')
+        with open(os.path.join(project_dir, 'project.schema1.json'), encoding='utf-8') as f:
+            assert json.load(f)['segments'][0]['translated_text'] == '甲'
+
+    def test_failed_group_of_one_status_cleared_and_named(self, tmp_path):
+        segments = [_segment('c2', 1, '<p>Intro line.</p>\nFirst bare sentence.', '甲', 'failed'),
+                    _segment('c2', 2, 'Second bare sentence.', '', 'failed')]
+        project_dir = _legacy_project(tmp_path, {'c2': CHAPTERS['c2']}, segments)
+        report = migrate_project(project_dir)
+        assert report.notes == ['c2_seg0001：2 個段落的狀態為 failed, failed；'
+                                '合併後為 failed，部分譯文已清除（保留於 project.schema1.json）']
+        pm = ProjectManager(project_dir)
+        pm.load()
+        assert pm.data.segments[0].translated_text == ''
+
+    def test_untranslated_group_has_no_note(self, tmp_path):
+        segments = [_segment('c2', 1, '<p>Intro line.</p>\nFirst bare sentence.'),
+                    _segment('c2', 2, 'Second bare sentence.')]
+        project_dir = _legacy_project(tmp_path, {'c2': CHAPTERS['c2']}, segments)
+        assert migrate_project(project_dir).notes == []
+
+    def test_partial_group_exports_in_the_original(self, tmp_path):
+        import zipfile
+        from src.epub.builder import EPUBBuilder
+        segments = DEFAULT_SEGMENTS[:2] + [
+            _segment('c2', 1, '<p>Intro line.</p>\nFirst bare sentence.', '<p>引言。</p>\n第一句。',
+                     'translated'),
+            _segment('c2', 2, 'Second bare sentence.', '', 'failed')]
+        project_dir = _legacy_project(tmp_path, segments=segments)
+        migrate_project(project_dir)
+        output = str(tmp_path / 'out.epub')
+        EPUBBuilder(project_dir).build(output, fmt='chinese-only')
+        with zipfile.ZipFile(output) as z:
+            member = {n.rsplit('/', 1)[-1]: n for n in z.namelist()}
+            c2 = z.read(member['c2.xhtml']).decode('utf-8')
+        assert 'First bare sentence. Second bare sentence.' in c2 and '第一句' not in c2
+
+    def test_group_mixing_code_and_text_unmatched(self, tmp_path):
+        chapters = {'c1': '<p>Call <code>save()</code> before leaving.</p>'}
+        segments = [_segment('c1', 1, '<code>save()</code>', 'save()', 'translated', 'code'),
+                    _segment('c1', 2, 'before leaving.', '離開前。', 'translated')]
+        segments[0]['html'] = '<p>Call <code>save()</code>'
+        project_dir = _legacy_project(tmp_path, chapters, segments)
+        before = _files(project_dir)
+        report = migrate_project(project_dir)
+        assert report.unmatched == [('c1', 'c1_seg0001 merges code and text segments')]
+        assert not report.written and report.merged == []
+        after = _files(project_dir)
+        after.pop('project.lock')
+        assert after == before
+
+    def test_existing_backup_refused(self, tmp_path):
+        project_dir = _legacy_project(tmp_path)
+        backup = os.path.join(project_dir, 'project.schema1.json')
+        with open(backup, 'w', encoding='utf-8') as f:
+            f.write('older backup')
+        before = _files(project_dir)
+        with pytest.raises(MigrationError) as e:
+            migrate_project(project_dir)
+        assert str(e.value) == 'project.schema1.json 已存在，不會覆寫；請先移走它'
+        after = _files(project_dir)
+        after.pop('project.lock')
+        assert after == before
+
+    def test_restored_schema_1_after_migration_refused(self, tmp_path):
+        project_dir = _legacy_project(tmp_path)
+        migrate_project(project_dir)
+        shutil.copy(os.path.join(project_dir, 'project.schema1.json'),
+                    os.path.join(project_dir, 'project.json'))
+        with pytest.raises(MigrationError, match='已存在'):
+            migrate_project(project_dir)
+
+    def test_source_copied_through_a_temporary_file(self, tmp_path, monkeypatch):
+        import src.core.migrate as migrate_module
+        project_dir = _legacy_project(tmp_path, source_inside=False)
+
+        def broken_copy(src, dst):
+            with open(dst, 'wb') as f:
+                f.write(b'PK partial')
+            raise OSError('disk full')
+        monkeypatch.setattr(migrate_module.shutil, 'copy2', broken_copy)
+        with pytest.raises(OSError):
+            migrate_project(project_dir)
+        assert sorted(os.listdir(project_dir)) == ['project.json', 'project.lock']
+        monkeypatch.undo()
+        assert migrate_project(project_dir).written
+
+    def test_corrupt_source_is_a_migration_error(self, tmp_path):
+        project_dir = _legacy_project(tmp_path)
+        with open(os.path.join(project_dir, 'source.epub'), 'wb') as f:
+            f.write(b'PK truncated')
+        with pytest.raises(MigrationError) as e:
+            migrate_project(project_dir, dry_run=True)
+        assert str(e.value) == '來源 EPUB 無法讀取：無法讀取 EPUB：File is not a zip file'
+
+    def test_not_a_project_refused_without_a_lock_file(self, tmp_path):
+        with pytest.raises(MigrationError) as e:
+            migrate_project(str(tmp_path))
+        assert str(e.value) == f'不是專案目錄（沒有 project.json）：{tmp_path}'
+        assert os.listdir(tmp_path) == []
+
+    def test_corrupt_project_file_is_a_migration_error(self, tmp_path):
+        (tmp_path / 'project.json').write_text('{"segments": [', encoding='utf-8')
+        with pytest.raises(MigrationError, match='^無法讀取 project.json：'):
+            migrate_project(str(tmp_path), dry_run=True)
+
+    def test_chapter_with_entity_reference_unmatched(self, tmp_path):
+        chapters = {'c1': ('<?xml version="1.0"?>\n<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
+                           '"x.dtd">\n<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+                           '<p>a&mdash;b</p></body></html>')}
+        segments = [_segment('c1', 1, '<p>a—b</p>', '甲', 'translated')]
+        project_dir = _legacy_project(tmp_path, chapters, segments)
+        report = migrate_project(project_dir, dry_run=True)
+        assert report.unmatched == [('c1', 'unresolved entity reference')]
 
     def test_merge_keeps_fields(self, tmp_path):
         segments = [_segment('c2', 1, '<p>Intro line.</p>\nFirst bare sentence.', '甲',
@@ -385,6 +508,13 @@ class TestMigrateCLI:
         assert '無法對應的章節 c2：text differs' in result.output
         assert not os.path.exists(os.path.join(project_dir, 'project.schema1.json'))
 
+    def test_not_a_project_gives_a_message(self, tmp_path):
+        from translate import cli
+        result = CliRunner().invoke(cli, ['migrate', str(tmp_path)])
+        assert result.exit_code == 1
+        assert result.output == f'不是專案目錄（沒有 project.json）：{tmp_path}\n'
+        assert os.listdir(tmp_path) == []
+
     @pytest.mark.parametrize('case', ['schema2', 'locked'])
     def test_refusals_exit_non_zero(self, tmp_path, case):
         from translate import cli
@@ -448,6 +578,6 @@ class TestMigrateSurvivors:
                              '<p>一</p>', 'translated'),
                     _segment('c2', 1, '<p>Intro line.</p>\nFirst bare sentence.', '<p>引</p>',
                              'translated'),
-                    _segment('c2', 2, 'Second bare sentence.', '', 'pending')]
+                    _segment('c2', 2, 'Second bare sentence.', '<p>乙</p><p>丙</p>', 'translated')]
         project_dir = _legacy_project(tmp_path, segments=segments)
         assert migrate_project(project_dir, dry_run=True).count_differs == 2
