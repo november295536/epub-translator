@@ -764,21 +764,27 @@ def _without_originals(text: str) -> str:
     return ''.join(ch for ch, gone in zip(text, removed) if not gone)
 
 
-def _comparable(text: str) -> str:
-    """Plain `text` in NFKC (full-width parentheses become ASCII), one kind of
-    middle dot, parenthetical originals and whitespace removed, case-folded."""
-    text = unicodedata.normalize('NFKC', text).translate(_DOTS)
-    return re.sub(r'\s+', '', _without_originals(text)).casefold()
+def _normalized(text: str) -> str:
+    """`text` in NFKC (full-width parentheses become ASCII), one kind of
+    middle dot."""
+    return unicodedata.normalize('NFKC', text).translate(_DOTS)
+
+
+def _compact(text: str) -> str:
+    """Whitespace removed, case-folded."""
+    return re.sub(r'\s+', '', text).casefold()
 
 
 def occurrence_pattern(entry) -> re.Pattern:
     """Where the check takes a term as occurring in a source text: the
-    prompt's start (`term_pattern`), then at most a short inflection and a
-    word boundary (the prompt's matching has no end boundary: `Eve` would
-    match "every"). A name (NAME_CATEGORIES) may take a plural and a
-    possessive; another term also -ed / -ing (a final e dropped or kept).
-    A `work` entry is case-sensitive: the prompt applies its translation only
-    to the title of a work, taken as written with the glossary's capitals."""
+    prompt's start (`term_pattern`), then at most a short inflection, then
+    no letter (a digit may follow: a note number, "Ella Vane3"; the prompt's
+    matching has no end boundary at all: `Eve` would match "every"). A name
+    (NAME_CATEGORIES) may take a plural and a possessive; another term also
+    -ed / -ing (a final e dropped or kept). A name is case-sensitive when
+    the glossary writes it with a capital (`Will` is not "will"), a `work`
+    always (the prompt applies its translation only to the title of a work,
+    taken as written). The bare term always matches."""
     term = entry.term.strip()
     category = entry.category if isinstance(entry.category, str) else ''
     if category in NAME_CATEGORIES:
@@ -787,29 +793,47 @@ def occurrence_pattern(entry) -> re.Pattern:
         body = term_pattern(term[:-1]) + '(?:e(?:s|d)?|ing)'
     else:
         body = term_pattern(term) + '(?:e?s|ed|ing)?'
-    flags = 0 if category == 'work' else re.IGNORECASE
-    return re.compile(body + _POSSESSIVE + r'(?!\w)', flags)
+    exact = category == 'work' or (category in NAME_CATEGORIES and term[:1].isupper())
+    return re.compile(body + _POSSESSIVE + r'(?![^\W\d])', 0 if exact else re.IGNORECASE)
 
 
 def _checkable(entry) -> bool:
     return all(isinstance(v, str) and v.strip() for v in (entry.term, entry.translation))
 
 
+def occurring(source_text: str, entries) -> list:
+    """The entries that occur in `source_text` (occurrence_pattern), longest
+    term first: an occurrence inside the span of a longer term's occurrence
+    does not count (`key` inside "primary key")."""
+    taken, found = [], []
+    for entry in sorted(entries, key=lambda e: -len(e.term.strip())):
+        spans = [m.span() for m in occurrence_pattern(entry).finditer(source_text)]
+        own = [(a, b) for a, b in spans if not any(x <= a and b <= y for x, y in taken)]
+        if own:
+            found.append(entry)
+            taken += own
+    return found
+
+
 def terms_not_applied(source_text: str, translation: str, glossary) -> list:
-    """The glossary entries that occur in `source_text` (occurrence_pattern)
-    and whose translation is not in the text of `translation` (both
-    compared as `_comparable`). The prompt holds every such entry
-    (`terms_for_prompt`: the whole glossary, or above its size limit the
-    entries whose start matches, which an occurrence implies). An entry
-    whose term or translation is not a non-empty string is skipped."""
+    """The glossary entries the prompt got for `source_text`
+    (`terms_for_prompt`) that occur in it (`occurring`) and whose rendering
+    is not in the text of `translation`. The rendering is read as text too
+    (tags and entities decoded) and normalized, never shortened, and looked
+    for in the translation as written (`C (language)`; `API` in
+    "應用程式介面（API）") and without its parenthetical originals (滴水
+    (drip) 線). An entry whose term or translation is not a non-empty string
+    is skipped.
+    Sorted by term, as the prompt lists them."""
     if glossary is None or not glossary.entries:
         return []
-    text = _comparable(plain_text(translation))
+    text = _normalized(plain_text(translation))
+    as_written, without_originals = _compact(text), _compact(_without_originals(text))
+    present = occurring(source_text, filter(_checkable, glossary.terms_for_prompt(source_text)))
     missing = []
-    for entry in sorted(filter(_checkable, glossary.entries.values()),
-                        key=lambda e: e.term.lower()):
-        expected = _comparable(entry.translation)
-        if expected and expected not in text and occurrence_pattern(entry).search(source_text):
+    for entry in sorted(present, key=lambda e: e.term.lower()):
+        expected = _compact(_normalized(plain_text(entry.translation)))
+        if expected and expected not in as_written and expected not in without_originals:
             missing.append(entry)
     return missing
 

@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import re
-import tempfile
+import secrets
 from dataclasses import dataclass, asdict, field
 
 
@@ -45,6 +45,9 @@ def term_pattern(term: str) -> str:
 
 logger = logging.getLogger(__name__)
 
+# The fields of a stored entry that must be strings where present
+TEXT_FIELDS = ('term', 'translation', 'category', 'notes', 'context')
+
 
 def load_glossary(path: str):
     """The glossary at `path`, or None when it cannot be read (unreadable,
@@ -80,34 +83,50 @@ class GlossaryManager:
         self.entries: dict[str, GlossaryEntry] = {}
 
     def load(self) -> None:
-        """Load glossary from JSON file."""
+        """Load glossary from JSON file. Raises ValueError (also for JSON
+        that does not decode) when the file is not a list of entries whose
+        text fields (TEXT_FIELDS) are strings where present."""
         if not os.path.isfile(self.glossary_path):
             return
         with open(self.glossary_path, 'r', encoding='utf-8') as f:
             raw = json.load(f)
-        self.entries = {}
+        if not isinstance(raw, list):
+            raise ValueError('the glossary is not a list')
+        entries = {}
         for item in raw:
-            key = item['term'].lower()
-            self.entries[key] = GlossaryEntry(**item)
+            if not isinstance(item, dict) or not isinstance(item.get('term'), str) \
+                    or any(not isinstance(item[k], str) for k in TEXT_FIELDS if k in item):
+                raise ValueError('a glossary entry is not an object with text fields')
+            entries[item['term'].lower()] = GlossaryEntry(**item)
+        self.entries = entries
 
     def save(self) -> None:
         """Save glossary to JSON file, atomically: written to a temporary
-        file in the same directory and moved over the old one, so a reader
-        never sees a half-written file."""
-        directory = os.path.dirname(self.glossary_path) or '.'
+        file in the directory of the real file (a symlinked glossary.json
+        stays a symlink) and moved over it, so a reader never sees a
+        half-written file. The old file's mode is kept; a new file is created
+        with 0o666, so the kernel applies the umask (no os.umask call: it is
+        process-wide)."""
+        target = os.path.realpath(self.glossary_path)
+        directory = os.path.dirname(target)
         os.makedirs(directory, exist_ok=True)
         raw = [asdict(e) for e in self.entries.values()]
         raw.sort(key=lambda x: x['term'].lower())
         try:
-            mode = os.stat(self.glossary_path).st_mode & 0o777
+            mode = os.stat(target).st_mode & 0o777
         except FileNotFoundError:
-            mode = 0o644  # mkstemp creates 0600: keep the mode a plain write gave
-        fd, tmp = tempfile.mkstemp(dir=directory, prefix='.glossary-', suffix='.tmp')
+            mode = None
+        tmp = os.path.join(directory, f'.glossary-{secrets.token_hex(8)}.tmp')
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
         try:
-            os.fchmod(fd, mode)
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                if mode is not None:
+                    try:
+                        os.fchmod(f.fileno(), mode)
+                    except OSError:  # the file is still written, with the default mode
+                        logger.warning("無法沿用術語表的權限設定")
                 json.dump(raw, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.glossary_path)
+            os.replace(tmp, target)
         except BaseException:
             os.unlink(tmp)
             raise

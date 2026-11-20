@@ -4069,6 +4069,12 @@ DAMAGED_GLOSSARIES = {
     'not a list of objects': '["paragraph"]',
     'unknown field': '[{"term": "paragraph", "translation": "段落", "x": 1}]',
     'not utf-8': b'\xff\xfe[',
+    # round 2: wrong field types
+    'term null': '[{"term": null, "translation": "段落"}]',
+    'category list': '[{"term": "paragraph", "translation": "段落", "category": ["term"]}]',
+    'translation null': '[{"term": "paragraph", "translation": null}]',
+    'translation number': '[{"term": "paragraph", "translation": 5}]',
+    'notes number': '[{"term": "paragraph", "translation": "段落", "notes": 1}]',
 }
 
 
@@ -4112,8 +4118,10 @@ class TestDamagedGlossary:
             os.chmod(path, 0o644)
         assert data['status'] == 'ok' and data['glossary_unavailable'] is True
 
-    def test_retranslate_goes_on(self, client, project_with_translations):
-        self._write(project_with_translations, 'null')
+    @pytest.mark.parametrize('content', ['null', DAMAGED_GLOSSARIES['term null'],
+                                         DAMAGED_GLOSSARIES['category list']])
+    def test_retranslate_goes_on(self, client, project_with_translations, content):
+        self._write(project_with_translations, content)
         with use_fake_backend(FakeBackend(['<p k="1">第二節。</p>'])):
             response = client.post(
                 f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
@@ -4122,7 +4130,7 @@ class TestDamagedGlossary:
         assert data['translated_text'] == '<p>第二節。</p>'
         assert data['glossary_unavailable'] is True
 
-    @pytest.mark.parametrize('translation', ['null', '5', '""', '"  "'])
+    @pytest.mark.parametrize('translation', ['""', '"  "'])
     def test_entry_without_translation_skipped(self, client, project_with_translations,
                                                 translation):
         self._write(project_with_translations,
@@ -4196,7 +4204,9 @@ class Node_ {
 }
 const seg = new Node_('div');
 seg.parts = {'.issue-badge': new Node_('span'), '.segment-issues': new Node_('ul'),
-             '.segment-status': new Node_('span'), '.btn-retranslate': new Node_('button')};
+             '.segment-status': new Node_('span'), '.btn-retranslate': new Node_('button'),
+             '.glossary-notice': new Node_('p')};
+seg.parts['.glossary-notice'].hidden = scenario.endsWith('-notice-shown');
 seg.parts['.segment-status'].title = 'OLD';
 const textarea = new Node_('textarea');
 textarea.value = 'KEPT';
@@ -4216,7 +4226,7 @@ global.fetch = async () => ({ok: scenario !== 'retranslate-failed', status: 500,
 const page = require('fs').readFileSync(0, 'utf8');
 eval(page);
 (async () => {
-    if (scenario === 'show') showIssues('s1', payload);
+    if (scenario.startsWith('show')) showIssues('s1', payload);
     else if (scenario === 'save') saveSegment('s1');
     else if (scenario === 'approve') approveSegment('s1');
     else retranslateSegment('s1');
@@ -4228,7 +4238,8 @@ eval(page);
         count: String(count.textContent), badge: p['.issue-badge'].textContent,
         badgeHidden: p['.issue-badge'].hidden, listHidden: p['.segment-issues'].hidden,
         items: p['.segment-issues'].children.map(show), title: p['.segment-status'].title,
-        status: p['.segment-status'].textContent, text: textarea.value, alerts}));
+        status: p['.segment-status'].textContent, text: textarea.value, alerts,
+        notice: !p['.glossary-notice'].hidden}));
 })();
 """
 
@@ -4288,3 +4299,24 @@ eval(page);
         assert result['text'] == 'KEPT' and result['alerts'] == ['ERR']
         assert (result['count'], result['badge'], result['title']) == ('1', '1 個問題', 'NO')
         assert result['status'] == ''  # the status text is left as it was
+
+
+class TestReviewPageGlossaryNotice(TestReviewPageScript):
+    """Round 2, item 9: the page says when the glossary could not be read."""
+
+    def test_notice_shown_and_hidden(self, client):
+        assert self._run(client, 'show', {'issues': [], 'glossary_unavailable': True})['notice']
+        # a later answer with the glossary read hides it again
+        assert not self._run(client, 'show-notice-shown', {'issues': []})['notice']
+        assert not self._run(client, 'show', {'error': 'x'})['notice']
+
+    def test_save_approve_retranslate_show_it(self, client):
+        for scenario in ('save', 'approve', 'retranslate', 'retranslate-failed'):
+            result = self._run(client, scenario, {'status': 'ok', 'issues': [],
+                                                  'translated_text': 'T', 'error': 'E',
+                                                  'glossary_unavailable': True})
+            assert result['notice'], scenario
+
+    def test_notice_in_the_page(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1').get_data(as_text=True)
+        assert html.count('<p class="glossary-notice" hidden>術語表無法讀取，這次未檢查術語。</p>') == 3

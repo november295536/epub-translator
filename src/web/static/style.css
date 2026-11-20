@@ -180,7 +180,14 @@ header .subtitle {
 
 .issue-structure .issue-kind, .issue-backend .issue-kind { background: #c0392b; color: white; }
 
-.issue-badge[hidden], .segment-issues[hidden] { display: none; }
+.issue-badge[hidden], .segment-issues[hidden], .glossary-notice[hidden] { display: none; }
+
+.glossary-notice {
+    margin: 0;
+    padding: 0.4rem 1rem;
+    background: #fdebd0;
+    font-size: 0.85rem;
+}
 
 .issue-filter {
     margin-bottom: 1rem;
