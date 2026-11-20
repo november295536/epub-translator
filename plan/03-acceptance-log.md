@@ -2399,10 +2399,10 @@ counts as exported.
 
 ```
 $ python3 -m pytest tests/ -q -p no:cacheprovider
-1386 passed in 133.93s (0:02:13)
+1407 passed in 139.75s (0:02:19)
 ```
 
-(After review round 2; 1341 after review round 1.)
+(After review round 3; 1386 after review round 2, 1341 after review round 1.)
 
 1176 before the phase (1210 at the first hand-back; the fix round added 33; review round 1 and
 its mutation runs 98: `TestReviewRound1Archive`, `TestReviewRound1Chapters`,
@@ -2482,8 +2482,9 @@ also FAILs when any file under its real directory changed. The TOC count is foll
 number of entries that point into a chapter with at least one segment exported as
 translation (the meaningful denominator).
 
-The output above is after review round 1 (section 10); after review round 2 (section 11)
-the same command printed the identical lines and exited 0; after the fix round the totals were
+The output above is after review round 1 (section 10); after review rounds 2 and 3 (sections
+11, 12) the same command printed the identical lines and exited 0 (H1's stricter anchor rule
+keeps no further real segment); after the fix round the totals were
 `as translation 4072  kept original 90 (missing_anchor 5, not_well_formed 20, structure_mismatch
 65)  toc labels changed 406/1895 (527 into translated chapters)`. Since review round 1 the
 check also requires every source member, the raw name, order, compression, date and
@@ -2762,11 +2763,35 @@ labels only from the NCX and nav files (an SVG `text` is no label; a `text` dire
 NCX root), `head_items` without head, a changed or renamed file in the project directory, the
 listing error with the path.
 
-Run 10's 100 survivors and 6 timeouts, all with a disposition:
+Runs 11 and 12 (review round 3):
 
-| survivors (run 10 ids) | mutation | disposition |
+| run | after | mutants | killed | survived | timeout | suspicious | untested |
+|---|---|---|---|---|---|---|---|
+| 11 | "fix: drop the ZIP64 record in the check's comparison and stop the whole mutmut group" | 2626 | 2528 | 92 | 6 | 0 | 0 |
+| 12 | "test: a changed a@name value is an anchor mismatch" (final) | 2626 | 2531 | 90 | 5 | 0 | 0 |
+
+```
+$ scripts/verify/mutation.sh main
+...
+TOTAL mutants 2626  killed 2531  survived 90  timeout 5  suspicious 0  untested 0
+$ echo $?
+1
+```
+
+Killed in review round 3 (section 12): the five no-namespace mutants of runs 7–10 (`_fill`
+`_bilingual(fmt, None)`, `_link_stylesheet` `QName(None, 'head')` / `QName('head')`, `_package`
+`QName(None, 'item')` / `QName('item')`) by the prefixed XHTML and OPF tests (their earlier
+"equivalent in the output" disposition held only for default-namespace documents); the check
+script's processing-instruction mutants of `broken_links`, `id_counts`, `uses_bilingual` and
+`Archive.anchors` by `TestExportCheckReviewRound3`; the two `_anchors` name mutants of run 11
+by a changed `a@name` value.
+
+Run 12's 90 survivors and 5 timeouts, all with a disposition:
+
+| survivors (run 12 ids) | mutation | disposition |
 |---|---|---|
-| exporter `_fragment` 12, `_member_info` 11, 15, `_serialize` 21, 32, 43, 49, `has_internal_subset` 28–31 (codec names) | codec or `encoding` name in another case (`'UTF-8'`, `'CP437'`, `'UNICODE'`, `'UTF-16-LE'`) | equivalent: Python and lxml look encodings up without case |
+| exporter `_fragment` 12, `_member_info` 11, 15, `_serialize` 21, 32, 43, 49, `has_internal_subset` 14, 17, 20, 23, 26 | codec or `encoding` name in another case (`'UTF-8'`, `'CP437'`, `'UNICODE'`, `'UTF-16-LE'`, `'LATIN-1'`) | equivalent: Python and lxml look encodings up without case |
+| exporter `has_internal_subset` 31–33 | the `'replace'` error handler changed or dropped | equivalent: it matters only when decoding fails, and latin-1 never fails; UTF-16 is used only for bytes libxml2 has already parsed as UTF-16 |
 | exporter `_serialize` 16, 19, 22, 38, 41, 44 | `with_tail` of the nodes before and after the root | equivalent: lxml keeps no text outside the root element |
 | exporter `_serialize` 30, `_code_piece` 25, `_fill` 16 | `copy.deepcopy` → `copy.copy` | equivalent: lxml's `__copy__` copies the subtree |
 | exporter `_code_piece` 26, `_fill` 17, `_take_run` 13 | `tail = None` → `""` | equivalent: no tail and an empty tail serialize the same |
@@ -2775,26 +2800,24 @@ Run 10's 100 survivors and 6 timeouts, all with a disposition:
 | exporter `_relabel` 106–108 | `changed += 1` variants | equivalent: only its truth value is used |
 | exporter `_export` 58, 59 | source language `XXXX` | equivalent unless an element has `lang="XXXX"` |
 | exporter `_export` 61, 162 | `css_path = ""`; `css_path if css_used or True` | equivalent: only its truth value is used; the OPF is rewritten only when a chapter was filled, so `css_used` is then true whenever `css_path` is set |
-| exporter `_fill` 68, `_link_stylesheet` 12, 14, `_package` 47, 49 | the new `div` / `head` / `item` without namespace | equivalent in the output: lxml serializes a no-namespace child of a default-namespace parent without `xmlns=""`, so the bytes are the same (checked) |
-| exporter `_mark_translated` 1, 21, `_toc_targets` 7 | `iter(etree.Element)` → `iter(None)` where processing instructions only add keys or are read for `id` / `epub:type` | equivalent: a PI's `attrib` is a copy (deleting from it changes nothing); a PI with an `epub:type` pseudo-attribute does not exist in XHTML; `owner` gets unused PI keys |
+| exporter `_mark_translated` 1, 21, `_toc_targets` 7 | `iter(etree.Element)` → `iter(None)`, so processing instructions are walked too | equivalent: a PI's `attrib` is a copy, so deleting from it changes nothing (checked); no XHTML PI carries an `epub:type` pseudo-attribute; in `_toc_targets` PIs only become unused keys of `owner` |
 | exporter `_mark_translated` 25, `_relabel` 69 | missing `epub:type` read as `XXXX` | equivalent: `XXXX` is neither a note type nor `toc` |
 | exporter `_toc_targets` 25 | `first_heading = False` → `None` | equivalent: truth value |
-| exporter `_member_info` 13, 19 | name flag mask `0x800` → `2049` | equivalent: the extra bit is "encrypted"; an encrypted member cannot be read, so the export fails before |
+| exporter `_member_info` 13, 19 | name flag mask `0x800` → `2049` | equivalent: the extra bit means "encrypted"; an encrypted member cannot be read, so the export fails before any name is written |
 | exporter `_write_archive` 14, 15 | length of the random temporary name | equivalent |
-| exporter `has_internal_subset` 11, 14, 15, 17, 20 | the `'<\x00'` key renamed (falls back to the declared `UTF-16`, which Python decodes little-endian on this host); `decode` error handler changed or dropped; `lstrip('XX\ufeffXX')` | equivalent: little-endian host; libxml2 has already decoded the bytes, so no decoding error occurs; the BOM is still stripped |
-| check script `main` 2–5, 8, 11, 16–18, 21, 24, 29–31 (the `--help` and description texts) | texts changed or dropped | subprocess gap: `TestExportCheck::test_runs_as_script_with_help` runs the script as a subprocess and checks these texts; mutmut 3 does not link it to `main`. Confirmed by hand for 29 (help text) and 5 (description): applied to a copy, that test fails |
+| check script `main` 2–5, 8, 11, 16–18, 21, 24, 29–31 (the `--help` and description texts) | texts changed or dropped | subprocess gap: `TestExportCheck::test_runs_as_script_with_help` runs the script as a subprocess and checks these texts; mutmut 3 does not link it to `main`. Confirmed by hand for 29 (help text) and 5 (description) in run 8: applied to a copy, that test fails |
 | check script `main` 15 | default `PROJECTS` | equivalent on this machine's case-insensitive file system (`test_default_projects_dir` passes); killed on a case-sensitive one |
 | check script `main` 66, 68 | `mkdtemp(dir=parent)` → default | equivalent: the default is `gettempdir()`, of which `parent` is the real path |
-| check script `_entries` 10, 22, 27, 37, `broken_links` 7, `id_counts` 5, `uses_bilingual` 8, `Archive.anchors` 4 | `iter(None)`: processing instructions also walked | equivalent for the checks: PIs have no local name, and an `id`/`href`/`class` pseudo-attribute of a PI would be the same in source and export, which are compared |
+| check script `_entries` 10, 22, 27, 37 | `iter(None)`: processing instructions also walked | equivalent: a PI has no local name, so it never matches `nav`, `a` or `text`, the only elements these loops use |
 | check script `_entries` 21, `_links_bilingual_css` 15, 27, `chapter_problems` 25, `uses_bilingual` 7 | missing attribute read as `XXXX` | equivalent unless a value is `XXXX` (see run 2) |
 | check script `_entries` 45 | `point` computed for a root `text` element | equivalent unless a document's root element is `text` |
 | check script `_links_bilingual_css` 29, `toc_labels` 14 | the dummy fragment `#x` → `#X` | equivalent: only the member part is used |
 | check script `_links_bilingual_css` 45, `epubcheck_errors` 22, 24, 26 | `'UTF-8'`, or the locale's encoding for the JSON report | equivalent (case; the locale is UTF-8) |
-| check script `broken_links` 23 | `_resolve(name, None)` for elements without `href` | equivalent: `urlsplit(None)` gives no fragment, so `None` is returned as before |
+| check script `broken_links` 23 | `_resolve(name, None)` for elements without `href` | equivalent: `urlsplit(None)` gives no fragment (checked), so `None` is returned as before |
 | check script `epubcheck_errors` 7–9 | report file suffix | equivalent (run 2) |
 | check script `member_problems` 47, 55 | flag mask `2049` | equivalent (encrypted, as above) |
 | check script `snapshot` 13, 15 | paths relative to the working directory instead of the project | equivalent: still unique and the same before and after |
-| timeouts: exporter `_free_name` 8, `_package` 28, `_without_zip64` 31–33, check script `epubcheck_errors` 4 | infinite loops (`not in`, `i = 4 + size`, …); `which('EPUBCHECK')` finds the tool on this case-insensitive file system and the run exceeds the timeout | detected |
+| timeouts: exporter `_free_name` 8, `_package` 28, `_without_zip64` 32, 33, check script `epubcheck_errors` 4 | infinite loops (`not in`, `i -= 4 + size`, …); `which('EPUBCHECK')` finds the tool on this case-insensitive file system and the run exceeds the timeout | detected |
 
 The run 4 table's mutant 214 (`os.umask(1)`) no longer exists: review round 2 (F2) removed the
 `os.umask` calls.
@@ -2930,6 +2953,21 @@ without it.
 
 Also changed while triaging: `_Kept` no longer passes its reason to `Exception` (unused); the
 unused `compress_type` for a missing `mimetype` is gone (a new `ZipInfo` is stored).
+
+### 12. Review round 3
+
+Opus and Gemini approved with minors; GPT requested changes (one major). Each fix has a test
+that fails without it (H3: only on Python 3.12, see below).
+
+| # | finding | action | tests |
+|---|---|---|---|
+| H1 (major) | ids and `a@name` values were counted in one multiset: source `<a id="n" name="n">` and translation `<a id="n"/><a id="n"/>` both gave n=2 and passed, with a duplicate id | two multisets, ids and `a@name` values, each must equal the source's; a `name` turned into an `id` (accepted before) is now a mismatch too | `TestAnchorsInTheGate::test_anchor_mismatch_kept_original[*]` (the H1 case, `name` → `id`, a changed `name` value) |
+| H2 | a declared encoding Python does not know (`ISO-Latin-1`) raised `LookupError` and failed the export | everything that is not UTF-16 is decoded as latin-1 (the prolog structure is ASCII; a UTF-8 BOM is skipped first) | `TestReviewRound3::test_encoding_python_does_not_know[*]` (with and without a subset) |
+| H3 | the raw name came from `info.filename`, which Python 3.12 takes from an Info-ZIP Unicode Path field (0x7075) | built from `info.orig_filename`. Observed: with UTF-8 name bytes, no UTF-8 flag and a 0x7075 field, Python 3.9 gives `filename == orig_filename` (code page 437 reading), Python 3.12 gives `filename` from the field. The test therefore fails without the fix on 3.12 (where mutmut runs) and passes either way on 3.9 | `TestReviewRound3::test_stored_name_bytes_kept_with_a_unicode_path_field` |
+| H4 | the check script compared `extra` with the source's ZIP64 record, which the exporter drops | the source's extra is compared without its ZIP64 record (the exporter's `_without_zip64`) | `TestExportCheckReviewRound3::test_source_member_with_a_zip64_record_passes` |
+| H5 | no tests with a prefixed XHTML or OPF namespace | added; the code was already correct (no change). They kill the five no-namespace mutants, whose "equivalent" disposition (section 6) held only for default namespaces | `TestReviewRound3::test_prefixed_xhtml_without_head[*]`, `test_prefixed_opf[*]` |
+| H6 | the check script's processing-instruction survivors | focused tests with PI pseudo-attributes (`class`, `id`, `name`, `href`); the four mutants of `broken_links`, `id_counts`, `uses_bilingual`, `Archive.anchors` are killed; the remaining `_entries` ones are reworded accurately (section 6) | `TestExportCheckReviewRound3::test_pi_*` |
+| H7 | `mutation.py` cleanup | further SIGTERM/SIGHUP are ignored once cleanup starts; the recorded process group is signalled whether or not its leader has exited; members still alive after the grace period get SIGKILL; then the copy is removed | `TestMutationScript::test_stop_group_after_the_leader_exited` |
 
 ### Not done
 
