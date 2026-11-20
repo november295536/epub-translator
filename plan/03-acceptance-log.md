@@ -2399,10 +2399,10 @@ counts as exported.
 
 ```
 $ python3 -m pytest tests/ -q -p no:cacheprovider
-1407 passed in 139.75s (0:02:19)
+1408 passed in 144.17s (0:02:24)
 ```
 
-(After review round 3; 1386 after review round 2, 1341 after review round 1.)
+(After review round 4; 1407 after review round 3; 1386 after review round 2, 1341 after review round 1.)
 
 1176 before the phase (1210 at the first hand-back; the fix round added 33; review round 1 and
 its mutation runs 98: `TestReviewRound1Archive`, `TestReviewRound1Chapters`,
@@ -2981,6 +2981,22 @@ Verdicts: Opus approve, GPT approve, Gemini approve; only minors remained. Final
 | J2 | the check script removed the ZIP64 record only from the source's extra field | removed from both operands | `TestExportCheckReviewRound3::test_export_member_with_a_zip64_record_passes` |
 | J3 | `test_stop_group_after_the_leader_exited` assumed the child is reaped within one pause; `proc.stdout` left open | polls with a 10 s deadline; closes `proc.stdout` | the test itself |
 | J4 | limitation | recorded below and in section 7 | — |
+
+Mutation testing after this pass: run 13 stopped at mutmut's clean baseline (this pass had
+dropped an `import zipfile` from `test_untouched_member_compression_changed`; restored in "fix:
+restore a test import dropped in the final review pass"). Run 14:
+
+```
+$ scripts/verify/mutation.sh main
+...
+TOTAL mutants 2629  killed 2533  survived 90  timeout 6  suspicious 0  untested 0
+$ echo $?
+1
+```
+
+Against run 12: the three new mutants (J2's line) are killed; the 90 survivors are the same
+mutations as run 12's, with the dispositions of section 6; `_without_zip64`'s `i = 4 + size`,
+killed in run 12, is a timeout here (an infinite loop either way: detected).
 
 Known limitation (not fixed): a UTF-32 chapter with an internal DOCTYPE subset is not detected
 by `has_internal_subset` (UTF-32 is decoded there as UTF-16 or latin-1, so the subset is not
