@@ -37,6 +37,17 @@ class SegmentStatus(str, Enum):
 # project.json layout written for projects created now (see ProjectData)
 SCHEMA = 2
 
+# The segmentation rules there are (src/core/segmenter.py)
+SEGMENTATION_RULES = (1, 2)
+
+
+def check_rules(value) -> int:
+    """`value` when it is one of the segmentation rules (the integer 1 or 2:
+    not a string, a bool, a float or None); raises ValueError otherwise."""
+    if type(value) is not int or value not in SEGMENTATION_RULES:
+        raise ValueError(f'unknown segmentation rules: {value!r}')
+    return value
+
 
 def sha256_file(path: str) -> str:
     """SHA-256 of a file, hex."""
@@ -115,11 +126,12 @@ class ProjectData:
     schema: int = 1
     # SHA-256 of the project's copy of the source EPUB (schema 2)
     source_sha256: str = ''
-    # The segmentation rules the segments were cut by (src/core/segmenter.py):
-    # 1 before Phase 6 (never written, so those files round-trip unchanged),
-    # 2 for projects created since (written). With 2 the prompt's context is
+    # The segmentation rules the segments were cut by (src/core/segmenter.py),
+    # 1 or 2; None: the file has no such key (projects from before Phase 6),
+    # which means rules 1 and is never written, so those files round-trip
+    # unchanged. Projects created since have 2. With 2 the prompt's context is
     # the previous segment's translation when it has one (translator.get_context)
-    segmentation: int = 1
+    segmentation: int | None = None
     segments: list[SegmentState] = field(default_factory=list)
 
 
@@ -155,7 +167,7 @@ class ProjectManager:
 
     def create(self, epub_path: str, title: str, author: str,
                segments: list[Segment], source_sha256: str = '',
-               segmentation: int = 1) -> ProjectData:
+               segmentation: int | None = None) -> ProjectData:
         """Create a new translation project (schema 2).
 
         Args:
@@ -164,10 +176,14 @@ class ProjectManager:
             author: Book author.
             segments: List of segments from the segmenter.
             source_sha256: SHA-256 of that copy.
-            segmentation: The rules `segments` were cut by (Segmenter.rules).
+            segmentation: The rules `segments` were cut by (Segmenter.rules),
+                written to project.json; None: rules 1, not written (as
+                projects created before Phase 6). Anything else raises ValueError.
 
         A passthrough segment is created translated, its code as its text.
         """
+        if segmentation is not None:
+            check_rules(segmentation)
         os.makedirs(self.project_dir, exist_ok=True)
 
         now = time.strftime('%Y-%m-%d %H:%M:%S')
@@ -228,6 +244,8 @@ class ProjectManager:
         segments = [SegmentState(**s) for s in raw_segments]
         if 'model' not in raw:
             raw['model'] = llm.default_backend().default_model
+        if 'segmentation' in raw:  # absent: rules 1 (None)
+            check_rules(raw['segmentation'])
         self.data = ProjectData(**raw, segments=segments)
         return self.data
 
@@ -245,8 +263,8 @@ class ProjectManager:
                 del raw['segmenter_version']
         else:
             del raw['segmenter_version']  # superseded by the schema
-        if raw['segmentation'] == 1:
-            del raw['segmentation']  # projects from before Phase 6 save as before
+        if raw['segmentation'] is None:
+            del raw['segmentation']  # the file had none: saved as before
         for seg in raw['segments']:
             for key, default in _SEGMENT_DEFAULTS.items():
                 if seg[key] == default:
@@ -293,9 +311,11 @@ class ProjectManager:
         if not self.data:
             raise RuntimeError("No project loaded.")
         with self.mutex:
-            seg = self._find(segment_id)
-            seg.status = SegmentStatus.TRANSLATED
+            seg = self._changeable(segment_id)
+            # the text before the status: a reader without the mutex never
+            # sees the new status with the old text
             seg.translated_text = translated_text
+            seg.status = SegmentStatus.TRANSLATED
             seg.translated_at = time.strftime('%Y-%m-%d %H:%M:%S')
 
     def apply_outcome(self, segment_id: str, outcome: TranslationOutcome,
@@ -303,12 +323,15 @@ class ProjectManager:
         """Store a translation outcome (in-memory; call save() to persist).
 
         Returns False, changing nothing, when `revision` is given and the
-        segment has been edited since (its revision differs). A failure
+        segment has been edited since (its revision differs), and for a
+        passthrough segment. A failure
         keeps the text and status of a translated or reviewed segment and
         only attaches the issues; any other segment becomes FAILED.
         """
         with self.mutex:  # the check and the write are one step
             seg = self._find(segment_id)
+            if seg.passthrough:  # never a model's result (e.g. the project was re-created)
+                return False
             if revision is not None and seg.revision != revision:
                 return False
             seg.issues = list(outcome.issues)
@@ -316,12 +339,20 @@ class ProjectManager:
                 if seg.status == SegmentStatus.PENDING:
                     seg.status = SegmentStatus.FAILED
                 return True
+            seg.translated_text = outcome.text  # before the status (mark_translated)
             seg.status = SegmentStatus.TRANSLATED
-            seg.translated_text = outcome.text
             seg.translated_at = time.strftime('%Y-%m-%d %H:%M:%S')
             seg.model = outcome.model
             seg.usage = asdict(outcome.usage) if outcome.usage else None
             return True
+
+    def _changeable(self, segment_id: str) -> SegmentState:
+        """The segment, for a change of its translation or status; a
+        passthrough segment raises PassthroughError (its code stays)."""
+        seg = self._find(segment_id)
+        if seg.passthrough:
+            raise PassthroughError(f'passthrough segment cannot be changed: {segment_id}')
+        return seg
 
     def _find(self, segment_id: str) -> SegmentState:
         if not self.data:
@@ -368,7 +399,7 @@ class ProjectManager:
         """Mark a segment as reviewed (in-memory only; call save() to persist).
         A manual decision: earlier issues are cleared."""
         with self.mutex:
-            seg = self._find(segment_id)
+            seg = self._changeable(segment_id)
             if text:
                 seg.translated_text = text
             seg.status = SegmentStatus.REVIEWED
@@ -383,7 +414,7 @@ class ProjectManager:
         it now has a translation. Earlier issues are replaced by `issues`
         (the new text's warnings; none by default)."""
         with self.mutex:
-            seg = self._find(segment_id)
+            seg = self._changeable(segment_id)
             seg.translated_text = text
             if seg.status == SegmentStatus.FAILED:
                 seg.status = SegmentStatus.TRANSLATED
@@ -395,7 +426,7 @@ class ProjectManager:
         segment becomes FAILED with `issues`. Its text is kept: a later
         re-translation replaces it, a failed one leaves it (apply_outcome)."""
         with self.mutex:
-            seg = self._find(segment_id)
+            seg = self._changeable(segment_id)
             seg.status = SegmentStatus.FAILED
             seg.issues = list(issues)
 
@@ -428,6 +459,10 @@ class ProjectManager:
     def exists(self) -> bool:
         """Check if a project file exists in the project directory."""
         return os.path.isfile(self.project_file)
+
+
+class PassthroughError(ValueError):
+    """A change of a passthrough segment (raised by ProjectManager)."""
 
 
 class ProjectLockedError(Exception):

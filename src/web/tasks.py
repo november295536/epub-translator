@@ -645,7 +645,7 @@ class TaskManager:
                     # A failed segment, also one with an unexpected error, is
                     # an outcome: recorded as FAILED
                     outcome = translate_segment(engine, seg, all_segments, gm,
-                                                translations=translations)
+                                                translations=translations, mutex=pm.mutex)
                     task.result_queue.put(TranslationResult(
                         segment_id=seg.segment_id, outcome=outcome, revision=revision))
 

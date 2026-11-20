@@ -3314,3 +3314,77 @@ class TestSegmentationCheckSurvivors:
         monkeypatch.setattr(segmentation_check, 'open', recording, raising=False)
         segmentation_check.source_of(beta)
         assert opened == [('project.json', 'r', {'encoding': 'utf-8'})]
+
+
+class TestSegmentationCheckRound1:
+    """Review round 1: unreadable chapters, per-segment fingerprints, errors."""
+
+    def _book_project(self, root, chapters):
+        from tests.test_exporter import _project, _raw_book
+        root.mkdir()
+        books = root.parent / 'books'
+        books.mkdir()
+        epub = _raw_book(books, chapters, nav=None, ncx=None)
+        return _project(root, epub, {}, name='alpha')
+
+    def _main(self, root):
+        return segmentation_check.main(['--projects-dir', str(root), '--anonymize'])
+
+    def test_partly_unreadable_book_fails(self, tmp_path, capsys):
+        from tests.conftest import xhtml
+        root = tmp_path / 'projects'
+        project_dir = self._book_project(root, {'a': ('a.xhtml', xhtml('<p>One.</p>'))})
+        # a second spine chapter that is not well-formed, and one missing
+        import zipfile
+        epub = segmentation_check.source_of(project_dir)
+        with zipfile.ZipFile(epub) as z:
+            members = {n: z.read(n) for n in z.namelist()}
+        opf = members['OEBPS/content.opf'].decode()
+        opf = opf.replace('</manifest>', '<item id="b" href="Text/b.xhtml" '
+                          'media-type="application/xhtml+xml"/><item id="c" href="Text/c.xhtml" '
+                          'media-type="application/xhtml+xml"/></manifest>')
+        opf = opf.replace('</spine>', '<itemref idref="b"/><itemref idref="c"/></spine>')
+        members['OEBPS/content.opf'] = opf.encode()
+        members['OEBPS/Text/b.xhtml'] = b'<html><body><p>broken</div></body></html>'
+        with zipfile.ZipFile(epub, 'w') as z:
+            for name, data in members.items():
+                z.writestr(name, data)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[0] == (
+            'FAIL project-1: segments 1 -> 1, calls 1 -> 1 (ratio 1.000), passthrough 0, '
+            'headings merged 0 of 0; 2 chapters could not be checked')
+
+    def test_wholly_unreadable_book_fails(self, tmp_path, capsys):
+        root = tmp_path / 'projects'
+        self._book_project(root, {'a': ('a.xhtml', '<html><body><p>x</div></body></html>')})
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[0] == (
+            'FAIL project-1: segments 0 -> 0, calls 0 -> 0 (ratio -), passthrough 0, '
+            'headings merged 0 of 0; 1 chapters could not be checked; no chapter checked')
+
+    def test_book_without_chapters_fails(self, tmp_path, capsys):
+        from tests.conftest import xhtml
+        root = tmp_path / 'projects'
+        self._book_project(root, {'a': ('a.xhtml', xhtml(''))})  # no text: no chapter
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[0].endswith('; no chapter checked')
+
+    def test_covers_compares_each_segment_with_its_blocks(self):
+        from types import SimpleNamespace as N
+        blocks = [N(fingerprint='a'), N(fingerprint='b'), N(fingerprint='c')]
+        segs = [N(block_start=0, block_end=1, fingerprints=['a', 'b']),
+                N(block_start=1, block_end=3, fingerprints=['c'])]
+        assert not segmentation_check.covers(blocks, segs)
+        segs = [N(block_start=0, block_end=1, fingerprints=['a']),
+                N(block_start=1, block_end=3, fingerprints=['b', 'c'])]
+        assert segmentation_check.covers(blocks, segs)
+
+    def test_value_error_of_the_path_check(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+
+        def commonpath(paths):
+            raise ValueError('/MARKER mixes absolute and relative')
+        monkeypatch.setattr(segmentation_check.os.path, 'commonpath', commonpath)
+        assert self._main(root) == 1
+        out, err = capsys.readouterr()
+        assert out == 'ERROR the check stopped (ValueError)\n' and err == ''

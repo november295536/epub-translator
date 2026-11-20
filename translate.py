@@ -264,7 +264,8 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
 
             try:
                 outcome = translate_segment(engine, seg, all_segments, gm,
-                                            translations=pm.data.segmentation == 2)
+                                            translations=pm.data.segmentation == 2,
+                                            mutex=pm.mutex)
             except RUN_ERRORS as e:
                 stop_errors.append(e)
                 error_event.set()
@@ -421,7 +422,8 @@ def export(project, fmt):
         sys.exit(1)
 
     progress = pm.get_progress()
-    if progress['translated'] + progress['reviewed'] == 0:
+    # passthrough code is translated without a model: it is no translation
+    if progress['translated'] + progress['reviewed'] - progress['passthrough'] == 0:
         click.echo("尚未翻譯任何段落。請先執行 start 指令。")
         sys.exit(1)
 

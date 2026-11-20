@@ -46,12 +46,15 @@
                         <div class="search-result-checkbox">
                             <input type="checkbox"
                                    :checked="selected.has(seg.segment_id)"
-                                   @change="toggleSelect(seg.segment_id)">
+                                   :disabled="seg.passthrough"
+                                   :title="seg.passthrough ? '沒有註解的程式碼，原樣保留，不需翻譯' : ''"
+                                   @change="toggleSelect(seg)">
                         </div>
                         <div class="search-result-content">
                             <div class="search-result-header">
                                 <span class="segment-id" x-text="seg.segment_id"></span>
-                                <span class="segment-status" :class="'status-' + seg.status" x-text="seg.status"></span>
+                                <span class="segment-status" :class="'status-' + seg.status" x-text="seg.status" x-show="!seg.passthrough"></span>
+                                <span class="segment-status status-passthrough" x-show="seg.passthrough" title="沒有註解的程式碼：不送模型翻譯，匯出時原樣保留">passthrough（原樣保留，不需翻譯）</span>
                                 <span class="text-muted" style="font-size: 0.8rem;"
                                       x-text="'匹配: ' + matchLabel(seg.match_in)"></span>
                                 <button class="btn-expand" @click.prevent="seg._expanded = !seg._expanded"
@@ -134,7 +137,9 @@ function searchRetranslate() {
             this.searching = false;
         },
 
-        toggleSelect(id) {
+        toggleSelect(seg) {
+            if (seg.passthrough) return;  // code without comments: nothing to translate
+            const id = seg.segment_id;
             if (this.selected.has(id)) {
                 this.selected.delete(id);
             } else {
@@ -145,7 +150,7 @@ function searchRetranslate() {
         },
 
         selectAll() {
-            this.selected = new Set(this.results.map(s => s.segment_id));
+            this.selected = new Set(this.results.filter(s => !s.passthrough).map(s => s.segment_id));
         },
 
         selectNone() {
@@ -173,6 +178,11 @@ function searchRetranslate() {
                 const data = await res.json();
                 if (data.error) {
                     this.error = data.error;
+                    this.retranslating = false;
+                    return;
+                }
+                if (data.total === 0) {
+                    this.error = '選取的段落都不需要翻譯（沒有註解的程式碼原樣保留），沒有開始翻譯。';
                     this.retranslating = false;
                     return;
                 }

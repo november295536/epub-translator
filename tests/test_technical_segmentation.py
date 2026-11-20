@@ -141,7 +141,9 @@ class TestPassthrough:
         ('x = 1\ny = 2', True),
         ('#include &lt;stdio.h&gt;\nint x;', True),           # a directive, not a comment
         ('x = 1  # trailing comment', True),            # trailing comments are not translated
-        ('#!/bin/sh\necho hi', False),                  # the comment-line rule of the check
+        ('#!/bin/sh\necho hi', True),                   # review round 1: a shebang is code
+        ('#!/bin/sh\n# say hi\necho hi', False),
+        ('echo hi\n#! not first', False),
         ('# a comment\nx = 1', False),
         ('    // indented comment\nf();', False),
         ('x = 1\n#', False),
@@ -251,7 +253,7 @@ class TestProjectState:
         assert 'segmentation' not in raw
         assert not any('passthrough' in s for s in raw['segments'])
         pm = _load(project_dir)
-        assert pm.data.segmentation == 1
+        assert pm.data.segmentation is None  # rules 1
         assert [s.segment_id for s in pm.data.segments] == [
             'c_seg0001', 'c_seg0002', 'c_seg0003', 'c_seg0004', 'c_seg0005', 'c_seg0006',
             'c_seg0007', 'k_seg0001']
@@ -295,7 +297,7 @@ class TestContextFromTranslations:
     def test_previous_translation_tags_stripped(self, status):
         segments = [_state('a_1', 'One.', status, '<h2 id="x">一</h2>\n<p>甲 &amp; <em>乙</em></p>'),
                     _state('a_2', 'Two.'), _state('a_3', 'Three.', status, '<p>三</p>')]
-        assert get_context(segments, 'a_2', translations=True) == ('一\n甲 & 乙', 'Three.')
+        assert get_context(segments, 'a_2', translations=True) == ('一 甲 & 乙', 'Three.')
         assert get_context(segments, 'a_2') == ('One.', 'Three.')
 
     @pytest.mark.parametrize('status, text', [
@@ -433,8 +435,8 @@ class TestCli:
         assert len(fake.requests) == 4
         assert not any('x = 1' in p for p in fake.prompts)
         # sequential: the previous text segment is translated when the next one starts
-        assert '前文參考（不需翻譯）：\n潮汐表\n把表讀兩次。\n' in fake.prompts[1]
-        assert '前文參考（不需翻譯）：\n閱讀\n讀第一列。\n' in fake.prompts[3]
+        assert '前文參考（不需翻譯）：\n潮汐表 把表讀兩次。\n' in fake.prompts[1]
+        assert '前文參考（不需翻譯）：\n閱讀 讀第一列。\n' in fake.prompts[3]
         progress = _load(project_dir).get_progress()
         assert progress['translated'] == 6 and progress['percent'] == 100.0
 
@@ -597,7 +599,7 @@ class TestContextOnEveryPath:
     def test_cli(self, tmp_path, workers):
         from translate import cli
         new, old = self._rules_2(tmp_path), self._rules_1(tmp_path)
-        for project_dir, before in ((new, '前文參考（不需翻譯）：\n潮汐表\n把表讀兩次。\n'),
+        for project_dir, before in ((new, '前文參考（不需翻譯）：\n潮汐表 把表讀兩次。\n'),
                                     (old, '前文參考（不需翻譯）：\nRead the tables twice.\n')):
             fake = FakeBackend(responder=self._reply)
             with use_fake_backend(fake):
@@ -610,7 +612,7 @@ class TestContextOnEveryPath:
         projects.mkdir()
         for rules, name, translations, before in (
                 (2, 'new', {'c_seg0001': TRANSLATIONS['c_seg0001']},
-                 '前文參考（不需翻譯）：\n潮汐表\n把表讀兩次。\n'),
+                 '前文參考（不需翻譯）：\n潮汐表 把表讀兩次。\n'),
                 (1, 'old', {'c_seg0002': '<p>把表讀兩次。</p>'},
                  '前文參考（不需翻譯）：\nRead the tables twice.\n')):
             _project(projects, _book(tmp_path), translations, name=name, rules=rules)
@@ -627,3 +629,320 @@ class TestContextOnEveryPath:
     def test_unknown_rules_message(self):
         with pytest.raises(ValueError, match='^unknown segmentation rules: 3$'):
             Segmenter(rules=3)
+
+
+# --- Review round 1 ----------------------------------------------------------------
+
+class TestRound1ContextText:
+
+    @pytest.mark.parametrize('translated, text', [
+        ('<p title="x > y">正文</p>', '正文'),                     # `>` inside an attribute
+        ('<p alt="a>b" title=\'c > d\'>甲<em class="e>f">乙</em></p>', '甲乙'),
+        ('<p><![CDATA[a<b & c]]>一</p>', 'a<b & c一'),
+        ('<p>\n      一\n      二</p>\n\n  <p>三</p>', '一 二 三'),  # whitespace collapsed
+        ('<p>a&#160;b&amp;c</p>', 'a b&c'),
+    ])
+    def test_parsed_text(self, translated, text):
+        assert translation_text(_state('a', 'x', SegmentStatus.TRANSLATED, translated)) == text
+
+    def test_mutex_held_only_while_the_context_is_read(self, monkeypatch):
+        import src.core.translator as translator
+        events = []
+
+        class Recording:
+            def __enter__(self):
+                events.append('lock')
+
+            def __exit__(self, *exc):
+                events.append('unlock')
+        real = translator.get_context
+
+        def context(*args):
+            events.append('context')
+            return real(*args)
+        monkeypatch.setattr(translator, 'get_context', context)
+        fake = FakeBackend(responder=lambda r: events.append('call') or '<p k="1">譯</p>')
+        seg = _state('a_1', 'One.')
+        translate_segment(TranslationEngine(model='haiku', backend=fake), seg, [seg],
+                          translations=True, mutex=Recording())
+        assert events == ['lock', 'context', 'unlock', 'call']
+
+    def test_callers_pass_the_project_mutex(self, tmp_path, monkeypatch):
+        """The web worker and the parallel CLI read the context under pm.mutex."""
+        import src.core.translator as translator
+        from translate import cli
+        from src.web.tasks import TaskManager
+        seen = []
+        real = translator.translate_segment
+
+        def recording(*args, **kwargs):
+            seen.append(kwargs.get('mutex'))
+            return real(*args, **kwargs)
+        monkeypatch.setattr('translate.translate_segment', recording)
+        monkeypatch.setattr('src.web.tasks.translate_segment', recording)
+        project_dir = _new_project(tmp_path, {})
+        with use_fake_backend(FakeBackend(responder=lambda r: '<h2 k="1">標</h2>')):
+            CliRunner().invoke(cli, ['start', '--project', project_dir, '-w', '2'])
+        assert seen and all(m is ProjectManager(project_dir).mutex for m in seen)
+        seen.clear()
+        projects = tmp_path / 'projects'
+        projects.mkdir()
+        _project(projects, _book(tmp_path), {}, name='w', rules=2)
+        TaskManager._instance = None
+        tm = TaskManager()
+        with use_fake_backend(FakeBackend(responder=lambda r: '<h2 k="1">標</h2>')):
+            task = tm.start_translation('w', str(projects))
+            task._coordinator.join(timeout=30)
+        assert seen and all(m is ProjectManager(str(projects / 'w')).mutex for m in seen)
+        TaskManager._instance = None
+
+
+class TestRound1Marker:
+
+    def _file(self, tmp_path, **changes):
+        project_dir = _new_project(tmp_path, {})
+        path = os.path.join(project_dir, 'project.json')
+        with open(path, encoding='utf-8') as f:
+            raw = json.load(f)
+        for key, value in changes.items():
+            if value is KeyError:
+                raw.pop(key)
+            else:
+                raw[key] = value
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(raw, f, ensure_ascii=False, indent=2)
+        return project_dir, path
+
+    @pytest.mark.parametrize('value', ['2', 3, 0, True, False, 1.0, 2.0, None, [2]])
+    def test_load_rejects(self, tmp_path, value):
+        project_dir, _ = self._file(tmp_path, segmentation=value)
+        with pytest.raises(ValueError, match='unknown segmentation rules'):
+            ProjectManager(project_dir).load()
+
+    @pytest.mark.parametrize('value', ['2', 3, True, 1.0, None])
+    def test_create_and_segmenter_reject(self, tmp_path, value):
+        if value is not None:
+            with pytest.raises(ValueError):
+                ProjectManager(str(tmp_path / 'x')).create('b.epub', 'T', 'A', [],
+                                                           segmentation=value)
+            assert not os.path.exists(tmp_path / 'x')
+        with pytest.raises(ValueError, match='^unknown segmentation rules: '):
+            Segmenter(rules=value)
+
+    @pytest.mark.parametrize('value', [1, 2])
+    def test_explicit_value_saved_as_it_is(self, tmp_path, value):
+        project_dir, path = self._file(tmp_path, segmentation=value)
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+        pm = _load(project_dir)
+        assert pm.data.segmentation == value
+        assert pm.to_json() == text
+
+    def test_absent_is_rules_1(self, tmp_path):
+        project_dir, path = self._file(tmp_path, segmentation=KeyError)
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+        pm = _load(project_dir)
+        assert pm.data.segmentation is None
+        assert pm.to_json() == text and '"segmentation"' not in text
+
+    def test_create_writes_the_given_rules(self, tmp_path):
+        for value in (1, 2):
+            pm = ProjectManager(str(tmp_path / f'p{value}'))
+            pm.create('b.epub', 'T', 'A', [], segmentation=value)
+            with open(pm.project_file, encoding='utf-8') as f:
+                assert json.load(f)['segmentation'] == value
+
+
+class TestRound1StateGuards:
+
+    def test_state_layer_refuses_passthrough(self, tmp_path):
+        from src.core.project import Issue, PassthroughError
+        from src.core.translator import TranslationOutcome
+        pm = _load(_new_project(tmp_path, {}))
+        seg = pm.data.segments[1]
+        before = pm.to_json()
+        outcome = TranslationOutcome(text='y = 0', status=SegmentStatus.TRANSLATED, issues=[],
+                                     model='haiku', usage=None)
+        assert pm.apply_outcome('c_seg0002', outcome) is False
+        assert pm.apply_outcome('c_seg0002', outcome, revision=0) is False
+        for change in (lambda: pm.update_translation('c_seg0002', 'y = 0'),
+                       lambda: pm.mark_reviewed('c_seg0002'),
+                       lambda: pm.mark_reviewed('c_seg0002', 'y = 0'),
+                       lambda: pm.mark_failed('c_seg0002', [Issue('structure', 'x', 'd', True)]),
+                       lambda: pm.mark_translated('c_seg0002', 'y = 0')):
+            with pytest.raises(PassthroughError, match='c_seg0002'):
+                change()
+        assert pm.to_json() == before
+        assert seg.translated_text == 'x = 1\ny = 2' and seg.status == SegmentStatus.TRANSLATED
+        # other segments still change
+        assert pm.apply_outcome('c_seg0004', outcome) is True
+
+
+class TestRound1Search:
+
+    def test_search_marks_and_page_blocks_passthrough(self, web):
+        client, _ = web
+        found = client.post('/api/projects/p/search-segments', json={'query': 'x = 1'}).get_json()
+        assert [(s['segment_id'], s['passthrough']) for s in found['segments']] == [
+            ('c_seg0002', True)]
+        found = client.post('/api/projects/p/search-segments', json={'query': 'Tide'}).get_json()
+        assert [(s['segment_id'], s['passthrough']) for s in found['segments']] == [
+            ('c_seg0001', False)]
+        page = client.get('/project/p/search').data.decode()
+        assert ':disabled="seg.passthrough"' in page
+        assert 'x-show="seg.passthrough"' in page and '原樣保留' in page
+        assert '.filter(s => !s.passthrough)' in page           # select all skips them
+        assert 'if (data.total === 0)' in page                  # a run of nothing is explained
+
+
+class TestRound1Guards:
+
+    def test_cli_export_refuses_without_a_model_translation(self, tmp_path):
+        from translate import cli
+        project_dir = _new_project(tmp_path, {})
+        result = CliRunner().invoke(cli, ['export', '-p', project_dir, '-f', 'chinese-only'])
+        assert result.exit_code == 1 and '尚未翻譯任何段落' in result.output
+        assert not os.path.exists(os.path.join(project_dir, 'output'))
+        pm = _load(project_dir)
+        pm.mark_translated('c_seg0005', '<h2>尾</h2>')
+        pm.save()
+        result = CliRunner().invoke(cli, ['export', '-p', project_dir, '-f', 'chinese-only'])
+        assert result.exit_code == 0, result.output
+
+    def test_web_export_refuses_without_a_model_translation(self, tmp_path):
+        from src.web.server import create_app
+        from src.web.tasks import TaskManager
+        TaskManager._instance = None
+        projects = tmp_path / 'projects'
+        projects.mkdir()
+        _project(projects, _book(tmp_path), {}, name='p', rules=2)
+        (projects / 'empty').mkdir()
+        client = create_app(projects_dir=str(projects)).test_client()
+        r = client.post('/api/projects/p/export', json={'format': 'chinese-only'})
+        assert r.status_code == 400 and '尚未翻譯任何段落' in r.get_json()['error']
+        assert client.post('/api/projects/empty/export', json={}).status_code == 404
+        pm = _load(str(projects / 'p'))
+        pm.mark_translated('c_seg0005', '<h2>尾</h2>')
+        pm.save()
+        r = client.post('/api/projects/p/export', json={'format': 'chinese-only'})
+        assert r.status_code == 200
+        TaskManager._instance = None
+
+    def test_overview_and_home_status(self, tmp_path):
+        from src.web.blueprints.home import _get_status
+        from src.web.server import create_app
+        from src.web.tasks import TaskManager
+        TaskManager._instance = None
+        projects = tmp_path / 'projects'
+        projects.mkdir()
+        project_dir = _project(projects, _book(tmp_path), {}, name='p', rules=2)
+        client = create_app(projects_dir=str(projects)).test_client()
+        page = client.get('/project/p/overview').data.decode()
+        assert '已翻譯 0 字' in page and '含 2 段原樣保留的程式碼（不需翻譯）' in page
+        assert client.get('/api/projects').get_json()[0]['status'] == 'pending'
+        pm = _load(project_dir)
+        for seg in pm.data.segments:
+            if not seg.passthrough:
+                pm.mark_translated(seg.segment_id, TRANSLATIONS.get(seg.segment_id, 'x'))
+        pm.save()
+        assert client.get('/api/projects').get_json()[0]['status'] == 'in_progress'
+        words = sum(s.word_count for s in pm.data.segments if not s.passthrough)
+        assert f'已翻譯 {words:,} 字' in client.get('/project/p/overview').data.decode()
+        for seg in pm.data.segments:
+            if not seg.passthrough:
+                seg.status = SegmentStatus.REVIEWED
+        pm.save()
+        assert client.get('/api/projects').get_json()[0]['status'] == 'completed'
+        base = {'total': 4, 'translated': 2, 'reviewed': 0, 'pending': 2, 'failed': 0,
+                'passthrough': 2, 'percent': 50.0}
+        assert _get_status(base) == 'pending'
+        assert _get_status(dict(base, translated=3)) == 'in_progress'
+        assert _get_status(dict(base, reviewed=2, translated=2, pending=0)) == 'completed'
+        assert _get_status(dict(base, reviewed=1, translated=3, pending=0)) == 'in_progress'
+        TaskManager._instance = None
+
+    def test_export_report_never_counts_passthrough_untranslated(self, tmp_path):
+        project_dir = _new_project(tmp_path, {'c_seg0005': '<h2>尾</h2>'})
+        path = os.path.join(project_dir, 'project.json')
+        with open(path, encoding='utf-8') as f:
+            raw = json.load(f)
+        raw['segments'][1]['translated_text'] = ''  # as for code with no text to take
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+        report, _ = _export(tmp_path, project_dir, 'chinese-only')
+        # pending: c_seg0001, c_seg0003, c_seg0004; both passthrough segments left out
+        assert report.summary() == {'translated': 1, 'kept': 0, 'untranslated': 3, 'reasons': {}}
+
+
+class TestRound1Shebang:
+
+    def test_check_code_keeps_the_shebang(self):
+        from src.core.validation import check_code, code_lines
+        source = '#!/bin/sh\n# say hi\necho hi'
+        assert not check_code(source, '#!/bin/sh\n# 打招呼\necho hi').blocking
+        assert [i.code for i in check_code(source, '#!/bin/bash\n# 打招呼\necho hi').blocking] == [
+            'code_changed']
+        assert [i.code for i in check_code(source, '#! 直譯器\n# 打招呼\necho hi').blocking] == [
+            'code_changed']
+        assert code_lines(source) == ['#!/bin/sh', 'echo hi']
+        assert code_lines('echo\n#!x') == ['echo']      # not on the first line: a comment
+        assert code_lines('  #!x\ny') == ['y']           # indented: no shebang
+
+    def test_prompt_says_so(self):
+        from src.core.translator import CODE_PROMPT
+        assert '第一行的 #! 指定直譯器，也不是註解' in CODE_PROMPT
+
+
+class TestRound1Retranslate:
+
+    def test_endpoint_context(self, tmp_path):
+        from src.web.server import create_app
+        from src.web.tasks import TaskManager
+        projects = tmp_path / 'projects'
+        projects.mkdir()
+        _project(projects, _book(tmp_path), {'c_seg0001': TRANSLATIONS['c_seg0001']},
+                 name='new', rules=2)
+        _project(projects, _book(tmp_path), {'c_seg0002': '<p>把表讀兩次。</p>'}, name='old',
+                 rules=1)
+        TaskManager._instance = None
+        client = create_app(projects_dir=str(projects)).test_client()
+        for name, seg_id, before in (('new', 'c_seg0003', '潮汐表 把表讀兩次。'),
+                                     ('old', 'c_seg0004', 'Read the tables twice.')):
+            fake = FakeBackend(responder=lambda r: '<h2 k="1">閱讀</h2>\n<p k="2">讀<em>第一</em>列。</p>'
+                               if 'Read the' in r.messages[-1].content.split('原文')[-1]
+                               else '<h2 k="1">閱讀</h2>')
+            with use_fake_backend(fake):
+                client.post(f'/api/projects/{name}/segments/{seg_id}/retranslate')
+            assert f'前文參考（不需翻譯）：\n{before}\n' in fake.prompts[0]
+        TaskManager._instance = None
+
+
+BR_BOOK = xhtml('<h2 id="v">Verse</h2>First line<br/>Second line<br/>Third line'
+                '<p>After the <em>verse</em>.</p><pre>plain()</pre>')
+
+
+class TestRound1MergedExport:
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_heading_with_br_runs(self, tmp_path, fmt):
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml#v">Verse</a></li>'
+                    '</ol></nav>', head='<title>Contents</title>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', BR_BOOK)}, nav=nav, ncx=None)
+        merged = '<h2 id="v">詩</h2>\n第一行\n第二行\n第三行\n<p>詩<em>之後</em>。</p>'
+        new = _project(tmp_path, epub, {'c_seg0001': merged}, name='new', rules=2)
+        assert [(s.block_start, s.block_end, s.passthrough)
+                for s in _load(new).data.segments] == [(0, 5, False), (5, 6, True)]
+        old = _project(tmp_path, epub, {
+            'c_seg0001': '<h2 id="v">詩</h2>',
+            'c_seg0002': '第一行\n第二行\n第三行\n<p>詩<em>之後</em>。</p>'}, name='old', rules=1)
+        report, z_new = _export(tmp_path, new, fmt, name='new.epub')
+        _, z_old = _export(tmp_path, old, fmt, name='old.epub')
+        assert report.summary()['translated'] == 1 and report.summary()['kept'] == 0
+        chapter = z_new.read('OEBPS/Text/c.xhtml').decode()
+        for text in ('詩', '第一行', '第二行', '第三行', '之後'):
+            assert text in chapter
+        assert chapter.count('First line') == (0 if fmt == 'chinese-only' else 1)
+        assert chapter.count('plain()') == 1
+        assert z_new.read('OEBPS/Text/c.xhtml') == z_old.read('OEBPS/Text/c.xhtml')
+        assert _inner(next(_root(z_new, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a'))) == '詩'

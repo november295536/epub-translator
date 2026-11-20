@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Phase 6 check: segmentation rules 1 (before Phase 6) and 2 (new projects) on the real books.
 
-For every project of --projects-dir, copies its source EPUB (the project's
-`source.epub`; a project without one: the file its project.json names) into
-a new temporary directory outside every git work tree and outside
---projects-dir, and segments every chapter of the copy twice, with the
-rules of projects created before Phase 6 (Segmenter(rules=1)) and with the
-rules of new projects (Segmenter(rules=2)). Nothing is written to the
-project; the project's stored segments are not read.
+For every project of --projects-dir, copies its source EPUB into a new
+temporary directory outside every git work tree and outside --projects-dir,
+and segments every chapter of the copy twice, with the rules of projects
+created before Phase 6 (Segmenter(rules=1)) and with the rules of new
+projects (Segmenter(rules=2)). Nothing is written to the project; the
+project's stored segments are not read. The source is the project's own
+`source.epub`; a project without one is read from the path its project.json
+stores (schema 1 projects), which may lie outside the project directory and
+is then not covered by the snapshot below.
 
 Per project it prints: segments under both rules; model calls needed under
 both rules (segments that are not passthrough); passthrough code segments;
@@ -17,8 +19,13 @@ exactly: every segment's range starts where the previous one ended, the
 last one ends at the last block, and the fingerprints of all segments, in
 order, are the fingerprints of the blocks.
 
-A project PASSes when both segmentations cover the blocks exactly and the
-new rules need no more calls than the old ones. The plan's acceptance
+A project PASSes when every chapter of its spine could be read and
+segmented (the extractor's failures: missing, unreadable or not well-formed
+chapters, chapters that are not XHTML, unresolved entities; a book with no
+chapter at all also FAILs), both segmentations of every chapter cover its
+blocks exactly (contiguous ranges from the first block to the last, each
+segment's fingerprints equal to those of its own blocks), and the new rules
+need no more calls than the old ones. The plan's acceptance
 (project-3: fewer than half the calls) is read from the printed ratio.
 
 Only counts are printed, never book text. Everything in the temporary
@@ -82,14 +89,15 @@ def source_of(project_dir: str) -> str:
 
 def covers(blocks: list, segments: list) -> bool:
     """The segments' ranges follow each other from the first block to the
-    last, and their fingerprints, in order, are the blocks'."""
-    position, prints = 0, []
+    last, and each segment's fingerprints are those of its own blocks."""
+    position = 0
     for seg in segments:
         if seg.block_start != position or seg.block_end <= seg.block_start:
             return False
+        if seg.fingerprints != [b.fingerprint for b in blocks[seg.block_start:seg.block_end]]:
+            return False
         position = seg.block_end
-        prints += seg.fingerprints
-    return position == len(blocks) and prints == [b.fingerprint for b in blocks]
+    return position == len(blocks)
 
 
 def check_source(epub: str) -> tuple[dict, list[str]]:
@@ -98,7 +106,8 @@ def check_source(epub: str) -> tuple[dict, list[str]]:
     extractor.load()
     r = dict.fromkeys(COUNTS, 0)
     uncovered = 0
-    for chapter in extractor.extract_chapters():
+    chapters = extractor.extract_chapters()
+    for chapter in chapters:
         blocks = walk_blocks(chapter.body)
         old = Segmenter(rules=1).segment_chapter(chapter.id, chapter.body)
         new = Segmenter(rules=2).segment_chapter(chapter.id, chapter.body)
@@ -116,6 +125,10 @@ def check_source(epub: str) -> tuple[dict, list[str]]:
             if headings < len(tags):
                 r['merged'] += headings
     problems = []
+    if extractor.failed:
+        problems.append(f'{len(extractor.failed)} chapters could not be checked')
+    if not chapters:
+        problems.append('no chapter checked')
     if uncovered:
         problems.append(f'{uncovered} segmentations do not cover their chapter exactly')
     if r['new_calls'] > r['old_calls']:
