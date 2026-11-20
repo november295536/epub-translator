@@ -2983,8 +2983,8 @@ Verdicts: Opus approve, GPT approve, Gemini approve; only minors remained. Final
 | J4 | limitation | recorded below and in section 7 | — |
 
 Known limitation (not fixed): a UTF-32 chapter with an internal DOCTYPE subset is not detected
-by `has_internal_subset` (UTF-32 is read as latin-1 there, so the subset is not seen and the
-chapter could be filled, dropping the subset). UTF-32 is not a conforming encoding for EPUB
+by `has_internal_subset` (UTF-32 is decoded there as UTF-16 or latin-1, so the subset is not
+seen and the chapter could be filled, dropping the subset). UTF-32 is not a conforming encoding for EPUB
 content documents.
 
 ### Not done
