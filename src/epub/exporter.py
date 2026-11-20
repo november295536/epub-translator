@@ -10,9 +10,8 @@ copied with identical uncompressed bytes.
 Per chapter the blocks (src/epub/blocks.py) must match the stored segments:
 every range valid, the ranges covering all blocks exactly once, every
 fingerprint equal. Otherwise all of its segments stay in the original
-language. Per segment, until Phase 4 brings keyed validation, a reduced
-structural check decides (see `_pieces`); a segment that fails it stays in
-the original language. The translation is filled into the source elements
+language. Per segment the check of src/core/validation.py decides (see
+`_pieces`); a segment that fails it stays in the original language. The translation is filled into the source elements
 on the parsed tree: a block element keeps its own tag and attributes and
 gets the translation's content; a run of inline content is replaced by the
 translation's inline content. The chapter head is not touched (a bilingual
@@ -33,7 +32,6 @@ import zipfile
 from collections import Counter
 from dataclasses import dataclass, field
 from urllib.parse import quote, unquote, urlsplit
-from xml.sax.saxutils import quoteattr
 
 from lxml import etree
 
@@ -41,7 +39,9 @@ from src.core.project import (
     ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus, sha256_file,
 )
 from src.core.segmenter import SegmentType, _code_text
-from src.epub.blocks import BLOCK_TAGS, NO_TEXT_TAGS, element_text, fingerprint, localname, walk_blocks
+import src.core.validation as validation
+from src.core.validation import check_code, check_html
+from src.epub.blocks import element_text, localname, walk_blocks
 from src.epub.extractor import (
     XHTML_MEDIA_TYPE, EPUBError, find_body, open_archive, package_path, parse_xml,
     read_member, read_package, unresolved_entities,
@@ -85,25 +85,31 @@ BILINGUAL_CSS = """
 }
 """
 
-# Why a translated segment was exported in the original language
+# Why a translated segment was exported in the original language: a
+# chapter-level reason, or the first structural rule of the check
+# (src/core/validation.py) that the translation fails
 CHAPTER_UNREADABLE = 'chapter_unreadable'  # chapter not in the spine, missing or not parsed
 CHAPTER_MISMATCH = 'chapter_mismatch'      # blocks differ from the stored ranges/fingerprints
-NOT_WELL_FORMED = 'not_well_formed'        # the translation is not well-formed XML
-STRUCTURE_MISMATCH = 'structure_mismatch'  # its top-level structure differs from the blocks
-AMBIGUOUS_SOURCE = 'ambiguous_source'      # the mapping rule cannot split the source itself
 CODE_MARKUP = 'code_markup'                # the code element holds markup (e.g. highlighting)
-ANCHOR_MISMATCH = 'anchor_mismatch'        # the ids (and a@name) inside a block differ in its translation
 CHAPTER_DOCTYPE = 'chapter_doctype'        # the chapter's DOCTYPE has an internal subset
+NOT_WELL_FORMED = validation.NOT_WELL_FORMED
+STRUCTURE_MISMATCH = validation.STRUCTURE_MISMATCH
+AMBIGUOUS_SOURCE = validation.AMBIGUOUS_SOURCE
 
 REASON_TEXT = {
     CHAPTER_UNREADABLE: '章節無法讀取',
     CHAPTER_MISMATCH: '章節內容與分段紀錄不符',
-    NOT_WELL_FORMED: '譯文不是格式正確的 XML',
-    STRUCTURE_MISMATCH: '譯文的頂層結構與原文區塊不符',
-    AMBIGUOUS_SOURCE: '原文區塊無法明確對應',
     CODE_MARKUP: '程式碼區塊含標記',
-    ANCHOR_MISMATCH: '譯文的錨點（id 或 a 的 name）與原文區塊不同',
     CHAPTER_DOCTYPE: '章節的 DOCTYPE 含內部子集，無法原樣寫回',
+    validation.NOT_WELL_FORMED: '譯文不是格式正確的 XML',
+    validation.STRUCTURE_MISMATCH: '譯文的頂層結構與原文區塊不符',
+    validation.AMBIGUOUS_SOURCE: '原文區塊無法明確對應',
+    validation.EMPTY_BLOCK: '原文有文字的區塊在譯文中沒有文字',
+    validation.UNKNOWN_TAG: '譯文有原文沒有的標籤',
+    validation.KEY_MISMATCH: '帶屬性的標籤（id、連結等）在譯文中缺少或重複',
+    validation.EXTRA_ATTRIBUTES: '譯文的標籤帶有原文沒有的屬性',
+    validation.TAG_COUNT: '譯文的標籤數量與原文不同',
+    validation.CODE_CHANGED: '程式碼在註解行以外與原文不同',
 }
 
 SCHEMA_1_MESSAGE = ('此專案是舊格式（schema 1），無法匯出。'
@@ -628,151 +634,30 @@ def _link_stylesheet(root, ns, href: str) -> None:
     link.set('href', href)
 
 
-# --- The reduced structural check (until Phase 4) -----------------------------
+# --- The check -------------------------------------------------------------------
 
 def _pieces(seg, blocks: list) -> list:
-    """The translation of each block of the segment (raises _Kept).
-
-    The rule. The segment's stored HTML is its blocks' serializations
-    joined by newlines. The translation must be well-formed XML (parsed as
-    the content of an element holding the chapter's namespace
-    declarations). Its top-level nodes are grouped: each element whose name
-    is a block tag is a group of its own; a top-level <br> is refused; the
-    text and inline elements between them form one inline group (comments
-    and whitespace alone form none). The groups must correspond one to one
-    to the blocks, taking each maximal sequence of consecutive inline runs
-    of the source as one group: a block element to an element of the same
-    name, a sequence of runs to one inline group. A sequence of one run
-    takes the whole group; a sequence of k > 1 runs (lines separated by
-    <br> in the source) takes the group split at the newlines in its
-    top-level text, which must give exactly k pieces with content. A
-    piece whose source block has text must have text. The
-    stored HTML must itself split into its blocks by the same rule
-    (checked by fingerprint), else the segment cannot be mapped. Finally
-    the ids inside a source block, below the block element itself, must be
-    the same values, as many times each, in that block's translation, and
-    so must the names of <a> (counted apart from the ids); inner tags and other attributes are not checked
-    (Phase 4).
+    """The translation of each block of the segment (raises _Kept with the
+    first blocking rule). The check is the one every place uses
+    (src/core/validation.py): the stored issues are not trusted.
 
     A code segment's translation is plain text, filled into the code
     element; a translation equal to the source code leaves the block as
     it is (piece None).
     """
     if seg.segment_type == SegmentType.CODE:
-        return [_code_piece(seg, blocks)]
+        piece = _code_piece(seg, blocks)  # the source's shape first
+        result = check_code(seg.text, seg.translated_text)
+        if result.blocking:
+            raise _Kept(result.blocking[0].code)
+        return [piece]
     nsmap = {}  # the declarations in scope for every block of the segment
     for block in blocks:
         nsmap.update(block.parent.nsmap)
-    try:
-        source = _split(_fragment(seg.html, nsmap), blocks)
-    except etree.XMLSyntaxError:
-        raise _Kept(AMBIGUOUS_SOURCE)
-    if source is None or [fingerprint(_text(p)) for p in source] != [b.fingerprint for b in blocks]:
-        raise _Kept(AMBIGUOUS_SOURCE)
-    try:
-        fragment = _fragment(seg.translated_text, nsmap)
-    except etree.XMLSyntaxError:
-        raise _Kept(NOT_WELL_FORMED)
-    pieces = _split(fragment, blocks)
-    if pieces is None:
-        raise _Kept(STRUCTURE_MISMATCH)
-    if any(_text(s).strip() and not _text(p).strip() for s, p in zip(source, pieces)):
-        raise _Kept(STRUCTURE_MISMATCH)  # a block with text translated to none
-    if any(_anchors(s) != _anchors(p) for s, p in zip(source, pieces)):
-        raise _Kept(ANCHOR_MISMATCH)
-    return pieces
-
-
-def _anchors(piece) -> tuple:
-    """The id values and the name values of <a> inside one block's piece,
-    counted separately: below a block element (its own attributes come
-    from the source) or in a run's nodes."""
-    if isinstance(piece, list):
-        elements = [e for n in piece if not isinstance(n, str) for e in n.iter(etree.Element)]
-    else:
-        elements = list(piece.iterdescendants(etree.Element))
-    return (Counter(e.get('id') for e in elements if e.get('id')),
-            Counter(e.get('name') for e in elements if localname(e) == 'a' and e.get('name')))
-
-
-def _fragment(html: str, nsmap: dict):
-    """`html` parsed as the content of an element declaring `nsmap`."""
-    decls = ''.join(f' xmlns={quoteattr(uri)}' if prefix is None
-                    else f' xmlns:{prefix}={quoteattr(uri)}' for prefix, uri in nsmap.items())
-    return parse_xml(f'<fragment{decls}>{html}</fragment>'.encode('utf-8'))
-
-
-def _has_content(items: list) -> bool:
-    return any(item.strip() if isinstance(item, str) else localname(item) is not None
-               for item in items)
-
-
-def _split(fragment, blocks: list):
-    """The fragment's top-level nodes as one piece per block (an element,
-    or a list of strings and nodes for a run), or None when the structure
-    differs (see `_pieces`)."""
-    groups, region = [], [fragment.text or '']
-    for child in fragment:
-        name = localname(child)
-        if name == 'br':
-            return None
-        if name in BLOCK_TAGS:
-            if _has_content(region):
-                groups.append(region)
-            groups.append(child)
-            region = []
-        else:
-            region.append(child)
-        region.append(child.tail or '')
-    if _has_content(region):
-        groups.append(region)
-
-    # The blocks with each sequence of consecutive runs as one entry (a count)
-    shape = []
-    for block in blocks:
-        if block.tag:
-            shape.append(block.nodes[0])
-        elif shape and isinstance(shape[-1], int):
-            shape[-1] += 1
-        else:
-            shape.append(1)
-    if len(groups) != len(shape):
-        return None
-    pieces = []
-    for want, group in zip(shape, groups):
-        if isinstance(want, int):
-            if not isinstance(group, list):
-                return None
-            lines = [group] if want == 1 else [p for p in _lines(group) if _has_content(p)]
-            if len(lines) != want:
-                return None
-            pieces += lines
-        else:
-            if isinstance(group, list) or group.tag != want.tag:
-                return None
-            pieces.append(group)
-    return pieces
-
-
-def _lines(items: list) -> list:
-    """`items` split at the newlines of its strings."""
-    lines = [[]]
-    for item in items:
-        if isinstance(item, str):
-            first, *rest = item.split('\n')
-            lines[-1].append(first)
-            lines += [[part] for part in rest]
-        else:
-            lines[-1].append(item)
-    return lines
-
-
-def _text(piece) -> str:
-    if not isinstance(piece, list):
-        return element_text(piece)
-    return ''.join(item if isinstance(item, str)
-                   else '' if localname(item) in (None, *NO_TEXT_TAGS) else element_text(item)
-                   for item in piece)
+    result = check_html(seg.html, seg.translated_text, [b.fingerprint for b in blocks], nsmap)
+    if result.blocking:
+        raise _Kept(result.blocking[0].code)
+    return result.pieces
 
 
 def _code_target(el):

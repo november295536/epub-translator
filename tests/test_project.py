@@ -1055,3 +1055,47 @@ class TestPhase2ProjectFields:
         assert raw['source_sha256'] == ''
         assert all(not ({'block_start', 'block_end', 'fingerprints'} & set(s))
                    for s in raw['segments'])
+
+
+class TestPhase4MarkFailed:
+    """validate --mark-failed: a broken stored translation becomes FAILED,
+    keeps its text, and a re-translation replaces it only on success."""
+
+    ISSUE = Issue('structure', 'tag_count', 'x', True)
+
+    def test_text_kept_status_and_issues_set(self, pm):
+        pm.mark_translated('ch1_seg0002', '<p>舊</p>')
+        pm.data.segments[1].status = SegmentStatus.REVIEWED
+        revision = pm.data.segments[1].revision
+        pm.mark_failed('ch1_seg0002', [self.ISSUE])
+        seg = pm.data.segments[1]
+        assert (seg.status, seg.translated_text, seg.issues, seg.revision) == \
+            (SegmentStatus.FAILED, '<p>舊</p>', [self.ISSUE], revision)
+        assert pm.get_pending_segments(include_failed=True)[0].segment_id == 'ch1_seg0001'
+        assert 'ch1_seg0002' in [s.segment_id for s in pm.get_pending_segments(include_failed=True)]
+        assert 'ch1_seg0002' not in [s.segment_id for s in pm.get_pending_segments()]
+
+    def test_failed_retry_keeps_the_old_text(self, pm):
+        pm.mark_translated('ch1_seg0002', '<p>舊</p>')
+        pm.mark_failed('ch1_seg0002', [self.ISSUE])
+        new_issue = Issue('backend', 'not_html', 'y', True)
+        failed = TranslationOutcome(None, SegmentStatus.FAILED, [new_issue], 'm', None)
+        assert pm.apply_outcome('ch1_seg0002', failed)
+        seg = pm.data.segments[1]
+        assert (seg.status, seg.translated_text, seg.issues) == \
+            (SegmentStatus.FAILED, '<p>舊</p>', [new_issue])
+        ok = TranslationOutcome('<p>新</p>', SegmentStatus.TRANSLATED, [], 'm', None)
+        assert pm.apply_outcome('ch1_seg0002', ok)
+        assert (seg.status, seg.translated_text, seg.issues) == \
+            (SegmentStatus.TRANSLATED, '<p>新</p>', [])
+
+    def test_unknown_segment(self, pm):
+        with pytest.raises(ValueError):
+            pm.mark_failed('nope', [])
+
+    def test_update_translation_stores_given_issues(self, pm):
+        warning = Issue('quality', 'length_ratio', 'z', False)
+        pm.update_translation('ch1_seg0002', '<p>x</p>', issues=[warning])
+        assert pm.data.segments[1].issues == [warning]
+        pm.update_translation('ch1_seg0002', '<p>y</p>')
+        assert pm.data.segments[1].issues == []
