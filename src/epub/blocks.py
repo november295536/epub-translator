@@ -88,13 +88,17 @@ class Block:
     legacy_text: str    # normalized text with the walked elements' direct comments
     html: str
     nodes: list         # the element, or the strings and nodes of the run
+    # A run only: the walked element that holds it, and the child whose
+    # tail begins it (None: it begins with the parent's text)
+    parent: object = None
+    prev: object = None
 
     @property
     def fingerprint(self) -> str:
         return fingerprint(self.text)
 
 
-def _run_block(items: list) -> Block:
+def _run_block(items: list, parent, prev) -> Block:
     text, legacy, html = [], [], []
     for item in items:
         if isinstance(item, str):
@@ -109,14 +113,15 @@ def _run_block(items: list) -> Block:
             legacy.append(t)
             html.append(serialize(item))
     return Block(None, '', ''.join(text), normalize(''.join(legacy)),
-                 ''.join(html).strip(), list(items))
+                 ''.join(html).strip(), list(items), parent, prev)
 
 
 def _walk(el, out: list) -> None:
     run = [el.text or '']
+    prev = None
 
     def flush():
-        out.append(_run_block(run))
+        out.append(_run_block(run, el, prev))
         run.clear()
 
     for child in el:
@@ -134,6 +139,8 @@ def _walk(el, out: list) -> None:
         else:
             run.append(child)
         run.append(child.tail or '')
+        if name == 'br' or name in BLOCK_TAGS:
+            prev = child  # the next run begins at its tail
     flush()
 
 
