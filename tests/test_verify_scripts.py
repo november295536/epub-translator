@@ -827,7 +827,7 @@ def _migratable(root, name, unmatched=False):
 class TestMigrateCopiesCheck:
 
     PASS_LINE = ('PASS project-1: chapters 2/2, segments 4/4, merge groups 1 (2 segments), '
-                 'count differs 0, export fallback 1, translated chars 54 -> 54, '
+                 'count differs 0, export fallback 1 (cross-parent 0), translated chars 54 -> 54, '
                  'export places 2/2, web load ok')
 
     def _main(self, root, anonymize=True):
@@ -847,11 +847,11 @@ class TestMigrateCopiesCheck:
         assert capsys.readouterr().out.splitlines() == [
             self.PASS_LINE,
             'FAIL project-2: chapters 1/2, segments 2/4, merge groups 0 (0 segments), '
-            'count differs 0, export fallback 0, translated chars 52 -> 52, '
+            'count differs 0, export fallback 0 (cross-parent 0), translated chars 52 -> 52, '
             'export places 0/2, web load ok; '
             '1 chapters unmatched, nothing written; 2 chapters not placed by the export',
             'TOTAL projects 2  chapters 3/4  segments 6/8  merge groups 1 (2 segments)  '
-            'count differs 0  export fallback 1  translated chars unchanged 2  '
+            'count differs 0  export fallback 1 (cross-parent 0)  translated chars unchanged 2  '
             'export places 2/4  web loads 2  failed projects 1',
         ]
         # the originals were only read
@@ -926,8 +926,26 @@ class TestMigrateCopiesCheck:
         _legacy_project(root, chapters, segments, name='alpha')
         assert self._main(root) == 0
         out = capsys.readouterr().out.splitlines()
-        assert 'count differs 2, export fallback 3,' in out[0]
-        assert 'count differs 2  export fallback 3  ' in out[1]
+        assert 'count differs 2, export fallback 3 (cross-parent 0),' in out[0]
+        assert 'count differs 2  export fallback 3 (cross-parent 0)  ' in out[1]
+
+    def test_cross_parent_fallback_counted(self, tmp_path, capsys):
+        # Review round 3: a whole-segment placement whose blocks sit in a
+        # div and after it (c1); one inside a single parent does not count (c2)
+        from tests.test_migrate import _legacy_project, _segment
+        root = tmp_path / 'projects'
+        root.mkdir()
+        chapters = {'c1': '<div class="footnote">Note one<br/>Note two</div><p>Body.</p>',
+                    'c2': '<div class="box">Line one<br/>Line two</div>'}
+        segments = [_segment('c1', 1, '<div class="footnote">Note one<br/>Note two</div>\n'
+                                      '<p>Body.</p>', '<p>一</p><p>二</p><p>本</p>', 'translated'),
+                    _segment('c2', 1, '<div class="box">Line one<br/>Line two</div>',
+                             '<p>一</p><p>二</p>', 'translated')]
+        _legacy_project(root, chapters, segments, name='alpha')
+        assert self._main(root) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert 'export fallback 2 (cross-parent 1),' in out[0]
+        assert 'export fallback 2 (cross-parent 1)  ' in out[1]
 
     def test_glossary_copied_and_names_shown(self, tmp_path, capsys, monkeypatch):
         root = tmp_path / 'projects'
@@ -997,7 +1015,7 @@ class TestMigrateCopiesCheck:
             return book
         monkeypatch.setattr(migrate_check.epub, 'read_epub', read_epub)
         # c2 (left) holds the merged segment with a run: the one fallback
-        assert migrate_check.placed_chapters(directory) == (2, 1, 1)
+        assert migrate_check.placed_chapters(directory) == (2, 1, 1, 0)
 
     def test_web_load_checked(self, tmp_path, capsys, monkeypatch):
         root = tmp_path / 'projects'
