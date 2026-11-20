@@ -2,14 +2,17 @@
 """Phase 2 check: the migration succeeds on copies of the existing projects.
 
 Copies every project of --projects-dir (its project.json, source.epub and
-glossary.json) into a new temporary directory outside the repository,
-migrates each copy with the migration command's code (src/core/migrate.py),
+glossary.json) into a new temporary directory outside the repository and
+outside --projects-dir, migrates each copy with the migration command's code (src/core/migrate.py),
 and checks per project:
 
 - every chapter and every segment matched, and the copy was written;
 - the total number of characters of translated text is unchanged;
 - the export's block placement (EPUBBuilder._place_by_blocks on the chapters
   as ebooklib serves them) accepts every chapter that has segments;
+  translated text segments whose translation has a different number of
+  top-level nodes than the blocks the placement gives them are counted as
+  "export fallback" (they are replaced or wrapped as a whole);
 - the migrated project loads through the web app (Flask test client on the
   copies: home page, project JSON with the migrated segment count, review
   page).
@@ -28,8 +31,8 @@ Usage:
     python3 scripts/verify/phase2_migrate_copies.py [--projects-dir projects] [--anonymize]
 
 Exit code: 0 when every project PASSes, 1 when any FAILs, 2 when the projects
-directory cannot be listed or the temporary directory is inside the
-repository.
+directory cannot be listed or the temporary directory would be inside the
+repository or the projects directory (checked before it is created).
 """
 
 from __future__ import annotations
@@ -50,7 +53,8 @@ from bs4 import BeautifulSoup  # noqa: E402
 from ebooklib import epub  # noqa: E402
 
 from src.core.migrate import migrate_project  # noqa: E402
-from src.epub.builder import EPUBBuilder  # noqa: E402
+from src.core.segmenter import SegmentType  # noqa: E402
+from src.epub.builder import EPUBBuilder, _top_level_count  # noqa: E402
 from src.web.server import create_app  # noqa: E402
 
 PROJECT_FILE = 'project.json'
@@ -76,8 +80,10 @@ def read_segments(project_file: str) -> tuple[int, int]:
     return len(segments), sum(len(s['translated_text']) for s in segments)
 
 
-def placed_chapters(project_dir: str) -> tuple[int, int]:
-    """(chapters with segments, chapters the export's block placement accepts)."""
+def placed_chapters(project_dir: str) -> tuple[int, int, int]:
+    """(chapters with segments, chapters the export's block placement
+    accepts, translated text segments of those that take the whole-segment
+    path because their node count differs from the placement's)."""
     builder = EPUBBuilder(project_dir)
     builder.pm.load()
     with warnings.catch_warnings():
@@ -86,15 +92,19 @@ def placed_chapters(project_dir: str) -> tuple[int, int]:
     by_chapter: dict = {}
     for seg in builder.pm.data.segments:
         by_chapter.setdefault(seg.chapter_id, []).append(seg)
-    placed = 0
+    placed = fallback = 0
     for chapter_id, segments in by_chapter.items():
         item = book.get_item_with_id(chapter_id)
         if item is None:
             continue
         body = BeautifulSoup(item.get_content().decode('utf-8'), 'html.parser').find('body')
-        if body is not None and builder._place_by_blocks(body, segments) is not None:
+        result = None if body is None else builder._place_by_blocks(body, segments)
+        if result is not None:
             placed += 1
-    return len(by_chapter), placed
+            fallback += sum(1 for seg, units, _ in result
+                            if seg.translated_text and seg.segment_type == SegmentType.TEXT
+                            and _top_level_count(seg.translated_text) != len(units))
+    return len(by_chapter), placed, fallback
 
 
 def web_loads(client, name: str, segments: int) -> bool:
@@ -110,13 +120,14 @@ def check_copy(copy_dir: str, client, name: str) -> tuple[dict, list[str]]:
     _, before = read_segments(project_file)
     report = migrate_project(copy_dir)
     migrated, after = read_segments(project_file)
-    with_segments, placed = placed_chapters(copy_dir)
+    with_segments, placed, fallback = placed_chapters(copy_dir)
     loads = web_loads(client, name, migrated)
     result = {
         'chapters': report.chapters, 'chapters_matched': report.chapters_matched,
         'segments': report.segments, 'segments_matched': report.segments_matched,
         'groups': len(report.merged), 'grouped': sum(len(g) for g in report.merged),
-        'count_differs': report.count_differs, 'chars': (before, after),
+        'count_differs': report.count_differs, 'fallback': fallback,
+        'chars': (before, after),
         'placed': (placed, with_segments), 'loads': loads,
     }
     problems = []
@@ -148,11 +159,14 @@ def main(argv: list[str] | None = None) -> int:
     names = sorted(name for name in entries
                    if os.path.isfile(os.path.join(args.projects_dir, name, PROJECT_FILE)))
 
-    work = os.path.realpath(tempfile.mkdtemp(prefix='phase2-migrate-'))
-    try:
-        if os.path.commonpath([work, ROOT]) == ROOT:
-            print('ERROR the temporary directory is inside the repository')
+    parent = os.path.realpath(tempfile.gettempdir())
+    for place, what in ((ROOT, 'the repository'),
+                        (os.path.realpath(args.projects_dir), 'the projects directory')):
+        if os.path.commonpath([parent, place]) == place:
+            print(f'ERROR the temporary directory would be inside {what}')
             return 2
+    work = tempfile.mkdtemp(prefix='phase2-migrate-', dir=parent)
+    try:
         return run(args, names, work)
     finally:
         shutil.rmtree(work)
@@ -161,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
 def run(args, names: list[str], copies: str) -> int:
     client = create_app(projects_dir=copies).test_client()
     keys = ('chapters_matched', 'chapters', 'segments_matched', 'segments', 'groups',
-            'grouped', 'count_differs')
+            'grouped', 'count_differs', 'fallback')
     totals = dict.fromkeys(keys + ('chars_equal', 'placed', 'with_segments', 'loads'), 0)
     failed = 0
     for index, name in enumerate(names, 1):
@@ -191,6 +205,7 @@ def run(args, names: list[str], copies: str) -> int:
                 f"segments {r['segments_matched']}/{r['segments']}, "
                 f"merge groups {r['groups']} ({r['grouped']} segments), "
                 f"count differs {r['count_differs']}, "
+                f"export fallback {r['fallback']}, "
                 f"translated chars {r['chars'][0]} -> {r['chars'][1]}, "
                 f"export places {r['placed'][0]}/{r['placed'][1]}, "
                 f"web load {'ok' if r['loads'] else 'failed'}")
@@ -204,6 +219,7 @@ def run(args, names: list[str], copies: str) -> int:
           f"  segments {totals['segments_matched']}/{totals['segments']}"
           f"  merge groups {totals['groups']} ({totals['grouped']} segments)"
           f"  count differs {totals['count_differs']}"
+          f"  export fallback {totals['fallback']}"
           f"  translated chars unchanged {totals['chars_equal']}"
           f"  export places {totals['placed']}/{totals['with_segments']}"
           f"  web loads {totals['loads']}  failed projects {failed}")
