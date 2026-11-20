@@ -1686,3 +1686,33 @@ class TestReviewRound1Additions:
         assert report.translated == 1 and report.reasons() == {}
         a = next(_body(z, 'OEBPS/Text/c.xhtml').iter(f'{XHTML_NS}a'))
         assert a.get('{http://www.idpf.org/2007/ops}type') == 'noteref'
+
+
+def test_zero_external_attributes_kept(tmp_path):
+    # review round 1: zipfile writes 0 as 0o600 << 16 unless told otherwise
+    epub = _raw_book(tmp_path)
+    info = zipfile.ZipInfo('OEBPS/Images/pic.png')
+    info.create_system = 0
+    with zipfile.ZipFile(epub, 'a') as z:
+        z.writestr(info, b'invented')
+    with zipfile.ZipFile(epub) as z:
+        assert z.getinfo('OEBPS/Images/pic.png').external_attr == 0o600 << 16
+    # rewrite the source with external attributes 0 (as some EPUB tools write)
+    data = bytearray(open(epub, 'rb').read())
+    pos = 0
+    while True:
+        pos = data.find(b'PK\x01\x02', pos)
+        if pos < 0:
+            break
+        name_len = int.from_bytes(data[pos + 28:pos + 30], 'little')
+        if data[pos + 46:pos + 46 + name_len] == b'OEBPS/Images/pic.png':
+            data[pos + 38:pos + 42] = b'\x00\x00\x00\x00'
+        pos += 4
+    open(epub, 'wb').write(bytes(data))
+    with zipfile.ZipFile(epub) as z:
+        assert z.getinfo('OEBPS/Images/pic.png').external_attr == 0
+    project_dir = _project(tmp_path, epub, RAW_TRANSLATIONS)
+    for fmt in FORMATS:
+        _, z = _export(tmp_path, project_dir, fmt)
+        assert z.getinfo('OEBPS/Images/pic.png').external_attr == 0
+        assert z.getinfo('OEBPS/Text/one.xhtml').external_attr == 0o600 << 16
