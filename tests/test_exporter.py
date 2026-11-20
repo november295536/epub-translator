@@ -1768,3 +1768,70 @@ class TestRound1Survivors:
             '<table><tr><td id="c"><h3>甲</h3></td><td id="d"><h3>乙</h3></td></tr></table>')})
         assert [_inner(a) for a in _root(z, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a')] == [
             '甲', '乙']
+
+
+class TestReviewRound2:
+    """Review round 2: note types in the whole copy, no umask call, DOCTYPE
+    subsets read from the parsed prolog, ZIP64 records dropped."""
+
+    @pytest.mark.parametrize('fmt', BILINGUAL)
+    def test_note_types_dropped_throughout_the_copy(self, tmp_path, fmt):
+        chapter = xhtml('<table><tr><td id="n1" epub:type="footnote invented">Note words.</td>'
+                        '<td epub:type="endnote">More.</td></tr></table>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': (
+            '<table><tr><td id="n1" epub:type="footnote invented">註。</td>'
+            '<td epub:type="endnote">多。</td></tr></table>')})
+        report, z = _export(tmp_path, project_dir, fmt)
+        assert report.translated == 1
+        body = _body(z, 'OEBPS/Text/c.xhtml')
+        epub_type = '{http://www.idpf.org/2007/ops}type'
+        original = body.find(f'.//{XHTML_NS}div[@class="original"]')
+        translation = body.find(f'.//{XHTML_NS}div[@class="translation"]')
+        assert [td.get(epub_type) for td in original.iter(f'{XHTML_NS}td')] == [
+            'footnote invented', 'endnote']
+        assert [td.get(epub_type) for td in translation.iter(f'{XHTML_NS}td')] == [
+            'invented', None]
+
+    def test_umask_not_called(self, tmp_path, raw_project, monkeypatch):
+        def umask(mask):
+            raise AssertionError('os.umask is process-wide')
+        monkeypatch.setattr(exporter.os, 'umask', umask)
+        report, z = _export(tmp_path, raw_project, 'chinese-only')
+        assert report.translated == 4
+        assert not [p for p in os.listdir(tmp_path) if p.startswith('.export-')]
+
+    SUBSET = ('<!DOCTYPE html [\n<!ATTLIST p class CDATA #IMPLIED>\n]>\n'
+              '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head>'
+              '<body><p>Words.</p></body></html>')
+
+    def _one(self, tmp_path, chapter):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<p>字。</p>'})
+        return _export(tmp_path, project_dir, 'chinese-only')
+
+    def test_utf16_internal_subset_kept(self, tmp_path):
+        chapter = ('<?xml version="1.0" encoding="utf-16"?>\n' + self.SUBSET).encode('utf-16')
+        report, _ = self._one(tmp_path, chapter)
+        assert report.chapters[0].kept == [('c_seg0001', CHAPTER_DOCTYPE)]
+
+    def test_doctype_text_in_comments_is_no_subset(self, tmp_path):
+        chapter = ('<?xml version="1.0" encoding="utf-8"?>\n<!-- <!DOCTYPE x [ -->\n'
+                   '<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml"><head>'
+                   '<title>T</title></head><body><!-- <!DOCTYPE y [ --><p>Words.</p>'
+                   '</body></html>')
+        report, z = self._one(tmp_path, chapter)
+        assert report.translated == 1 and report.reasons() == {}
+        assert '字。' in z.read('OEBPS/Text/c.xhtml').decode()
+
+    def test_zip64_record_dropped_from_the_extra_field(self, tmp_path):
+        epub = _raw_book(tmp_path)
+        info = zipfile.ZipInfo('OEBPS/Images/pic.png')
+        other = b'\xfe\xca\x02\x00xy'
+        info.extra = b'\x01\x00\x08\x00' + (12).to_bytes(8, 'little') + other
+        with zipfile.ZipFile(epub, 'a') as z:
+            z.writestr(info, b'invented')
+        project_dir = _project(tmp_path, epub, RAW_TRANSLATIONS)
+        _, z = _export(tmp_path, project_dir, 'chinese-only')
+        assert z.getinfo('OEBPS/Images/pic.png').extra == other
+        assert z.read('OEBPS/Images/pic.png') == b'invented'
