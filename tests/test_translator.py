@@ -12,6 +12,7 @@ from src.core.translator import (
     available_models, default_model,
 )
 from src.core.project import SegmentState
+from src.glossary.glossary_manager import GlossaryEntry
 
 
 class TestTranslationEngine:
@@ -900,8 +901,8 @@ class TestTranslateSegment:
         class Glossary:
             entries = {'x': 1}
 
-            def terms_for_prompt(self, text):
-                return ['GLOSSMARK'] if 'One' in text else []
+            def terms_for_prompt(self, text):  # entries since Phase 5 (glossary check)
+                return [GlossaryEntry('GLOSSMARK', '詞彙')] if 'One' in text else []
 
             def format_for_prompt(self, found):
                 return 'GLOSSMARK → 詞彙'
@@ -1951,3 +1952,90 @@ class TestRound3Translator:
         outcome = translate_segment(_engine(fake, max_calls=2), seg, [seg])
         assert [(i.code, i.detail) for i in outcome.issues] == [
             ('not_well_formed', '不是格式正確的 XML：Opening and ending tag mismatch: p and fragment')]
+
+
+# --- Phase 5: glossary warnings of a translated segment ---------------------------
+
+class TestTranslateSegmentGlossary:
+
+    def _gm(self):
+        from tests.test_validation import glossary
+        return glossary(('drip line', '滴水線', 'term'))
+
+    def test_term_not_applied_is_a_warning(self):
+        seg = _seg(text='The drip line moved.')
+        outcome = translate_segment(_engine(FakeBackend(['<p k="1">滴線移動了。</p>'])),
+                                    seg, [seg], self._gm())
+        assert outcome.status == SegmentStatus.TRANSLATED
+        assert outcome.text == '<p>滴線移動了。</p>'
+        assert [(i.kind, i.code, i.blocking) for i in outcome.issues] == \
+            [('glossary', 'term_not_applied', False)]
+
+    def test_after_the_quality_warnings(self):
+        seg = _seg(text='The drip line moved.')
+        outcome = translate_segment(_engine(FakeBackend(['<p k="1">The drip line moved.</p>'])),
+                                    seg, [seg], self._gm())
+        assert [i.code for i in outcome.issues] == ['untranslated', 'term_not_applied']
+
+    def test_applied_term_gives_none(self):
+        seg = _seg(text='The drip line moved.')
+        outcome = translate_segment(_engine(FakeBackend(['<p k="1">滴水線移動了。</p>'])),
+                                    seg, [seg], self._gm())
+        assert outcome.issues == []
+
+    def test_code_segment_not_checked(self):
+        seg = _seg(text='# drip line\nx = 1', seg_type='code')
+        outcome = translate_segment(_engine(FakeBackend(['# 滴線\nx = 1'])), seg, [seg],
+                                    self._gm())
+        assert outcome.status == SegmentStatus.TRANSLATED and outcome.issues == []
+
+
+class TestTranslateSegmentGlossaryRound1:
+    """Item 13: a failing glossary check drops the warnings, never the reply."""
+
+    def test_check_failure_keeps_the_translation(self, caplog):
+        from tests.test_validation import glossary
+
+        class Broken:
+            def __init__(self):
+                self.real = glossary(('drip line', '滴水線'))
+
+            @property
+            def entries(self):
+                if getattr(self, 'prompt_built', False):
+                    raise RuntimeError('damaged')
+                return self.real.entries
+
+            def terms_for_prompt(self, text):
+                self.prompt_built = True
+                return self.real.terms_for_prompt(text)
+
+            def format_for_prompt(self, found):
+                return self.real.format_for_prompt(found)
+
+        seg = _seg(text='The drip line moved.')
+        outcome = translate_segment(_engine(FakeBackend(['<p k="1">滴線移動了。</p>'])),
+                                    seg, [seg], Broken())
+        assert outcome.status == SegmentStatus.TRANSLATED
+        assert (outcome.text, outcome.issues) == ('<p>滴線移動了。</p>', [])
+        assert any('術語檢查失敗' in r.getMessage() for r in caplog.records)
+
+    def test_bad_entries_do_not_fail(self):
+        from tests.test_validation import glossary
+        gm = glossary(('drip line', '滴水線', 'term'))
+        gm.entries['x'] = GlossaryEntry('moved', None, 'term')
+        seg = _seg(text='The drip line moved.')
+        outcome = translate_segment(_engine(FakeBackend(['<p k="1">滴線移動了。</p>'])),
+                                    seg, [seg], gm)
+        assert outcome.status == SegmentStatus.TRANSLATED
+        assert [i.detail for i in outcome.issues] == ['術語「drip line」未譯為「滴水線」']
+
+    def test_check_failure_logged(self, caplog):
+        class Broken:
+            entries = property(lambda self: (_ for _ in ()).throw(RuntimeError('x')))
+        from src.core.translator import _glossary_warnings
+        seg = _seg(seg_id='c1_seg0042', text='Words.')
+        assert _glossary_warnings(seg, '<p>字</p>', Broken()) == []
+        record = caplog.records[-1]
+        assert record.getMessage() == '術語檢查失敗，略過術語警告: c1_seg0042'
+        assert record.exc_info is not None and record.exc_info[0] is RuntimeError

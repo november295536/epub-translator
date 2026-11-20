@@ -892,3 +892,323 @@ class TestRound3Survivors:
         assert self._details('<p>A <img src="s" alt="x"/><img src="s" alt=""/></p>',
                              '<p>甲<img src="s" alt=""/></p>') == [
             ('key_mismatch', '第 1 個區塊帶 k 屬性的 <img>：原文 1 個，譯文 0 個')]
+
+
+# --- Phase 5: glossary compliance --------------------------------------------------
+
+from src.glossary.glossary_manager import FULL_GLOSSARY_MAX_TERMS, GlossaryEntry, GlossaryManager  # noqa: E402
+
+
+def glossary(*items):
+    """A glossary of (term, translation[, category]) held in memory only."""
+    gm = GlossaryManager('/nonexistent/glossary.json')
+    for term, translation, *category in items:
+        gm.entries[term.lower()] = GlossaryEntry(term, translation, *category)
+    return gm
+
+
+def missing(source, translation, gm):
+    return [e.term for e in validation.terms_not_applied(source, translation, gm)]
+
+
+class TestGlossaryCompliance:
+
+    GM = glossary(('drip line', '滴水線', 'term'), ('Velmora', 'Velmora', 'place'))
+
+    def test_other_rendering_gets_an_issue(self):
+        issues = validation.glossary_issues('The drip line moved.', '<p>滴線移動了。</p>', self.GM)
+        assert issues == [validation.Issue(kind='glossary', code='term_not_applied',
+                                           detail='術語「drip line」未譯為「滴水線」',
+                                           blocking=False)]
+
+    def test_glossary_rendering_gets_none(self):
+        assert validation.glossary_issues('The drip line moved.', '<p>滴水線移動了。</p>',
+                                          self.GM) == []
+
+    def test_parenthetical_original_ignored(self):
+        assert missing('The drip line moved.', '滴水線（drip line）移動了。', self.GM) == []
+        # round 2: a rendering found as written complies, also inside parentheses
+        assert missing('Near Velmora.', '在某城（Velmora）附近。', self.GM) == []
+        assert missing('Near Velmora.', '在某城(Velmora)附近。', self.GM) == []
+        assert missing('Near Velmora.', '在 Velmora 附近。', self.GM) == []
+        # a parenthetical with Chinese is text, not an original
+        assert missing('The drip line moved.', '線（滴水線）移動了。', self.GM) == []
+
+    def test_only_terms_of_the_source(self):
+        # a small glossary sends every entry; only those in the source are checked
+        assert missing('Nothing here.', '這裡沒有。', self.GM) == []
+        assert missing('Drip lines and Velmora.', '無。', self.GM) == ['drip line', 'Velmora']
+
+    def test_matching_of_the_prompt(self):
+        gm = glossary(('render', '算繪'), ('AI', '人工智慧'))
+        assert missing('We maintain rendering.', '我們維護。', gm) == ['render']  # AI not in maintain
+
+    def test_large_glossary(self):
+        gm = glossary(*[(f'word{i:03d}', f'詞{i}') for i in range(FULL_GLOSSARY_MAX_TERMS + 1)])
+        assert missing('Only word007 here.', '只有這裡。', gm) == ['word007']
+
+    def test_empty_translation_and_term_skipped(self):
+        gm = glossary(('drip line', ' '), ('  ', '空'), ('', '空'))
+        assert missing('The drip line moved.', '移動了。', gm) == []
+
+    def test_no_glossary(self):
+        assert validation.terms_not_applied('The drip line.', '無。', None) == []
+        assert validation.terms_not_applied('The drip line.', '無。', glossary()) == []
+
+    def test_work_only_as_a_title(self):
+        gm = glossary(('Silver Atlas', '銀色地圖集', 'work'))
+        # the prompt: a work's translation only where it is the work's title
+        assert missing('She owned a silver atlas.', '她有一本銀色的地圖集。', gm) == []
+        assert missing('She read Silver Atlas.', '她讀了一本地圖集。', gm) == ['Silver Atlas']
+        assert missing('She read Silver Atlas.', '她讀了《銀色地圖集》。', gm) == []
+        other = glossary(('Silver Atlas', '銀色地圖集', 'term'))
+        assert missing('She owned a silver atlas.', '她有一本地圖集。', other) == ['Silver Atlas']
+
+    @pytest.mark.parametrize('expected,translation', [
+        ('Velmora 小姐', '<p>Velmora小姐笑了。</p>'),            # whitespace
+        ('API', '<p>api 呼叫</p>'),                               # case
+        ('艾拉·維恩', '<p>艾拉・維恩</p>'),                      # middle dots
+        ('艾拉‧維恩', '<p>艾拉•維恩</p>'),
+        ('Ｘ光', '<p>X光</p>'),                                  # NFKC
+        ('甲&乙', '<p>甲&amp;乙</p>'),                           # entities
+        ('滴水線', '<p><em>滴水</em>線</p>'),                     # tags
+        ('滴水\n線', '<p>滴水 線</p>'),
+    ])
+    def test_normalization(self, expected, translation):
+        gm = glossary(('drip line', expected))
+        assert missing('The drip line.', translation, gm) == []
+
+    def test_comparable(self):
+        comparable = validation._compact(validation._without_originals(
+            validation._normalized('A b（Orig）<Ｃ・d')))
+        assert comparable == 'ab<c·d'
+
+    def test_check_segment_adds_glossary_warnings(self):
+        seg = SimpleNamespace(segment_type='text', html='<p>The drip line.</p>',
+                              text='The drip line.', fingerprints=[])
+        result = check_segment(seg, '<p>滴線。</p>', self.GM)
+        assert codes(result) == ['term_not_applied'] and not result.blocking
+        assert check_segment(seg, '<p>滴水線。</p>', self.GM).issues == []
+        assert check_segment(seg, '<p>滴線。</p>').issues == []  # no glossary given
+        # a failing translation gets only its structural issues
+        assert codes(check_segment(seg, '<p>滴線。<b>x</b></p>', self.GM)) == ['unknown_tag']
+
+    def test_check_segment_schema_1_and_code(self):
+        seg = SimpleNamespace(segment_type='text', html='', text='The drip line.', fingerprints=[])
+        assert codes(check_segment(seg, '滴線。', self.GM)) == ['term_not_applied']
+        code = SimpleNamespace(segment_type='code', html='', text='# drip line\nx = 1',
+                               fingerprints=[])
+        assert check_segment(code, '# 滴線\nx = 1', self.GM).issues == []
+
+    def test_glossary_kind_never_blocks(self):
+        assert not validation._issue(validation.GLOSSARY, 'x', 'y').blocking
+        assert not validation._issue(validation.QUALITY, 'x', 'y').blocking
+        assert validation._issue(validation.STRUCTURE, 'x', 'y').blocking
+
+
+
+# --- Phase 5 review round 1 -------------------------------------------------------
+
+class TestGlossaryRound1:
+
+    @pytest.mark.parametrize('text,expected', [
+        # after NFKC (see _normalized) every parenthesis is ASCII
+        ('介面(API (v2))', '介面'),                        # nested, no Han: all gone
+        ('介面(說明 (v2))', '介面(說明 )'),                # Han outside: only the inner group
+        ('(a (b) c)', ''),
+        ('甲 (乙', '甲 (乙'),                               # unmatched: kept
+        ('甲) 乙 (x)', '甲) 乙 '),
+        ('值 (\U00020000)', '值 (\U00020000)'),            # a supplementary-plane Han character
+        ('值 (一)', '值 (一)'),
+        ('值 (鿿)', '值 (鿿)'),
+        ('值 (㐀)', '值 (㐀)'),
+        ('值 (豈)', '值 (豈)'),
+        ('值 (、)', '值 '),                             # punctuation is not Han
+    ])
+    def test_without_originals(self, text, expected):
+        assert validation._without_originals(text) == expected
+
+    def test_nested_original_ignored(self):
+        gm = glossary(('interface', '介面', 'term'))
+        assert missing('The interface.', '<p>介面（API (v2)）。</p>', gm) == []
+        gm = glossary(('Velmora', '維城', 'place'))
+        assert missing('Velmora.', '<p>某城（Velmora (old)）。</p>', gm) == ['Velmora']
+
+    def test_greater_than_inside_an_attribute(self):
+        gm = glossary(('drip line', '滴水線', 'term'))
+        translation = '<p>甲<em title="a > b">滴水</em>線。</p>'
+        assert missing('The drip line.', translation, gm) == []
+
+    def test_plain_text(self):
+        assert validation.plain_text('<p>甲<em title="a > b">乙</em>&amp;<!-- c -->丙</p>'
+                                     '<style>x</style>') == '甲乙&丙'
+        assert validation.plain_text('a < b & c') == 'a < b & c'  # does not parse: as it is
+        assert validation.plain_text('<p>\ud800</p>') == '<p>\ud800</p>'
+
+    @pytest.mark.parametrize('term,category,source,found', [
+        ('Eve', 'person', 'Every event.', False),
+        ('Eve', 'person', 'Eve came.', True),
+        ('Eve', 'person', "Eve's hat.", True),               # possessive
+        ('Eve', 'person', 'Eve’s hat.', True),
+        ('Java', 'term', 'In JavaScript.', False),
+        ('Java', 'term', 'In Java.', True),
+        ('Mark', 'person', 'The market.', False),
+        ('Q', 'term', 'Quick, quiet.', False),               # one letter
+        ('Q', 'term', 'Ask Q.', True),
+        ('API', 'term', 'Two APIs.', True),                  # plural
+        ('box', 'term', 'Two boxes.', True),
+        ('Jones', 'person', 'The Joneses came.', True),
+        ('Velmora', 'place', 'Velmorans came.', False),
+        ('render', 'term', 'Rendering and rendered.', True),  # inflected verbs
+        ('render', 'term', 'Renders.', True),
+        ('render', 'term', 'A renderer.', False),
+        ('calibrate', 'term', 'It calibrates.', True),        # a final e
+        ('calibrate', 'term', 'It calibrated.', True),
+        ('calibrate', 'term', 'Calibrating it.', True),
+        ('calibrate', 'term', 'A calibrator.', False),
+        ('Bolt', 'person', 'Bolting.', False),               # names take no -ing
+        ('Bolt', 'person', 'Bolted.', False),
+        ('Bolt', 'organization', 'Bolts.', True),
+        ('C#', 'term', 'In C# code.', True),
+        ('e', 'term', 'The e here.', True),                 # one letter e: no e-stem
+        ('e', 'term', 'The ing here.', False),
+    ])
+    def test_occurrence(self, term, category, source, found):
+        entry = GlossaryEntry(term, '譯', category)
+        assert bool(validation.occurrence_pattern(entry).search(source)) is found
+
+    def test_work_case_sensitive_with_inflection(self):
+        pattern = validation.occurrence_pattern(GlossaryEntry('Silver Atlas', '譯', 'work'))
+        assert pattern.search("Silver Atlas's map")
+        assert not pattern.search('silver atlas map')
+        assert pattern.flags & validation.re.IGNORECASE == 0
+        # round 2: a capitalised name is case-sensitive too; a term is not
+        other = validation.occurrence_pattern(GlossaryEntry('Silver Atlas', '譯', 'term'))
+        assert other.search('silver atlas map')
+
+    def test_bad_entries_skipped(self):
+        gm = glossary(('drip line', '滴水線', 'term'))
+        gm.entries['a'] = GlossaryEntry('alpha', None, 'term')
+        gm.entries['b'] = GlossaryEntry('beta', 5, 'term')
+        gm.entries['d'] = GlossaryEntry('delta', '丁', ['not', 'a', 'string'])
+        assert missing('Alpha beta drip line delta.', '無。', gm) == ['delta', 'drip line']
+        # a term that is not a string is skipped by the check (load() refuses it)
+        assert not validation._checkable(GlossaryEntry(None, '丙', 'term'))
+
+    def test_sorted_by_term(self):
+        gm = glossary(('beta', '乙'), ('Alpha', '甲'), ('gamma', '丙'))
+        assert missing('Gamma beta alpha.', '無。', gm) == ['Alpha', 'beta', 'gamma']
+
+    def test_large_glossary_needs_an_occurrence(self):
+        # above the prompt's size limit the prompt holds the entries whose
+        # start matches; the check needs the full occurrence
+        gm = glossary(*[(f'word{i:03d}', f'詞{i}') for i in range(FULL_GLOSSARY_MAX_TERMS + 1)])
+        assert missing('Only word007x here.', '無。', gm) == []
+
+
+class TestGlossaryRound1Survivors:
+    """Mutation testing, Phase 5 review round 1."""
+
+    @pytest.mark.parametrize('term,source,found', [
+        ('de', 'The ding.', True),            # a two-letter term with a final e
+        ('TAX', 'The TAX.', True),            # a final X is not an e
+        ('CODE', 'Coding it.', True),         # a capital final E
+        ('X1 rate', 'X1 rating.', True),      # the letter before the e decides
+        ('Q-te', 'Q-ting.', True),
+    ])
+    def test_final_e(self, term, source, found):
+        entry = GlossaryEntry(term, '譯', 'term')
+        assert bool(validation.occurrence_pattern(entry).search(source)) is found
+
+    def test_work_plural_case_sensitive(self):
+        entry = GlossaryEntry('Silver Atlas', '譯', 'work')
+        assert validation.occurrence_pattern(entry).search('Two Silver Atlases.')
+
+    def test_sorted_by_lower_case(self):
+        # '_' sorts after capitals and before small letters
+        gm = glossary(('ab', '甲'), ('_x', '乙'))
+        assert missing('ab and _x.', '無。', gm) == ['_x', 'ab']
+
+
+
+# --- Phase 5 review round 2 -------------------------------------------------------
+
+class TestGlossaryRound2:
+
+    def test_only_terms_the_prompt_got(self):
+        # below the size limit the prompt has every entry; above it only those
+        # whose start matches: "Calibrating" does not start with "calibrate"
+        small = glossary(('calibrate', '校準', 'term'))
+        assert missing('Calibrating it.', '無。', small) == ['calibrate']
+        large = glossary(('calibrate', '校準', 'term'),
+                         *[(f'word{i:03d}', f'詞{i}') for i in range(FULL_GLOSSARY_MAX_TERMS)])
+        assert missing('Calibrating it.', '無。', large) == []
+        assert missing('It calibrates.', '無。', large) == ['calibrate']
+
+    @pytest.mark.parametrize('term,category', [
+        ('VALE', 'work'), ('VALE', 'person'), ('CODE', 'term'), ('code', 'work'),
+        ('Ella Vane', 'person'), ('calibrate', 'term'), ('e', 'term'), ('C#', 'term'),
+    ])
+    def test_bare_term_matches(self, term, category):
+        assert validation.occurrence_pattern(GlossaryEntry(term, '譯', category)).search(
+            f'x {term} y')
+
+    @pytest.mark.parametrize('rendering,translation,complies', [
+        ('滴<em>水</em>線', '<p>滴水線。</p>', True),          # tags in the rendering
+        ('滴&#27700;線', '<p>滴水線。</p>', True),             # entities in the rendering
+        ('C (language)', '<p>用 C (language) 寫。</p>', True),  # not shortened to "c"
+        ('C (language)', '<p>用 C 寫。</p>', False),
+        ('API', '<p>應用程式介面（API）。</p>', True),          # found as written
+        ('滴水線', '<p>滴水 (drip) 線。</p>', True),             # found without the original
+    ])
+    def test_rendering(self, rendering, translation, complies):
+        gm = glossary(('drip line', rendering, 'term'))
+        assert (missing('The drip line.', translation, gm) == []) is complies
+
+    def test_unmatched_after_nested(self):
+        assert validation._without_originals('(a(b))Z') == 'Z'
+        assert validation._without_originals('x(a(b)c)y(d)z') == 'xyz'
+
+    @pytest.mark.parametrize('term,category,source,found', [
+        ('Will', 'person', 'We will go.', False),
+        ('Will', 'person', 'Will went.', True),
+        ('Grace', 'place', 'With grace.', False),
+        ('rose', 'person', 'A Rose and a rose.', True),     # a lower-case name: any case
+        ('Will', 'term', 'We will go.', True),               # not a name
+    ])
+    def test_capitalised_names_case_sensitive(self, term, category, source, found):
+        entry = GlossaryEntry(term, '譯', category)
+        assert bool(validation.occurrence_pattern(entry).search(source)) is found
+
+    def test_longer_term_first(self):
+        gm = glossary(('primary key', '主鍵', 'term'), ('key', '鍵值', 'term'))
+        assert missing('Use a primary key.', '<p>使用主鍵。</p>', gm) == []
+        # an occurrence of its own still counts
+        assert missing('A primary key and a key.', '<p>主鍵與鑰匙。</p>', gm) == ['key']
+        assert [e.term for e in validation.occurring('primary key, key', gm.entries.values())] \
+            == ['primary key', 'key']
+        assert [e.term for e in validation.occurring('primary key', gm.entries.values())] \
+            == ['primary key']
+
+    def test_note_number_after_a_term(self):
+        gm = glossary(('Ella Vane', '艾拉·維恩', 'person'))
+        assert missing('Ella Vane<sup>3</sup> came.'.replace('<sup>', '').replace('</sup>', ''),
+                       '<p>她來了。</p>', gm) == ['Ella Vane']
+        assert not validation.occurrence_pattern(GlossaryEntry('Ella Vane', '譯', 'person')) \
+            .search('Ella Vanes_x')
+
+
+class TestGlossaryRound2Survivors:
+
+    def test_lower_case_work_stays_case_sensitive(self):
+        pattern = validation.occurrence_pattern(GlossaryEntry('vale road', '譯', 'work'))
+        assert pattern.search('the vale road') and not pattern.search('The Vale Road')
+
+    def test_shorter_term_at_the_same_start(self):
+        entries = glossary(('primary key', '主鍵'), ('primary', '主要')).entries.values()
+        assert [e.term for e in validation.occurring('a primary key', entries)] == ['primary key']
+
+    def test_every_longer_span_kept(self):
+        entries = glossary(('primary key', '主鍵'), ('sort order', '排序'), ('key', '鍵')).entries
+        found = validation.occurring('primary key, sort order', entries.values())
+        assert [e.term for e in found] == ['primary key', 'sort order']

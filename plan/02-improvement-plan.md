@@ -487,17 +487,44 @@ Acceptance:
 
 Depends on Phase 4.
 
+Split in two parts, so that the check is measured on real data before more machinery is
+built around it.
+
+Part A:
+
 - Compliance check as a quality issue. `work`-category terms are checked only where the prompt
   rule applies; parenthetical originals are ignored when comparing.
-- Targeted fix: send source, current translation, and one issue; re-validate the result.
 - Minimal review changes: an issue badge per segment, a filter for segments with issues, and
   search that includes `FAILED` segments. Validation result returned by update and approve.
+- Check script with a sample of 20 issues for the user to judge.
+
+Part B, decided only after the user has judged the sample of part A:
+
+- Targeted fix: send source, current translation, and one issue; re-validate the result.
+  Built only if the judged sample shows that most issues are real problems and that a fix
+  is worth a model call; otherwise dropped or replaced by what the sample suggests.
+
+As built (part A, 2026-11-21):
+
+- One `glossary`/`term_not_applied` warning per term: an entry the prompt gives
+  (`terms_for_prompt`) that occurs in the segment's source text (the prompt's matching,
+  `term_pattern`) and whose translation is not a substring of the translation. Both sides are
+  compared without tags, entities decoded, NFKC, one kind of middle dot, without whitespace,
+  case-folded, and without parentheticals that hold no Chinese character (a parenthetical
+  original). Entries with an empty translation are skipped; code segments are not checked.
+- The prompt applies a `work` translation only where the term is the title of a work; the
+  check takes "written in the source with the glossary's capitals" as that condition.
+- It runs where the other quality warnings run (after a model call, at review save and
+  approve, `translate.py validate`), only on a translation that passes the structural check.
+  Approve clears the stored issues, as before; its response still lists them. Warnings are
+  stored with the segment; existing translations get them only when saved or translated again
+  (`validate` and the check script report them without storing).
 
 Acceptance:
 
 - Tests: a translation that renders a glossary term differently gets a compliance issue; the
-  same translation with the glossary rendering gets none; a targeted fix whose result fails
-  structural validation is rejected and the previous translation is kept.
+  same translation with the glossary rendering gets none; (part B, if built) a targeted fix
+  whose result fails structural validation is rejected and the previous translation is kept.
 - Check script: per project, the number of translated segments with a compliance issue, and a
   sample of 20 listed by segment ID for the user to judge. Target agreed after the first run:
   the user marks how many of the 20 are real problems; the check is kept only if most are.
