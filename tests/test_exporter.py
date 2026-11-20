@@ -16,7 +16,7 @@ from src.epub import exporter
 from src.epub.blocks import serialize
 from src.epub.exporter import (
     AMBIGUOUS_SOURCE, BILINGUAL_CSS, CHAPTER_MISMATCH, CHAPTER_UNREADABLE, CODE_MARKUP,
-    FORMATS, MISSING_ANCHOR, NOT_WELL_FORMED, SCHEMA_1_MESSAGE, STRUCTURE_MISMATCH, ExportError,
+    CHAPTER_DOCTYPE, FORMATS, ANCHOR_MISMATCH, NOT_WELL_FORMED, SCHEMA_1_MESSAGE, STRUCTURE_MISMATCH, ExportError,
     export_project,
 )
 from src.epub.extractor import EPUBExtractor, parse_xml
@@ -614,8 +614,6 @@ class TestCode:
     @pytest.mark.parametrize('chapter, expected', [
         ('<pre class="c"><code>x = 1  # one\n</code></pre>',
          '<pre class="c"><code>x = 1  # 一 &lt;&amp;&gt;\n</code></pre>'),
-        ('<pre> <code>x = 1  # one\n</code> </pre>',
-         '<pre> <code>x = 1  # 一 &lt;&amp;&gt;\n</code> </pre>'),
         ('<pre>x = 1  # one\n</pre>', '<pre>x = 1  # 一 &lt;&amp;&gt;\n</pre>'),
         ('<code>x = 1  # one\n</code>', '<code>x = 1  # 一 &lt;&amp;&gt;\n</code>'),
         (' <code>x = 1  # one\n</code> ', '<code>x = 1  # 一 &lt;&amp;&gt;\n</code>'),
@@ -645,6 +643,7 @@ class TestCode:
         '<pre>x = 1<code>y</code></pre>',
         '<pre><code>a</code><code>b</code></pre>',
         '<pre>lead <code>x = 1  # one</code></pre>',
+        '<pre> <code>x = 1  # one</code> </pre>',   # stored text != the target's text
         '<pre><code>x = 1  # one</code> trail</pre>',
     ])
     def test_code_with_markup_kept(self, tmp_path, chapter):
@@ -733,7 +732,7 @@ class TestToc:
         # translated; Eight: no href
         assert nav == ['第一部', '第二部', 'Three', 'Four', '第二部', 'Six', 'Seven', 'Eight',
                        'Outside a nav']
-        assert ncx == ['第一部', '第二部', 'Three', 'Seven', '第二部']
+        assert ncx == ['第一部', '第二部', 'Three', 'Seven', '1']  # the pageTarget keeps its label
 
     def test_target_inside_a_heading_and_header_block(self, tmp_path):
         # the entry after one whose <span> is replaced is still relabelled
@@ -785,7 +784,7 @@ class TestToc:
         assert '<text>守燈人</text>' in z.read('OEBPS/toc.ncx').decode()
 
     def test_relative_to_the_toc_file(self, tmp_path):
-        nav = xhtml('<nav><ol><li><a href="../Text/c.xhtml">C</a></li></ol></nav>')
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="../Text/c.xhtml">C</a></li></ol></nav>')
         epub = write_raw_epub(
             tmp_path / 'b.epub',
             [('nav', 'Nav/nav.xhtml', 'application/xhtml+xml', 'nav'),
@@ -889,7 +888,7 @@ class TestProjectLevel:
     def test_reason_texts_cover_every_reason(self):
         assert set(exporter.REASON_TEXT) == {
             CHAPTER_UNREADABLE, CHAPTER_MISMATCH, NOT_WELL_FORMED, STRUCTURE_MISMATCH,
-            AMBIGUOUS_SOURCE, CODE_MARKUP, MISSING_ANCHOR}
+            AMBIGUOUS_SOURCE, CODE_MARKUP, ANCHOR_MISMATCH, CHAPTER_DOCTYPE}
 
     def test_no_duplicate_ids_in_raw_fixture(self, tmp_path, raw_project):
         for fmt in FORMATS:
@@ -946,7 +945,9 @@ class TestCLIAndWeb:
         assert status == {'state': 'completed', 'format': 'bilingual-horizontal',
                           'filename': 'proj_bilingual-horizontal.epub', 'error': None,
                           'summary': {'translated': 4, 'kept': 0, 'untranslated': 0,
-                                      'reasons': {}}}
+                                      'reasons': {}, 'lines': [
+                                          '以譯文匯出 4 段，保留原文 0 段'
+                                          '（另有 0 段未翻譯或翻譯失敗，以原文匯出）']}}
 
     def test_web_schema_1_message(self, tmp_path):
         from tests.test_migrate import _legacy_project
@@ -967,7 +968,10 @@ class TestCLIAndWeb:
         from src.web.server import create_app
         client = create_app(projects_dir=os.path.dirname(raw_project)).test_client()
         page = client.get('/project/proj/export').get_data(as_text=True)
-        assert 'exportSummary.translated' in page and 'exportSummary = data.summary' in page
+        # review round 1: the report's lines (reason texts, chapters), also
+        # for an export that finished before the tab was opened
+        assert 'exportSummary.lines' in page and 'exportSummary.reasons' not in page
+        assert 'this.showResult(data);\n                }' in page
 
 
 class TestSurvivors:
@@ -975,9 +979,9 @@ class TestSurvivors:
 
     def test_report_codes_texts_and_messages(self, tmp_path, raw_project):
         assert (CHAPTER_UNREADABLE, CHAPTER_MISMATCH, NOT_WELL_FORMED, STRUCTURE_MISMATCH,
-                AMBIGUOUS_SOURCE, CODE_MARKUP, MISSING_ANCHOR) == (
+                AMBIGUOUS_SOURCE, CODE_MARKUP, ANCHOR_MISMATCH, CHAPTER_DOCTYPE) == (
             'chapter_unreadable', 'chapter_mismatch', 'not_well_formed', 'structure_mismatch',
-            'ambiguous_source', 'code_markup', 'missing_anchor')
+            'ambiguous_source', 'code_markup', 'anchor_mismatch', 'chapter_doctype')
         assert exporter.REASON_TEXT == {
             'chapter_unreadable': '章節無法讀取',
             'chapter_mismatch': '章節內容與分段紀錄不符',
@@ -985,7 +989,8 @@ class TestSurvivors:
             'structure_mismatch': '譯文的頂層結構與原文區塊不符',
             'ambiguous_source': '原文區塊無法明確對應',
             'code_markup': '程式碼區塊含標記',
-            'missing_anchor': '譯文缺少原文區塊內的錨點（id 或 a 的 name）',
+            'anchor_mismatch': '譯文的錨點（id 或 a 的 name）與原文區塊不同',
+            'chapter_doctype': '章節的 DOCTYPE 含內部子集，無法原樣寫回',
         }
         assert SCHEMA_1_MESSAGE == ('此專案是舊格式（schema 1），無法匯出。'
                                     '請先執行 python3 translate.py migrate <專案目錄> 再匯出。')
@@ -1001,7 +1006,7 @@ class TestSurvivors:
 
     @pytest.mark.parametrize('tag', ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
     def test_every_heading_level_labels(self, tmp_path, tag):
-        nav = xhtml('<nav><ol><li><a href="Text/c.xhtml">C</a></li></ol></nav>')
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml">C</a></li></ol></nav>')
         chapter = xhtml(f'<p>Lead words.</p><{tag}>Heading words</{tag}>')
         epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=nav, ncx=None)
         project_dir = _project(tmp_path, epub, {'c_seg0001': '<p>引。</p>',
@@ -1083,17 +1088,18 @@ class TestSurvivors:
         assert {i.external_attr for i in z.infolist() if i.filename != 'mimetype'} == {
             0o100640 << 16}
 
-    def test_nav_list_targets_relabelled(self, tmp_path):
+    def test_nav_list_targets_not_relabelled(self, tmp_path):
+        # review round 1: only the navMap is the table of contents
         ncx = ('<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"><navList>'
                '<navTarget id="t"><navLabel><text>X</text></navLabel>'
                '<content src="Text/c.xhtml"/></navTarget></navList></ncx>')
         epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml('<h1>Cee</h1>'))}, nav=None, ncx=ncx)
         project_dir = _project(tmp_path, epub, {'c_seg0001': '<h1>西</h1>'})
         _, z = _export(tmp_path, project_dir, 'chinese-only')
-        assert '<text>西</text>' in z.read('OEBPS/toc.ncx').decode()
+        assert z.read('OEBPS/toc.ncx') == zipfile.ZipFile(epub).read('OEBPS/toc.ncx')
 
     def test_nav_labels_only_on_links(self, tmp_path):
-        nav = xhtml('<nav><ol><li><span href="Text/c.xhtml">Keep</span>'
+        nav = xhtml('<nav epub:type="toc"><ol><li><span href="Text/c.xhtml">Keep</span>'
                     '<a href="Text/c.xhtml">C</a></li></ol></nav>')
         epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml('<h1>Cee</h1>'))}, nav=nav, ncx=None)
         project_dir = _project(tmp_path, epub, {'c_seg0001': '<h1>西</h1>'})
@@ -1182,15 +1188,18 @@ class TestAnchorsInTheGate:
          '<p>見<a href="#n1">註</a>。</p>\n<p>文。</p>'),                       # inner id lost
         ('<p><a name="fn"/>Note text.</p>', '<p>註文。</p>'),                     # a@name lost
         ('<p><a id="x" name="y"/>Words.</p>', '<p><b name="x"/><a id="y"/>字。</p>'),  # b@name no anchor
+        ('<p>Words.</p>', '<p><a id="new"/>字。</p>'),                           # an extra id
+        ('<p>A <a id="r"/>b.</p>', '<p>甲<a id="r"/>乙<a id="r"/>。</p>'),          # a repeated id
+        ('<p id="own">Words.</p>', '<p><span id="own">字</span>。</p>'),          # the block's own id
         ('<p>Plain <span id="s">words</span>.</p>', '<p>普通<span id="t">字</span>。</p>'),
         ('<div class="v"><a id="l1"/>Line one<br/>Line two</div>', '第一行\n第二行'),  # in a run
         ('<div class="v">Line one<br/><a id="l2"/>Line two</div>',
          '<a id="l2"/>第一行\n第二行'),                                         # wrong line
     ])
     @pytest.mark.parametrize('fmt', FORMATS)
-    def test_missing_anchor_kept_original(self, tmp_path, chapter, translation, fmt):
+    def test_anchor_mismatch_kept_original(self, tmp_path, chapter, translation, fmt):
         report, z, epub = self._report(tmp_path, chapter, translation, fmt)
-        assert report.chapters[0].kept == [('c_seg0001', MISSING_ANCHOR)]
+        assert report.chapters[0].kept == [('c_seg0001', ANCHOR_MISMATCH)]
         src = zipfile.ZipFile(epub)
         assert z.read('OEBPS/Text/c.xhtml') == src.read('OEBPS/Text/c.xhtml')
 
@@ -1200,7 +1209,6 @@ class TestAnchorsInTheGate:
         ('<p><a name="fn"/>Note text.</p>', '<p><a name="fn"/>註文。</p>'),
         ('<p><span name="x"/>Words.</p>', '<p>字。</p>'),                        # name only counts on <a>
         ('<p><a name="fn"/>Note text.</p>', '<p><a id="fn"/>註文。</p>'),         # the value counts
-        ('<p>Words.</p>', '<p><a id="new"/>字。</p>'),                           # extra ids allowed
         ('<div class="v">Line one<br/><a id="l2"/>Line two</div>', '第一行\n<a id="l2"/>第二行'),
     ])
     def test_anchor_present_accepted(self, tmp_path, chapter, translation):
@@ -1217,7 +1225,7 @@ class TestTocContainerTarget:
     """Fix round: a target that contains blocks takes its first block's
     label when that block is a filled heading."""
 
-    NAV = xhtml('<nav><ol>'
+    NAV = xhtml('<nav epub:type="toc"><ol>'
                 '<li><a href="Text/c.xhtml#sec">A</a></li>'
                 '<li><a href="Text/c.xhtml#body">B</a></li>'
                 '<li><a href="Text/c.xhtml#lead">C</a></li>'
@@ -1249,9 +1257,10 @@ class TestTocContainerTarget:
                                          'c_seg0002': '<p>內文。</p>\n<p>引言。</p>',
                                          'c_seg0003': '<h3>後標題</h3>',
                                          'c_seg0004': '裸文\n更多'}, fmt)
-        # A, B (the body) and D: first block is the filled h2; C: first block
-        # is a <p>; E: first block is a run
-        assert labels == ['部分', '部分', 'C', '部分', 'E']
+        # A: the innermost container of the filled h2; B (the body) and D
+        # hold it only through another container (review round 1); C: first
+        # block is a <p>; E: first block is a run
+        assert labels == ['部分', 'B', 'C', 'D', 'E']
 
     def test_unfilled_heading_leaves_labels(self, tmp_path):
         labels = self._labels(tmp_path, {'c_seg0001': '<h2>部分',
@@ -1260,10 +1269,420 @@ class TestTocContainerTarget:
 
     def test_target_inside_a_block_wins(self, tmp_path):
         chapter = xhtml('<div id="d"><h2 id="h">Part words</h2></div>')
-        nav = xhtml('<nav><ol><li><a href="Text/c.xhtml#d">D</a></li>'
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml#d">D</a></li>'
                     '<li><a href="Text/c.xhtml#h">H</a></li></ol></nav>')
         epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=nav, ncx=None)
         project_dir = _project(tmp_path, epub, {'c_seg0001': '<h2>部分</h2>'})
         _, z = _export(tmp_path, project_dir, 'bilingual-vertical')
         assert [_inner(a) for a in _root(z, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a')] == [
             '部分', '部分']
+
+
+class TestReviewRound1Archive:
+    """Review round 1: the output never replaces the source; members keep
+    their stored form; write errors are ExportErrors."""
+
+    def test_output_is_the_source(self, tmp_path, raw_project):
+        source = ProjectManager(raw_project).load().epub_path
+        before = open(source, 'rb').read()
+        link = tmp_path / 'link.epub'
+        os.symlink(source, link)
+        for target in (source, str(link), os.path.join(os.path.dirname(source), '.', os.path.basename(source))):
+            with pytest.raises(ExportError, match='來源 EPUB 本身'):
+                export_project(raw_project, target, 'chinese-only')
+        assert open(source, 'rb').read() == before
+
+    def _book_with(self, tmp_path, entries):
+        """The raw fixture plus members written with the given ZipInfos."""
+        epub = _raw_book(tmp_path)
+        with zipfile.ZipFile(epub, 'a') as z:
+            for info, data in entries:
+                z.writestr(info, data)
+        return epub, _project(tmp_path, epub, RAW_TRANSLATIONS)
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_untouched_member_metadata_copied(self, tmp_path, fmt):
+        info = zipfile.ZipInfo('OEBPS/Images/pic.png', date_time=(2001, 2, 3, 4, 5, 6))
+        info.external_attr = 0o100640 << 16
+        info.internal_attr = 1
+        info.create_system = 0
+        info.extra = b'\xfe\xca\x02\x00xy'
+        info.comment = b'invented'
+        info.compress_type = zipfile.ZIP_STORED
+        epub, project_dir = self._book_with(tmp_path, [(info, b'\x89PNG invented')])
+        _, z = _export(tmp_path, project_dir, fmt)
+        out = z.getinfo('OEBPS/Images/pic.png')
+        assert (out.date_time, out.external_attr, out.internal_attr, out.create_system,
+                out.extra, out.comment, out.compress_type, out.flag_bits & 0x800) == (
+            (2001, 2, 3, 4, 5, 6), 0o100640 << 16, 1, 0, b'\xfe\xca\x02\x00xy', b'invented',
+            zipfile.ZIP_STORED, 0)
+        # a replaced chapter keeps its date and attributes too
+        src = zipfile.ZipFile(epub).getinfo('OEBPS/Text/one.xhtml')
+        out = z.getinfo('OEBPS/Text/one.xhtml')
+        assert (out.date_time, out.external_attr, out.create_system) == (
+            src.date_time, src.external_attr, src.create_system)
+
+    def test_mimetype_metadata_copied(self, tmp_path):
+        info = zipfile.ZipInfo('mimetype', date_time=(2002, 3, 4, 5, 6, 8))
+        info.external_attr = 0o100444 << 16
+        info.create_system = 0
+        info.extra = b'\xfe\xca\x00\x00'
+        items = [('css', 'Styles/book.css', 'text/css', None)]
+        path = tmp_path / 'm.epub'
+        write_raw_epub(path, items, [], {'OEBPS/Styles/book.css': 'p {}'})
+        with zipfile.ZipFile(path) as z:
+            rest = [(i, z.read(i)) for i in z.infolist() if i.filename != 'mimetype']
+        with zipfile.ZipFile(path, 'w') as z:
+            for i, d in rest:  # mimetype last and deflated
+                z.writestr(i, d)
+            z.writestr(info, 'application/epub+zip', compress_type=zipfile.ZIP_DEFLATED)
+        project_dir = _project(tmp_path, str(path), {})
+        _, z = _export(tmp_path, project_dir, 'chinese-only')
+        out = z.infolist()[0]
+        assert (out.filename, out.compress_type, out.date_time, out.external_attr,
+                out.create_system, out.extra) == (
+            'mimetype', zipfile.ZIP_STORED, (2002, 3, 4, 5, 6, 8), 0o100444 << 16, 0, b'')
+
+    def test_non_utf8_name_bytes_kept(self, tmp_path):
+        class Cp437(zipfile.ZipInfo):
+            def _encodeFilenameFlags(self):
+                return self.filename.encode('cp437'), self.flag_bits
+        info = Cp437('OEBPS/Images/café.png')
+        epub, project_dir = self._book_with(tmp_path, [(info, b'invented')])
+        assert b'caf\x82.png' in open(epub, 'rb').read()   # Info-ZIP style source
+        out = str(tmp_path / 'out.epub')
+        export_project(project_dir, out, 'chinese-only')
+        data = open(out, 'rb').read()
+        assert b'caf\x82.png' in data and 'café'.encode('utf-8') not in data
+        z = zipfile.ZipFile(out)
+        assert z.getinfo('OEBPS/Images/café.png').flag_bits & 0x800 == 0
+        assert z.read('OEBPS/Images/café.png') == b'invented'
+
+    def test_utf8_flagged_name_kept(self, tmp_path):
+        epub, project_dir = self._book_with(
+            tmp_path, [(zipfile.ZipInfo('OEBPS/Images/圖.png'), b'invented')])
+        out = str(tmp_path / 'out.epub')
+        export_project(project_dir, out, 'chinese-only')
+        info = zipfile.ZipFile(out).getinfo('OEBPS/Images/圖.png')
+        assert info.flag_bits & 0x800
+
+    def test_name_that_cannot_be_written_back(self):
+        info = zipfile.ZipInfo('OEBPS/圖.png')
+        info.flag_bits = 0   # decoded as code page 437, which has no such character
+        with pytest.raises(ExportError, match='成員名稱'):
+            exporter._member_info(info, zipfile.ZIP_STORED)
+
+    def test_output_file_mode_follows_the_umask(self, tmp_path, raw_project):
+        old = os.umask(0o027)
+        try:
+            out = str(tmp_path / 'out.epub')
+            export_project(raw_project, out, 'chinese-only')
+        finally:
+            os.umask(old)
+        assert os.stat(out).st_mode & 0o777 == 0o640
+
+    def test_corrupt_member_is_an_export_error(self, tmp_path):
+        info = zipfile.ZipInfo('OEBPS/Images/pic.png')
+        epub, _ = self._book_with(tmp_path, [(info, b'INVENTED-IMAGE-BYTES')])
+        data = open(epub, 'rb').read().replace(b'INVENTED-IMAGE-BYTES', b'INVENTED-IMAGE-BYTEZ')
+        open(epub, 'wb').write(data)
+        project_dir = _project(tmp_path, epub, RAW_TRANSLATIONS, name='p2')
+        out = tmp_path / 'out.epub'
+        with pytest.raises(ExportError, match='無法寫出 EPUB'):
+            export_project(project_dir, str(out), 'chinese-only')
+        assert not out.exists() and not [p for p in os.listdir(tmp_path) if p.startswith('.export-')]
+
+    def test_write_error_is_an_export_error(self, tmp_path, raw_project):
+        (tmp_path / 'file').write_text('x')
+        with pytest.raises(ExportError, match='無法寫出 EPUB'):
+            export_project(raw_project, str(tmp_path / 'file' / 'out.epub'), 'chinese-only')
+
+    def test_cli_unexpected_error(self, tmp_path, raw_project, monkeypatch):
+        import translate
+
+        def boom(*args):
+            raise RuntimeError('invented failure')
+        monkeypatch.setattr(translate, 'export_project', boom)
+        result = CliRunner().invoke(translate.cli, ['export', '-p', raw_project,
+                                                    '-f', 'chinese-only'])
+        assert result.exit_code == 1 and isinstance(result.exception, SystemExit)
+        assert result.output.splitlines()[-1] == '匯出失敗（RuntimeError）：invented failure'
+        assert 'Traceback' not in result.output
+
+
+class TestReviewRound1Chapters:
+    """Review round 1: DOCTYPE subsets, nodes after the root, code
+    boundaries, language and notes."""
+
+    def _export_chapter(self, tmp_path, chapter, translations, fmt='chinese-only', version='3.0'):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None,
+                         version=version)
+        project_dir = _project(tmp_path, epub, translations)
+        report, z = _export(tmp_path, project_dir, fmt)
+        return report, z, zipfile.ZipFile(epub)
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_internal_subset_kept(self, tmp_path, fmt):
+        chapter = ('<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html [\n'
+                   '<!ATTLIST p class CDATA #IMPLIED>\n]>\n'
+                   '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head>'
+                   '<body><p>Words.</p></body></html>')
+        report, z, src = self._export_chapter(tmp_path, chapter, {'c_seg0001': '<p>字。</p>'}, fmt)
+        assert report.chapters[0].kept == [('c_seg0001', CHAPTER_DOCTYPE)]
+        assert report.chapters[0].translated == 0
+        assert z.read('OEBPS/Text/c.xhtml') == src.read('OEBPS/Text/c.xhtml')
+        assert any('章節 c' in line and 'chapter_doctype' in line for line in report.lines())
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_nodes_after_the_root_kept(self, tmp_path, fmt):
+        chapter = xhtml('<p>Words.</p>').rstrip('\n') + '\n<!--invented after-->\n<?pi data?>'
+        report, z, _ = self._export_chapter(tmp_path, chapter, {'c_seg0001': '<p>字。</p>'}, fmt)
+        assert report.translated == 1
+        data = z.read('OEBPS/Text/c.xhtml').decode()
+        assert data.endswith('</html>\n<!--invented after-->\n<?pi data?>')
+        assert '字。' in data
+
+    def test_code_text_outside_the_target_not_duplicated(self, tmp_path):
+        chapter = xhtml('<pre>  <code>x = 1  # one</code></pre>')
+        report, z, src = self._export_chapter(tmp_path, chapter, {'c_seg0001': '  x = 1  # 一'})
+        assert report.chapters[0].kept == [('c_seg0001', CODE_MARKUP)]
+        assert z.read('OEBPS/Text/c.xhtml') == src.read('OEBPS/Text/c.xhtml')
+
+    def test_code_with_control_characters_kept(self, tmp_path):
+        chapter = xhtml('<pre><code>x = 1  # one</code></pre>')
+        report, _, _ = self._export_chapter(tmp_path, chapter, {'c_seg0001': 'x = 1  # \x01'})
+        assert report.chapters[0].kept == [('c_seg0001', NOT_WELL_FORMED)]
+
+    @pytest.mark.parametrize('version', ['3.0', '2.0'])
+    def test_source_language_on_ancestors_rewritten(self, tmp_path, version):
+        chapter = ('<?xml version="1.0" encoding="utf-8"?>\n<html xmlns="http://www.w3.org/1999/'
+                   'xhtml"><head><title>T</title></head><body xml:lang="en">'
+                   '<div lang="en-GB"><p>Words.</p></div><div lang="fr"><p>Mots.</p></div>'
+                   '<section xml:lang="en"><h2>Other words</h2></section></body></html>')
+        report, z, _ = self._export_chapter(
+            tmp_path, chapter, {'c_seg0001': '<p>字。</p>\n<p>詞。</p>'}, version=version)
+        assert report.translated == 1
+        body = _body(z, 'OEBPS/Text/c.xhtml')
+        divs = body.findall(f'{XHTML_NS}div')
+        assert body.get(XML_LANG) == 'zh-TW' and divs[0].get('lang') == 'zh-TW'
+        assert divs[1].get('lang') == 'fr'   # another language stays
+        # an element around blocks that were not filled stays as it is
+        assert body.find(f'{XHTML_NS}section').get(XML_LANG) == 'en'
+
+    @pytest.mark.parametrize('fmt', BILINGUAL)
+    def test_bilingual_ancestors_keep_their_language(self, tmp_path, fmt):
+        chapter = ('<?xml version="1.0" encoding="utf-8"?>\n<html xmlns="http://www.w3.org/1999/'
+                   'xhtml"><head><title>T</title></head><body xml:lang="en">'
+                   '<p>Words.</p></body></html>')
+        _, z, _ = self._export_chapter(tmp_path, chapter, {'c_seg0001': '<p>字。</p>'}, fmt)
+        assert _body(z, 'OEBPS/Text/c.xhtml').get(XML_LANG) == 'en'
+
+    @pytest.mark.parametrize('fmt', BILINGUAL)
+    @pytest.mark.parametrize('types, expected', [
+        ('footnote', None), ('endnote', None), ('rearnote', None), ('note', None),
+        ('rearnote footnote invented', 'invented'), ('noteref', 'noteref'),
+    ])
+    def test_note_types_dropped_from_the_block_copy(self, tmp_path, fmt, types, expected):
+        chapter = xhtml(f'<p epub:type="{types}" id="n">Note words.</p>')
+        _, z, _ = self._export_chapter(tmp_path, chapter, {'c_seg0001': '<p>註文。</p>'}, fmt)
+        body = _body(z, 'OEBPS/Text/c.xhtml')
+        epub_type = '{http://www.idpf.org/2007/ops}type'
+        original = body.find(f'.//{XHTML_NS}div[@class="original"]')[0]
+        translation = body.find(f'.//{XHTML_NS}div[@class="translation"]')[0]
+        assert original.get(epub_type) == types
+        assert translation.get(epub_type) == expected
+
+    def test_chinese_only_keeps_note_types(self, tmp_path):
+        chapter = xhtml('<p epub:type="footnote" id="n">Note words.</p>')
+        _, z, _ = self._export_chapter(tmp_path, chapter, {'c_seg0001': '<p>註文。</p>'})
+        p = _body(z, 'OEBPS/Text/c.xhtml')[0]
+        assert p.get('{http://www.idpf.org/2007/ops}type') == 'footnote'
+
+
+class TestReviewRound1Toc:
+    """Review round 1: which lists are relabelled, which heading a target
+    gets, and when an entry is left as it is."""
+
+    CHAPTER = xhtml('<h1>Title words</h1><p>Body words.</p>')
+
+    def _export(self, tmp_path, nav, ncx, chapter=None, translations=None, fmt='chinese-only'):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter or self.CHAPTER)}, nav=nav, ncx=ncx)
+        project_dir = _project(tmp_path, epub, translations or {'c_seg0001': '<h1>標題</h1>'})
+        _, z = _export(tmp_path, project_dir, fmt)
+        return z, zipfile.ZipFile(epub)
+
+    def test_only_the_toc_nav(self, tmp_path):
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml">T</a></li></ol></nav>'
+                    '<nav epub:type="page-list"><ol><li><a href="Text/c.xhtml">1</a></li></ol></nav>'
+                    '<nav epub:type="landmarks"><ol><li><a href="Text/c.xhtml">L</a></li></ol></nav>'
+                    '<nav><ol><li><a href="Text/c.xhtml">N</a></li></ol></nav>'
+                    '<p><a href="Text/c.xhtml">P</a></p>')
+        z, _ = self._export(tmp_path, nav, None)
+        assert [_inner(a) for a in _root(z, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a')] == [
+            '標題', '1', 'L', 'N', 'P']
+
+    def test_only_the_nav_map(self, tmp_path):
+        ncx = ('<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/">'
+               '<docTitle><text>D</text></docTitle><navMap><navPoint><navLabel><text>T</text>'
+               '</navLabel><content src="Text/c.xhtml"/></navPoint></navMap>'
+               '<pageList><pageTarget><navLabel><text>1</text></navLabel>'
+               '<content src="Text/c.xhtml"/></pageTarget></pageList>'
+               '<navList><navTarget><navLabel><text>X</text></navLabel>'
+               '<content src="Text/c.xhtml"/></navTarget></navList></ncx>')
+        z, _ = self._export(tmp_path, None, ncx)
+        ncx_root = _root(z, 'OEBPS/toc.ncx')
+        assert [e.text for e in ncx_root.iter('{http://www.daisy.org/z3986/2005/ncx/}text')] == [
+            'D', '標題', '1', 'X']
+
+    TWO = xhtml('<table><tr><td id="c"><h3 id="a">Alpha</h3><h3 id="b">Beta</h3></td>'
+                '</tr></table><p id="p">Words.</p>')
+
+    def test_each_id_its_own_heading(self, tmp_path):
+        nav = xhtml('<nav epub:type="toc"><ol>' + ''.join(
+            f'<li><a href="Text/c.xhtml#{k}">{k.upper()}</a></li>' for k in 'abcp')
+            + '<li><a href="Text/c.xhtml">F</a></li></ol></nav>')
+        z, _ = self._export(tmp_path, nav, None, self.TWO, {'c_seg0001': (
+            '<table><tr><td id="c"><h3 id="a">甲</h3><h3 id="b">乙</h3></td></tr></table>'),
+            'c_seg0002': '<p id="p">字。</p>'})
+        # c holds both headings: unchanged; p holds none
+        assert [_inner(a) for a in _root(z, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a')] == [
+            '甲', '乙', 'C', 'P', '甲']
+
+    def test_heading_count_changed_leaves_labels(self, tmp_path):
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml#b">B</a></li></ol></nav>')
+        z, src = self._export(tmp_path, nav, None, self.TWO, {'c_seg0001': (
+            '<table><tr><td id="c"><h3 id="a">甲</h3><p>乙</p></td></tr></table>'),
+            'c_seg0002': '<p id="p">字。</p>'})
+        assert z.read('OEBPS/nav.xhtml') == src.read('OEBPS/nav.xhtml')
+
+    def test_first_occurrence_of_a_duplicate_wins(self, tmp_path):
+        chapter = xhtml('<h2 id="d">First words</h2><p>Body.</p><h2 id="d">Second words</h2>')
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml#d">D</a></li></ol></nav>')
+        z, _ = self._export(tmp_path, nav, None, chapter, {
+            'c_seg0001': '<h2 id="d">第一</h2>', 'c_seg0002': '<p>文。</p>',
+            'c_seg0003': '<h2 id="d">第二</h2>'})
+        assert [_inner(a) for a in _root(z, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a')] == ['第一']
+
+    def test_duplicate_whose_first_is_not_a_heading(self, tmp_path):
+        chapter = xhtml('<p id="d">Body words.</p><h2 id="d">Heading words</h2>')
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml#d">D</a></li></ol></nav>')
+        z, src = self._export(tmp_path, nav, None, chapter, {
+            'c_seg0001': '<p>文。</p>', 'c_seg0002': '<h2 id="d">標題</h2>'})
+        assert z.read('OEBPS/nav.xhtml') == src.read('OEBPS/nav.xhtml')
+
+    def test_equal_label_left_as_it_is(self, tmp_path):
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml">'
+                    '<span class="n">標題</span></a></li></ol></nav>')
+        z, src = self._export(tmp_path, nav, None)
+        assert z.read('OEBPS/nav.xhtml') == src.read('OEBPS/nav.xhtml')
+
+    def test_label_with_an_id_left_as_it_is(self, tmp_path):
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml">'
+                    '<span id="z">One</span></a></li></ol></nav>')
+        z, src = self._export(tmp_path, nav, None)
+        assert z.read('OEBPS/nav.xhtml') == src.read('OEBPS/nav.xhtml')
+
+
+class TestReviewRound1Additions:
+    """Review round 1, second list: the project lock, DOCTYPE subsets in
+    the OPF and TOC files, text-less pieces, namespaces of nested blocks."""
+
+    def test_cli_refused_while_another_process_holds_the_lock(self, tmp_path, raw_project):
+        from tests.conftest import hold_lock_in_child, lock_free_for_other_process
+        from translate import cli
+        child = hold_lock_in_child(raw_project)
+        try:
+            result = CliRunner().invoke(cli, ['export', '-p', raw_project, '-f', 'chinese-only'])
+        finally:
+            child.stdin.close()
+            child.wait()
+        assert result.exit_code == 1 and isinstance(result.exception, SystemExit)
+        last = result.output.splitlines()[-1]
+        assert last.startswith('無法匯出：') and str(child.pid) in last
+        assert not os.path.exists(os.path.join(raw_project, 'output', 'proj-chinese-only.epub'))
+        assert lock_free_for_other_process(raw_project)
+
+    def test_lock_released_after_export(self, tmp_path, raw_project):
+        from tests.conftest import lock_free_for_other_process
+        _export(tmp_path, raw_project, 'chinese-only')
+        assert lock_free_for_other_process(raw_project)
+
+    SUBSET = '<!DOCTYPE ncx [\n<!ATTLIST text class CDATA #IMPLIED>\n]>\n'
+
+    def _subset_book(self, tmp_path, opf=False, toc=False):
+        epub = _raw_book(tmp_path)
+        with zipfile.ZipFile(epub) as z:
+            members = [(i, z.read(i)) for i in z.infolist()]
+        with zipfile.ZipFile(epub, 'w') as z:
+            for info, data in members:
+                if opf and info.filename == 'OEBPS/content.opf':
+                    data = data.replace(b'?>\n', b'?>\n<!DOCTYPE package [\n'
+                                        b'<!ATTLIST item class CDATA #IMPLIED>\n]>\n', 1)
+                if toc and info.filename in ('OEBPS/toc.ncx', 'OEBPS/nav.xhtml'):
+                    data = data.replace(b'?>\n', b'?>\n' + self.SUBSET.encode(), 1)
+                z.writestr(info, data)
+        return epub, _project(tmp_path, epub, RAW_TRANSLATIONS)
+
+    @pytest.mark.parametrize('fmt', BILINGUAL)
+    def test_opf_subset_refused_for_bilingual(self, tmp_path, fmt):
+        _, project_dir = self._subset_book(tmp_path, opf=True)
+        out = tmp_path / 'out.epub'
+        with pytest.raises(ExportError, match='OPF'):
+            export_project(project_dir, str(out), fmt)
+        assert not out.exists()
+
+    def test_opf_subset_left_for_chinese_only(self, tmp_path):
+        epub, project_dir = self._subset_book(tmp_path, opf=True)
+        report, z = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.translated == 4
+        assert z.read('OEBPS/content.opf') == zipfile.ZipFile(epub).read('OEBPS/content.opf')
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_toc_subset_left(self, tmp_path, fmt):
+        epub, project_dir = self._subset_book(tmp_path, toc=True)
+        report, z = _export(tmp_path, project_dir, fmt)
+        src = zipfile.ZipFile(epub)
+        assert report.translated == 4
+        for name in ('OEBPS/toc.ncx', 'OEBPS/nav.xhtml'):
+            assert z.read(name) == src.read(name)
+
+    @pytest.mark.parametrize('translation', [
+        '<a id="l1"/>\n第二行',       # the first line holds only a text-less anchor
+        '第一行\n<b>  </b>',          # the second only an empty element
+    ])
+    def test_line_without_text_kept(self, tmp_path, translation):
+        chapter = xhtml('<div class="v"><a id="l1"/>Line one<br/>Line two</div>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': translation})
+        report, _ = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.chapters[0].kept == [('c_seg0001', STRUCTURE_MISMATCH)]
+
+    def test_element_without_text_kept(self, tmp_path):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml('<p>Alpha.</p><p>Beta.</p>'))},
+                         nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<p>甲。</p>\n<p> </p>'})
+        report, _ = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.chapters[0].kept == [('c_seg0001', STRUCTURE_MISMATCH)]
+
+    def test_textless_source_line_may_stay_textless(self, tmp_path):
+        chapter = xhtml('<div class="v">Line one<br/><img src="x.png" alt=""/></div>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '第一行\n<img src="x.png" alt=""/>'})
+        report, _ = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.translated == 1
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_namespace_declared_on_a_nested_container(self, tmp_path, fmt):
+        chapter = ('<?xml version="1.0" encoding="utf-8"?>\n<html xmlns="http://www.w3.org/1999/'
+                   'xhtml"><head><title>T</title></head><body><p>Alpha words.</p>'
+                   '<div xmlns:epub="http://www.idpf.org/2007/ops"><p>See <a epub:type="noteref"'
+                   ' href="#n">1</a>.</p></div></body></html>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {
+            'c_seg0001': '<p>甲。</p>\n<p>見<a epub:type="noteref" href="#n">1</a>。</p>'})
+        segments = ProjectManager(project_dir).load().segments
+        assert len(segments) == 1
+        report, z = _export(tmp_path, project_dir, fmt)
+        assert report.translated == 1 and report.reasons() == {}
+        a = next(_body(z, 'OEBPS/Text/c.xhtml').iter(f'{XHTML_NS}a'))
+        assert a.get('{http://www.idpf.org/2007/ops}type') == 'noteref'
