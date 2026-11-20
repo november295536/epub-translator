@@ -423,6 +423,9 @@ def export(project, fmt):
     except ExportError as e:
         click.echo(f"無法匯出：{e}")
         sys.exit(1)
+    except Exception as e:  # anything unexpected: a message, no traceback
+        click.echo(f"匯出失敗（{type(e).__name__}）：{e}")
+        sys.exit(1)
     click.echo(f"已輸出：{report.output_path}")
     for line in report.lines():
         click.echo(line)

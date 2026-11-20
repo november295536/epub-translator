@@ -27,6 +27,7 @@ from __future__ import annotations
 import copy
 import os
 import posixpath
+import re
 import tempfile
 import zipfile
 from collections import Counter
@@ -36,7 +37,9 @@ from xml.sax.saxutils import quoteattr
 
 from lxml import etree
 
-from src.core.project import ProjectManager, SegmentStatus, sha256_file
+from src.core.project import (
+    ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus, sha256_file,
+)
 from src.core.segmenter import SegmentType, _code_text
 from src.epub.blocks import BLOCK_TAGS, NO_TEXT_TAGS, element_text, fingerprint, localname, walk_blocks
 from src.epub.extractor import (
@@ -47,6 +50,8 @@ from src.epub.extractor import (
 FORMATS = ('chinese-only', 'bilingual-horizontal', 'bilingual-vertical')
 TARGET_LANG = 'zh-TW'
 XML_LANG = '{http://www.w3.org/XML/1998/namespace}lang'
+EPUB_TYPE = '{http://www.idpf.org/2007/ops}type'
+NOTE_TYPES = frozenset({'footnote', 'endnote', 'rearnote', 'note'})
 NCX_MEDIA_TYPE = 'application/x-dtbncx+xml'
 HEADINGS = frozenset({'h1', 'h2', 'h3', 'h4', 'h5', 'h6'})
 WRAPPER_CLASS = {'bilingual-horizontal': 'bilingual-container',
@@ -87,7 +92,8 @@ NOT_WELL_FORMED = 'not_well_formed'        # the translation is not well-formed 
 STRUCTURE_MISMATCH = 'structure_mismatch'  # its top-level structure differs from the blocks
 AMBIGUOUS_SOURCE = 'ambiguous_source'      # the mapping rule cannot split the source itself
 CODE_MARKUP = 'code_markup'                # the code element holds markup (e.g. highlighting)
-MISSING_ANCHOR = 'missing_anchor'          # an id (or a@name) inside a block is not in its translation
+ANCHOR_MISMATCH = 'anchor_mismatch'        # the ids (and a@name) inside a block differ in its translation
+CHAPTER_DOCTYPE = 'chapter_doctype'        # the chapter's DOCTYPE has an internal subset
 
 REASON_TEXT = {
     CHAPTER_UNREADABLE: '章節無法讀取',
@@ -96,7 +102,8 @@ REASON_TEXT = {
     STRUCTURE_MISMATCH: '譯文的頂層結構與原文區塊不符',
     AMBIGUOUS_SOURCE: '原文區塊無法明確對應',
     CODE_MARKUP: '程式碼區塊含標記',
-    MISSING_ANCHOR: '譯文缺少原文區塊內的錨點（id 或 a 的 name）',
+    ANCHOR_MISMATCH: '譯文的錨點（id 或 a 的 name）與原文區塊不同',
+    CHAPTER_DOCTYPE: '章節的 DOCTYPE 含內部子集，無法原樣寫回',
 }
 
 SCHEMA_1_MESSAGE = ('此專案是舊格式（schema 1），無法匯出。'
@@ -133,6 +140,7 @@ class ExportReport:
                 'untranslated': self.untranslated, 'reasons': dict(sorted(reasons.items()))}
 
     def lines(self) -> list[str]:
+        """The report as text lines (the CLI prints them, the web shows them)."""
         s = self.summary()
         out = [f"以譯文匯出 {s['translated']} 段，保留原文 {s['kept']} 段"
                f"（另有 {s['untranslated']} 段未翻譯或翻譯失敗，以原文匯出）"]
@@ -162,10 +170,19 @@ def export_project(project_dir: str, output_path: str, fmt: str) -> ExportReport
     """Export the project as an EPUB at `output_path` (written atomically).
 
     Raises ValueError for an unknown format and ExportError when the project
-    cannot be exported (schema 1, source missing or changed, package
-    unreadable)."""
+    cannot be exported (schema 1, project locked by another process,
+    source missing or changed, package unreadable, write failure). Holds
+    the project lock while it reads the project."""
     if fmt not in FORMATS:
         raise ValueError(f"Invalid format: {fmt}. Must be one of {FORMATS}")
+    try:
+        with ProjectLock(project_dir):
+            return _export(project_dir, output_path, fmt)
+    except ProjectLockedError as e:
+        raise ExportError(str(e)) from e
+
+
+def _export(project_dir: str, output_path: str, fmt: str) -> ExportReport:
     data = ProjectManager(project_dir).load()
     if data.schema != 2:
         raise ExportError(SCHEMA_1_MESSAGE)
@@ -175,10 +192,13 @@ def export_project(project_dir: str, output_path: str, fmt: str) -> ExportReport
         raise ExportError(f'無法讀取來源 EPUB：{e}') from e
     if not data.source_sha256 or digest != data.source_sha256:
         raise ExportError('來源 EPUB 與專案記錄的雜湊值不符，無法匯出')
+    if os.path.exists(output_path) and os.path.samefile(output_path, data.epub_path):
+        raise ExportError('輸出檔不能是來源 EPUB 本身')
     try:
         zf = open_archive(data.epub_path)
         opf_path = package_path(zf)
         opf, manifest, spine = read_package(zf)
+        opf_subset = has_internal_subset(read_member(zf, opf_path))
     except EPUBError as e:
         raise ExportError(str(e)) from e
 
@@ -193,8 +213,7 @@ def export_project(project_dir: str, output_path: str, fmt: str) -> ExportReport
     by_chapter: dict = {}
     for seg in data.segments:
         by_chapter.setdefault(seg.chapter_id, []).append(seg)
-    chapters = {item.id: item for item in spine
-                if item.media_type == XHTML_MEDIA_TYPE and not item.is_nav}
+    chapters = chapter_items(spine)
     report = ExportReport(output_path, sum(not accepted(s) for s in data.segments))
     replaced: dict = {}   # member -> new bytes
     labels: dict = {}     # chapter member -> {fragment or None: TOC label}
@@ -219,10 +238,15 @@ def export_project(project_dir: str, output_path: str, fmt: str) -> ExportReport
             toc = _relabel(zf, path, labels, ncx=not is_nav)
             if toc is not None:
                 replaced[path] = toc
-    if replaced:
+    if opf_subset and css_used:  # the stylesheet must be registered in the OPF
+        raise ExportError('OPF 的 DOCTYPE 含內部子集，無法登錄雙語樣式表')
+    if replaced and not opf_subset:  # else dc:language stays as it is
         replaced[opf_path] = _package(opf, fmt, css_path if css_used else None, opf_path)
 
-    _write_archive(zf, output_path, replaced, css_path if css_used else None)
+    try:
+        _write_archive(zf, output_path, replaced, css_path if css_used else None)
+    except (EPUBError, OSError) as e:
+        raise ExportError(f'無法寫出 EPUB：{e}') from e
     return report
 
 
@@ -238,11 +262,21 @@ def _free_name(names: set, wanted: str) -> str:
     return candidate
 
 
+_INTERNAL_SUBSET = re.compile(rb'<!DOCTYPE[^>\[]*\[')
+
+
+def has_internal_subset(data: bytes) -> bool:
+    """True when the document's DOCTYPE has an internal subset, which
+    `_serialize` cannot write back."""
+    return _INTERNAL_SUBSET.search(data) is not None
+
+
 def _serialize(root) -> bytes:
-    """A parsed document as bytes: XML declaration, DOCTYPE, the comments and
-    processing instructions before the root, then the root element
-    serialized in a document of its own (serializing the parsed document
-    itself makes libxml2 add a <meta> to XHTML 1.0 documents)."""
+    """A parsed document (without internal DTD subset) as bytes: XML
+    declaration, DOCTYPE, the comments and processing instructions before
+    the root, the root element serialized in a document of its own
+    (serializing the parsed document itself makes libxml2 add a <meta> to
+    XHTML 1.0 documents), then those after the root."""
     doctype = root.getroottree().docinfo.doctype
     out = ['<?xml version="1.0" encoding="utf-8"?>\n']
     if doctype:
@@ -250,34 +284,70 @@ def _serialize(root) -> bytes:
     for node in reversed(list(root.itersiblings(preceding=True))):
         out.append(etree.tostring(node, encoding='unicode', with_tail=False) + '\n')
     out.append(etree.tostring(copy.deepcopy(root), encoding='unicode'))
+    for node in root.itersiblings():
+        out.append('\n' + etree.tostring(node, encoding='unicode', with_tail=False))
     return ''.join(out).encode('utf-8')
 
 
+class _ZipInfo(zipfile.ZipInfo):
+    """A ZipInfo that writes the member name as the given raw bytes, with
+    the source's UTF-8 flag (zipfile resets flag_bits when writing)."""
+    __slots__ = ('raw_name', 'name_flag')
+
+    def _encodeFilenameFlags(self):
+        return self.raw_name, self.flag_bits | self.name_flag
+
+
+def _member_info(info, compress_type: int):
+    """A ZipInfo for writing `info` again: name bytes (UTF-8 when the source
+    flags it, else code page 437, as zipfile decoded it), date, attributes,
+    system, versions, extra field and comment of the source."""
+    out = _ZipInfo(info.filename, date_time=info.date_time)
+    try:
+        out.raw_name = info.filename.encode('utf-8' if info.flag_bits & 0x800 else 'cp437')
+    except UnicodeEncodeError as e:
+        raise ExportError(f'無法原樣寫回成員名稱：{info.filename!r}') from e
+    out.name_flag = info.flag_bits & 0x800
+    out.compress_type = compress_type
+    for attr in ('external_attr', 'internal_attr', 'create_system', 'create_version',
+                 'extract_version', 'extra', 'comment'):
+        setattr(out, attr, getattr(info, attr))
+    return out
+
+
 def _write_archive(zf, output_path: str, replaced: dict, css_path) -> None:
+    """Write the archive (see the module docstring). A name that occurs more
+    than once is written once, at its first position, with the last
+    entry's data and metadata (the entry the chapter reader uses)."""
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=out_dir, prefix='.export-', suffix='.tmp')
+    umask = os.umask(0)
+    os.umask(umask)
     try:
+        os.fchmod(fd, 0o666 & ~umask)
+        last = {info.filename: info for info in zf.infolist()}
         with os.fdopen(fd, 'wb') as f, zipfile.ZipFile(f, 'w') as out:
-            names = zf.namelist()
-            mimetype = read_member(zf, 'mimetype') if 'mimetype' in names else b'application/epub+zip'
-            out.writestr(zipfile.ZipInfo('mimetype'), mimetype, compress_type=zipfile.ZIP_STORED)
+            if 'mimetype' in last:
+                zi = _member_info(last['mimetype'], zipfile.ZIP_STORED)
+                zi.extra = b''  # OCF: no extra field in the mimetype header
+                out.writestr(zi, read_member(zf, last['mimetype']))
+            else:
+                out.writestr(zipfile.ZipInfo('mimetype'), 'application/epub+zip',
+                             compress_type=zipfile.ZIP_STORED)
             written = {'mimetype'}
-            for info in zf.infolist():
-                name = info.filename
+            for name in [info.filename for info in zf.infolist()]:
                 if name in written:
                     continue
                 written.add(name)
-                zi = zipfile.ZipInfo(name, date_time=info.date_time)
-                zi.external_attr = info.external_attr
+                info = last[name]
                 if name in replaced:
-                    data, zi.compress_type = replaced[name], zipfile.ZIP_DEFLATED
+                    out.writestr(_member_info(info, zipfile.ZIP_DEFLATED), replaced[name])
                 else:
-                    data = read_member(zf, name)
-                    zi.compress_type = (info.compress_type if info.compress_type
-                                        in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
-                                        else zipfile.ZIP_DEFLATED)
-                out.writestr(zi, data)
+                    compress = (info.compress_type if info.compress_type
+                                in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                                else zipfile.ZIP_DEFLATED)
+                    out.writestr(_member_info(info, compress), read_member(zf, info))
             if css_path:
                 out.writestr(css_path, BILINGUAL_CSS, compress_type=zipfile.ZIP_DEFLATED)
         os.replace(tmp, output_path)
@@ -315,41 +385,45 @@ def _package(opf, fmt: str, css_path, opf_path: str) -> bytes:
 
 
 def _relabel(zf, path: str, labels: dict, ncx: bool):
-    """The NCX (`ncx`) or navigation document with its entry labels taken
-    from the translated headings, or None when no label changed or the file
-    cannot be read."""
+    """The NCX (`ncx`) or navigation document with the labels of its table
+    of contents taken from the translated headings, or None when no label
+    changed or the file cannot be read or written back. Only the NCX
+    navMap and the nav whose epub:type holds `toc` are relabelled; page
+    lists, landmarks and other lists keep their labels. A label that holds
+    an element with an id is left as it is."""
     try:
-        root = parse_xml(read_member(zf, path))
+        data = read_member(zf, path)
+        root = parse_xml(data)
     except (KeyError, EPUBError, etree.XMLSyntaxError):
         return None
-    changed = 0
+    if has_internal_subset(data):
+        return None
+    entries = []  # (element holding the label, href)
     if ncx:
-        for point in root.iter():
-            if localname(point) not in ('navPoint', 'navTarget', 'pageTarget'):
-                continue
-            content = next((c for c in point if localname(c) == 'content'), None)
-            nav_label = next((c for c in point if localname(c) == 'navLabel'), None)
-            text = None if nav_label is None else next(
-                (c for c in nav_label if localname(c) == 'text'), None)
-            if content is None or text is None:
-                continue
-            label = _label_for(path, content.get('src'), labels)
-            if label is not None and text.text != label:
-                text.text = label
-                changed += 1
+        for nav_map in (c for c in root if localname(c) == 'navMap'):
+            for point in nav_map.iter():
+                if localname(point) != 'navPoint':
+                    continue
+                content = next((c for c in point if localname(c) == 'content'), None)
+                nav_label = next((c for c in point if localname(c) == 'navLabel'), None)
+                text = None if nav_label is None else next(
+                    (c for c in nav_label if localname(c) == 'text'), None)
+                if content is not None and text is not None:
+                    entries.append((text, content.get('src')))
     else:
         for nav in root.iter():
-            if localname(nav) != 'nav':
-                continue
-            for a in list(nav.iter()):  # a list: labels are changed while walking
-                if localname(a) != 'a':
-                    continue
-                label = _label_for(path, a.get('href'), labels)
-                if label is not None and (len(a) or a.text != label):
-                    for child in list(a):
-                        a.remove(child)
-                    a.text = label
-                    changed += 1
+            if localname(nav) == 'nav' and 'toc' in (nav.get(EPUB_TYPE) or '').split():
+                entries += [(a, a.get('href')) for a in nav.iter() if localname(a) == 'a']
+    changed = 0
+    for el, href in entries:
+        label = _label_for(path, href, labels)
+        if (label is None or ' '.join(''.join(el.itertext()).split()) == label
+                or any(e.get('id') is not None for e in el.iterdescendants(etree.Element))):
+            continue
+        for child in list(el):
+            el.remove(child)
+        el.text = label
+        changed += 1
     return _serialize(root) if changed else None
 
 
@@ -370,20 +444,41 @@ def _label_for(base: str, href, labels: dict):
 
 # --- Chapters -----------------------------------------------------------------
 
+def chapter_items(spine: list) -> dict:
+    """The spine entries that can be chapters (XHTML, not the navigation
+    document), by id."""
+    return {item.id: item for item in spine
+            if item.media_type == XHTML_MEDIA_TYPE and not item.is_nav}
+
+
+def load_chapter(zf, path: str):
+    """(raw bytes, root, body, blocks) of a chapter as the segmenter reads
+    it, or None when it is missing, unreadable, not well-formed, without
+    body or holds an unresolved entity reference."""
+    try:
+        data = read_member(zf, path)
+        root = parse_xml(data)
+    except (KeyError, EPUBError, etree.XMLSyntaxError):
+        return None
+    body = find_body(root)
+    if body is None or unresolved_entities(body):
+        return None
+    return data, root, body, walk_blocks(body)
+
+
 def _export_chapter(zf, path: str, segments: list, todo: list, fmt: str, src_lang: str,
                     epub3: bool, css_path, chapter: ChapterReport):
     """(new bytes, TOC labels) of a chapter, or None when it stays as it is."""
-    try:
-        root = parse_xml(read_member(zf, path))
-    except (KeyError, EPUBError, etree.XMLSyntaxError):
-        root = None
-    body = None if root is None else find_body(root)
-    if body is None or unresolved_entities(body):
+    loaded = load_chapter(zf, path)
+    if loaded is None:
         chapter.kept = [(s.segment_id, CHAPTER_UNREADABLE) for s in todo]
         return None
-    blocks = walk_blocks(body)
+    data, root, body, blocks = loaded
     if not _matches(blocks, segments):
         chapter.kept = [(s.segment_id, CHAPTER_MISMATCH) for s in todo]
+        return None
+    if has_internal_subset(data):
+        chapter.kept = [(s.segment_id, CHAPTER_DOCTYPE) for s in todo]
         return None
 
     fills = []
@@ -399,40 +494,26 @@ def _export_chapter(zf, path: str, segments: list, todo: list, fmt: str, src_lan
     if not fills:
         return None
 
-    # TOC targets are found on the source tree, before it changes: the ids
-    # inside each filled block element (and None for the block holding the
-    # file's first heading), and, for an id on an element that contains
-    # blocks, its first block
-    first_heading = next((e for e in body.iter() if localname(e) in HEADINGS), None)
-    keys = {}
-    for block, _ in fills:
-        if block.tag:
-            subtree = list(block.nodes[0].iter(etree.Element))
-            keys[id(block)] = ([e.get('id') for e in subtree if e.get('id')]
-                               + ([None] if first_heading in subtree else []))
-    first_block = {}
-    for block in blocks:
-        for el in [block.parent, *block.parent.iterancestors()]:
-            if el.get('id'):
-                first_block.setdefault(el.get('id'), block)
-
+    targets = _toc_targets(body, blocks)  # on the source tree, before it changes
     ns = etree.QName(body).namespace
-    labels, headings = {}, {}
+    results = {}
     for block, piece in sorted(fills, key=lambda f: f[0].index, reverse=True):
-        result = _fill(block, piece, fmt, src_lang, epub3, ns)
-        if not block.tag:  # a run holds no heading
-            continue
-        heading = next((e for e in result.iter() if localname(e) in HEADINGS), None)
-        label = '' if heading is None else ' '.join(element_text(heading).split())
-        if label:
-            headings[id(block)] = label
-            for key in keys[id(block)]:
-                labels.setdefault(key, label)
-    for key, block in first_block.items():
-        if block.tag in HEADINGS and id(block) in headings:
-            labels.setdefault(key, headings[id(block)])
+        results[id(block)] = _fill(block, piece, fmt, src_lang, epub3, ns)
+    labels = {}
+    for key, (block, k, n) in targets.items():
+        result = results.get(id(block))
+        headings = [] if result is None else [
+            e for e in result.iter() if localname(e) in HEADINGS]
+        if len(headings) == n:  # the translated block's k-th heading
+            label = ' '.join(element_text(headings[k]).split())
+            if label:
+                labels[key] = label
 
     if fmt == 'chinese-only':
+        for block, _ in fills:  # source-language lang on the elements around the blocks
+            for el in block.parent.iterancestors():
+                _relang_one(el, src_lang)
+            _relang_one(block.parent, src_lang)
         root.set(XML_LANG, TARGET_LANG)
         if epub3 or root.get('lang') is not None:
             root.set('lang', TARGET_LANG)
@@ -440,6 +521,48 @@ def _export_chapter(zf, path: str, segments: list, todo: list, fmt: str, src_lan
         _link_stylesheet(root, ns, quote(posixpath.relpath(
             css_path, posixpath.dirname(path) or '.')))
     return _serialize(root), labels
+
+
+def _toc_targets(body, blocks: list) -> dict:
+    """The TOC targets of a chapter: id (None for the file's first heading)
+    -> (block, index of the target's heading among the block's headings,
+    number of the block's headings), all in the source. An id inside a
+    block element maps to the one heading that is it, holds it or that it
+    holds (else no target); an id on an element that directly holds blocks
+    (the innermost container) takes its first block when this is a
+    heading. The first occurrence of an id wins."""
+    owner, first_block, headings = {}, {}, {}
+    for block in blocks:
+        if block.tag:
+            headings[id(block)] = [e for e in block.nodes[0].iter() if localname(e) in HEADINGS]
+            for e in block.nodes[0].iter(etree.Element):
+                owner[e] = block
+        for el in [block.parent, *block.parent.iterancestors()]:
+            first_block.setdefault(el, block)
+    targets = {}
+    first_heading = True
+    for el in body.iter(etree.Element):
+        key = el.get('id')
+        if localname(el) in HEADINGS and first_heading:
+            first_heading = False
+            if el in owner:
+                found = headings[id(owner[el])]
+                targets[None] = (owner[el], found.index(el), len(found))
+        if key is None or key in targets:
+            continue
+        targets[key] = None  # taken: a later duplicate never wins
+        block = owner.get(el)
+        if block is not None:
+            hs = headings[id(block)]
+            found = ([h for h in hs if h is el or h in el.iterancestors()]
+                     or [h for h in hs if el in h.iterancestors()])
+            if len(found) == 1:
+                targets[key] = (block, hs.index(found[0]), len(hs))
+        elif el in first_block:
+            block = first_block[el]
+            if block.parent is el and block.tag in HEADINGS:
+                targets[key] = (block, 0, 1)
+    return {k: v for k, v in targets.items() if v is not None}
 
 
 def _matches(blocks: list, segments: list) -> bool:
@@ -486,12 +609,14 @@ def _pieces(seg, blocks: list) -> list:
     name, a sequence of runs to one inline group. A sequence of one run
     takes the whole group; a sequence of k > 1 runs (lines separated by
     <br> in the source) takes the group split at the newlines in its
-    top-level text, which must give exactly k pieces with content. The
+    top-level text, which must give exactly k pieces with content. A
+    piece whose source block has text must have text. The
     stored HTML must itself split into its blocks by the same rule
     (checked by fingerprint), else the segment cannot be mapped. Finally
-    every id (and name of an <a>) inside a source block, below the block
-    element itself, must occur in that block's translation; inner tags and
-    other attributes are not checked (Phase 4).
+    the ids (and names of <a>) inside a source block, below the block
+    element itself, must be the same values, as many times each, in that
+    block's translation; inner tags and other attributes are not checked
+    (Phase 4).
 
     A code segment's translation is plain text, filled into the code
     element; a translation equal to the source code leaves the block as
@@ -499,7 +624,9 @@ def _pieces(seg, blocks: list) -> list:
     """
     if seg.segment_type == SegmentType.CODE:
         return [_code_piece(seg, blocks)]
-    nsmap = blocks[0].parent.nsmap
+    nsmap = {}  # the declarations in scope for every block of the segment
+    for block in blocks:
+        nsmap.update(block.parent.nsmap)
     try:
         source = _split(_fragment(seg.html, nsmap), blocks)
     except etree.XMLSyntaxError:
@@ -513,21 +640,23 @@ def _pieces(seg, blocks: list) -> list:
     pieces = _split(fragment, blocks)
     if pieces is None:
         raise _Kept(STRUCTURE_MISMATCH)
-    if any(not _anchors(s) <= _anchors(p) for s, p in zip(source, pieces)):
-        raise _Kept(MISSING_ANCHOR)
+    if any(_text(s).strip() and not _text(p).strip() for s, p in zip(source, pieces)):
+        raise _Kept(STRUCTURE_MISMATCH)  # a block with text translated to none
+    if any(_anchors(s) != _anchors(p) for s, p in zip(source, pieces)):
+        raise _Kept(ANCHOR_MISMATCH)
     return pieces
 
 
-def _anchors(piece) -> set:
-    """The id values, and the name values of <a>, inside one block's piece:
-    below a block element (its own attributes come from the source) or in
-    a run's nodes."""
+def _anchors(piece) -> Counter:
+    """The id values, and the name values of <a>, inside one block's piece,
+    counted: below a block element (its own attributes come from the
+    source) or in a run's nodes."""
     if isinstance(piece, list):
         elements = [e for n in piece if not isinstance(n, str) for e in n.iter(etree.Element)]
     else:
         elements = piece.iterdescendants(etree.Element)
-    return {v for e in elements
-            for v in (e.get('id'), e.get('name') if localname(e) == 'a' else None) if v}
+    return Counter(v for e in elements
+                   for v in (e.get('id'), e.get('name') if localname(e) == 'a' else None) if v)
 
 
 def _fragment(html: str, nsmap: dict):
@@ -630,9 +759,14 @@ def _code_piece(seg, blocks: list):
     piece = copy.deepcopy(element)
     piece.tail = None
     target = _code_target(piece)
-    if target is None:
+    # the stored code must be exactly the target's text, else text outside
+    # the target would be written twice
+    if target is None or element_text(target) != _code_text(block):
         raise _Kept(CODE_MARKUP)
-    target.text = seg.translated_text
+    try:
+        target.text = seg.translated_text
+    except ValueError:  # characters XML does not allow
+        raise _Kept(NOT_WELL_FORMED)
     return piece if block.tag else [piece]
 
 
@@ -734,13 +868,18 @@ def _same_language(value: str, language: str) -> bool:
     return bool(language) and value.split('-')[0].lower() == language.split('-')[0].lower()
 
 
+def _relang_one(e, src_lang: str) -> None:
+    """An explicit source-language lang attribute of `e` becomes zh-TW."""
+    for attr in ('lang', XML_LANG):
+        value = e.get(attr)
+        if value is not None and _same_language(value, src_lang):
+            e.set(attr, TARGET_LANG)
+
+
 def _relang(el, src_lang: str) -> None:
     """Explicit source-language lang attributes in `el`'s subtree become zh-TW."""
     for e in el.iter(etree.Element):
-        for attr in ('lang', XML_LANG):
-            value = e.get(attr)
-            if value is not None and _same_language(value, src_lang):
-                e.set(attr, TARGET_LANG)
+        _relang_one(e, src_lang)
 
 
 def _mark_translated(el, src_lang: str, epub3: bool) -> None:
@@ -754,3 +893,11 @@ def _mark_translated(el, src_lang: str, epub3: bool) -> None:
     el.set(XML_LANG, TARGET_LANG)
     if epub3:
         el.set('lang', TARGET_LANG)
+    # Readers may hide notes: the translated row of a note stays visible
+    kinds = (el.get(EPUB_TYPE) or '').split()
+    kept = [k for k in kinds if k not in NOTE_TYPES]
+    if kept != kinds:
+        if kept:
+            el.set(EPUB_TYPE, ' '.join(kept))
+        else:
+            del el.attrib[EPUB_TYPE]
