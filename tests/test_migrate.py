@@ -12,7 +12,9 @@ from click.testing import CliRunner
 from src.core.migrate import MigrationError, migrate_project, _groups
 from src.core.project import ProjectLockedError, ProjectManager, SegmentStatus, sha256_file
 from src.epub.blocks import fingerprint
-from tests.conftest import hold_lock_in_child, write_raw_epub, xhtml
+from tests.conftest import (
+    hold_lock_in_child, lock_free_for_other_process, write_raw_epub, xhtml,
+)
 
 CHAPTERS = {
     'c1': '<h1>Harbour</h1><p>The boats came home.</p><p>Nets were dried.</p>',
@@ -690,6 +692,7 @@ class TestMigrateReview3:
         after = _files(project_dir)
         after.pop('project.lock')
         assert after == before
+        assert lock_free_for_other_process(project_dir)   # review round 4
 
     def test_malformed_segment_through_the_cli(self, tmp_path):
         from translate import cli
@@ -715,6 +718,7 @@ class TestMigrateReview3:
         with pytest.raises(OSError):
             migrate_project(project_dir)
         assert sorted(os.listdir(project_dir)) == ['project.json', 'project.lock', 'source.epub']
+        assert lock_free_for_other_process(project_dir)   # review round 4
         monkeypatch.undo()
         assert migrate_project(project_dir).written
 
