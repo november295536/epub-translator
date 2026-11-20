@@ -23,14 +23,21 @@ directory, and checks every export against the project's source EPUB:
 - SVG attribute names keep their case (every attribute name on an SVG
   element of an output chapter occurs on an SVG element of the source
   chapter);
-- epubcheck, when it is on PATH, reports no error the source does not have:
-  per message ID (ERROR and FATAL), the export's count of reported
-  locations is not above the source's. Only counts and message IDs are
-  printed (messages can quote the book).
+- epubcheck, when it is on PATH, reports no error the source does not have,
+  counted per message ID (ERROR and FATAL) as reported locations:
+  chinese-only: the export's count is not above the source's;
+  bilingual: every ID also occurs in the source, and the export's count is
+  at most twice the source's. The bilingual rule is looser on purpose: the
+  translated copy of a block repeats the source element's attributes and
+  markup, so each source error inside a translated block can appear once
+  more; an error ID the source does not have is still a failure.
+  Only counts and message IDs are printed (messages can quote the book).
 
 It prints per project and in total: translated segments exported as
 translation and kept in the original language, with counts per reason
-(the export report), and the TOC labels changed. Everything in the
+(the export report), and the TOC labels changed, out of all entries and
+out of the entries that point into a chapter with at least one segment
+exported as translation. Everything in the
 temporary directory is removed at the end. The projects directory is only
 read: a project FAILs if any file in it changed during the run.
 
@@ -169,7 +176,8 @@ def uses_bilingual(root) -> bool:
 
 
 def toc_labels(archive: Archive) -> list:
-    """(member, position, label) of every NCX and navigation entry."""
+    """(member, position, label, target member or None) of every NCX and
+    navigation entry."""
     out = []
     for path, media_type, is_nav in archive.manifest.values():
         root = archive.tree(path) if (is_nav or media_type == NCX_MEDIA_TYPE) else None
@@ -177,7 +185,14 @@ def toc_labels(archive: Archive) -> list:
             continue
         tag = 'a' if is_nav else 'text'
         for i, e in enumerate(e for e in root.iter(etree.Element) if localname(e) == tag):
-            out.append((path, i, ' '.join(''.join(e.itertext()).split())))
+            if is_nav:
+                href = e.get('href')
+            else:  # text -> navLabel -> navPoint, whose content holds the target
+                point = e.getparent().getparent()
+                content = next((c for c in point if localname(c) == 'content'), None)
+                href = None if content is None else content.get('src')
+            target = _resolve(path, href + '#x')[0] if href else None
+            out.append((path, i, ' '.join(''.join(e.itertext()).split()), target))
     return out
 
 
@@ -203,9 +218,11 @@ def epubcheck_errors(path: str):
     return counts
 
 
-def new_errors(source: Counter, export: Counter) -> Counter:
-    """Errors of the export beyond the source's, by message ID."""
-    return Counter({i: n - source[i] for i, n in export.items() if n > source[i]})
+def new_errors(source: Counter, export: Counter, factor: int) -> Counter:
+    """Errors of the export beyond `factor` times the source's, by
+    message ID (an ID the source does not have counts in full)."""
+    return Counter({i: n - factor * source[i] for i, n in export.items()
+                    if n > factor * source[i]})
 
 
 def check_export(source: Archive, output_path: str, report, fmt: str, source_errors,
@@ -246,7 +263,7 @@ def check_export(source: Archive, output_path: str, report, fmt: str, source_err
     if source_errors is not None:
         errors = epubcheck_errors(output_path)
         epubcheck[fmt] = sum(errors.values())
-        new = new_errors(source_errors, errors)
+        new = new_errors(source_errors, errors, 1 if fmt == 'chinese-only' else 2)
         if new:
             problems.append('epubcheck new errors '
                             + ', '.join(f'{i} {n}' for i, n in sorted(new.items())))
@@ -298,6 +315,7 @@ def check_copy(copy_dir: str, out_dir: str) -> tuple[dict, list[str]]:
     src_labels = toc_labels(source)
     source_errors = epubcheck_errors(pm.data.epub_path)
     result = {'exports': len(FORMATS), 'entries': len(src_labels), 'epubcheck': {},
+              'into': 0,
               'source_errors': source_errors}
     for fmt in FORMATS:  # chinese-only first: its counts are the project's
         output = os.path.join(out_dir, f'{fmt}.epub')
@@ -307,7 +325,11 @@ def check_copy(copy_dir: str, out_dir: str) -> tuple[dict, list[str]]:
         counts = (report.translated, report.reasons())
         if fmt == FORMATS[0]:
             result['translated'], result['kept'] = counts
-            result['labels'] = sum(a != b for a, b in zip(src_labels, toc_labels(Archive(output))))
+            result['labels'] = sum(a[2] != b[2] for a, b in zip(src_labels,
+                                                                toc_labels(Archive(output))))
+            by_id = {i: p for i, (p, _, _) in source.manifest.items()}
+            exported = {by_id.get(c.chapter_id) for c in report.chapters if c.translated}
+            result['into'] = sum(entry[3] in exported for entry in src_labels)
         elif counts != (result['translated'], result['kept']):
             problems.append(f'{fmt}: segment counts differ from chinese-only')
     result['epubcheck_failed'] = sum('epubcheck new errors' in p for p in problems)
@@ -365,6 +387,7 @@ def run(args, names: list[str], work: str) -> int:
         print(f'epubcheck found; errors compared by message ID ({", ".join(FORMATS)})')
     epubcheck = shutil.which('epubcheck') is not None
     totals = {'exports': 0, 'translated': 0, 'kept': Counter(), 'labels': 0, 'entries': 0,
+              'into': 0,
               'epubcheck_failed': 0}
     failed = 0
     for index, name in enumerate(names, 1):
@@ -390,12 +413,13 @@ def run(args, names: list[str], work: str) -> int:
             failed += 1
             print(f'FAIL {label}: ' + '; '.join(problems))
             continue
-        for key in ('exports', 'translated', 'labels', 'entries', 'epubcheck_failed'):
+        for key in ('exports', 'translated', 'labels', 'entries', 'into', 'epubcheck_failed'):
             totals[key] += r[key]
         totals['kept'] += r['kept']
         line = (f"{label}: exports {r['exports']}, translated segments "
                 f"{r['translated'] + sum(r['kept'].values())}: as translation {r['translated']}, "
-                f"{kept_text(r['kept'])}, toc labels changed {r['labels']}/{r['entries']}"
+                f"{kept_text(r['kept'])}, toc labels changed {r['labels']}/{r['entries']} "
+                f"({r['into']} into translated chapters)"
                 + epubcheck_text(r))
         if problems:
             failed += 1
@@ -406,7 +430,8 @@ def run(args, names: list[str], work: str) -> int:
     kept = totals['kept']
     print(f"TOTAL projects {len(names)}  exports {totals['exports']}  translated segments "
           f"{totals['translated'] + sum(kept.values())}  as translation {totals['translated']}  "
-          f"{kept_text(kept)}  toc labels changed {totals['labels']}/{totals['entries']}  "
+          f"{kept_text(kept)}  toc labels changed {totals['labels']}/{totals['entries']} "
+          f"({totals['into']} into translated chapters)  "
           + (f"exports with new epubcheck errors {totals['epubcheck_failed']}  " if epubcheck
              else 'epubcheck not run  ')
           + f"failed projects {failed}")
