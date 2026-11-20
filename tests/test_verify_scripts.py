@@ -2002,6 +2002,19 @@ class TestValidateCheck:
         assert out[2].endswith(f'{ratio}  sources that cannot be cut 0  '
                                'with translatable attributes 0  failed projects 0')
 
+    def test_failing_every_tag_rule_counts_as_tags_only(self, tmp_path, capsys):
+        root, project_dir = _validate_projects(tmp_path / 'projects')
+        pm = validate_check.ProjectManager(project_dir)
+        pm.load()
+        seg = pm._find('c_seg0004')
+        seg.html = '<p>Same <a id="x">wo</a><b>rds</b>.</p>'
+        pm.mark_translated('c_seg0004', '<p>甲<span>乙</span><b class="z">丙</b></p>')
+        pm.save()
+        assert self._main(root) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert ('(code_changed 1, extra_attributes 1, key_mismatch 1, tag_count 2, '
+                'unknown_tag 1; only tag rules 2)') in out[1]
+
     def test_sources_and_attributes_counted(self, tmp_path, capsys):
         root, project_dir = _validate_projects(tmp_path / 'projects')
         pm = validate_check.ProjectManager(project_dir)

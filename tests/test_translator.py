@@ -1851,6 +1851,7 @@ class TestRound1Translator:
         assert str(outcome.failure) == 'Translation failed after 0 attempts: 原文無法切成各個區塊'
         assert outcome.failure.prompt.endswith('\n\n<p k="1">A</p>')
         assert outcome.failure.attempts == []
+        assert outcome.failure.code == 'ambiguous_source'
 
     def test_failed_outcome_carries_usage(self):
         fake = FakeBackend([LLMResponse(DROPPED_B, 'complete', Usage(10, 3), 'haiku')] * 2)
@@ -1874,3 +1875,8 @@ class TestRound1Translator:
                             '<p k="1">二<b>乙</b>。</p>\n<p k="2">三乙。</p>'])
         outcome = translate_segment(_engine(fake), seg, [seg])
         assert outcome.issues[0].detail == '第 3 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'
+        bad1 = bad.replace('一<b>乙</b>', '一乙').replace('二乙', '二<b>乙</b>')
+        fake = FakeBackend([bad1, bad1, '<p k="1">一乙。</p>', ''])
+        outcome = translate_segment(_engine(fake), seg, [seg])
+        assert outcome.issues[0].detail == '第 1 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'
+        assert len(fake.requests) == 3
