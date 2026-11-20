@@ -993,11 +993,11 @@ class TestExportCheck(_ExportCheckBase):
     PASS = [
         'epubcheck not available (not on PATH): not run',
         'PASS project-1: exports 3, translated segments 3: as translation 3, kept original 0, '
-        'toc labels changed 0/0',
+        'toc labels changed 0/0 (0 into translated chapters)',
         'PASS project-2: exports 3, translated segments 4: as translation 4, kept original 0, '
-        'toc labels changed 2/2',
+        'toc labels changed 2/2 (2 into translated chapters)',
         'TOTAL projects 2  exports 6  translated segments 7  as translation 7  kept original 0  '
-        'toc labels changed 2/2  epubcheck not run  failed projects 0',
+        'toc labels changed 2/2 (2 into translated chapters)  epubcheck not run  failed projects 0',
     ]
 
     def test_pass_lines_and_originals_untouched(self, tmp_path, capsys):
@@ -1025,10 +1025,10 @@ class TestExportCheck(_ExportCheckBase):
         out = capsys.readouterr().out.splitlines()
         assert out[1] == ('PASS project-1: exports 3, translated segments 4: as translation 2, '
                           'kept original 2 (not_well_formed 1, structure_mismatch 1), '
-                          'toc labels changed 2/2')
+                          'toc labels changed 2/2 (2 into translated chapters)')
         assert out[2] == ('TOTAL projects 1  exports 3  translated segments 4  '
                           'as translation 2  kept original 2 (not_well_formed 1, '
-                          'structure_mismatch 1)  toc labels changed 2/2  epubcheck not run  '
+                          'structure_mismatch 1)  toc labels changed 2/2 (2 into translated chapters)  epubcheck not run  '
                           'failed projects 0')
 
     def test_work_directory_removed_and_outside_repository(self, tmp_path, capsys, monkeypatch):
@@ -1273,19 +1273,20 @@ class TestExportCheckEpubcheck:
         root = _export_projects(tmp_path / 'projects', schema_1=False)
         seen = self._fake(monkeypatch, {
             'source': [('RSC-005', 'ERROR', 2), ('OPF-1', 'WARNING', 9)],
-            'chinese-only': [('RSC-005', 'ERROR', 2), ('X-1', 'USAGE', 3)],
-            'bilingual-horizontal': [('RSC-005', 'ERROR', 3), ('RSC-012', 'FATAL', 0)],
-            'bilingual-vertical': [('RSC-005', 'ERROR', 1)]})
+            'chinese-only': [('RSC-005', 'ERROR', 3), ('X-1', 'USAGE', 3)],
+            'bilingual-horizontal': [('RSC-005', 'ERROR', 5), ('RSC-012', 'FATAL', 0)],
+            'bilingual-vertical': [('RSC-005', 'ERROR', 4)]})
         assert export_check.main(['--projects-dir', str(root), '--anonymize']) == 1
         out = capsys.readouterr().out
         assert out.splitlines() == [
             'epubcheck found; errors compared by message ID '
             '(chinese-only, bilingual-horizontal, bilingual-vertical)',
             'FAIL project-1: exports 3, translated segments 4: as translation 4, '
-            'kept original 0, toc labels changed 2/2, epubcheck errors source 2 (RSC-005:2), '
-            'exports 2/4/1; bilingual-horizontal: epubcheck new errors RSC-005 1, RSC-012 1',
+            'kept original 0, toc labels changed 2/2 (2 into translated chapters), epubcheck errors source 2 (RSC-005:2), '
+            'exports 3/6/4; chinese-only: epubcheck new errors RSC-005 1; '
+            'bilingual-horizontal: epubcheck new errors RSC-005 1, RSC-012 1',
             'TOTAL projects 1  exports 3  translated segments 4  as translation 4  '
-            'kept original 0  toc labels changed 2/2  exports with new epubcheck errors 1  '
+            'kept original 0  toc labels changed 2/2 (2 into translated chapters)  exports with new epubcheck errors 2  '
             'failed projects 1']
         assert 'quoted book text' not in out
         assert seen == ['source', 'chinese-only', 'bilingual-horizontal', 'bilingual-vertical']
@@ -1313,8 +1314,11 @@ class TestExportCheckEpubcheck:
 
     def test_new_errors(self):
         from collections import Counter
-        assert export_check.new_errors(Counter(a=2, b=1), Counter(a=3, b=1, c=2)) == {
+        assert export_check.new_errors(Counter(a=2, b=1), Counter(a=3, b=1, c=2), 1) == {
             'a': 1, 'c': 2}
+        # bilingual: up to twice the source's count, no ID the source lacks
+        assert export_check.new_errors(Counter(a=2, b=1), Counter(a=4, b=3, c=1), 2) == {
+            'b': 1, 'c': 1}
 
 
 def _edit_all(edits):
@@ -1402,8 +1406,9 @@ class TestExportCheckSurvivors(_ExportCheckBase):
              ('gone', 'gone.ncx', 'application/x-dtbncx+xml', None)], ['nav'],
             {'OEBPS/a.css': 'p {}', 'OEBPS/nav.xhtml': nav, 'OEBPS/toc.ncx': ncx})
         assert export_check.toc_labels(export_check.Archive(epub)) == [
-            ('OEBPS/nav.xhtml', 0, 'Two words'), ('OEBPS/nav.xhtml', 1, 'Three'),
-            ('OEBPS/nav.xhtml', 2, 'x'), ('OEBPS/toc.ncx', 0, 'One')]
+            ('OEBPS/nav.xhtml', 0, 'Two words', 'OEBPS/c.xhtml'),
+            ('OEBPS/nav.xhtml', 1, 'Three', None),
+            ('OEBPS/nav.xhtml', 2, 'x', 'OEBPS/c.xhtml'), ('OEBPS/toc.ncx', 0, 'One', None)]
 
     def test_bilingual_stylesheet_read_after_a_non_utf8_one(self, tmp_path, capsys):
         from tests.test_exporter import RAW_TRANSLATIONS, _project, _raw_book
@@ -1437,7 +1442,7 @@ class TestExportCheckSurvivors(_ExportCheckBase):
             'files in the project directory changed',
             'FAIL project-2: 1 chapters unmatched by the migration',
             'TOTAL projects 2  exports 0  translated segments 0  as translation 0  '
-            'kept original 0  toc labels changed 0/0  epubcheck not run  failed projects 2']
+            'kept original 0  toc labels changed 0/0 (0 into translated chapters)  epubcheck not run  failed projects 2']
 
     def test_totals_over_two_failing_projects(self, tmp_path, capsys, monkeypatch):
         from tests.test_exporter import RAW_TRANSLATIONS, _project, _raw_book
@@ -1451,7 +1456,7 @@ class TestExportCheckSurvivors(_ExportCheckBase):
         assert self._main(root) == 1
         assert capsys.readouterr().out.splitlines()[3] == (
             'TOTAL projects 2  exports 6  translated segments 8  as translation 6  '
-            'kept original 2 (structure_mismatch 2)  toc labels changed 4/4  '
+            'kept original 2 (structure_mismatch 2)  toc labels changed 4/4 (4 into translated chapters)  '
             'epubcheck not run  failed projects 2')
 
 
@@ -1481,3 +1486,30 @@ class TestExportCheckEpubcheckSurvivors:
         assert export_check.main(['--projects-dir', str(root), '--anonymize']) == 0
         assert capsys.readouterr().out.splitlines()[1].endswith(
             'epubcheck errors source 3 (A-1:2 B-1:1), exports 0/0/0')
+
+
+class TestExportCheckTocDenominator(_ExportCheckBase):
+    """Fix round: entries that point into a chapter exported with a translation."""
+
+    def test_entries_into_translated_chapters(self, tmp_path, capsys):
+        from tests.test_exporter import RAW_TRANSLATIONS, _project, _raw_book
+        root = tmp_path / 'projects'
+        root.mkdir()
+        (tmp_path / 'b').mkdir()
+        # the nav and NCX entries point at chapter one, which stays untranslated
+        _project(root, _raw_book(tmp_path / 'b'),
+                 {k: v for k, v in RAW_TRANSLATIONS.items() if k.startswith('two')}, name='p')
+        assert self._main(root) == 0
+        assert capsys.readouterr().out.splitlines()[1].endswith(
+            'toc labels changed 0/2 (0 into translated chapters)')
+
+    def test_kept_chapter_is_not_counted(self, tmp_path, capsys):
+        from tests.test_exporter import RAW_TRANSLATIONS, _project, _raw_book
+        root = tmp_path / 'projects'
+        root.mkdir()
+        (tmp_path / 'b').mkdir()
+        translations = dict(RAW_TRANSLATIONS, one_seg0001='<h1>守', one_seg0002='字')
+        _project(root, _raw_book(tmp_path / 'b'), translations, name='p')
+        assert self._main(root) == 0
+        assert capsys.readouterr().out.splitlines()[1].endswith(
+            'toc labels changed 0/2 (0 into translated chapters)')
