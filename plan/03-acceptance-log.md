@@ -4309,3 +4309,75 @@ script was added to the mutated files.
   of translated context on quality, is for the owner to measure with the real model.
 - The new rules were not applied to any real project (none was created); the check script
   re-cuts copies of the sources only.
+
+## Phase 6 — review round 1
+
+Date: 2026-11-21. Same branch and worktree. Findings of three reviewers, fixed together.
+
+### Changes
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| 1 | context text: the tag regex broke on `>` in an attribute value and on CDATA, whitespace not collapsed | `translation_text` uses `validation.plain_text` (parsed) and collapses all whitespace to single spaces | `TestRound1ContextText::test_parsed_text[*]` |
+| 2 | the check script printed PASS for books with chapters it could not read | a project FAILs with `N chapters could not be checked` (the extractor's failures) and with `no chapter checked` | `TestSegmentationCheckRound1` (partly, wholly unreadable, no chapter) |
+| 3 | `covers()` compared the flattened fingerprints | each segment's fingerprints against its own block slice | `test_covers_compares_each_segment_with_its_blocks` (the counterexample `(0,1,[a,b])`, `(1,3,[c])`) |
+| 4 | `segmentation` accepted any value; an explicit `1` was dropped on save | only the integers 1 and 2 (`project.check_rules`: not `"2"`, `3`, `true`, `1.0`, `null`) on load, on create and in `Segmenter`; the field is `None` when absent and only then left out, so explicit 1 and 2 save byte-identical | `TestRound1Marker` |
+| 5 | passthrough guarded only in the callers | `apply_outcome` returns False, `update_translation`, `mark_reviewed`, `mark_failed`, `mark_translated` raise `PassthroughError` (a `ValueError`) | `TestRound1StateGuards` |
+| 6 | search / re-translate page could select passthrough code and start a run of 0 segments | results carry `passthrough`; such rows are labelled, their checkbox disabled, "select all" skips them; a start answering `total: 0` shows an explanation instead of redirecting | `TestRound1Search` |
+| 7 | passthrough passed the "nothing translated" export guards and the translated word count | CLI `export` and web export (new guard there, 400) need a translation other than passthrough; the overview's translated words leave passthrough out and its "translated" card says how many are passthrough; the percentage still counts them as done | `TestRound1Guards` |
+| 8 | a first-line `#!` counted as a comment line | `validation.is_comment_line`: a `#!` first line is code. Such code without other comments is passthrough, and `check_code` requires the shebang unchanged (all projects: the only change for rules 1); the code prompt says so | `TestRound1Shebang`, `TestPassthrough` cases |
+| 9 | the context read was not atomic | `translate_segment(..., mutex=pm.mutex)` (web worker, both CLI paths) reads the context under the project mutex and releases it before the model call; `apply_outcome` and `mark_translated` store the text before the status | `test_mutex_held_only_while_the_context_is_read`, `test_callers_pass_the_project_mutex` |
+| 10 | tests that would pass without the behaviour | re-translate endpoint prompts with an already-translated neighbour (rules 2: translation, rules 1: source); a merged heading followed by `<br>` runs exported in all three formats, identical to the rules 1 cut | `TestRound1Retranslate`, `TestRound1MergedExport` |
+| 11 | script docstring, `ValueError` | docstring states that a project without its own `source.epub` is read from the path in `project.json` (outside the snapshot) and what PASS proves; any error outside a project ends in `ERROR the check stopped (<type>)` (it already did; now tested) | `test_value_error_of_the_path_check` |
+| 12 | project list status counted passthrough | `home._get_status` leaves passthrough out: pending until something is really translated, completed when every other segment is reviewed | `test_overview_and_home_status` |
+| 13 | export report could count passthrough as untranslated | never counted as untranslated | `test_export_report_never_counts_passthrough_untranslated` |
+
+Readers of `get_progress()` checked (item 12): changed: home status, CLI `export` guard, web
+export guard (new), overview card and word count. Unchanged on purpose: the progress bar and
+percentage (layout, review page; passthrough is done), CLI `status` (already says how many of the
+translated are passthrough), CLI `start` counter, `/progress` API (reports `passthrough`).
+
+### Checks
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase6_segmentation_check.py --projects-dir <repo>/projects --anonymize
+(the same nine lines as in the Phase 6 entry; diffed, identical)
+TOTAL projects 8  segments 9520 -> 7870, calls 9520 -> 6432 (ratio 0.676), passthrough 1438, headings merged 1655 of 1770  failed projects 0
+$ python3 scripts/verify/phase3_export_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  exports 24  translated segments 4162  as translation 3956  kept original 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 53)  toc labels changed 405/1885 (527 into translated chapters)  exports with new epubcheck errors 0  failed projects 0
+$ python3 scripts/verify/phase4_validate_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  round trip 9491/9491  translated 4162  failing the structural check 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 54; only tag rules 88)  warnings (length_ratio 36, untranslated 8)  length ratio over 2925 segments: p1 0.312 p5 0.333 p50 0.404 p95 0.547 p99 0.976; outside 0.25-0.8: 38 (1.3%)  sources that cannot be cut 0  with translatable attributes 22  failed projects 0
+$ python3 scripts/verify/phase5_glossary_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  glossary entries 15, translated 4162, passing the structural check 3956, with term_not_applied 12, terms 4, by category (person: 9 warnings, 2 terms, term: 6 warnings, 2 terms)  failed projects 0
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+All exited 0. The Phase 6 numbers did not move: no code block of the 8 books has a first-line
+shebang as its only comment, and no chapter is unreadable. The stricter shebang check changed
+no Phase 4 count (`code_changed 19`). No temporary directory left.
+
+### Tests
+
+2133 passed (before this round: 2089). Changed: `test_exporter._project` writes no marker for
+rules 1 (`segmentation=None`, as a project from before Phase 6); context expectations in
+`TestContextFromTranslations` and `TestCli` now have collapsed whitespace; the shebang case of
+`TestPassthrough::test_comment_lines_decide` is now passthrough (item 8). None removed.
+
+### Mutation testing
+
+| Run | Mutants | Killed | Survived | Timeout |
+|---|---|---|---|---|
+| round 1 (final) | 561 | 559 | 2 | 0 |
+
+The two survivors are `check_source` 15 and 22 (`segment_chapter(None, ...)`), equivalent as
+recorded in the Phase 6 entry. `get_context` was restructured (it returns the neighbouring
+segments, then picks the text), so its former `None`-for-`False` survivor no longer exists.
+
+### Not verified
+
+- No real `claude` call.
+- The ordering "text before status" in `apply_outcome` / `mark_translated` is not observable
+  in a single-threaded test; the mutex test covers the reader side.
