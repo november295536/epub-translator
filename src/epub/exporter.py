@@ -298,6 +298,14 @@ class _ZipInfo(zipfile.ZipInfo):
         return self.raw_name, self.flag_bits | self.name_flag
 
 
+class _NoAttributes(int):
+    """External attributes 0 that zipfile writes as 0 (it replaces a false
+    value by 0o600 << 16)."""
+
+    def __bool__(self):
+        return True
+
+
 def _member_info(info, compress_type: int):
     """A ZipInfo for writing `info` again: name bytes (UTF-8 when the source
     flags it, else code page 437, as zipfile decoded it), date, attributes,
@@ -309,9 +317,10 @@ def _member_info(info, compress_type: int):
         raise ExportError(f'無法原樣寫回成員名稱：{info.filename!r}') from e
     out.name_flag = info.flag_bits & 0x800
     out.compress_type = compress_type
-    for attr in ('external_attr', 'internal_attr', 'create_system', 'create_version',
+    for attr in ('internal_attr', 'create_system', 'create_version',
                  'extract_version', 'extra', 'comment'):
         setattr(out, attr, getattr(info, attr))
+    out.external_attr = info.external_attr or _NoAttributes(0)
     return out
 
 
