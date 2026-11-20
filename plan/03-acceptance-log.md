@@ -3972,3 +3972,125 @@ All survivors of run 1 were in the check script and in two lines of `review.py`;
 - No real `claude` call; the warning after a model call is tested with the fake backend.
 - `translate.py validate` was not run on the real projects: they are schema 1 and the command
   refuses them (migration needed); the check script migrates copies instead.
+
+## Phase 5 — part A, review round 1
+
+Date: 2026-11-21. Same branch and worktree. Findings of review round 1 (three reviewers).
+
+### Changes
+
+| # | Finding | Change |
+|---|---|---|
+| 1 | A damaged `glossary.json` broke save / approve / re-translate (invalid JSON gave a misleading 404, `null` or `[{}]` a 500) | `glossary_manager.load_glossary(path)`: the glossary, or None on any load failure (logged as a warning with the exception type). Save, approve and re-translate use it through one helper (`review._glossary`); without a glossary the structural check and the save still happen, and the response carries `glossary_unavailable: true` (re-translate then also runs without the glossary in the prompt). `translate.py validate` prints `術語表無法讀取（glossary.json 損壞或格式不符），未檢查術語。` and goes on. `GlossaryManager.save()` is atomic: a temporary file in the same directory, `os.replace`, the old mode kept (0644 for a new file). |
+| 2 | Path guard of the check script missed the main checkout of a linked worktree | `in_work_tree`: refused when the resolved path or any ancestor holds `.git` (file or directory); also refused inside the projects directory, after resolving symlinks and `..`. Applies to `--sample-out` and the temporary directory. |
+| 3 | Script errors escaped as tracebacks with paths | `main` catches any exception at the command boundary: `ERROR the check stopped (<type>)`, exit 1; the temporary directory is removed in `finally`, and a failure to remove it prints `ERROR cannot remove the temporary directory (<type>)`. |
+| 4 | Categories printed verbatim | only `CATEGORY_LABELS` keys; any other category (also an empty one) is counted as `other`. |
+| 5 | Parentheses | balanced groups found with a stack; each group without a Han character (CJK ideographs incl. the supplementary planes) is removed with what it holds, so `介面（API (v2)）` → `介面`; a group with Han stays (its inner groups without Han go); unmatched parentheses stay. |
+| 6 | Regex tag removal broke on `>` in an attribute | `validation.plain_text`: the translation parsed as a fragment and its text taken with `element_text` (as the structural check does); text that does not parse (legacy plain text) is used as it is. |
+| 7 | A failed re-translation returned only `error` | the response also has the stored `issues` and `issue_count`; the page shows them, the kept text and status stay. |
+| 8 | Stale review page state | every review response has `issue_count` (segments with stored issues, after the change); the page sets the sidebar count from it and the status tooltip from the shown issues (removed when none). Approve still returns warnings it does not store; the count stays authoritative. |
+| 9 | Tests that would pass without the behaviour | `TestReviewPageScript` runs the page script in Node (badge, list, absent `issues`, detail inserted as text, sidebar count, save, approve, failed re-translation); `distinct_terms` asserted directly. |
+| 10 | Survivor `.lower()` → `.upper()` was not equivalent | `straße` / `strasse` are two entries; `upper()` would merge them. Test added. Round 0's justification of `category_text` 14 was wrong. |
+| 11 | `sample_item` searched case-insensitively for `work` terms | both use `validation.occurrence_pattern`. |
+| 12 | `term_pattern` has no end boundary (`Eve` in "every", `Java` in "JavaScript") | for the check only: `occurrence_pattern` = the prompt's start, then a short inflection, then `(?!\w)`. Names (`person`, `place`, `organization`, `work`): plural `s`/`es` and possessive (`'s`, `’s`, `'`). Other terms also `ed` / `ing`, and for a final `e` (`calibrate`) `es` / `ed` / `ing` with the `e` dropped for `ing`. The prompt's matching is unchanged. |
+| 13 | The glossary check in `translate_segment` ran outside its `try` | entries whose term or translation is not a non-empty string are skipped; an unusable category is treated as none; the check is wrapped (`_glossary_warnings`): a failure logs a warning and drops the warnings only. The review endpoints pass only a loaded glossary, whose entries the check skips if malformed. |
+| 14 | TOTAL "terms" summed per project, "by category" counted across projects | both sum the per-project counts. |
+
+`terms_not_applied` no longer calls `terms_for_prompt`: it takes every well-formed entry with an
+occurrence. That equals "in the prompt and occurring": the prompt holds the whole glossary up
+to `FULL_GLOSSARY_MAX_TERMS` entries, and above that every entry whose start matches, which an
+occurrence implies.
+
+### Known limitations (recorded, not fixed)
+
+- A term that occurs in the source only inside inline `<code>`, `<kbd>` or `<samp>` still counts
+  as an occurrence.
+- The check compiles one pattern per entry and segment; fine for the glossary sizes in use
+  (0 to 6 entries per project).
+- Inflections are a short fixed list: no consonant doubling (`stop` → `stopped`), no `y` → `ies`.
+- `translate.py start` and the web translation task still load the glossary with
+  `GlossaryManager.load()` and stop before any model call if it is damaged (the prompt needs it);
+  only the check and the review endpoints go on without it.
+
+### Checks
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase5_glossary_check.py --projects-dir <repo>/projects --anonymize --sample-out <file outside every git work tree>
+(per-project lines identical to part A)
+TOTAL projects 8  glossary entries 15, translated 4162, passing the structural check 3956, with term_not_applied 12, terms 4, by category (person: 9 warnings, 2 terms, term: 6 warnings, 2 terms)  failed projects 0
+sample written: 15 warnings
+$ echo $?
+0
+$ python3 scripts/verify/phase4_validate_check.py --projects-dir <repo>/projects --anonymize | tail -1
+TOTAL projects 8  round trip 9491/9491  translated 4162  failing the structural check 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 54; only tag rules 88)  warnings (length_ratio 36, untranslated 8)  length ratio over 2925 segments: p1 0.312 p5 0.333 p50 0.404 p95 0.547 p99 0.976; outside 0.25-0.8: 38 (1.3%)  sources that cannot be cut 0  with translatable attributes 22  failed projects 0
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+The TOTAL line is unchanged: the end boundary removed no real warning (the inflected verb forms
+in the data are `-s` and `-d` of a final-`e` term, both covered), and with at most one category
+per term in a project the per-project sums equal the earlier cross-project counts. The Phase 4
+TOTAL is unchanged. The sample holds the same 15 warnings in the same order; three source
+excerpts end two characters later because the match now includes the inflection. The sample
+file was rewritten at the same place outside the repository. Two `phase5-glossary-*` directories
+left by a failing test run during development (a test whose `rmtree` stub also blocked its own
+cleanup) were removed; none is left.
+
+### Tests
+
+1927 passed (part A: 1817). New: `TestDamagedGlossary`, `TestIssueCount`,
+`TestReviewPageScript` (Node; skipped where `node` is missing) (`test_web.py`);
+`TestGlossaryRound1`, `TestGlossaryRound1Survivors` (`test_validation.py`);
+`TestAtomicSave`, `TestLoadGlossary`, `TestRound1Survivors` (`test_glossary.py`);
+`TestTranslateSegmentGlossaryRound1` (`test_translator.py`); `TestPhase5ValidateGlossary::
+test_damaged_glossary` (`test_cli.py`); `TestGlossaryCheckRound1`,
+`TestGlossaryCheckRound1Survivors`, `TestReviewRound1Survivors` (`test_verify_scripts.py`).
+Every term and name in the fixtures is invented for the tests.
+
+Tests changed, none removed:
+
+| Test | Change | Reason |
+|---|---|---|
+| `TestRound1Exact::test_review_responses_exact`, `TestReviewIssues::test_update_returns_and_stores_glossary_warning`, `TestRetranslateDetails::test_failure_diagnostics_and_logs` | responses carry `issue_count`; a failed re-translation also `issues` | items 7, 8 |
+| `TestReviewIssues::test_no_segment_with_issues`, `test_badge_and_details` | the count element has `id="issue-count"`; `showIssues(segId, data)` five times | item 8 |
+| `TestGlossaryCompliance::test_comparable` | plain text in, no tags | item 6: tags are removed by parsing |
+| `TestGlossaryCheck::test_refuses_*_inside[repository]` | a checkout made in the test, message "a git work tree" | item 2; the mutation run's copy of the repository has no `.git` |
+| `TestGlossaryCheck::test_plain` | removed; replaced by `test_sample_translation_text_parsed` | the script's own `plain` is gone (item 6) |
+| `TestGlossaryCheckSurvivors::test_help_in_process`, `test_glossary_file_name`, `test_category_text`, `TestReviewSurvivors::test_glossary_file_name` | new help text, `load_glossary`, `category_counts`, `_glossary(project_dir)` | items 1, 2, 4, 14 |
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, mutmut 3.8.1, parallel.
+
+| Run | Mutants | Killed | Survived |
+|---|---|---|---|
+| 1 | 809 | 764 | 45 |
+| 2 (final) | 807 | 802 | 5 |
+
+| mutant(s) | done |
+|---|---|
+| `_glossary_warnings` 9, 10, 12–14, 16 (log message, `exc_info`) | killed: `test_check_failure_logged` |
+| `occurrence_pattern` 11 (`E?S` for a name), 15, 19, 20, 22, 23 (the final-e condition) | killed: `test_work_plural_case_sensitive`, `test_final_e` |
+| `terms_not_applied` 17 (sort by `upper()`) | killed: `test_sorted_by_lower_case` |
+| `load_glossary` 4, 6, 9 (warning text) | killed: `test_warning_names_the_exception` |
+| `save` 17–26, 33, 36, 40, 44, 47–50 (temporary file place and name, encoding, JSON layout) | killed: `test_temporary_file_next_to_the_glossary`, `test_content` |
+| `review._refused` 3 | killed: `test_refused_with_a_glossary_is_not_flagged` |
+| `check` 39, 41 (`mkdtemp` without the resolved directory) | killed: `test_work_directory_under_the_resolved_temporary_directory` |
+| `check` 44, 45 (`code = 1` before `run`) | code changed: the assignment was dead (when `run` raises, nothing is returned) and is removed |
+| `in_work_tree` 10 (`.GIT`, the same on a case-insensitive file system) | killed: `test_looks_for_dot_git` |
+| `_without_originals` 21 (`removed[start:i - 1] = [True] * (i + 1 - start)`) | equivalent: the slice assignment inserts two more `True` and shifts the later flags by two; all later flags are still `False` (groups close left to right, inner ones first), so positions `start` to `i` are marked and every later one stays unmarked, as before; `zip` drops the extra tail |
+| `occurrence_pattern` 30, 35 (upper-case inflection) | equivalent: these branches are only for categories outside NAME_CATEGORIES, whose pattern is always compiled with IGNORECASE (only `work`, a name category, is case-sensitive) |
+| `occurrence_pattern` 5 (`'XXXX'` for a category that is not a string) | equivalent: any value outside NAME_CATEGORIES and other than `work` gives the same pattern |
+| `save` 43 (`ensure_ascii=None`) | equivalent: `json.dump` only tests its truth value |
+
+### Not verified
+
+- No real `claude` call.
+- The review page was not opened in a browser in this round; its script is exercised in Node
+  with a DOM stub (`TestReviewPageScript`), and the endpoints through the Flask test client.
+- `translate.py validate` was not run on the real projects (schema 1, and no command is run on a
+  real project directory any more; only the check scripts, which work on copies).
+- Atomicity is tested by the write path (temporary file in the same directory, `os.replace`,
+  old file intact after a failed write), not by a concurrent reader.
