@@ -2890,3 +2890,51 @@ class TestGlossaryCheckRound1:
                               translated_text='<p>甲<em title="a > b">乙</em>&lt;5&gt;</p>')
         lines = glossary_check.sample_item(1, 'p', seg, GlossaryEntry('term', '詞', 'term'))
         assert lines.splitlines()[5] == '- 譯文（對應位置附近）：甲乙<5>'
+
+
+class TestGlossaryCheckRound1Survivors:
+    """Mutation testing, Phase 5 review round 1."""
+
+    def test_work_directory_under_the_resolved_temporary_directory(self, tmp_path, capsys,
+                                                                   monkeypatch):
+        root, _ = _glossary_projects(tmp_path / 'projects')
+        real_tmp = tmp_path / 'real-tmp'
+        real_tmp.mkdir()
+        link = tmp_path / 'tmp-link'
+        link.symlink_to(real_tmp)
+        made = []
+        real = glossary_check.tempfile.mkdtemp
+
+        def mkdtemp(**kwargs):
+            made.append(real(**kwargs))
+            return made[-1]
+        monkeypatch.setattr(glossary_check.tempfile, 'gettempdir', lambda: str(link))
+        monkeypatch.setattr(glossary_check.tempfile, 'mkdtemp', mkdtemp)
+        assert glossary_check.main(['--projects-dir', str(root), '--anonymize']) == 0
+        assert os.path.dirname(made[0]) == os.path.realpath(str(real_tmp))
+
+    def test_looks_for_dot_git(self, tmp_path, monkeypatch):
+        looked = []
+        real = glossary_check.os.path.lexists
+
+        def lexists(path):
+            looked.append(os.path.basename(path))
+            return real(path)
+        monkeypatch.setattr(glossary_check.os.path, 'lexists', lexists)
+        glossary_check.in_work_tree(str(tmp_path))
+        assert looked and set(looked) == {'.git'}
+
+
+class TestReviewRound1Survivors:
+
+    def test_refused_with_a_glossary_is_not_flagged(self, tmp_path):
+        from src.core.project import ProjectManager
+        from src.core.segmenter import Segment
+        from src.web.server import create_app
+        pm = ProjectManager(str(tmp_path / 'demo'))
+        pm.create('/x.epub', 'T', 'A', [Segment(id='c_seg0001', html='<p>A.</p>', text='A.',
+                                                word_count=1, segment_type='text')])
+        client = create_app(projects_dir=str(tmp_path)).test_client()
+        response = client.post('/api/projects/demo/segments/c_seg0001', json={'text': '<p>甲<b>乙</b></p>'})
+        assert response.status_code == 422
+        assert 'glossary_unavailable' not in response.get_json()

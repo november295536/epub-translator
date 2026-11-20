@@ -538,3 +538,40 @@ class TestLoadGlossary:
         assert list(gm.entries) == ['alpha'] and gm.glossary_path == str(path)
         missing = load_glossary(str(tmp_path / 'none.json'))
         assert missing is not None and missing.entries == {}
+
+
+class TestRound1Survivors:
+    """Mutation testing, Phase 5 review round 1."""
+
+    def test_temporary_file_next_to_the_glossary(self, tmp_path, monkeypatch):
+        import src.glossary.glossary_manager as module
+        moved, opened = [], []
+        real_replace, real_fdopen = module.os.replace, module.os.fdopen
+
+        def replace(src, dst):
+            moved.append(src)
+            real_replace(src, dst)
+
+        def fdopen(fd, mode, **kwargs):
+            opened.append(kwargs)
+            return real_fdopen(fd, mode, **kwargs)
+        monkeypatch.setattr(module.os, 'replace', replace)
+        monkeypatch.setattr(module.os, 'fdopen', fdopen)
+        _GM(str(tmp_path / 'glossary.json')).add_term('alpha', '甲')
+        name = os.path.basename(moved[0])
+        assert os.path.dirname(moved[0]) == str(tmp_path)
+        assert name.startswith('.glossary-') and name.endswith('.tmp')
+        assert opened == [{'encoding': 'utf-8'}]
+
+    def test_content(self, tmp_path):
+        path = tmp_path / 'glossary.json'
+        _GM(str(path)).add_term('Alpha', '甲', 'term')
+        assert path.read_text(encoding='utf-8') == (
+            '[\n  {\n    "term": "Alpha",\n    "translation": "甲",\n    "category": "term",\n'
+            '    "frequency": 0\n  }\n]')
+
+    def test_warning_names_the_exception(self, tmp_path, caplog):
+        path = tmp_path / 'glossary.json'
+        path.write_text('[{"term": ', encoding='utf-8')
+        assert load_glossary(str(path)) is None
+        assert caplog.records[-1].getMessage() == '術語表無法讀取，略過術語檢查 (JSONDecodeError)'

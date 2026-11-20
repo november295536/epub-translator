@@ -216,7 +216,6 @@ def check(args) -> int:
             print(message)
             return 2
     work = tempfile.mkdtemp(prefix='phase5-glossary-', dir=parent)
-    code = 1
     try:
         code = run(args, names, work)
     finally:
