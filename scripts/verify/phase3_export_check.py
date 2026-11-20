@@ -315,7 +315,6 @@ def check_copy(copy_dir: str, out_dir: str) -> tuple[dict, list[str]]:
     src_labels = toc_labels(source)
     source_errors = epubcheck_errors(pm.data.epub_path)
     result = {'exports': len(FORMATS), 'entries': len(src_labels), 'epubcheck': {},
-              'into': 0,
               'source_errors': source_errors}
     for fmt in FORMATS:  # chinese-only first: its counts are the project's
         output = os.path.join(out_dir, f'{fmt}.epub')
