@@ -9,13 +9,22 @@ class _StringSegmenter:
     """Segments an HTML string: a fragment is put into a <body> and parsed
     as XML, as the extractor parses a chapter."""
 
+    def __init__(self, rules=2):
+        self.rules = rules
+
     def segment_chapter(self, chapter_id, html):
-        return Segmenter().segment_chapter(chapter_id, body_of(html))
+        return Segmenter(rules=self.rules).segment_chapter(chapter_id, body_of(html))
 
 
 @pytest.fixture
 def segmenter():
     return _StringSegmenter()
+
+
+@pytest.fixture
+def segmenter_1():
+    """Rules 1: the segmentation of projects created before Phase 6."""
+    return _StringSegmenter(rules=1)
 
 
 def make_paragraph(word_count: int, index: int = 0) -> str:
@@ -32,9 +41,10 @@ def make_paragraph(word_count: int, index: int = 0) -> str:
 
 class TestSegmenter:
 
-    def test_heading_standalone_segment(self, segmenter):
+    def test_heading_standalone_segment(self, segmenter_1):
+        # Phase 6: rules 1 only (rules 2 merges the heading: TestRules2)
         html = '<h1>Chapter Title</h1><p>Some content here in the paragraph.</p>'
-        segments = segmenter.segment_chapter('ch1', html)
+        segments = segmenter_1.segment_chapter('ch1', html)
 
         heading_segs = [s for s in segments if '<h1' in s.html]
         assert len(heading_segs) >= 1
@@ -110,7 +120,8 @@ class TestSegmenter:
         for seg in segments:
             assert seg.id.startswith('chap01_seg')
 
-    def test_multiple_headings(self, segmenter):
+    def test_multiple_headings(self, segmenter_1):
+        # Phase 6: rules 1 only (rules 2: TestRules2.test_each_heading_starts_a_segment)
         html = (
             '<h1>Main Title</h1>'
             '<p>Intro paragraph.</p>'
@@ -119,7 +130,7 @@ class TestSegmenter:
             '<h2>Section 2</h2>'
             '<p>Section 2 content.</p>'
         )
-        segments = segmenter.segment_chapter('ch1', html)
+        segments = segmenter_1.segment_chapter('ch1', html)
         headings = [s for s in segments if s.standalone and '<h' in s.html]
         assert len(headings) == 3
 
@@ -174,14 +185,15 @@ class TestSmallSegmentMerging:
         for seg in text_segs:
             assert seg.word_count <= MAX_WORDS * 1.2
 
-    def test_heading_breaks_small_merge(self, segmenter):
-        """Headings (standalone) should interrupt small segment merging."""
+    def test_heading_breaks_small_merge(self, segmenter_1):
+        """Headings (standalone) should interrupt small segment merging.
+        Phase 6: rules 1 only (rules 2: TestRules2.test_heading_ends_the_previous_segment)."""
         html = (
             '<p>Short text one.</p>'
             '<h2>Section Break</h2>'
             '<p>Short text two.</p>'
         )
-        segments = segmenter.segment_chapter('ch1', html)
+        segments = segmenter_1.segment_chapter('ch1', html)
         non_standalone_text = [s for s in segments if s.segment_type == SegmentType.TEXT and not s.standalone]
         heading_segs = [s for s in segments if s.standalone and '<h' in s.html]
 

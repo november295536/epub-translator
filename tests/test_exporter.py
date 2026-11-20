@@ -65,16 +65,18 @@ def _raw_book(tmp_path, chapters=None, nav=RAW_NAV, ncx=RAW_NCX, extra=None, ver
     return write_raw_epub(tmp_path / name, items, spine + spine[-1:], members, version=version)
 
 
-def _project(tmp_path, epub, translations, statuses=None, name='proj'):
+def _project(tmp_path, epub, translations, statuses=None, name='proj', rules=1):
     """A schema 2 project of `epub` with the given translations (status
-    translated unless `statuses` says otherwise)."""
+    translated unless `statuses` says otherwise), segmented by `rules`
+    (default 1: a project created before Phase 6)."""
     ex = EPUBExtractor(epub)
     ex.load()
+    segmenter = Segmenter(rules=rules)
     segments = [s for ch in ex.extract_chapters()
-                for s in Segmenter().segment_chapter(ch.id, ch.body)]
+                for s in segmenter.segment_chapter(ch.id, ch.body)]
     project_dir = str(tmp_path / name)
     pm = ProjectManager(project_dir)
-    pm.create(epub, 'T', 'A', segments, source_sha256=sha256_file(epub))
+    pm.create(epub, 'T', 'A', segments, source_sha256=sha256_file(epub), segmentation=rules)
     for seg in pm.data.segments:
         if seg.segment_id in translations:
             pm.mark_translated(seg.segment_id, translations[seg.segment_id])

@@ -103,6 +103,8 @@ def update_segment(project_name: str, segment_id: str):
     try:
         with transaction(project_name) as pm:
             seg = pm._find(segment_id)
+            if seg.passthrough:
+                return _passthrough_refused()
             gm = _glossary(pm.project_dir)
             issues = []
             if data['text'].strip():  # an empty text clears the translation
@@ -140,6 +142,15 @@ def _answer(pm: ProjectManager, gm, issues: list, **fields) -> dict:
     return fields
 
 
+PASSTHROUGH_MESSAGE = '此段是沒有註解的程式碼，原樣保留，不需翻譯，也不能編輯或審閱'
+
+
+def _passthrough_refused():
+    """The answer to a change of a passthrough segment (a code block
+    without comment lines, src/core/segmenter.py): nothing is changed."""
+    return jsonify({'error': PASSTHROUGH_MESSAGE}), 409
+
+
 def _refused(result, pm: ProjectManager, gm):
     """The answer to a save or approval whose text fails the structural
     check: nothing is changed."""
@@ -164,6 +175,8 @@ def approve_segment(project_name: str, segment_id: str):
     try:
         with transaction(project_name) as pm:
             seg = pm._find(segment_id)
+            if seg.passthrough:
+                return _passthrough_refused()
             approved = text or seg.translated_text
             if not approved.strip():
                 return jsonify({'error': '沒有譯文可以核可'}), 422
@@ -195,7 +208,10 @@ def retranslate_segment(project_name: str, segment_id: str):
             return jsonify({'error': f'Segment {segment_id} not found'}), 404
         revision = seg.revision
         source = (seg.html, seg.text)  # a replaced project has other text
+        if seg.passthrough:
+            return _passthrough_refused()
         model = pm.data.model
+        translations = pm.data.segmentation == 2
         segments = copy.deepcopy(pm.data.segments)
         seg = next(s for s in segments if s.segment_id == segment_id)
     project_dir = pm.project_dir
@@ -206,7 +222,7 @@ def retranslate_segment(project_name: str, segment_id: str):
     try:
         engine = TranslationEngine(model=model)
         logger.info("重新翻譯段落: %s (模型: %s)", segment_id, engine.model)
-        outcome = translate_segment(engine, seg, segments, gm)
+        outcome = translate_segment(engine, seg, segments, gm, translations=translations)
         with transaction(project_name) as pm:
             current = next((s for s in pm.data.segments if s.segment_id == segment_id), None)
             if current is None or (current.html, current.text) != source:
