@@ -372,7 +372,8 @@ class TestHTMLAwareTranslation:
             translated_text='<p class="author">作者 <span>Name</span></p><p class="copyright">版權</p><p class="loc">地點</p>',
         )
 
-        builder._apply_chinese_only(seg, elements, soup)
+        # Review round 2: remove and pair are required (schema 1 passes these)
+        builder._apply_chinese_only(seg, elements, soup, elements, True)
         result = str(body)
         # HTML tags should be rendered, not escaped
         assert '&lt;' not in result, "HTML should not be escaped"
@@ -1730,3 +1731,32 @@ class TestSchema2BridgeReview2:
         assert soup.find('em').get_text() == '你好'
         assert soup.find('p').get_text() == '段'
         assert 'Hello' not in soup.get_text()
+
+
+class TestSchema2BridgeReview2Survivors:
+    """Mutation survivors of review round 2."""
+
+    @staticmethod
+    def _export(tmp_path, chapter, states, fmt):
+        return BeautifulSoup(_transform(_schema2_builder(tmp_path), chapter, states, fmt),
+                             'html.parser')
+
+    def test_enclosing_element_keeps_its_tag_for_a_one_node_translation(self, tmp_path):
+        chapter = '<html><body><div class="note" id="fn1">L1<br/>L2</div></body></html>'
+        states = _schema2_states(chapter, ['<p>一<br/>二</p>'])
+        soup = self._export(tmp_path, chapter, states, 'chinese-only')
+        note = soup.find('div', id='fn1')
+        assert note is not None and [str(c) for c in note.children] == ['一', '<br/>', '二']
+
+    @pytest.mark.parametrize('fmt', ['bilingual-horizontal', 'bilingual-vertical'])
+    def test_block_only_segment_paired_in_bilingual(self, tmp_path, fmt):
+        chapter = '<html><body><p>A one.</p><p>B two.</p></body></html>'
+        states = _schema2_states(chapter, ['<p>甲</p><p>乙</p>'])
+        soup = self._export(tmp_path, chapter, states, fmt)
+        assert _pairs(soup) == [('A one.', '甲'), ('B two.', '乙')]
+
+    def test_whitespace_between_blocks_removed_with_them(self, tmp_path):
+        chapter = '<html><body><p>A one.</p>\n<p>B two.</p></body></html>'
+        states = _schema2_states(chapter, ['<p>甲乙</p>'])
+        out = _transform(_schema2_builder(tmp_path), chapter, states, 'chinese-only')
+        assert '<body><p>甲乙</p></body>' in out
