@@ -1365,7 +1365,8 @@ class TestExportCheckSurvivors(_ExportCheckBase):
                          'chinese-only: 1 fragment links do not resolve')
 
     def test_link_checked_after_an_unparsed_member(self, tmp_path, capsys, monkeypatch):
-        edits = {'OEBPS/nav.xhtml': (b'</body>', b''),
+        # members are checked in name order: chapter two comes before one
+        edits = {'OEBPS/Text/chapter two.xhtml': (b'</body>', b''),
                  'OEBPS/Text/one.xhtml': (b'</body>', b'<p><a href="#zz">x</a></p></body>')}
         self._fails_with(tmp_path, capsys, monkeypatch, _edit_all(edits),
                          'chinese-only: 1 chapters: not well-formed; '
