@@ -39,7 +39,10 @@ import os
 import sys
 from collections import Counter
 
-# At index 0, ahead of everything (see phase0_builder_alignment.py)
+# The repository root at index 0, ahead of everything: this repository's
+# `src` package must win over any other `src` on the path. With default
+# interpreter path settings sys.path[0] is this script's directory (no src
+# package), so index 1 would import the same src.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from src.core.project import ProjectManager, SegmentStatus  # noqa: E402

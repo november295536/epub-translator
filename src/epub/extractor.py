@@ -89,17 +89,27 @@ class Chapter:
     order: int
 
 
+def package_path(zf: zipfile.ZipFile) -> str:
+    """Member name of the OPF, from META-INF/container.xml (raises EPUBError)."""
+    try:
+        container = parse_xml(read_member(zf, 'META-INF/container.xml'))
+    except KeyError as e:
+        raise EPUBError(f'EPUB 缺少檔案：{e}') from e
+    except etree.XMLSyntaxError as e:
+        raise EPUBError(f'EPUB 的套件文件不是格式正確的 XML：{e}') from e
+    rootfiles = _xpath_local(container, 'rootfile')
+    if not rootfiles or not rootfiles[0].get('full-path'):
+        raise EPUBError('container.xml 沒有指出 OPF（rootfile）')
+    return unquote(rootfiles[0].get('full-path'))
+
+
 def read_package(zf: zipfile.ZipFile) -> tuple:
     """Return (OPF root element, manifest, spine) of an open archive: the
     manifest maps item id -> (member name, media type, is navigation
     document); the spine lists its entries, duplicates removed, with their
     media types. Raises EPUBError when the package cannot be read."""
+    opf_path = package_path(zf)
     try:
-        container = parse_xml(read_member(zf, 'META-INF/container.xml'))
-        rootfiles = _xpath_local(container, 'rootfile')
-        if not rootfiles or not rootfiles[0].get('full-path'):
-            raise EPUBError('container.xml 沒有指出 OPF（rootfile）')
-        opf_path = unquote(rootfiles[0].get('full-path'))
         opf = parse_xml(read_member(zf, opf_path))
     except KeyError as e:
         raise EPUBError(f'EPUB 缺少檔案：{e}') from e
