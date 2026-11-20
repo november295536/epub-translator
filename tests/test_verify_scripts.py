@@ -1587,6 +1587,8 @@ class TestExportCheckReviewRound1(_ExportCheckBase):
                          'chinese-only: 1 untouched members stored differently')
 
     def test_untouched_member_compression_changed(self, tmp_path, capsys, monkeypatch):
+        import zipfile
+
         def change(members):
             for info, _ in members:
                 if info.filename == 'OEBPS/Styles/book.css':
