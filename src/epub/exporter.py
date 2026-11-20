@@ -156,7 +156,6 @@ class _Kept(Exception):
     """A segment stays in the original language."""
 
     def __init__(self, reason: str):
-        super().__init__(reason)
         self.reason = reason
 
 
@@ -270,12 +269,16 @@ def has_internal_subset(root, data: bytes) -> bool:
     """True when the document `data`, parsed as `root`, has a DOCTYPE with
     an internal subset, which `_serialize` cannot write back. lxml exposes
     no subset content (`docinfo.internalDTD` exists for any DOCTYPE), so
-    the source is decoded with the encoding the parser found and its prolog
-    read, skipping comments and processing instructions."""
+    the source is decoded and its prolog read, skipping comments and
+    processing instructions. The encoding: UTF-16 by byte order mark or by
+    the first character (XML 1.0, appendix F), else the one the parser
+    reports (from the declaration; UTF-8 without one)."""
     info = root.getroottree().docinfo
     if info.internalDTD is None:
         return False
-    text = data.decode(info.encoding or 'utf-8', 'replace').lstrip('\ufeff')
+    codec = {b'\xff\xfe': 'utf-16', b'\xfe\xff': 'utf-16',
+             b'<\x00': 'utf-16-le', b'\x00<': 'utf-16-be'}.get(data[:2], info.encoding)
+    text = data.decode(codec, 'replace').lstrip('\ufeff')
     return _SUBSET.match(_PROLOG_NODE.sub('', text)) is not None
 
 
@@ -363,8 +366,7 @@ def _write_archive(zf, output_path: str, replaced: dict, css_path) -> None:
                 zi.extra = b''  # OCF: no extra field in the mimetype header
                 out.writestr(zi, read_member(zf, last['mimetype']))
             else:
-                out.writestr(zipfile.ZipInfo('mimetype'), 'application/epub+zip',
-                             compress_type=zipfile.ZIP_STORED)
+                out.writestr(zipfile.ZipInfo('mimetype'), 'application/epub+zip')  # stored
             written = {'mimetype'}
             for name in [info.filename for info in zf.infolist()]:
                 if name in written:

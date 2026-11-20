@@ -1776,3 +1776,59 @@ class TestExportCheckReviewRound2(_ExportCheckBase):
             'project snapshot raised PermissionError')
         assert out[2].startswith('PASS project-2: ')
         assert 'alpha' not in '\n'.join(out) and 'invented failure' not in '\n'.join(out)
+
+
+class TestExportCheckRound2Survivors(_ExportCheckBase):
+    """Mutation run 7 (mutmut 3): the check script's rules spelled out."""
+
+    def test_two_broken_links_counted(self, tmp_path, capsys, monkeypatch):
+        self._fails_with(tmp_path, capsys, monkeypatch,
+                         _edit_all({'OEBPS/toc.ncx': (b'src="Text/one.xhtml"',
+                                                      b'src="Text/one.xhtml#nowhere"'),
+                                    'OEBPS/nav.xhtml': (b'href="Text/one.xhtml"',
+                                                        b'href="Text/one.xhtml#gone"')}),
+                         'chinese-only: 2 fragment links do not resolve')
+
+    def test_labels_only_from_nav_and_ncx_files(self, tmp_path):
+        from tests.conftest import write_raw_epub, xhtml
+        ncx = ('<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/">'
+               '<text>Loose</text><navMap/></ncx>')
+        chapter = xhtml('<svg xmlns="http://www.w3.org/2000/svg"><text>Drawn</text></svg>')
+        epub = write_raw_epub(
+            tmp_path / 'b.epub', [('ncx', 'toc.ncx', 'application/x-dtbncx+xml', None),
+                                  ('c', 'c.xhtml', 'application/xhtml+xml', None)], ['c'],
+            {'OEBPS/toc.ncx': ncx, 'OEBPS/c.xhtml': chapter})
+        archive = export_check.Archive(epub)
+        assert export_check.other_labels(archive) == [('OEBPS/toc.ncx', 'Loose')]
+        assert export_check.toc_labels(archive) == []
+
+    def test_head_items_without_head(self):
+        from lxml import etree
+        assert export_check.head_items(etree.fromstring('<html><body/></html>')) == []
+
+    @pytest.mark.parametrize('change', ['content', 'rename'])
+    def test_changed_file_in_the_project_directory(self, tmp_path, capsys, monkeypatch, change):
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+        glossary = root / 'beta' / 'notes.txt'
+        glossary.write_text('a')
+        stat = os.stat(glossary)
+        real = export_check.check_copy
+
+        def check_copy(copy_dir, out_dir):
+            result = real(copy_dir, out_dir)
+            if change == 'content':
+                glossary.write_text('bb')
+            else:
+                os.rename(glossary, root / 'beta' / 'other.txt')
+                os.utime(root / 'beta' / 'other.txt', ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            return result
+        monkeypatch.setattr(export_check, 'check_copy', check_copy)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[1].endswith(
+            '; files in the project directory changed')
+
+    def test_listing_error_shows_the_path_without_anonymize(self, tmp_path, capsys):
+        missing = tmp_path / 'missing'
+        assert self._main(missing, anonymize=False) == 2
+        assert capsys.readouterr().out == (
+            f'ERROR cannot list projects directory {missing} (FileNotFoundError)\n')

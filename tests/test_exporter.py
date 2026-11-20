@@ -1835,3 +1835,165 @@ class TestReviewRound2:
         _, z = _export(tmp_path, project_dir, 'chinese-only')
         assert z.getinfo('OEBPS/Images/pic.png').extra == other
         assert z.read('OEBPS/Images/pic.png') == b'invented'
+
+
+class TestRound2Survivors:
+    """Mutation run 7 (mutmut 3): rules spelled out."""
+
+    def _one(self, tmp_path, body, translation, fmt='chinese-only', nav=None, version='3.0'):
+        chapter = body if isinstance(body, bytes) or body.startswith('<?xml') else xhtml(body)
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=nav, ncx=None, version=version)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': translation})
+        report, z = _export(tmp_path, project_dir, fmt)
+        return report, z
+
+    # processing instructions have pseudo-attributes: never anchors, targets or languages
+    def test_pi_in_a_block_is_no_anchor(self, tmp_path):
+        report, _ = self._one(tmp_path, '<p>Words<?pi id="z"?>.</p>', '<p>字。</p>')
+        assert report.translated == 1 and report.reasons() == {}
+
+    def test_pi_in_a_run_is_no_anchor(self, tmp_path):
+        report, _ = self._one(tmp_path, '<div class="v">Line one<?pi id="z"?><br/>Line two</div>',
+                              '第一行\n第二行')
+        assert report.translated == 1 and report.reasons() == {}
+
+    def test_pi_with_a_lang_pseudo_attribute_kept(self, tmp_path):
+        report, z = self._one(tmp_path, '<p>Words.</p>', '<p>字<?pi lang="en"?>。</p>')
+        assert report.translated == 1
+        assert '<?pi lang="en"?>' in z.read('OEBPS/Text/c.xhtml').decode()
+
+    def test_pi_with_an_id_is_no_toc_target(self, tmp_path):
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml#h">H</a></li></ol></nav>')
+        _, z = self._one(tmp_path, '<?pi id="h"?><h2 id="h">Part words</h2>', '<h2 id="h">部分</h2>',
+                         nav=nav)
+        assert [_inner(a) for a in _root(z, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a')] == ['部分']
+
+    def test_pi_with_an_id_in_a_label_does_not_block_it(self, tmp_path):
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml">One<?pi id="x"?></a>'
+                    '</li></ol></nav>')
+        _, z = self._one(tmp_path, '<h1>Title words</h1>', '<h1>標題</h1>', nav=nav)
+        assert [_inner(a) for a in _root(z, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a')] == ['標題']
+
+    def test_code_target_with_one_non_code_child(self, tmp_path):
+        report, _ = self._one(tmp_path, '<pre><b>x = 1</b></pre>', 'x = 2')
+        assert report.chapters[0].kept == [('c_seg0001', CODE_MARKUP)]
+
+    def test_package_without_language(self, tmp_path):
+        epub = _raw_book(tmp_path)
+        with zipfile.ZipFile(epub) as z:
+            members = [(i, z.read(i)) for i in z.infolist()]
+        with zipfile.ZipFile(epub, 'w') as z:
+            for info, data in members:
+                z.writestr(info, data.replace(b'<dc:language>en</dc:language>', b''))
+        project_dir = _project(tmp_path, epub, RAW_TRANSLATIONS)
+        for fmt in FORMATS:
+            report, _ = _export(tmp_path, project_dir, fmt)
+            assert report.translated == 4
+
+    @pytest.mark.parametrize('fmt', BILINGUAL)
+    def test_copy_inner_language_rewritten(self, tmp_path, fmt):
+        _, z = self._one(tmp_path, '<p>Hi <span lang="en">there</span>.</p>',
+                         '<p>你好<span lang="en">那</span>。</p>', fmt)
+        translation = _body(z, 'OEBPS/Text/c.xhtml').find(f'.//{XHTML_NS}div[@class="translation"]')
+        assert translation.find(f'.//{XHTML_NS}span').get('lang') == 'zh-TW'
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_run_inner_language_rewritten(self, tmp_path, fmt):
+        _, z = self._one(tmp_path, '<div class="v">Line <span lang="en">one</span><br/>Line two</div>',
+                         '第<span lang="en">一</span>行\n第二行', fmt)
+        spans = list(_body(z, 'OEBPS/Text/c.xhtml').iter(f'{XHTML_NS}span'))
+        assert [s.get('lang') for s in spans] == (
+            ['zh-TW'] if fmt == 'chinese-only' else ['en', 'zh-TW'])
+
+    @pytest.mark.parametrize('fmt', BILINGUAL)
+    def test_run_rows_in_the_body_namespace(self, tmp_path, fmt):
+        _, z = self._one(tmp_path, 'Bare words.', '裸字。', fmt)
+        body = _body(z, 'OEBPS/Text/c.xhtml')
+        assert body.find(f'{XHTML_NS}div[@class="{exporter.WRAPPER_CLASS[fmt]}"]') is not None
+
+    def test_head_created_in_the_xhtml_namespace(self, tmp_path):
+        chapter = ('<?xml version="1.0" encoding="utf-8"?>\n<html xmlns="http://www.w3.org/1999/'
+                   'xhtml"><body><p>Words.</p></body></html>')
+        _, z = self._one(tmp_path, chapter, '<p>字。</p>', 'bilingual-vertical')
+        root = _root(z, 'OEBPS/Text/c.xhtml')
+        assert root[0].tag == f'{XHTML_NS}head' and root[0][0].tag == f'{XHTML_NS}link'
+
+    def test_stylesheet_item_in_the_opf_namespace(self, tmp_path, raw_project):
+        _, z = _export(tmp_path, raw_project, 'bilingual-vertical')
+        opf = _root(z, 'OEBPS/content.opf')
+        items = opf.findall('.//{http://www.idpf.org/2007/opf}item[@id="bilingual-css"]')
+        assert len(items) == 1
+
+    def test_stylesheet_deflated(self, tmp_path, raw_project):
+        _, z = _export(tmp_path, raw_project, 'bilingual-horizontal')
+        assert z.getinfo('OEBPS/bilingual.css').compress_type == zipfile.ZIP_DEFLATED
+
+    def test_export_emits_no_warnings(self, tmp_path, raw_project):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            for fmt in FORMATS:
+                _export(tmp_path, raw_project, fmt)
+
+    def test_nav_points_without_content_or_label(self, tmp_path):
+        ncx = ('<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"><navMap>'
+               '<navPoint><navLabel><text>No target</text></navLabel></navPoint>'
+               '<navPoint><content src="Text/c.xhtml"/></navPoint>'
+               '<navPoint><navLabel><text>T</text></navLabel><content src="Text/c.xhtml"/>'
+               '</navPoint></navMap></ncx>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml('<h1>Title words</h1>'))},
+                         nav=None, ncx=ncx)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<h1>標題</h1>'})
+        _, z = _export(tmp_path, project_dir, 'chinese-only')
+        texts = [e.text for e in _root(z, 'OEBPS/toc.ncx').iter(
+            '{http://www.daisy.org/z3986/2005/ncx/}text')]
+        assert texts == ['No target', '標題']
+
+    def test_temporary_file_next_to_the_output(self, tmp_path, raw_project, monkeypatch):
+        moves = []
+        real = exporter.os.replace
+
+        def replace(src, dst):
+            moves.append((src, dst))
+            return real(src, dst)
+        monkeypatch.setattr(exporter.os, 'replace', replace)
+        monkeypatch.chdir(tmp_path)
+        out_dir = tmp_path / 'out'
+        out_dir.mkdir()
+        export_project(raw_project, str(out_dir / 'x.epub'), 'chinese-only')
+        (src, dst), = moves
+        assert os.path.dirname(src) == str(out_dir) == os.path.dirname(dst)
+
+    def test_other_compression_becomes_deflated(self, tmp_path):
+        epub = _raw_book(tmp_path)
+        with zipfile.ZipFile(epub, 'a') as z:
+            z.writestr('OEBPS/Images/pic.png', b'invented bytes', compress_type=zipfile.ZIP_BZIP2)
+        project_dir = _project(tmp_path, epub, RAW_TRANSLATIONS)
+        _, z = _export(tmp_path, project_dir, 'chinese-only')
+        info = z.getinfo('OEBPS/Images/pic.png')
+        assert info.compress_type == zipfile.ZIP_DEFLATED and z.read(info) == b'invented bytes'
+
+    @pytest.mark.parametrize('extra, expected', [
+        (b'', b''),
+        (b'\x01\x00\x08\x00' + bytes(8) + b'\xfe\xca\x02\x00xy', b'\xfe\xca\x02\x00xy'),
+        (b'\xfe\xca\x02\x00xy\x01\x00\x08\x00' + bytes(8), b'\xfe\xca\x02\x00xy'),
+        (b'\xfe\xca\x02\x00xy\x01\x00\x00\x00', b'\xfe\xca\x02\x00xy'),  # a last empty record
+        (b'\xfe\xca\x02\x00xy\x0d\x00\x01\x00z', b'\xfe\xca\x02\x00xy\x0d\x00\x01\x00z'),
+        (b'\xfe\xca\x02\x00xy\x01\x00', b'\xfe\xca\x02\x00xy\x01\x00'),  # a partial record stays
+    ])
+    def test_without_zip64(self, extra, expected):
+        assert exporter._without_zip64(extra) == expected
+
+    SUBSET = ('<!DOCTYPE html [\n<!ATTLIST p class CDATA #IMPLIED>\n]>\n'
+              '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head>'
+              '<body><p>Words.</p></body></html>')
+
+    @pytest.mark.parametrize('data', [
+        b'\xef\xbb\xbf' + SUBSET.encode('utf-8'),
+        SUBSET.encode('utf-16'),                                     # BOM, no declaration
+        ('<?xml version="1.0" encoding="UTF-16"?>' + SUBSET).encode('utf-16-be'),  # no BOM
+        ('<?xml version="1.0" encoding="UTF-16"?>' + SUBSET).encode('utf-16-le'),
+    ], ids=['utf-8-bom', 'utf-16-bom', 'utf-16-be', 'utf-16-le'])
+    def test_internal_subset_found_in_any_encoding(self, tmp_path, data):
+        report, _ = self._one(tmp_path, data, '<p>字。</p>')
+        assert report.chapters[0].kept == [('c_seg0001', CHAPTER_DOCTYPE)]
