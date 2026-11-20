@@ -359,7 +359,7 @@ def xhtml(body: str, head: str = '<title>Chapter</title>') -> str:
 
 
 def write_raw_epub(path, items, spine, members, opf_path='OEBPS/content.opf',
-                   title='The Lantern Keeper', author='Invented Author'):
+                   title='The Lantern Keeper', author='Invented Author', version='3.0'):
     """Write an EPUB as a plain ZIP archive, without ebooklib.
 
     items: (id, href, media type, properties or None) for the manifest;
@@ -374,7 +374,7 @@ def write_raw_epub(path, items, spine, members, opf_path='OEBPS/content.opf',
     refs = ''.join(f'<itemref idref={quoteattr(i)}/>' for i in spine)
     toc = ' toc="ncx"' if any(item[0] == 'ncx' for item in items) else ''
     opf = ('<?xml version="1.0" encoding="utf-8"?>\n'
-           '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" '
+           f'<package xmlns="http://www.idpf.org/2007/opf" version="{version}" '
            'unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
            f'<dc:identifier id="uid">invented-0001</dc:identifier><dc:title>{title}</dc:title>'
            f'<dc:creator>{author}</dc:creator><dc:language>en</dc:language></metadata>'
