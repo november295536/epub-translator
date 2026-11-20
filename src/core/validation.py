@@ -660,9 +660,9 @@ def _compare_elements(src_pieces: list, pieces: list, first_block: int) -> list:
         want = Counter(_signature(e) for e in inner_s)
         got = Counter(_signature(e) for e in inner_p)
         for sw in sorted(want - got):  # an element whose readable value was emptied
-            for sg in sorted(got - want):
+            for sg in sorted(got - want):  # each still in excess: paired once per sw
                 emptied = _emptied(sw, sg)
-                if emptied and want[sw] > got[sw] and got[sg] > want[sg]:
+                if emptied and want[sw] > got[sw]:
                     extra.append(f'第 {index} 個區塊的 {_shown(sw[0])} 的 {"、".join(emptied)} 不可為空')
                     want[sw] -= 1
                     want[sg] += 1

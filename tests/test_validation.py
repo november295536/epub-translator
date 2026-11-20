@@ -887,3 +887,8 @@ class TestRound3Survivors:
         assert self._details('<p title="T" aria-label="L">A</p>',
                              '<p title="" aria-label=" ">甲</p>') == [
             ('extra_attributes', '第 1 個區塊的 <p> 的 aria-label、title 不可為空')]
+
+    def test_a_balanced_element_is_not_paired(self):
+        assert self._details('<p>A <img src="s" alt="x"/><img src="s" alt=""/></p>',
+                             '<p>甲<img src="s" alt=""/></p>') == [
+            ('key_mismatch', '第 1 個區塊帶 k 屬性的 <img>：原文 1 個，譯文 0 個')]
