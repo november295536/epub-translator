@@ -165,11 +165,7 @@ class TestCLIStart:
         project_dir = _get_project_dir(sample_epub)
         full_path = os.path.join(str(tmp_path), project_dir)
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '翻譯結果'
-
-        with patch('src.llm.cli.run_process', return_value=mock_result):
+        with patch('src.llm.cli.run_process', side_effect=echo_process):
             result = runner.invoke(cli, ['start', '--project', full_path])
 
         assert result.exit_code == 0
@@ -235,11 +231,7 @@ class TestCLIModelOption:
         project_dir = _get_project_dir(sample_epub)
         full_path = os.path.join(str(tmp_path), project_dir)
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '翻譯結果'
-
-        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', side_effect=echo_process) as mock_run:
             result = runner.invoke(cli, ['start', '--project', full_path, '--model', 'opus'])
 
         assert result.exit_code == 0
@@ -273,11 +265,7 @@ class TestCLIModelOption:
         project_dir = _get_project_dir(sample_epub)
         full_path = os.path.join(str(tmp_path), project_dir)
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '翻譯結果'
-
-        with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
+        with patch('src.llm.cli.run_process', side_effect=echo_process) as mock_run:
             result = runner.invoke(cli, ['start', '--project', full_path])
 
         assert result.exit_code == 0
@@ -298,11 +286,7 @@ class TestCLIWorkersOption:
         project_dir = _get_project_dir(sample_epub)
         full_path = os.path.join(str(tmp_path), project_dir)
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '翻譯結果'
-
-        with patch('src.llm.cli.run_process', return_value=mock_result):
+        with patch('src.llm.cli.run_process', side_effect=echo_process):
             result = runner.invoke(cli, ['start', '--project', full_path, '--workers', '3'])
 
         assert result.exit_code == 0
@@ -316,11 +300,7 @@ class TestCLIWorkersOption:
         project_dir = _get_project_dir(sample_epub)
         full_path = os.path.join(str(tmp_path), project_dir)
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '翻譯結果'
-
-        with patch('src.llm.cli.run_process', return_value=mock_result):
+        with patch('src.llm.cli.run_process', side_effect=echo_process):
             result = runner.invoke(cli, ['start', '--project', full_path])
 
         assert result.exit_code == 0
@@ -365,7 +345,9 @@ class TestCLIContext:
 from src.core.project import SegmentStatus
 from src.llm import AuthError, RateLimitError, TransientError
 from src.llm.fake import FakeBackend
-from tests.conftest import hold_lock_in_child, lock_free_for_other_process, use_fake_backend
+from tests.conftest import (
+    echo_process, hold_lock_in_child, lock_free_for_other_process, use_fake_backend,
+)
 
 
 def _make_project(path, n=4):
@@ -383,9 +365,9 @@ def _responder(fail_marks=(), error=TransientError('exit 1', raw='RAW')):
         prompt = request.messages[-1].content
         for mark in fail_marks:
             # The segment's own HTML; neighbours appear as plain-text context
-            if f'<p>Sentence {mark}.</p>' in prompt:
+            if f'Sentence {mark}.</p>' in prompt:
                 raise error
-        return '<p>譯文</p>'
+        return '<p k="1">譯文</p>'
     return respond
 
 
@@ -419,8 +401,8 @@ class TestCLIFailedSegments:
         assert pm.data.segments[0].model == 'sonnet'
         # Diagnostics for the failed segment only
         assert os.listdir(os.path.join(path, 'log', 'failed')) == ['c1_seg0002-dbf96005d5.txt']
-        # 3 attempts for the failing segment, 1 for each other
-        assert len(fake.requests) == 6
+        # 4 calls for the failing segment (Phase 4), 1 for each other
+        assert len(fake.requests) == 7
 
     @pytest.mark.parametrize('workers', ['1', '3'])
     def test_failed_not_retried_without_flag(self, runner, tmp_path, workers):
@@ -441,7 +423,7 @@ class TestCLIFailedSegments:
                                          '--retry-failed'])
         assert result.exit_code == 0, result.output
         assert len(fake.requests) == 1
-        assert '<p>Sentence MARK2.</p>' in fake.prompts[0]
+        assert '<p k="1">Sentence MARK2.</p>' in fake.prompts[0]
         assert set(_statuses(path).values()) == {SegmentStatus.TRANSLATED}
         assert os.listdir(os.path.join(path, 'log', 'failed')) == []
 
@@ -486,7 +468,7 @@ class TestCLILock:
 
         def respond(request):
             seen.append(lock_free_for_other_process(path))
-            return '<p>譯文</p>'
+            return '<p k="1">譯文</p>'
 
         with use_fake_backend(FakeBackend(responder=respond)):
             result = runner.invoke(cli, ['start', '--project', path])
@@ -539,7 +521,7 @@ class TestCLIGlossaryExtract:
 class TestCLIMessages:
     """Exact CLI output (mutation survivors)."""
 
-    FAIL = 'Translation failed after 3 attempts: exit 1'
+    FAIL = 'Translation failed after 4 attempts: exit 1'
 
     def test_version_line(self, runner):
         assert runner.invoke(cli, ['--version']).output == 'epub-translator, version 1.0.0\n'
@@ -635,9 +617,9 @@ class TestCLISupervisorFailure:
 
         def respond(request):
             threads.append(threading.current_thread())
-            if '<p>Sentence MARK4.</p>' in request.messages[-1].content:
+            if 'Sentence MARK4.</p>' in request.messages[-1].content:
                 _time.sleep(1)  # still in flight when the save fails
-            return '<p>譯文</p>'
+            return '<p k="1">譯文</p>'
 
         # Without --model the run's first save is the supervisor's
         with use_fake_backend(FakeBackend(responder=respond)), \
@@ -754,7 +736,7 @@ class TestCLIRound1Exact:
 
         def respond(request):
             daemons.append(threading.current_thread().daemon)
-            return '<p>譯文</p>'
+            return '<p k="1">譯文</p>'
 
         with use_fake_backend(FakeBackend(responder=respond)):
             runner.invoke(cli, ['start', '--project', path, '--workers', '2'])
@@ -766,7 +748,7 @@ class TestCLIRound1Exact:
 
         def respond(request):
             _time.sleep(0.8)
-            return '<p>譯文</p>'
+            return '<p k="1">譯文</p>'
 
         with use_fake_backend(FakeBackend(responder=respond)):
             result = runner.invoke(cli, ['start', '--project', path, '--workers', '2'])
@@ -779,7 +761,7 @@ class TestCLIRound1Exact:
 
         def respond(request):
             both.wait(10)
-            return '<p>譯文</p>'
+            return '<p k="1">譯文</p>'
 
         with use_fake_backend(FakeBackend(responder=respond)), \
                 patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
@@ -825,7 +807,7 @@ class TestRound2WorkerStartup:
             workers.append(threading.current_thread())
             in_flight.set()
             _time.sleep(0.3)  # still in flight when the second start fails
-            return '<p>譯文</p>'
+            return '<p k="1">譯文</p>'
 
         monkeypatch.setattr(threading.Thread, 'start', start)
         with use_fake_backend(FakeBackend(responder=respond)):
@@ -865,8 +847,8 @@ class TestCLIRound3UnexpectedStreak:
         path = _make_project(str(tmp_path / 'p'), n=9)
 
         def respond(request):
-            if '<p>Sentence MARK5.</p>' in request.messages[-1].content:
-                return '<p>譯文</p>'
+            if '<p k="1">Sentence MARK5.</p>' in request.messages[-1].content:
+                return '<p k="1">譯文</p>'
             return {}['missing']
 
         with use_fake_backend(FakeBackend(responder=respond)):
@@ -973,3 +955,161 @@ class TestCLIPhase2:
     def test_migrate_help(self, runner):
         result = runner.invoke(cli, ['migrate', '--help'])
         assert '--dry-run  Only report; write nothing' in result.output
+
+
+class TestPhase4Validate:
+    """translate.py validate: counts per rule; --mark-failed."""
+
+    def _project(self, tmp_path, translations, statuses=None):
+        path = _make_project(str(tmp_path / 'p'), n=4)
+        pm = ProjectManager(path)
+        pm.load()
+        for seg_id, text in translations.items():
+            pm.mark_translated(seg_id, text)
+        for seg_id, status in (statuses or {}).items():
+            pm._find(seg_id).status = status
+        pm.save()
+        return path
+
+    def test_read_only_report(self, runner, tmp_path):
+        path = self._project(tmp_path, {'c1_seg0001': '<p>句子。</p>',
+                                        'c1_seg0002': '句子。',
+                                        'c1_seg0003': '<p>句<b>子</b>。</p>',
+                                        'c1_seg0004': '<p>Sentence MARK4.</p>'},
+                             {'c1_seg0003': SegmentStatus.REVIEWED})
+        before = open(os.path.join(path, 'project.json'), encoding='utf-8').read()
+        result = runner.invoke(cli, ['validate', path])
+        assert result.exit_code == 0, result.output
+        assert result.output.splitlines() == [
+            '已檢查 4 段譯文：2 段未通過結構檢查（匯出時以原文輸出），2 段通過',
+            '  structure_mismatch：1',
+            '  unknown_tag：1',
+            '品質警告（不影響匯出）：',
+            '  untranslated：1',
+        ]
+        assert open(os.path.join(path, 'project.json'), encoding='utf-8').read() == before
+        # read-only: works while another process holds the project lock
+        child = hold_lock_in_child(path)
+        try:
+            again = runner.invoke(cli, ['validate', path])
+        finally:
+            child.stdin.close()
+            child.wait()
+        assert again.exit_code == 0 and again.output == result.output
+
+    def test_pending_failed_and_empty_not_checked(self, runner, tmp_path):
+        # skipped: an empty text, a failed segment with text, a pending one;
+        # the translated segment after them is still checked
+        path = self._project(tmp_path, {'c1_seg0002': '  ', 'c1_seg0003': '壞',
+                                        'c1_seg0004': '<p>句子。</p>'},
+                             {'c1_seg0003': SegmentStatus.FAILED})
+        result = runner.invoke(cli, ['validate', path])
+        assert result.output.splitlines() == ['已檢查 1 段譯文：0 段未通過結構檢查（匯出時以原文輸出），1 段通過']
+
+    def test_mark_failed_then_retry(self, runner, tmp_path):
+        path = self._project(tmp_path, {'c1_seg0001': '<p>句子。</p>', 'c1_seg0002': '句子。',
+                                        'c1_seg0003': '<p>三。</p>', 'c1_seg0004': '<p>四。</p>'},
+                             {'c1_seg0002': SegmentStatus.REVIEWED})
+        result = runner.invoke(cli, ['validate', path, '--mark-failed'])
+        assert result.exit_code == 0, result.output
+        assert result.output.splitlines()[-1] == \
+            '已將 1 段標為翻譯失敗（原譯文保留），可用 start --retry-failed 重新翻譯。'
+        pm = ProjectManager(path)
+        pm.load()
+        seg = pm._find('c1_seg0002')
+        assert (seg.status, seg.translated_text) == (SegmentStatus.FAILED, '句子。')
+        assert [(i.kind, i.code, i.blocking) for i in seg.issues] == \
+            [('structure', 'structure_mismatch', True)]
+        assert pm._find('c1_seg0001').status == SegmentStatus.TRANSLATED
+
+        # a retry that fails keeps the old text
+        with use_fake_backend(FakeBackend(['nope', 'nope'])):
+            result = runner.invoke(cli, ['start', '--project', path, '--retry-failed'])
+        assert result.exit_code == 1
+        pm.load()
+        seg = pm._find('c1_seg0002')
+        assert (seg.status, seg.translated_text, seg.issues[0].code) == \
+            (SegmentStatus.FAILED, '句子。', 'not_html')
+
+        # a retry that succeeds replaces it
+        fake = FakeBackend(responder=_responder())
+        with use_fake_backend(fake):
+            result = runner.invoke(cli, ['start', '--project', path, '--retry-failed'])
+        assert result.exit_code == 0, result.output
+        assert len(fake.requests) == 1
+        pm.load()
+        assert pm._find('c1_seg0002').translated_text == '<p>譯文</p>'
+        assert runner.invoke(cli, ['validate', path]).output.splitlines()[0] == \
+            '已檢查 4 段譯文：0 段未通過結構檢查（匯出時以原文輸出），4 段通過'
+
+    def test_mark_failed_with_nothing_failing_writes_nothing(self, runner, tmp_path):
+        path = self._project(tmp_path, {'c1_seg0001': '<p>句子。</p>'})
+        before = os.stat(os.path.join(path, 'project.json')).st_mtime_ns
+        result = runner.invoke(cli, ['validate', path, '--mark-failed'])
+        assert result.exit_code == 0
+        assert '標為翻譯失敗' not in result.output
+        assert os.stat(os.path.join(path, 'project.json')).st_mtime_ns == before
+
+    def test_mark_failed_refused_while_locked(self, runner, tmp_path):
+        path = self._project(tmp_path, {'c1_seg0002': '句子。'})
+        child = hold_lock_in_child(path)
+        try:
+            result = runner.invoke(cli, ['validate', path, '--mark-failed'])
+        finally:
+            child.stdin.close()
+            child.wait()
+        assert result.exit_code == 1
+        assert '專案正由另一個程序使用' in result.output
+        pm = ProjectManager(path)
+        pm.load()
+        assert pm._find('c1_seg0002').status == SegmentStatus.TRANSLATED
+        assert lock_free_for_other_process(path)
+
+    def test_help(self, runner):
+        output = ' '.join(runner.invoke(cli, ['validate', '--help']).output.split())
+        assert '--mark-failed Set the segments that fail the structural check to failed' in output
+
+
+class TestRound1Validate:
+    """Phase 4 review round 1: validate refuses schema 1 and a missing project."""
+
+    @pytest.mark.parametrize('flag', [[], ['--mark-failed']])
+    def test_schema_1_refused(self, runner, tmp_path, flag):
+        from tests.test_migrate import _legacy_project
+        project_dir = _legacy_project(tmp_path)
+        before = open(os.path.join(project_dir, 'project.json'), encoding='utf-8').read()
+        files = sorted(os.listdir(project_dir))
+        result = runner.invoke(cli, ['validate', str(project_dir), *flag])
+        assert result.exit_code == 1
+        assert result.output == ('此專案是舊格式（schema 1），無法檢查譯文。'
+                                 '請先執行 python3 translate.py migrate <專案目錄> 再檢查。\n')
+        assert open(os.path.join(project_dir, 'project.json'), encoding='utf-8').read() == before
+        assert sorted(os.listdir(project_dir)) == sorted(files + (['project.lock'] if flag else []))
+
+    @pytest.mark.parametrize('flag', [[], ['--mark-failed']])
+    def test_directory_without_project(self, runner, tmp_path, flag):
+        empty = tmp_path / 'empty'
+        empty.mkdir()
+        result = runner.invoke(cli, ['validate', str(empty), *flag])
+        assert result.exit_code == 1
+        assert result.output == f'找不到專案：{empty} 裡沒有 project.json。\n'
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert os.listdir(empty) == []
+
+    def test_lone_surrogate_is_not_well_formed(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=2)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.mark_translated('c1_seg0001', '<p>句子。</p>')
+        pm.mark_translated('c1_seg0002', 'SURROGATE')
+        pm.save()
+        project_json = os.path.join(path, 'project.json')
+        with open(project_json, encoding='utf-8') as f:
+            text = f.read()
+        with open(project_json, 'w', encoding='utf-8') as f:
+            f.write(text.replace('SURROGATE', '<p>\\ud800</p>'))
+        result = runner.invoke(cli, ['validate', path])
+        assert result.exit_code == 0, result.output
+        assert result.output.splitlines()[:2] == [
+            '已檢查 2 段譯文：1 段未通過結構檢查（匯出時以原文輸出），1 段通過',
+            '  not_well_formed：1']

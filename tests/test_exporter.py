@@ -10,13 +10,14 @@ from click.testing import CliRunner
 from lxml import etree
 
 from src.core.migrate import migrate_project
-from src.core.project import ProjectManager, SegmentStatus, sha256_file
+from src.core.project import Issue, ProjectManager, SegmentStatus, sha256_file
 from src.core.segmenter import Segmenter
+import src.core.validation as validation
 from src.epub import exporter
 from src.epub.blocks import serialize
 from src.epub.exporter import (
     AMBIGUOUS_SOURCE, BILINGUAL_CSS, CHAPTER_MISMATCH, CHAPTER_UNREADABLE, CODE_MARKUP,
-    CHAPTER_DOCTYPE, FORMATS, ANCHOR_MISMATCH, NOT_WELL_FORMED, SCHEMA_1_MESSAGE, STRUCTURE_MISMATCH, ExportError,
+    CHAPTER_DOCTYPE, FORMATS, NOT_WELL_FORMED, SCHEMA_1_MESSAGE, STRUCTURE_MISMATCH, ExportError,
     export_project,
 )
 from src.epub.extractor import EPUBExtractor, parse_xml
@@ -28,8 +29,8 @@ BILINGUAL = ('bilingual-horizontal', 'bilingual-vertical')
 
 # Translations of the raw_epub fixture's segments (see test_segments_of_the_fixture)
 RAW_TRANSLATIONS = {
-    'one_seg0001': '<h1>守燈人</h1>',
-    'one_seg0002': ('<p class="other" id="moved">米拉在黃昏爬上<em>螺旋</em>樓梯。</p>\n'
+    'one_seg0001': '<h1 id="c1">守燈人</h1>',
+    'one_seg0002': ('<p class="first">米拉在黃昏爬上<em>螺旋</em>樓梯。</p>\n'
                     '身體下的一行文字。<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
                     '<rect width="5" height="5"/></svg>\n歌的第一行\n歌的第二行\n歌的第三行'),
     'two_seg0001': '<h2>第二晚</h2>',
@@ -237,7 +238,8 @@ class TestChineseOnly:
                         '<p lang="fr">Bonjour le monde.</p>')
         epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
         project_dir = _project(tmp_path, epub, {
-            'c_seg0001': '<p>普通<span xml:lang="en">字</span>。</p>\n<p>你好。</p>'})
+            'c_seg0001': '<p lang="en-GB">普通<span xml:lang="EN">字</span>。</p>\n'
+                         '<p lang="fr">你好。</p>'})
         _, z = _export(tmp_path, project_dir, 'chinese-only')
         assert _inner(_body(z, 'OEBPS/Text/c.xhtml')) == (
             '<p lang="zh-TW">普通<span xml:lang="zh-TW">字</span>。</p><p lang="fr">你好。</p>')
@@ -318,7 +320,7 @@ class TestBilingual:
                         '<p id="n1"><a name="anchor"/>The note text.</p>')
         epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
         project_dir = _project(tmp_path, epub, {
-            'c_seg0001': '<p id="p1">見<a id="r1" href="#n1">註</a>。</p>\n'
+            'c_seg0001': '<p id="p1" class="x">見<a id="r1" href="#n1">註</a>。</p>\n'
                          '<p id="n1"><a name="anchor"/>註文。</p>'})
         _, z = _export(tmp_path, project_dir, fmt)
         root = _root(z, 'OEBPS/Text/c.xhtml')
@@ -401,7 +403,7 @@ class TestBilingual:
     def test_copy_source_language_rewritten(self, tmp_path):
         chapter = xhtml('<p lang="en" class="k">Plain words.</p>')
         epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
-        project_dir = _project(tmp_path, epub, {'c_seg0001': '<p>字。</p>'})
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<p lang="en" class="k">字。</p>'})
         _, z = _export(tmp_path, project_dir, 'bilingual-horizontal')
         copy = _root(z, 'OEBPS/Text/c.xhtml').find(f'.//{XHTML_NS}div[@class="translation"]')[0]
         assert dict(copy.attrib) == {'lang': 'zh-TW', 'class': 'k', XML_LANG: 'zh-TW'}
@@ -466,7 +468,7 @@ class TestReducedCheck:
         assert report.reasons() == {STRUCTURE_MISMATCH: 1}
 
     @pytest.mark.parametrize('translation, expected', [
-        ('第一行\n第二行', '第一行<br/>第二行'),
+        ('第一行\n第二<em>行</em>', '第一行<br/>第二<em>行</em>'),
         ('  第一行 \n\n 第二<em>行</em>\n', ' 第一行 <br/> 第二<em>行</em>'),
     ])
     def test_br_runs_split_at_newlines(self, tmp_path, translation, expected):
@@ -485,7 +487,7 @@ class TestReducedCheck:
         assert report.reasons() == {STRUCTURE_MISMATCH: 1}
 
     def test_newline_inside_an_inline_element_does_not_split(self, tmp_path):
-        chapter = xhtml('<div class="v">Line one<br/>Line two</div>')
+        chapter = xhtml('<div class="v">Line <em>one</em><br/>Line two</div>')
         report, z, _ = self._kept(tmp_path, '第一<em>行\n還是</em>第一\n第二行', chapter)
         assert report.translated == 1
         assert _inner(_body(z, 'OEBPS/Text/c.xhtml')[0]) == '第一<em>行\n還是</em>第一<br/>第二行'
@@ -512,13 +514,16 @@ class TestReducedCheck:
         assert _inner(_body(z, 'OEBPS/Text/c.xhtml')[0]) == (
             '<p>首。</p>一<br/>二<p>尾。</p>\n末')
 
-    def test_inline_attributes_come_from_the_translation(self, tmp_path):
-        # only block elements keep their source attributes until Phase 4
+    def test_inline_attributes_must_match_the_source(self, tmp_path):
+        # Phase 4: every attribute-bearing element keeps its attributes
         chapter = xhtml('<p class="s">A <a href="x.xhtml" class="k">link</a> here.</p>')
-        report, z, _ = self._kept(tmp_path, '<p class="t">一個<a href="x.xhtml">連結</a>。</p>',
+        report, _, _ = self._kept(tmp_path, '<p class="s">一個<a href="x.xhtml">連結</a>。</p>',
                                   chapter)
+        assert report.reasons() == {'key_mismatch': 1}
+        report, z, _ = self._kept(
+            tmp_path, '<p class="s">一個<a href="x.xhtml" class="k">連結</a>。</p>', chapter)
         assert _inner(_body(z, 'OEBPS/Text/c.xhtml')) == (
-            '<p class="s">一個<a href="x.xhtml">連結</a>。</p>')
+            '<p class="s">一個<a href="x.xhtml" class="k">連結</a>。</p>')
 
     def test_epub_prefix_in_translation_parses(self, tmp_path):
         chapter = xhtml('<p>See <span epub:type="noteref">1</span> here.</p>')
@@ -613,23 +618,24 @@ class TestCode:
         return report, _body(z, 'OEBPS/Text/c.xhtml'), z, epub
 
     @pytest.mark.parametrize('chapter, expected', [
-        ('<pre class="c"><code>x = 1  # one\n</code></pre>',
-         '<pre class="c"><code>x = 1  # 一 &lt;&amp;&gt;\n</code></pre>'),
-        ('<pre>x = 1  # one\n</pre>', '<pre>x = 1  # 一 &lt;&amp;&gt;\n</pre>'),
-        ('<code>x = 1  # one\n</code>', '<code>x = 1  # 一 &lt;&amp;&gt;\n</code>'),
-        (' <code>x = 1  # one\n</code> ', '<code>x = 1  # 一 &lt;&amp;&gt;\n</code>'),
+        ('<pre class="c"><code># one\nx = 1\n</code></pre>',
+         '<pre class="c"><code># 一 &lt;&amp;&gt;\nx = 1\n</code></pre>'),
+        ('<pre># one\nx = 1\n</pre>', '<pre># 一 &lt;&amp;&gt;\nx = 1\n</pre>'),
+        ('<code># one\nx = 1\n</code>', '<code># 一 &lt;&amp;&gt;\nx = 1\n</code>'),
+        (' <code># one\nx = 1\n</code> ', '<code># 一 &lt;&amp;&gt;\nx = 1\n</code>'),
     ])
     def test_code_text_filled(self, tmp_path, chapter, expected):
-        report, body, _, _ = self._code(tmp_path, chapter, 'x = 1  # 一 <&>\n')
+        # Phase 4: comment lines translated, the code unchanged
+        report, body, _, _ = self._code(tmp_path, chapter, '# 一 <&>\nx = 1\n')
         assert report.translated == 1
         assert _inner(body) == expected
 
     @pytest.mark.parametrize('fmt', BILINGUAL)
     def test_code_bilingual_copy(self, tmp_path, fmt):
-        report, body, _, _ = self._code(tmp_path, '<pre id="k"><code>x = 1  # one</code></pre>',
-                                        'x = 1  # 一', fmt)
+        report, body, _, _ = self._code(tmp_path, '<pre id="k"><code># one\nx = 1</code></pre>',
+                                        '# 一\nx = 1', fmt)
         copy = body.find(f'.//{XHTML_NS}div[@class="translation"]')[0]
-        assert serialize(copy) == ('<pre xml:lang="zh-TW" lang="zh-TW"><code>x = 1  # 一'
+        assert serialize(copy) == ('<pre xml:lang="zh-TW" lang="zh-TW"><code># 一\nx = 1'
                                    '</code></pre>')
 
     @pytest.mark.parametrize('fmt', FORMATS)
@@ -709,8 +715,8 @@ class TestToc:
                 '<p>More words.</p><header><h3>Third Part</h3></header>')
     TWO = xhtml('<h2>Other File</h2>')
     ONE_TRANSLATED = {'one_seg0001': '<h1>第一部</h1>',
-                      'one_seg0002': '<p>普通的字。</p>',
-                      'one_seg0003': '<h2><a id="inner"/>第二<em>部</em></h2>',
+                      'one_seg0002': '<p id="plain">普通的字。</p>',
+                      'one_seg0003': '<h2 id="s2"><a id="inner"/>第二<em>部</em></h2>',
                       'one_seg0004': '<p>更多。</p>\n<header><h3>第三部</h3></header>'}
 
     def _toc(self, tmp_path, translations, fmt='chinese-only'):
@@ -888,8 +894,8 @@ class TestProjectLevel:
 
     def test_reason_texts_cover_every_reason(self):
         assert set(exporter.REASON_TEXT) == {
-            CHAPTER_UNREADABLE, CHAPTER_MISMATCH, NOT_WELL_FORMED, STRUCTURE_MISMATCH,
-            AMBIGUOUS_SOURCE, CODE_MARKUP, ANCHOR_MISMATCH, CHAPTER_DOCTYPE}
+            CHAPTER_UNREADABLE, CHAPTER_MISMATCH, CODE_MARKUP, CHAPTER_DOCTYPE,
+            *validation.STRUCTURAL_CODES}
 
     def test_no_duplicate_ids_in_raw_fixture(self, tmp_path, raw_project):
         for fmt in FORMATS:
@@ -980,18 +986,23 @@ class TestSurvivors:
 
     def test_report_codes_texts_and_messages(self, tmp_path, raw_project):
         assert (CHAPTER_UNREADABLE, CHAPTER_MISMATCH, NOT_WELL_FORMED, STRUCTURE_MISMATCH,
-                AMBIGUOUS_SOURCE, CODE_MARKUP, ANCHOR_MISMATCH, CHAPTER_DOCTYPE) == (
+                AMBIGUOUS_SOURCE, CODE_MARKUP, CHAPTER_DOCTYPE) == (
             'chapter_unreadable', 'chapter_mismatch', 'not_well_formed', 'structure_mismatch',
-            'ambiguous_source', 'code_markup', 'anchor_mismatch', 'chapter_doctype')
+            'ambiguous_source', 'code_markup', 'chapter_doctype')
         assert exporter.REASON_TEXT == {
             'chapter_unreadable': '章節無法讀取',
             'chapter_mismatch': '章節內容與分段紀錄不符',
+            'code_markup': '程式碼區塊含標記',
+            'chapter_doctype': '章節的 DOCTYPE 含內部子集，無法原樣寫回',
             'not_well_formed': '譯文不是格式正確的 XML',
             'structure_mismatch': '譯文的頂層結構與原文區塊不符',
             'ambiguous_source': '原文區塊無法明確對應',
-            'code_markup': '程式碼區塊含標記',
-            'anchor_mismatch': '譯文的錨點（id 或 a 的 name）與原文區塊不同',
-            'chapter_doctype': '章節的 DOCTYPE 含內部子集，無法原樣寫回',
+            'empty_block': '原文有文字的區塊在譯文中沒有文字',
+            'unknown_tag': '譯文有原文沒有的標籤',
+            'key_mismatch': '帶屬性的標籤（id、連結等）在譯文中缺少或重複',
+            'extra_attributes': '譯文的標籤帶有原文沒有的屬性',
+            'tag_count': '譯文的標籤數量與原文不同',
+            'code_changed': '程式碼在註解行以外與原文不同',
         }
         assert SCHEMA_1_MESSAGE == ('此專案是舊格式（schema 1），無法匯出。'
                                     '請先執行 python3 translate.py migrate <專案目錄> 再匯出。')
@@ -1027,7 +1038,7 @@ class TestSurvivors:
                                         b'<dc:language>en-US</dc:language>'
                                         b'<dc:language>fr</dc:language>')
                 dst.writestr(info, data)
-        project_dir = _project(tmp_path, epub, {'c_seg0001': '<p>字。</p>'})
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<p lang="en" class="k">字。</p>'})
         _, z = _export(tmp_path, project_dir, 'chinese-only')
         assert _body(z, 'OEBPS/Text/c.xhtml')[0].get('lang') == 'zh-TW'
         opf = z.read('OEBPS/content.opf').decode()
@@ -1142,7 +1153,8 @@ class TestSurvivors:
     def test_run_with_inline_script(self, tmp_path):
         chapter = xhtml('<div class="v">Line <script>var x;</script>one<br/>Line two</div>')
         epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
-        project_dir = _project(tmp_path, epub, {'c_seg0001': '第一行\n第二行'})
+        project_dir = _project(tmp_path, epub,
+                               {'c_seg0001': '第一<script>var x;</script>行\n第二行'})
         report, _ = _export(tmp_path, project_dir, 'chinese-only')
         assert report.translated == 1
 
@@ -1176,7 +1188,10 @@ class TestSurvivors:
 
 
 class TestAnchorsInTheGate:
-    """Fix round: ids (and names of <a>) inside a block must survive."""
+    """Fix round: ids (and names of <a>) inside a block must survive.
+    Phase 4: the full check covers them (an attribute-bearing element must
+    appear once in its block with its attributes); the reason is the rule
+    that breaks first."""
 
     def _report(self, tmp_path, chapter, translation, fmt='chinese-only'):
         epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml(chapter))}, nav=None, ncx=None)
@@ -1199,29 +1214,36 @@ class TestAnchorsInTheGate:
         ('<div class="v"><a id="l1"/>Line one<br/>Line two</div>', '第一行\n第二行'),  # in a run
         ('<div class="v">Line one<br/><a id="l2"/>Line two</div>',
          '<a id="l2"/>第一行\n第二行'),                                         # wrong line
+        ('<p><span name="x"/>Words.</p>', '<p>字。</p>'),       # Phase 4: any attribute counts
     ])
     @pytest.mark.parametrize('fmt', FORMATS)
     def test_anchor_mismatch_kept_original(self, tmp_path, chapter, translation, fmt):
         report, z, epub = self._report(tmp_path, chapter, translation, fmt)
-        assert report.chapters[0].kept == [('c_seg0001', ANCHOR_MISMATCH)]
+        [(segment, reason)] = report.chapters[0].kept
+        assert segment == 'c_seg0001'
+        assert reason in (validation.KEY_MISMATCH, validation.EXTRA_ATTRIBUTES,
+                          validation.UNKNOWN_TAG)
         src = zipfile.ZipFile(epub)
         assert z.read('OEBPS/Text/c.xhtml') == src.read('OEBPS/Text/c.xhtml')
 
     @pytest.mark.parametrize('chapter, translation', [
         ('<p>See <a id="r1" href="#n1">note</a>.</p><p id="n1">Text.</p>',
-         '<p>見<a id="r1" href="#n1">註</a>。</p>\n<p>文。</p>'),                # block's own id from the source
+         '<p>見<a id="r1" href="#n1">註</a>。</p>\n<p id="n1">文。</p>'),
         ('<p><a name="fn"/>Note text.</p>', '<p><a name="fn"/>註文。</p>'),
-        ('<p><span name="x"/>Words.</p>', '<p>字。</p>'),                        # name only counts on <a>
         ('<div class="v">Line one<br/><a id="l2"/>Line two</div>', '第一行\n<a id="l2"/>第二行'),
     ])
     def test_anchor_present_accepted(self, tmp_path, chapter, translation):
         report, _, _ = self._report(tmp_path, chapter, translation)
         assert report.translated == 1 and report.reasons() == {}
 
-    def test_code_not_checked(self, tmp_path):
-        report, _, _ = self._report(tmp_path, '<pre id="k"><code>x = 1  # one</code></pre>',
-                                    'x = 1  # 一')
+    def test_code_checked_outside_comment_lines(self, tmp_path):
+        # Phase 4: code is accepted when it equals the source outside
+        # comment lines; an end-of-line comment is part of its line
+        chapter = '<pre id="k"><code># one\nx = 1  # two</code></pre>'
+        report, _, _ = self._report(tmp_path, chapter, '# 一\nx = 1  # two')
         assert report.translated == 1
+        report, _, _ = self._report(tmp_path, chapter, '# 一\nx = 1  # 二')
+        assert report.chapters[0].kept == [('c_seg0001', validation.CODE_CHANGED)]
 
 
 class TestTocContainerTarget:
@@ -1275,7 +1297,7 @@ class TestTocContainerTarget:
         nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml#d">D</a></li>'
                     '<li><a href="Text/c.xhtml#h">H</a></li></ol></nav>')
         epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=nav, ncx=None)
-        project_dir = _project(tmp_path, epub, {'c_seg0001': '<h2>部分</h2>'})
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<h2 id="h">部分</h2>'})
         _, z = _export(tmp_path, project_dir, 'bilingual-vertical')
         assert [_inner(a) for a in _root(z, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a')] == [
             '部分', '部分']
@@ -1490,7 +1512,8 @@ class TestReviewRound1Chapters:
     ])
     def test_note_types_dropped_from_the_block_copy(self, tmp_path, fmt, types, expected):
         chapter = xhtml(f'<p epub:type="{types}" id="n">Note words.</p>')
-        _, z, _ = self._export_chapter(tmp_path, chapter, {'c_seg0001': '<p>註文。</p>'}, fmt)
+        _, z, _ = self._export_chapter(
+            tmp_path, chapter, {'c_seg0001': f'<p epub:type="{types}" id="n">註文。</p>'}, fmt)
         body = _body(z, 'OEBPS/Text/c.xhtml')
         epub_type = '{http://www.idpf.org/2007/ops}type'
         original = body.find(f'.//{XHTML_NS}div[@class="original"]')[0]
@@ -1661,19 +1684,24 @@ class TestReviewRound1Additions:
         epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
         project_dir = _project(tmp_path, epub, {'c_seg0001': translation})
         report, _ = _export(tmp_path, project_dir, 'chinese-only')
-        assert report.chapters[0].kept == [('c_seg0001', STRUCTURE_MISMATCH)]
+        assert report.chapters[0].kept == [('c_seg0001', validation.EMPTY_BLOCK)]
 
     def test_element_without_text_kept(self, tmp_path):
         epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml('<p>Alpha.</p><p>Beta.</p>'))},
                          nav=None, ncx=None)
         project_dir = _project(tmp_path, epub, {'c_seg0001': '<p>甲。</p>\n<p> </p>'})
         report, _ = _export(tmp_path, project_dir, 'chinese-only')
-        assert report.chapters[0].kept == [('c_seg0001', STRUCTURE_MISMATCH)]
+        assert report.chapters[0].kept == [('c_seg0001', validation.EMPTY_BLOCK)]
 
     def test_textless_source_line_may_stay_textless(self, tmp_path):
         chapter = xhtml('<div class="v">Line one<br/><img src="x.png" alt=""/></div>')
         epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        # The text-less line is not a block, so not in the segment: Phase 4
+        # refuses a translation that adds its <img>
         project_dir = _project(tmp_path, epub, {'c_seg0001': '第一行\n<img src="x.png" alt=""/>'})
+        report, _ = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.chapters[0].kept == [('c_seg0001', validation.UNKNOWN_TAG)]
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '第一行'})
         report, _ = _export(tmp_path, project_dir, 'chinese-only')
         assert report.translated == 1
 
@@ -2086,3 +2114,126 @@ class TestReviewRound3:
         assert opf.tag == '{http://www.idpf.org/2007/opf}package'
         items = opf.findall('.//{http://www.idpf.org/2007/opf}item[@id="bilingual-css"]')
         assert len(items) == 1 and items[0].get('href') == 'bilingual.css'
+
+
+class TestPhase4FullCheck:
+    """Phase 4: the export runs the full check and does not trust stored issues."""
+
+    def _report(self, tmp_path, chapter, translation, issues=None):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml(chapter))}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': translation})
+        if issues is not None:
+            pm = ProjectManager(project_dir)
+            pm.load()
+            pm.data.segments[0].issues = issues
+            pm.save()
+        report, z = _export(tmp_path, project_dir, 'chinese-only')
+        return report, z
+
+    @pytest.mark.parametrize('translation, reason', [
+        ('<p>甲乙丙</p>', 'tag_count'),                         # <em> dropped
+        ('<p>甲<em>乙</em><em>丙</em></p>', 'tag_count'),       # <em> added
+        ('<p>甲<span>乙</span></p>', 'unknown_tag'),
+        ('<p class="x">甲<em>乙</em></p>', 'extra_attributes'),
+    ])
+    def test_inline_tag_counts_block(self, tmp_path, translation, reason):
+        report, _ = self._report(tmp_path, '<p>A <em>b</em> c.</p>', translation)
+        assert report.chapters[0].kept == [('c_seg0001', reason)]
+
+    def test_inline_order_free(self, tmp_path):
+        report, z = self._report(tmp_path, '<p>A <em>b</em> <b>c</b>.</p>',
+                                 '<p><b>丙</b>甲<em>乙</em>。</p>')
+        assert report.translated == 1
+        assert _inner(_body(z, 'OEBPS/Text/c.xhtml')) == '<p><b>丙</b>甲<em>乙</em>。</p>'
+
+    def test_stored_issues_not_trusted(self, tmp_path):
+        stale = [Issue('structure', 'tag_count', 'old', True)]
+        report, _ = self._report(tmp_path, '<p>A <em>b</em>.</p>', '<p>甲<em>乙</em>。</p>', stale)
+        assert report.translated == 1
+        report, _ = self._report(tmp_path, '<p>A <em>b</em>.</p>', '<p>甲乙。</p>', [])
+        assert report.reasons() == {'tag_count': 1}
+
+    def test_reason_lines(self, tmp_path):
+        report, _ = self._report(tmp_path, '<p>A <em>b</em>.</p>', '<p>甲乙。</p>')
+        assert report.lines()[1] == '  譯文的標籤數量與原文不同（tag_count）：1'
+
+
+class TestRound1Export:
+    """Phase 4 review round 1: translated alt/title in every format; a block
+    root's attributes compared on their own."""
+
+    CHAPTER = ('<p>See <img src="i.png" alt="A map &amp; key"/> '
+               '<a href="#x" title="Go">here</a>.</p>')
+    TRANSLATION = ('<p>見<img src="i.png" alt="地圖 &amp; &quot;圖例&quot;"/>'
+                   '<a href="#x" title="前往">此處</a>。</p>')
+
+    @pytest.mark.parametrize('fmt', ['chinese-only', *BILINGUAL])
+    def test_translated_alt_in_every_format(self, tmp_path, fmt):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml(self.CHAPTER))}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': self.TRANSLATION})
+        report, z = _export(tmp_path, project_dir, fmt)
+        assert report.translated == 1
+        body = _body(z, 'OEBPS/Text/c.xhtml')
+        alts = [img.get('alt') for img in body.iter(f'{XHTML_NS}img')]
+        titles = [a.get('title') for a in body.iter(f'{XHTML_NS}a')]
+        if fmt == 'chinese-only':
+            assert (alts, titles) == (['地圖 & "圖例"'], ['前往'])
+        else:  # the original keeps the source values
+            assert sorted(alts) == sorted(['A map & key', '地圖 & "圖例"'])
+            assert sorted(titles) == sorted(['Go', '前往'])
+
+    @pytest.mark.parametrize('source, translation', [
+        ('<blockquote id="q"><blockquote>A b.</blockquote></blockquote>',
+         '<blockquote><blockquote id="q">甲乙。</blockquote></blockquote>'),
+        ('<blockquote><blockquote id="q">A b.</blockquote></blockquote>',
+         '<blockquote id="q"><blockquote>甲乙。</blockquote></blockquote>'),
+    ])
+    def test_block_root_attributes_cannot_move(self, tmp_path, source, translation):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml(source))}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': translation})
+        report, z = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.translated == 0 and len(report.chapters[0].kept) == 1
+        assert report.chapters[0].kept[0][1] in ('key_mismatch', 'extra_attributes')
+        assert _inner(_body(z, 'OEBPS/Text/c.xhtml')) == source
+
+    def test_lone_surrogate_kept_as_not_well_formed(self, tmp_path):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml('<p>A b.</p>'))}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': 'SURROGATE'})
+        path = os.path.join(project_dir, 'project.json')
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text.replace('SURROGATE', '<p>\\ud800</p>'))
+        report, _ = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.chapters[0].kept == [('c_seg0001', 'not_well_formed')]
+
+
+class TestRound2Export:
+    """Phase 4 review round 2: a translated alt/title/aria-label on the
+    block element itself reaches every format."""
+
+    @pytest.mark.parametrize('fmt', ['chinese-only', *BILINGUAL])
+    @pytest.mark.parametrize('chapter, translation, tag, source_value, value', [
+        ('<p title="Note" class="c">Hi.</p>', '<p title="註" class="c">嗨。</p>',
+         'p', 'Note', '註'),
+        ('<table title="Totals" id="t"><tr><td>One</td></tr></table>',
+         '<table title="合計" id="t"><tr><td>一</td></tr></table>', 'table', 'Totals', '合計'),
+        ('<figure aria-label="Map" id="f"><img src="m.png" alt="A map"/>Map one.</figure>',
+         '<figure aria-label="地圖" id="f"><img src="m.png" alt="一張地圖"/>地圖一。</figure>',
+         'figure', 'Map', '地圖'),
+    ])
+    def test_block_root_value(self, tmp_path, fmt, chapter, translation, tag, source_value,
+                              value):
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', xhtml(chapter))}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': translation})
+        report, z = _export(tmp_path, project_dir, fmt)
+        assert report.translated == 1, report.lines()
+        body = _body(z, 'OEBPS/Text/c.xhtml')
+        name = 'aria-label' if tag == 'figure' else 'title'
+        els = list(body.iter(f'{XHTML_NS}{tag}'))
+        if fmt == 'chinese-only':
+            assert [e.get(name) for e in els] == [value]
+            machine = {'p': ('class', 'c'), 'table': ('id', 't'), 'figure': ('id', 'f')}[tag]
+            assert els[0].get(machine[0]) == machine[1]  # untouched
+        else:  # the original keeps the source's value, the copy gets the translation's
+            assert [e.get(name) for e in els] == [source_value, value]
