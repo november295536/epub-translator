@@ -1194,6 +1194,7 @@ class TestAnchorsInTheGate:
         ('<p id="own">Words.</p>', '<p><span id="own">字</span>。</p>'),          # the block's own id
         ('<p><a name="fn"/>Note text.</p>', '<p><a id="fn"/>註文。</p>'),         # name became id
         ('<p><a id="n" name="n"/>Words.</p>', '<p><a id="n"/><a id="n"/>字。</p>'),  # review round 3: duplicate id
+        ('<p><a name="x"/>Words.</p>', '<p><a name="y"/>字。</p>'),               # another name value
         ('<p>Plain <span id="s">words</span>.</p>', '<p>普通<span id="t">字</span>。</p>'),
         ('<div class="v"><a id="l1"/>Line one<br/>Line two</div>', '第一行\n第二行'),  # in a run
         ('<div class="v">Line one<br/><a id="l2"/>Line two</div>',
