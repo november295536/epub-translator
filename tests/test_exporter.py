@@ -1192,6 +1192,8 @@ class TestAnchorsInTheGate:
         ('<p>Words.</p>', '<p><a id="new"/>字。</p>'),                           # an extra id
         ('<p>A <a id="r"/>b.</p>', '<p>甲<a id="r"/>乙<a id="r"/>。</p>'),          # a repeated id
         ('<p id="own">Words.</p>', '<p><span id="own">字</span>。</p>'),          # the block's own id
+        ('<p><a name="fn"/>Note text.</p>', '<p><a id="fn"/>註文。</p>'),         # name became id
+        ('<p><a id="n" name="n"/>Words.</p>', '<p><a id="n"/><a id="n"/>字。</p>'),  # review round 3: duplicate id
         ('<p>Plain <span id="s">words</span>.</p>', '<p>普通<span id="t">字</span>。</p>'),
         ('<div class="v"><a id="l1"/>Line one<br/>Line two</div>', '第一行\n第二行'),  # in a run
         ('<div class="v">Line one<br/><a id="l2"/>Line two</div>',
@@ -1209,7 +1211,6 @@ class TestAnchorsInTheGate:
          '<p>見<a id="r1" href="#n1">註</a>。</p>\n<p>文。</p>'),                # block's own id from the source
         ('<p><a name="fn"/>Note text.</p>', '<p><a name="fn"/>註文。</p>'),
         ('<p><span name="x"/>Words.</p>', '<p>字。</p>'),                        # name only counts on <a>
-        ('<p><a name="fn"/>Note text.</p>', '<p><a id="fn"/>註文。</p>'),         # the value counts
         ('<div class="v">Line one<br/><a id="l2"/>Line two</div>', '第一行\n<a id="l2"/>第二行'),
     ])
     def test_anchor_present_accepted(self, tmp_path, chapter, translation):
@@ -1998,3 +1999,89 @@ class TestRound2Survivors:
     def test_internal_subset_found_in_any_encoding(self, tmp_path, data):
         report, _ = self._one(tmp_path, data, '<p>字。</p>')
         assert report.chapters[0].kept == [('c_seg0001', CHAPTER_DOCTYPE)]
+
+
+class TestReviewRound3:
+    """Review round 3: unknown declared encodings, the stored member name,
+    documents whose XHTML or OPF namespace has a prefix."""
+
+    LATIN = ('<?xml version="1.0" encoding="ISO-Latin-1"?>\n{doctype}'
+             '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head>'
+             '<body><p>Words \xe9.</p></body></html>')
+
+    @pytest.mark.parametrize('doctype, kept', [
+        ('<!DOCTYPE html>\n', []),
+        ('<!DOCTYPE html [\n<!ATTLIST p class CDATA #IMPLIED>\n]>\n', [('c_seg0001', CHAPTER_DOCTYPE)]),
+    ])
+    def test_encoding_python_does_not_know(self, tmp_path, doctype, kept):
+        chapter = self.LATIN.format(doctype=doctype).encode('latin-1')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '<p>字。</p>'})
+        report, _ = _export(tmp_path, project_dir, 'chinese-only')
+        assert report.chapters[0].kept == kept
+        assert report.translated == (0 if kept else 1)
+
+    def test_stored_name_bytes_kept_with_a_unicode_path_field(self, tmp_path):
+        # The name bytes are UTF-8 without the UTF-8 flag, plus an Info-ZIP
+        # Unicode Path field (0x7075). Python 3.12 takes `filename` from the
+        # field, 3.9 does not; the stored bytes must be written either way.
+        import struct
+        import zlib
+        raw = 'OEBPS/Images/café.png'.encode('utf-8')
+
+        class Raw(zipfile.ZipInfo):
+            def _encodeFilenameFlags(self):
+                return raw, self.flag_bits
+        info = Raw('placeholder')
+        field = b'\x01' + struct.pack('<L', zlib.crc32(raw)) + raw
+        info.extra = struct.pack('<HH', 0x7075, len(field)) + field
+        epub = _raw_book(tmp_path)
+        with zipfile.ZipFile(epub, 'a') as z:
+            z.writestr(info, b'invented')
+        project_dir = _project(tmp_path, epub, RAW_TRANSLATIONS)
+        out = str(tmp_path / 'out.epub')
+        export_project(project_dir, out, 'chinese-only')
+        source, output = zipfile.ZipFile(epub), zipfile.ZipFile(out)
+        assert [i.orig_filename for i in output.infolist()] == [
+            i.orig_filename for i in source.infolist()]
+        # headers and the field, as in the source
+        assert open(out, 'rb').read().count(raw) == open(epub, 'rb').read().count(raw) == 4
+
+    @pytest.mark.parametrize('fmt', BILINGUAL)
+    def test_prefixed_xhtml_without_head(self, tmp_path, fmt):
+        h = 'http://www.w3.org/1999/xhtml'
+        chapter = (f'<?xml version="1.0" encoding="utf-8"?>\n<h:html xmlns:h="{h}">'
+                   '<h:body>Bare words.<h:p>Para words.</h:p></h:body></h:html>')
+        epub = _raw_book(tmp_path, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+        project_dir = _project(tmp_path, epub, {'c_seg0001': '裸字。\n<h:p>段。</h:p>'})
+        segments = ProjectManager(project_dir).load().segments
+        report, z = _export(tmp_path, project_dir, fmt)
+        assert report.translated == len(segments) == 1
+        root = _root(z, 'OEBPS/Text/c.xhtml')
+        assert root[0].tag == f'{{{h}}}head' and root[0][0].tag == f'{{{h}}}link'
+        rows = root.find(f'{{{h}}}body').findall(f'{{{h}}}div')
+        assert [r.get('class') for r in rows] == [exporter.WRAPPER_CLASS[fmt]] * 2
+        assert all(c.tag == f'{{{h}}}div' for r in rows for c in r)
+
+    @pytest.mark.parametrize('fmt', BILINGUAL)
+    def test_prefixed_opf(self, tmp_path, fmt):
+        epub = _raw_book(tmp_path)
+        with zipfile.ZipFile(epub) as z:
+            members = [(i, z.read(i)) for i in z.infolist()]
+        o = b'http://www.idpf.org/2007/opf'
+        with zipfile.ZipFile(epub, 'w') as z:
+            for info, data in members:
+                if info.filename == 'OEBPS/content.opf':
+                    data = data.replace(b'xmlns="' + o + b'"', b'xmlns:opf="' + o + b'"')
+                    for tag in (b'package', b'metadata', b'manifest', b'item', b'spine', b'itemref'):
+                        data = data.replace(b'<' + tag + b' ', b'<opf:' + tag + b' ')
+                        data = data.replace(b'<' + tag + b'>', b'<opf:' + tag + b'>')
+                        data = data.replace(b'</' + tag + b'>', b'</opf:' + tag + b'>')
+                z.writestr(info, data)
+        project_dir = _project(tmp_path, epub, RAW_TRANSLATIONS)
+        report, z = _export(tmp_path, project_dir, fmt)
+        assert report.translated == 4
+        opf = _root(z, 'OEBPS/content.opf')
+        assert opf.tag == '{http://www.idpf.org/2007/opf}package'
+        items = opf.findall('.//{http://www.idpf.org/2007/opf}item[@id="bilingual-css"]')
+        assert len(items) == 1 and items[0].get('href') == 'bilingual.css'
