@@ -891,7 +891,7 @@ class TestRound1Shebang:
 
     def test_prompt_says_so(self):
         from src.core.translator import CODE_PROMPT
-        assert '第一行的 #! 指定直譯器，也不是註解' in CODE_PROMPT
+        assert '第一個非空白行的 #! 指定直譯器，也不是註解' in CODE_PROMPT
 
 
 class TestRound1Retranslate:
@@ -946,3 +946,88 @@ class TestRound1MergedExport:
         assert chapter.count('plain()') == 1
         assert z_new.read('OEBPS/Text/c.xhtml') == z_old.read('OEBPS/Text/c.xhtml')
         assert _inner(next(_root(z_new, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a'))) == '詩'
+
+
+# --- Review round 2 ----------------------------------------------------------------
+
+class TestRound2Shebang:
+    """The shebang is the first non-blank line: the source keeps the newline
+    after <pre>, a cleaned reply does not."""
+
+    def test_after_a_leading_newline_passthrough(self):
+        segs = _segments('<pre>\n#!/bin/sh\necho hi</pre>')
+        assert segs[0].text == '\n#!/bin/sh\necho hi' and segs[0].passthrough
+        assert has_comment_line('\n \n#!/bin/sh\n# c\nls')
+        assert not has_comment_line('\n\t\n#!/bin/sh\nls')
+
+    def test_check_code_with_leading_blank_lines(self):
+        from src.core.validation import check_code, code_lines
+        assert not check_code('\n#!/bin/sh\n# c\nls', '#!/bin/sh\n# 譯\nls').blocking
+        assert not check_code('#!/bin/sh\nls', '\n\n#!/bin/sh\nls\n').blocking
+        assert [i.code for i in check_code('\n#!/bin/sh\nls', '#!/bin/bash\nls').blocking] == [
+            'code_changed']
+        assert [i.code for i in check_code('\n#!/bin/sh\nls', '\n#! 譯\nls').blocking] == [
+            'code_changed']
+        assert code_lines('\n#!/bin/sh\nls') == ['#!/bin/sh', 'ls']
+        assert code_lines('\n\necho\n#!x') == ['echo']        # later #!: a comment line
+        assert code_lines('\n#!a\n#!b\nx') == ['#!a', 'x']     # only the first one is code
+
+    @pytest.mark.parametrize('reply', ['#!/bin/sh\n# 譯\nls', '\n\n#!/bin/sh\n# 譯\nls\n',
+                                       '```sh\n#!/bin/sh\n# 譯\nls\n```'])
+    def test_through_the_reply_cleaning(self, reply):
+        seg = SegmentState(segment_id='a_1', chapter_id='a', html='<pre>\n#!/bin/sh\n# c\nls</pre>',
+                           text='\n#!/bin/sh\n# c\nls', word_count=3,
+                           segment_type=SegmentType.CODE)
+        fake = FakeBackend([reply])
+        outcome = translate_segment(TranslationEngine(model='haiku', backend=fake), seg, [seg])
+        assert outcome.status == SegmentStatus.TRANSLATED, outcome.issues
+        assert outcome.text == '#!/bin/sh\n# 譯\nls' and len(fake.requests) == 1
+
+    def test_changed_shebang_rejected_through_the_reply_cleaning(self):
+        seg = SegmentState(segment_id='a_1', chapter_id='a', html='<pre>\n#!/bin/sh\n# c\nls</pre>',
+                           text='\n#!/bin/sh\n# c\nls', word_count=3,
+                           segment_type=SegmentType.CODE)
+        fake = FakeBackend(responder=lambda r: '#!/bin/zsh\n# 譯\nls')
+        outcome = translate_segment(TranslationEngine(model='haiku', backend=fake), seg, [seg])
+        assert outcome.status == SegmentStatus.FAILED
+        assert outcome.issues[0].code == 'code_changed'
+
+
+class TestRound2WebExportGuard:
+
+    @pytest.mark.parametrize('content', ['{not json', '{"segmentation": "2"}'])
+    def test_unreadable_project_is_a_json_error(self, tmp_path, content):
+        from src.web.server import create_app
+        from src.web.tasks import TaskManager
+        TaskManager._instance = None
+        projects = tmp_path / 'projects'
+        project_dir = _project(projects.parent, _book(tmp_path), {}, name='projects/p', rules=2)
+        path = os.path.join(project_dir, 'project.json')
+        if content.startswith('{"'):
+            with open(path, encoding='utf-8') as f:
+                raw = json.load(f)
+            raw['segmentation'] = '2'
+            content = json.dumps(raw)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        client = create_app(projects_dir=str(projects)).test_client()
+        r = client.post('/api/projects/p/export', json={'format': 'chinese-only'})
+        assert r.status_code == 500 and r.is_json
+        assert r.get_json()['error'].startswith('無法讀取專案')
+        TaskManager._instance = None
+
+    def test_project_gone_before_the_load(self, tmp_path, monkeypatch):
+        from src.web.server import create_app
+        from src.web.tasks import TaskManager
+        TaskManager._instance = None
+        projects = tmp_path / 'projects'
+        projects.mkdir()
+        _project(projects, _book(tmp_path), {}, name='p', rules=2)
+
+        def gone(self, name, projects_dir):
+            raise FileNotFoundError('project.json')
+        monkeypatch.setattr(TaskManager, 'get_or_load_pm', gone)
+        client = create_app(projects_dir=str(projects)).test_client()
+        r = client.post('/api/projects/p/export', json={'format': 'chinese-only'})
+        assert r.status_code == 404 and r.get_json() == {'error': '專案不存在'}
+        TaskManager._instance = None

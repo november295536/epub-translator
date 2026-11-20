@@ -26,6 +26,9 @@ the migrate command), and then, per project:
 (e) of the segments failing the structural check, how many fail only on
     the tag rules (TAG_RULES: unknown_tag, key_mismatch, extra_attributes,
     tag_count).
+(f) of the translated or reviewed code segments, how many have a shebang
+    (`#!`) as the first non-blank line of their source: since Phase 6 that
+    line is code and must stay unchanged (validation.comment_flags).
 
 Only counts, rule names and ratios are printed, never book text. Everything
 in the temporary directory is removed at the end. The projects directory
@@ -71,7 +74,7 @@ COPIED = (PROJECT_FILE, 'source.epub', 'glossary.json')
 PERCENTILES = (1, 5, 50, 95, 99)
 TAG_RULES = frozenset({UNKNOWN_TAG, KEY_MISMATCH, EXTRA_ATTRIBUTES, TAG_COUNT})
 COUNTS = ('segments', 'round_trip_failed', 'translated', 'failing', 'tags_only', 'ambiguous',
-          'with_attributes')
+          'with_attributes', 'shebang')
 
 
 def snapshot(project_dir: str) -> list:
@@ -115,6 +118,7 @@ def check_copy(copy_dir: str) -> tuple[dict, list[str]]:
                 or not seg.translated_text.strip()):
             continue
         r['translated'] += 1
+        r['shebang'] += seg.segment_type == 'code' and starts_with_shebang(seg.text)
         result = check_segment(seg, seg.translated_text)
         r['rules'].update({i.code for i in result.blocking})
         r['warnings'].update({i.code for i in result.issues if not i.blocking})
@@ -130,6 +134,12 @@ def check_copy(copy_dir: str) -> tuple[dict, list[str]]:
     if r['round_trip_failed']:
         problems.append(f"round trip fails for {r['round_trip_failed']} segments")
     return r, problems
+
+
+def starts_with_shebang(code: str) -> bool:
+    """Whether the first non-blank line of the code starts with `#!` (a
+    shebang: code since Phase 6, review round 1)."""
+    return next((line for line in code.splitlines() if line.strip()), '').startswith('#!')
 
 
 def counts_text(counts: Counter) -> str:
@@ -212,7 +222,8 @@ def run(args, names: list[str], work: str) -> int:
                 f"({counts_text(r['rules'])}; only tag rules {r['tags_only']}), "
                 f"warnings ({counts_text(r['warnings'])}), {ratio_text(r['ratios'])}, "
                 f"sources that cannot be cut {r['ambiguous']}, "
-                f"with translatable attributes {r['with_attributes']}")
+                f"with translatable attributes {r['with_attributes']}, "
+                f"translated code starting with a shebang {r['shebang']}")
         if problems:
             failed += 1
             print(f'FAIL {line}; ' + '; '.join(problems))
@@ -224,7 +235,8 @@ def run(args, names: list[str], work: str) -> int:
           f"({counts_text(totals['rules'])}; only tag rules {totals['tags_only']})  "
           f"warnings ({counts_text(totals['warnings'])})  {ratio_text(totals['ratios'])}  "
           f"sources that cannot be cut {totals['ambiguous']}  "
-          f"with translatable attributes {totals['with_attributes']}  failed projects {failed}")
+          f"with translatable attributes {totals['with_attributes']}  "
+          f"translated code starting with a shebang {totals['shebang']}  failed projects {failed}")
     return 1 if failed else 0
 
 

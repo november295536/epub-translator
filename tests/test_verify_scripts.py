@@ -1973,15 +1973,17 @@ class TestValidateCheck:
         assert capsys.readouterr().out.splitlines() == [
             'PASS project-1: round trip 3/3, translated 3, failing the structural check 0 '
             '(none; only tag rules 0), warnings (none), length ratio: no segment, '
-            'sources that cannot be cut 0, with translatable attributes 0',
+            'sources that cannot be cut 0, with translatable attributes 0, '
+            'translated code starting with a shebang 0',
             'PASS project-2: round trip 7/7, translated 6, failing the structural check 2 '
             '(code_changed 1, tag_count 1; only tag rules 1), warnings (untranslated 1), '
             'length ratio: no segment, sources that cannot be cut 0, '
-            'with translatable attributes 0',
+            'with translatable attributes 0, translated code starting with a shebang 0',
             'TOTAL projects 2  round trip 10/10  translated 9  failing the structural check 2 '
             '(code_changed 1, tag_count 1; only tag rules 1)  warnings (untranslated 1)  '
             'length ratio: no segment  sources that cannot be cut 0  '
-            'with translatable attributes 0  failed projects 0',
+            'with translatable attributes 0  translated code starting with a shebang 0  '
+            'failed projects 0',
         ]
         assert roundtrip_check.snapshot(str(root)) == before
 
@@ -1999,9 +2001,11 @@ class TestValidateCheck:
         ratio = ('length ratio over 1 segments: p1 0.535 p5 0.535 p50 0.535 '
                  'p95 0.535 p99 0.535; outside 0.25-0.8: 0 (0.0%)')
         assert out[1].endswith(f'{ratio}, sources that cannot be cut 0, '
-                               'with translatable attributes 0')
+                               'with translatable attributes 0, '
+                               'translated code starting with a shebang 0')
         assert out[2].endswith(f'{ratio}  sources that cannot be cut 0  '
-                               'with translatable attributes 0  failed projects 0')
+                               'with translatable attributes 0  '
+                               'translated code starting with a shebang 0  failed projects 0')
 
     def test_failing_every_tag_rule_counts_as_tags_only(self, tmp_path, capsys):
         root, project_dir = _validate_projects(tmp_path / 'projects')
@@ -2031,10 +2035,11 @@ class TestValidateCheck:
         pm.save()
         assert self._main(root) == 0
         out = capsys.readouterr().out.splitlines()
-        assert out[1].endswith('sources that cannot be cut 1, with translatable attributes 2')
+        assert out[1].endswith('sources that cannot be cut 1, with translatable attributes 2, '
+                               'translated code starting with a shebang 0')
         assert 'translated 5, ' in out[1]
         assert out[2].endswith('sources that cannot be cut 1  with translatable attributes 2  '
-                               'failed projects 0')
+                               'translated code starting with a shebang 0  failed projects 0')
 
     def test_names_without_anonymize(self, tmp_path, capsys):
         root, _ = _validate_projects(tmp_path / 'projects')
@@ -3388,3 +3393,80 @@ class TestSegmentationCheckRound1:
         assert self._main(root) == 1
         out, err = capsys.readouterr()
         assert out == 'ERROR the check stopped (ValueError)\n' and err == ''
+
+
+class TestValidateCheckShebang:
+    """Phase 6 review round 2: translated code whose source starts with a shebang."""
+
+    def test_counted(self, tmp_path, capsys):
+        root, project_dir = _validate_projects(tmp_path / 'projects')
+        pm = validate_check.ProjectManager(project_dir)
+        pm.load()
+        segs = {s.segment_id: s for s in pm.data.segments}
+        segs['c_seg0003'].text = '\n\n#!/bin/sh\n# note\nx = 1'   # blank lines first: counted
+        segs['d_seg0002'].text = '#!/usr/bin/env python\n' + segs['d_seg0002'].text
+        segs['c_seg0001'].text = '#! not code'                   # a text segment: not counted
+        pm.save()
+        assert validate_check.main(['--projects-dir', str(root), '--anonymize']) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert out[1].endswith('translated code starting with a shebang 2')
+        assert out[2].endswith('translated code starting with a shebang 2  failed projects 0')
+
+    def test_starts_with_shebang(self):
+        f = validate_check.starts_with_shebang
+        assert f('#!/bin/sh') and f('\n  \n#!x\ny')
+        assert not f('') and not f(' #!x') and not f('x\n#!y') and not f('# !x')
+
+
+class TestSegmentationCheckRound2:
+    """Review round 2: spine documents the extractor skips silently."""
+
+    def _book(self, tmp_path, chapters):
+        from tests.test_exporter import _project, _raw_book
+        root = tmp_path / 'projects'
+        root.mkdir()
+        books = tmp_path / 'books'
+        books.mkdir()
+        _project(root, _raw_book(books, chapters, nav=None, ncx=None), {}, name='alpha')
+        return root
+
+    def test_bodyless_document_fails(self, tmp_path, capsys):
+        from tests.conftest import xhtml
+        root = self._book(tmp_path, {'a': ('a.xhtml', xhtml('<p>One.</p>')),
+                                     'b': ('b.xhtml', '<html xmlns="http://www.w3.org/1999/xhtml"/>'),
+                                     'c': ('c.xhtml', '<html/>')})
+        assert segmentation_check.main(['--projects-dir', str(root), '--anonymize']) == 1
+        assert capsys.readouterr().out.splitlines()[0] == (
+            'FAIL project-1: segments 1 -> 1, calls 1 -> 1 (ratio 1.000), passthrough 0, '
+            'headings merged 0 of 0; 2 spine documents without a body')
+
+    def test_legitimate_skips_pass(self, tmp_path, capsys):
+        from tests.conftest import RAW_NAV, xhtml
+        from tests.test_exporter import _project, _raw_book
+        root = tmp_path / 'projects'
+        root.mkdir()
+        books = tmp_path / 'books'
+        books.mkdir()
+        # the navigation document is in the spine; the cover's body has no text
+        epub = _raw_book(books, {'a': ('a.xhtml', xhtml('<p>One.</p>')),
+                                 'cover': ('cover.xhtml', xhtml('<img src="c.png" alt=""/>'))},
+                         nav=RAW_NAV, ncx=None)
+        _project(root, epub, {}, name='alpha')
+        assert segmentation_check.main(['--projects-dir', str(root), '--anonymize']) == 0
+        assert capsys.readouterr().out.splitlines()[0].startswith('PASS project-1: ')
+
+    def test_without_body_counts_only_unseen_documents(self, tmp_path):
+        from types import SimpleNamespace as N
+        from tests.conftest import xhtml
+        root = self._book(tmp_path, {'a': ('a.xhtml', '<html/>'), 'b': ('b.xhtml', '<html/>'),
+                                     'c': ('c.xhtml', xhtml(''))})
+        epub = segmentation_check.source_of(os.path.join(root, 'alpha'))
+        ex = segmentation_check.EPUBExtractor(epub)
+        ex.load()
+        assert ex.extract_chapters() == []
+        assert segmentation_check.without_body(ex, []) == 2
+        assert segmentation_check.without_body(ex, [N(id='a')]) == 1
+        ex.failed = [('b', 'x')]
+        assert segmentation_check.without_body(ex, []) == 1
+        ex.spine[0].is_nav = True
+        assert segmentation_check.without_body(ex, []) == 0
