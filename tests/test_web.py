@@ -1471,6 +1471,14 @@ class TestCreateProjectMarker:
         assert response.get_json() == {
             'error': '無法解析 EPUB：無法讀取 EPUB：File is not a zip file'}
 
+    def test_new_project_page_shows_unparsed_chapters(self, tmp_path):
+        # Review round 1: the page tells the user before it redirects
+        app = create_app(projects_dir=str(tmp_path / 'projects'))
+        app.config['TESTING'] = True
+        with app.test_client() as client:
+            page = client.get('/new').get_data(as_text=True)
+        assert 'data.unparsed_chapters.length' in page
+        assert "alert('以下章節無法解析，未分段，將以原文保留：\\n'" in page
 
 # --- Phase 1: failed segments, revision, lock, extraction model ----------------
 
