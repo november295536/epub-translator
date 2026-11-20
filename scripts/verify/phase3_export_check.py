@@ -77,7 +77,9 @@ from lxml import etree  # noqa: E402
 from src.core.migrate import migrate_project  # noqa: E402
 from src.core.project import ProjectManager  # noqa: E402
 from src.epub.blocks import localname, serialize  # noqa: E402
-from src.epub.exporter import EPUB_TYPE, FORMATS, NCX_MEDIA_TYPE, export_project  # noqa: E402
+from src.epub.exporter import (  # noqa: E402
+    EPUB_TYPE, FORMATS, NCX_MEDIA_TYPE, _without_zip64, export_project,
+)
 from src.epub.extractor import (  # noqa: E402
     XHTML_MEDIA_TYPE, package_path, parse_xml, read_package,
 )
@@ -332,6 +334,7 @@ def member_problems(source: Archive, out: Archive, allowed: set) -> list[str]:
             continue
         stored = [getattr(info, f) for f in fields] + [info.flag_bits & 0x800]
         expect = [getattr(src, f) for f in fields] + [src.flag_bits & 0x800]
+        expect[6] = _without_zip64(expect[6])  # the exporter drops the source's ZIP64 record
         if info.filename == 'mimetype':  # stored, no extra field (OCF)
             expect[1], expect[6] = zipfile.ZIP_STORED, b''
         differ += stored != expect
