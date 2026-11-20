@@ -4080,7 +4080,7 @@ Tests changed, none removed:
 | `check` 39, 41 (`mkdtemp` without the resolved directory) | killed: `test_work_directory_under_the_resolved_temporary_directory` |
 | `check` 44, 45 (`code = 1` before `run`) | code changed: the assignment was dead (when `run` raises, nothing is returned) and is removed |
 | `in_work_tree` 10 (`.GIT`, the same on a case-insensitive file system) | killed: `test_looks_for_dot_git` |
-| `_without_originals` 21 (`removed[start:i - 1] = [True] * (i + 1 - start)`) | equivalent: the slice assignment inserts two more `True` and shifts the later flags by two; all later flags are still `False` (groups close left to right, inner ones first), so positions `start` to `i` are marked and every later one stays unmarked, as before; `zip` drops the extra tail |
+| `_without_originals` 21 (`removed[start:i - 1] = [True] * (i + 1 - start)`) | ~~equivalent~~ wrong, corrected in review round 2: an inner group's two extra flags shift the outer group's later `True` onto the text after it (`(a(b))Z` loses `Z`); killed by `TestGlossaryRound2::test_unmatched_after_nested` |
 | `occurrence_pattern` 30, 35 (upper-case inflection) | equivalent: these branches are only for categories outside NAME_CATEGORIES, whose pattern is always compiled with IGNORECASE (only `work`, a name category, is case-sensitive) |
 | `occurrence_pattern` 5 (`'XXXX'` for a category that is not a string) | equivalent: any value outside NAME_CATEGORIES and other than `work` gives the same pattern |
 | `save` 43 (`ensure_ascii=None`) | equivalent: `json.dump` only tests its truth value |
@@ -4094,3 +4094,90 @@ Tests changed, none removed:
   real project directory any more; only the check scripts, which work on copies).
 - Atomicity is tested by the write path (temporary file in the same directory, `os.replace`,
   old file intact after a failed write), not by a concurrent reader.
+
+## Phase 5 — part A, review round 2
+
+Date: 2026-11-21. Same branch and worktree. Minor findings of review round 2 (three reviewers).
+
+### Changes
+
+| # | Finding | Change |
+|---|---|---|
+| 1 | Wrong field types loaded (`"term": null` raised `AttributeError` past `load_glossary`; `"category": ["term"]` loaded and broke `format_for_prompt`: re-translate 500) | `GlossaryManager.load()` raises `ValueError` unless the file is a list of objects with a string `term` and with `term`, `translation`, `category`, `notes`, `context` strings where present (`TEXT_FIELDS`); entries are replaced only after the whole file passed. Every caller then treats such a file as unreadable (review: `glossary_unavailable`). Endpoint tests for save, approve, re-translate. `"translation": null` / a number now also make the file unreadable (round 1 skipped such entries; the check still skips blank translations and malformed in-memory entries). |
+| 2 | Above 150 entries the prompt may not hold a term the check reported (`calibrate` / "Calibrating it.": the prompt's matcher has no dropped-`e` rule) | the candidates are `terms_for_prompt(source_text)`, then `occurring`. Test below and above the limit. |
+| 3 | A `work` term ending in a capital `E` | already a name category (plural / possessive only, no `e` stem); tests that the bare term matches for every kind of term (`VALE` as work and person, `CODE`, a one-letter term, `C#`, ...). |
+| 4 | The rendering was normalized like a translation (parentheses removed: `C (language)` → `c`; tags and entities not decoded) | the rendering is read with `plain_text` and normalized, never shortened. It complies when found in the translation as written or after the translation's non-Chinese parentheticals are removed. So `API` complies in "應用程式介面（API）", and (a change from round 1) a rendering that only appears inside a parenthetical original complies too: the rendering is in the text. |
+| 5 | The `_without_originals` survivor was not equivalent | test `(a(b))Z` → `Z`; the round 1 table is corrected above. |
+| 6 | Names matched case-insensitively (`Will` fired on "will") | a name category is case-sensitive when the glossary term starts with a capital; `work` always is. |
+| 7 | A term inside a longer term counted (`key` in "primary key") | `occurring`: longest terms first; an occurrence inside the span of a longer term's occurrence does not count. |
+| 8 | A note number after a term blocked the end check ("Ella Vane3") | the end check is "no letter or underscore follows" (`(?![^\W\d])`): a digit may follow. |
+| 9 | The page ignored `glossary_unavailable` | each segment has a hidden notice 術語表無法讀取，這次未檢查術語。, shown when a save, approve or re-translate answer carries the flag and hidden by the next answer without it (Node tests). Re-translate still runs without the glossary in the prompt, unlike `translate.py start` and the web translation task, which stop before any model call when the glossary cannot be loaded. |
+| 10 | `save()` replaced a symlinked `glossary.json` by a file; new-file mode fixed at 0644; a failing `fchmod` leaked the descriptor | the real path is resolved first and the temporary file made next to it; the temporary file is created with `os.open(..., 0o666)` so the kernel applies the umask; an existing file's mode is copied with `fchmod` on the open file, and a failure is logged and ignored (the descriptor is closed by the `with`). |
+
+### Checks
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase5_glossary_check.py --projects-dir <repo>/projects --anonymize --sample-out <file outside every git work tree>
+(per-project lines identical to part A)
+TOTAL projects 8  glossary entries 15, translated 4162, passing the structural check 3956, with term_not_applied 12, terms 4, by category (person: 9 warnings, 2 terms, term: 6 warnings, 2 terms)  failed projects 0
+sample written: 15 warnings
+$ python3 scripts/verify/phase4_validate_check.py --projects-dir <repo>/projects --anonymize | tail -1
+(identical to round 1)
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+The TOTAL line is unchanged: the real glossaries hold at most 6 entries (the prompt gets all of
+them), the capitalised names in the data occur capitalised, no real term lies inside another,
+and no rendering occurs only inside a parenthetical. The sample written by this run was
+byte-identical to the stored one and was not kept; the stored sample is unchanged. No temporary
+directory left.
+
+### Tests
+
+1981 passed (round 1: 1927). New: `TestGlossaryRound2`, `TestGlossaryRound2Survivors`
+(`test_validation.py`), `TestRound2`, `TestRound2Survivors` (`test_glossary.py`), `TestReviewPageGlossaryNotice` (`test_web.py`), damaged-glossary cases in
+`TestDamagedGlossary`. Every term and name in the fixtures is invented.
+
+Tests changed, none removed:
+
+| Test | Change | Reason |
+|---|---|---|
+| `TestGlossaryCompliance::test_parenthetical_original_ignored` | `Velmora` inside parentheses complies | item 4 |
+| `TestGlossaryCompliance::test_only_terms_of_the_source` | `Velmora` instead of `VELMORA` | item 6 |
+| `TestGlossaryCompliance::test_comparable` | built from `_normalized`, `_without_originals`, `_compact` | `_comparable` removed (item 4) |
+| `TestGlossaryRound1::test_nested_original_ignored` | a Chinese rendering | item 4 |
+| `TestGlossaryRound1::test_bad_entries_skipped` | the `None` term asserted through `_checkable` | `terms_for_prompt` sorts by term (load() refuses such entries) |
+| `TestGlossaryRound1::test_work_case_sensitive_with_inflection` | the case-insensitive counterpart is a `term` | item 6 |
+| `TestDamagedGlossary::test_entry_without_translation_skipped` | only blank strings; `null` and numbers moved to the damaged files | item 1 |
+| `TestDamagedGlossary::test_retranslate_goes_on` | also `term null`, `category list` | item 1 |
+| `TestReviewPageScript` harness | a `.glossary-notice` element, `notice` in its result | item 9 |
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, mutmut 3.8.1, parallel.
+
+| Run | Mutants | Killed | Survived |
+|---|---|---|---|
+| 1 | 867 | 851 | 16 |
+| 2 (final) | 867 | 863 | 4 |
+
+| mutant(s) | done |
+|---|---|
+| `occurrence_pattern` 39, 40 (`work` misspelled) | killed: `test_lower_case_work_stays_case_sensitive` (a lower-case `work` term stays case-sensitive) |
+| `occurring` 15 (`x < a`), 18 (`taken = own`) | killed: `test_shorter_term_at_the_same_start`, `test_every_longer_span_kept` |
+| `load` 2–4, 13–15 (error messages) | killed: `TestRound2Survivors::test_messages` |
+| `save` 20, 21 (`token_hex` length) | killed: the temporary name checked as `.glossary-` + 16 hex digits + `.tmp` |
+| `occurrence_pattern` 30, 35 (upper-case inflection) | equivalent, as in round 1: these branches serve only categories outside NAME_CATEGORIES, always compiled with IGNORECASE (only names can be case-sensitive) |
+| `occurrence_pattern` 5 (`'XXXX'` for a category that is not a string) | equivalent, as in round 1 |
+| `save` 51 (`ensure_ascii=None`) | equivalent: `json.dump` only tests its truth value |
+
+### Not verified
+
+- No real `claude` call; no browser in this round (the page script runs in Node with a DOM stub).
+- Atomic save and the umask are tested through the file system in the tests, not with a
+  concurrent reader or another user's umask in a running server.
+- `translate.py validate` was not run on the real projects (schema 1; only the check scripts
+  touch them, on copies).
