@@ -4448,3 +4448,40 @@ the Phase 6 entry.
 ### Not verified
 
 - No real `claude` call.
+
+## Phase 6 — review round 3
+
+Date: 2026-11-21. Same branch and worktree.
+
+### Changes
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| 1 | an indented shebang (a block indented as a whole) was taken for a comment line: not passthrough, a changed shebang passed `check_code`, and the Phase 4 count missed it | `validation.comment_flags` and the Phase 4 check's `starts_with_shebang` test the first non-blank line with its indentation removed | `TestRound3IndentedShebang` (passthrough, changed shebang rejected, unchanged accepted, a later `#!` still a comment line); `TestValidateCheckShebang` (an indented one counted) |
+| 2 | plan wording | Phase 6 "As built": "a first non-blank line that starts with `#!` after its indentation"; the code prompt's shebang sentence applies to rules 1 projects too | — |
+
+Changed test: `TestRound1Shebang::test_check_code_keeps_the_shebang` expected an indented `#!`
+first line to be a comment; it is now code (this round's rule).
+
+### Checks
+
+Digest `a7197555c962562a530d6de80fa045af` before and after. The four scripts
+(`phase6_segmentation_check`, `phase3_export_check`, `phase4_validate_check`,
+`phase5_glossary_check`, each with `--projects-dir <repo>/projects --anonymize`) exited 0 and
+their whole output is identical to review round 2 (diffed), including
+`translated code starting with a shebang 0` in every project and `passthrough 1438` in the Phase 6
+TOTAL. No temporary directory left.
+
+### Tests
+
+2149 passed (round 2: 2148).
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`: `TOTAL mutants 603  killed 601  survived 2  timeout 0
+suspicious 0  untested 0`. The survivors are `check_source` 15 and 22 of the Phase 6 check,
+equivalent as recorded in the Phase 6 entry.
+
+### Not verified
+
+- No real `claude` call.
