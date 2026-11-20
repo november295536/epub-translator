@@ -11,6 +11,7 @@
         <div class="stat-card">
             <div class="stat-card-value text-blue">{{ progress.translated }}</div>
             <div class="stat-card-label">已翻譯</div>
+            {% if progress.passthrough %}<div class="stat-card-sub">含 {{ progress.passthrough }} 段原樣保留的程式碼（不需翻譯）</div>{% endif %}
         </div>
         <div class="stat-card">
             <div class="stat-card-value text-green">{{ progress.reviewed }}</div>

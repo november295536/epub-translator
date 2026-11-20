@@ -1973,15 +1973,17 @@ class TestValidateCheck:
         assert capsys.readouterr().out.splitlines() == [
             'PASS project-1: round trip 3/3, translated 3, failing the structural check 0 '
             '(none; only tag rules 0), warnings (none), length ratio: no segment, '
-            'sources that cannot be cut 0, with translatable attributes 0',
+            'sources that cannot be cut 0, with translatable attributes 0, '
+            'translated code starting with a shebang 0',
             'PASS project-2: round trip 7/7, translated 6, failing the structural check 2 '
             '(code_changed 1, tag_count 1; only tag rules 1), warnings (untranslated 1), '
             'length ratio: no segment, sources that cannot be cut 0, '
-            'with translatable attributes 0',
+            'with translatable attributes 0, translated code starting with a shebang 0',
             'TOTAL projects 2  round trip 10/10  translated 9  failing the structural check 2 '
             '(code_changed 1, tag_count 1; only tag rules 1)  warnings (untranslated 1)  '
             'length ratio: no segment  sources that cannot be cut 0  '
-            'with translatable attributes 0  failed projects 0',
+            'with translatable attributes 0  translated code starting with a shebang 0  '
+            'failed projects 0',
         ]
         assert roundtrip_check.snapshot(str(root)) == before
 
@@ -1999,9 +2001,11 @@ class TestValidateCheck:
         ratio = ('length ratio over 1 segments: p1 0.535 p5 0.535 p50 0.535 '
                  'p95 0.535 p99 0.535; outside 0.25-0.8: 0 (0.0%)')
         assert out[1].endswith(f'{ratio}, sources that cannot be cut 0, '
-                               'with translatable attributes 0')
+                               'with translatable attributes 0, '
+                               'translated code starting with a shebang 0')
         assert out[2].endswith(f'{ratio}  sources that cannot be cut 0  '
-                               'with translatable attributes 0  failed projects 0')
+                               'with translatable attributes 0  '
+                               'translated code starting with a shebang 0  failed projects 0')
 
     def test_failing_every_tag_rule_counts_as_tags_only(self, tmp_path, capsys):
         root, project_dir = _validate_projects(tmp_path / 'projects')
@@ -2031,10 +2035,11 @@ class TestValidateCheck:
         pm.save()
         assert self._main(root) == 0
         out = capsys.readouterr().out.splitlines()
-        assert out[1].endswith('sources that cannot be cut 1, with translatable attributes 2')
+        assert out[1].endswith('sources that cannot be cut 1, with translatable attributes 2, '
+                               'translated code starting with a shebang 0')
         assert 'translated 5, ' in out[1]
         assert out[2].endswith('sources that cannot be cut 1  with translatable attributes 2  '
-                               'failed projects 0')
+                               'translated code starting with a shebang 0  failed projects 0')
 
     def test_names_without_anonymize(self, tmp_path, capsys):
         root, _ = _validate_projects(tmp_path / 'projects')
@@ -2938,3 +2943,531 @@ class TestReviewRound1Survivors:
         response = client.post('/api/projects/demo/segments/c_seg0001', json={'text': '<p>甲<b>乙</b></p>'})
         assert response.status_code == 422
         assert 'glossary_unavailable' not in response.get_json()
+
+
+# --- Phase 6: segmentation check -------------------------------------------------
+
+segmentation_check = _load('phase6_segmentation_check')
+
+
+def _segmentation_projects(root):
+    """alpha: the Phase 6 test book, its own source.epub in the project;
+    beta: prose only, its source outside the project (the stored path)."""
+    from tests.conftest import xhtml
+    from tests.test_exporter import _project, _raw_book
+    from tests.test_technical_segmentation import _book
+    root.mkdir()
+    books = root.parent / 'books'
+    books.mkdir()
+    alpha_book = _book(books)
+    alpha = _project(root, alpha_book, {}, name='alpha')
+    shutil.copy(alpha_book, os.path.join(alpha, 'source.epub'))
+    os.remove(alpha_book)
+    beta_dir = books / 'b'
+    beta_dir.mkdir()
+    beta_book = _raw_book(beta_dir, {'p': ('p.xhtml', xhtml('<p>One.</p><p>Two.</p>'))},
+                          nav=None, ncx=None)
+    beta = _project(root, beta_book, {}, name='beta')
+    return root, alpha, beta
+
+
+SEGMENTATION_LINES = [
+    'PASS project-1: segments 8 -> 6, calls 8 -> 4 (ratio 0.500), passthrough 2, '
+    'headings merged 2 of 3, blocks covered identically',
+    'PASS project-2: segments 1 -> 1, calls 1 -> 1 (ratio 1.000), passthrough 0, '
+    'headings merged 0 of 0, blocks covered identically',
+    'TOTAL projects 2  segments 9 -> 7, calls 9 -> 5 (ratio 0.556), passthrough 2, '
+    'headings merged 2 of 3  failed projects 0',
+]
+
+
+class TestSegmentationCheck:
+
+    def _main(self, root, anonymize=True):
+        return segmentation_check.main(['--projects-dir', str(root)]
+                                       + (['--anonymize'] if anonymize else []))
+
+    def test_lines(self, tmp_path, capsys):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        (root / 'not-a-project').mkdir()
+        before = roundtrip_check.snapshot(str(root))
+        assert self._main(root) == 0
+        assert capsys.readouterr().out.splitlines() == SEGMENTATION_LINES
+        assert roundtrip_check.snapshot(str(root)) == before
+
+    def test_names_without_anonymize(self, tmp_path, capsys):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        assert self._main(root, anonymize=False) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert out[0].startswith('PASS alpha: ') and out[1].startswith('PASS beta: ')
+
+    def test_default_projects_directory(self, tmp_path, capsys, monkeypatch):
+        _segmentation_projects(tmp_path / 'projects')
+        monkeypatch.chdir(tmp_path)
+        assert segmentation_check.main(['--anonymize']) == 0
+        assert capsys.readouterr().out.splitlines() == SEGMENTATION_LINES
+
+    def test_copies_in_one_removed_directory(self, tmp_path, capsys, monkeypatch):
+        root, alpha, _ = _segmentation_projects(tmp_path / 'projects')
+        made, checked = [], []
+        real = segmentation_check.tempfile.mkdtemp
+        real_check = segmentation_check.check_source
+
+        def mkdtemp(**kwargs):
+            made.append(real(**kwargs))
+            return made[-1]
+
+        def check(epub):
+            checked.append((epub, sorted(os.listdir(os.path.dirname(epub)))))
+            return real_check(epub)
+        monkeypatch.setattr(segmentation_check.tempfile, 'mkdtemp', mkdtemp)
+        monkeypatch.setattr(segmentation_check, 'check_source', check)
+        assert self._main(root) == 0
+        assert len(made) == 1 and not os.path.exists(made[0])
+        assert os.path.basename(made[0]).startswith('phase6-segmentation-')
+        assert not os.path.realpath(made[0]).startswith(ROOT)
+        assert checked == [(os.path.join(made[0], '1.epub'), ['1.epub']),
+                           (os.path.join(made[0], '2.epub'), ['1.epub', '2.epub'])]
+
+    def test_source_of(self, tmp_path):
+        _, alpha, beta = _segmentation_projects(tmp_path / 'projects')
+        assert segmentation_check.source_of(alpha) == os.path.join(alpha, 'source.epub')
+        with open(os.path.join(beta, 'project.json'), encoding='utf-8') as f:
+            assert segmentation_check.source_of(beta) == json.load(f)['epub_path']
+
+    def test_missing_source_fails(self, tmp_path, capsys):
+        root, _, beta = _segmentation_projects(tmp_path / 'projects')
+        os.remove(segmentation_check.source_of(beta))
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[1] == 'FAIL project-2: check raised FileNotFoundError'
+        assert out[2] == ('TOTAL projects 2  segments 8 -> 6, calls 8 -> 4 (ratio 0.500), '
+                          'passthrough 2, headings merged 2 of 3  failed projects 1')
+
+    def test_uncovered_blocks_fail(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        monkeypatch.setattr(segmentation_check, 'covers', lambda blocks, segs: len(segs) > 2)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        # alpha: chapter k under both rules; beta: its chapter under both rules
+        assert out[0] == ('FAIL project-1: ' + SEGMENTATION_LINES[0][len('PASS project-1: '):]
+                          .replace(', blocks covered identically', '')
+                          + '; 2 segmentations do not cover their chapter exactly')
+        assert out[1].endswith('; 2 segmentations do not cover their chapter exactly')
+        assert out[2].endswith('failed projects 2')
+
+    def test_more_calls_fail(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        real = segmentation_check.Segmenter
+
+        class Swapped:  # the new rules given the old ones' segments and back
+            def __init__(self, rules):
+                self.inner = real(rules=3 - rules)
+
+            def segment_chapter(self, *args):
+                return self.inner.segment_chapter(*args)
+        monkeypatch.setattr(segmentation_check, 'Segmenter', Swapped)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[0] == ('FAIL project-1: segments 6 -> 8, calls 4 -> 8 (ratio 2.000), '
+                          'passthrough 0, headings merged 0 of 3; the new rules need more calls')
+        assert out[1].startswith('PASS project-2: ')  # equal calls pass
+
+    def test_changed_project_directory_fails(self, tmp_path, capsys, monkeypatch):
+        root, _, beta = _segmentation_projects(tmp_path / 'projects')
+        real = segmentation_check.check_source
+
+        def touching(epub):
+            if epub.endswith('2.epub'):
+                with open(os.path.join(beta, 'extra.txt'), 'w') as f:
+                    f.write('x')
+            return real(epub)
+        monkeypatch.setattr(segmentation_check, 'check_source', touching)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[1] == ('FAIL project-2: segments 1 -> 1, calls 1 -> 1 (ratio 1.000), '
+                          'passthrough 0, headings merged 0 of 0; '
+                          'files in the project directory changed')
+
+    def test_snapshot_error(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        calls = []
+
+        def snapshot(path):
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError('gone')
+            return []
+        monkeypatch.setattr(segmentation_check, 'snapshot', snapshot)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[0] == \
+            'FAIL project-1: project snapshot raised OSError'
+
+    def test_snapshot(self, tmp_path):
+        (tmp_path / 'sub').mkdir()
+        (tmp_path / 'sub' / 'b').write_text('xy')
+        (tmp_path / 'a').write_text('z')
+        names = [(name, size) for name, size, _ in segmentation_check.snapshot(str(tmp_path))]
+        assert names == [('a', 1), (os.path.join('sub', 'b'), 2)]
+
+    def test_no_calls_ratio(self):
+        r = dict.fromkeys(segmentation_check.COUNTS, 0)
+        assert segmentation_check.counts_line(r) == (
+            'segments 0 -> 0, calls 0 -> 0 (ratio -), passthrough 0, headings merged 0 of 0')
+
+    def test_covers(self):
+        from types import SimpleNamespace as N
+        blocks = [N(fingerprint='a'), N(fingerprint='b'), N(fingerprint='c')]
+
+        def seg(start, end, prints):
+            return N(block_start=start, block_end=end, fingerprints=prints)
+        covers = segmentation_check.covers
+        assert covers(blocks, [seg(0, 2, ['a', 'b']), seg(2, 3, ['c'])])
+        assert not covers(blocks, [seg(0, 2, ['a', 'b'])])                       # end missing
+        assert not covers(blocks, [seg(0, 2, ['a', 'b']), seg(1, 3, ['b', 'c'])])  # overlap
+        assert not covers(blocks, [seg(1, 3, ['b', 'c'])])                       # start missing
+        assert not covers(blocks, [seg(0, 2, ['a', 'x']), seg(2, 3, ['c'])])     # fingerprint
+        assert not covers(blocks, [seg(0, 0, []), seg(0, 3, ['a', 'b', 'c'])])   # empty range
+        assert covers([], [])
+
+    @pytest.mark.parametrize('where', ['repository', 'projects'])
+    def test_refuses_temporary_directory_inside(self, tmp_path, capsys, monkeypatch, where):
+        root, _, beta = _segmentation_projects(tmp_path / 'projects')
+        (tmp_path / 'checkout' / '.git').mkdir(parents=True)
+        (tmp_path / 'checkout' / 'src').mkdir()
+        place = str(tmp_path / 'checkout' / 'src') if where == 'repository' else beta
+        monkeypatch.setattr(segmentation_check.tempfile, 'gettempdir', lambda: place)
+        assert self._main(root) == 2
+        what = 'a git work tree' if where == 'repository' else 'the projects directory'
+        assert capsys.readouterr().out == \
+            f'ERROR the temporary directory would be inside {what}\n'
+        assert not any(n.startswith('phase6-segmentation-') for n in os.listdir(place))
+
+    def test_missing_directory(self, tmp_path, capsys):
+        assert self._main(tmp_path / 'nope') == 2
+        assert capsys.readouterr().out == (
+            'ERROR cannot list projects directory <projects-dir> (FileNotFoundError)\n')
+        assert self._main(tmp_path / 'nope', anonymize=False) == 2
+        assert str(tmp_path / 'nope') in capsys.readouterr().out
+
+    def test_temporary_directory_cannot_be_removed(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        made = []
+        real = segmentation_check.tempfile.mkdtemp
+        monkeypatch.setattr(segmentation_check.tempfile, 'mkdtemp',
+                            lambda **kw: made.append(real(**kw)) or made[-1])
+        real_rmtree = shutil.rmtree
+
+        def rmtree(path):
+            raise OSError(16, 'busy', '/MARKER')
+        monkeypatch.setattr(segmentation_check.shutil, 'rmtree', rmtree)
+        try:
+            assert self._main(root) == 1
+        finally:
+            real_rmtree(made[0])
+        out = capsys.readouterr().out
+        assert out.splitlines() == SEGMENTATION_LINES + [
+            'ERROR cannot remove the temporary directory (OSError)']
+        assert 'MARKER' not in out
+
+    def test_error_outside_a_project(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+
+        def run(args, names, work):
+            raise RuntimeError('/MARKER')
+        monkeypatch.setattr(segmentation_check, 'run', run)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out == 'ERROR the check stopped (RuntimeError)\n'
+
+    def test_help(self, tmp_path):
+        result = _run_script('phase6_segmentation_check', ['--help'], str(tmp_path))
+        assert result.returncode == 0
+        assert 'Phase 6 check: segmentation rules' in result.stdout
+
+    def test_script_run(self, tmp_path):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        result = _run_script('phase6_segmentation_check',
+                             ['--projects-dir', str(root), '--anonymize'], str(tmp_path))
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == SEGMENTATION_LINES
+
+
+class TestSegmentationCheckSurvivors:
+    """Mutation testing, Phase 6 run 1: the check script in-process."""
+
+    def _main(self, root):
+        return segmentation_check.main(['--projects-dir', str(root), '--anonymize'])
+
+    def test_help_in_process(self, capsys):
+        with pytest.raises(SystemExit):
+            segmentation_check.main(['--help'])
+        out = ' '.join(capsys.readouterr().out.split())
+        assert ('Phase 6 check: segmentation rules 1 (before Phase 6) and 2 (new projects) '
+                'on the real books.') in out
+        assert ('--projects-dir PROJECTS_DIR Directory that holds the project folders '
+                '(default: projects)') in out
+        assert '--anonymize Print project-N labels; omit names and paths' in out
+        assert 'For every project' not in out  # only the docstring's first line
+
+    def test_default_projects_directory_listed(self, tmp_path, capsys, monkeypatch):
+        _segmentation_projects(tmp_path / 'projects')
+        monkeypatch.chdir(tmp_path)
+        listed = []
+        real = segmentation_check.os.listdir
+
+        def listdir(path):
+            listed.append(path)
+            return real(path)
+        monkeypatch.setattr(segmentation_check.os, 'listdir', listdir)
+        assert segmentation_check.main(['--anonymize']) == 0
+        assert listed == ['projects']
+
+    def test_work_directory_under_the_resolved_temporary_directory(self, tmp_path, capsys,
+                                                                   monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        real_tmp = tmp_path / 'real-tmp'
+        real_tmp.mkdir()
+        link = tmp_path / 'tmp-link'
+        link.symlink_to(real_tmp)
+        made = []
+        real = segmentation_check.tempfile.mkdtemp
+
+        def mkdtemp(**kwargs):
+            made.append(real(**kwargs))
+            return made[-1]
+        monkeypatch.setattr(segmentation_check.tempfile, 'gettempdir', lambda: str(link))
+        monkeypatch.setattr(segmentation_check.tempfile, 'mkdtemp', mkdtemp)
+        assert self._main(root) == 0
+        assert os.path.dirname(made[0]) == os.path.realpath(str(real_tmp))
+
+    def test_looks_for_dot_git(self, tmp_path, monkeypatch):
+        looked = []
+        real = segmentation_check.os.path.lexists
+
+        def lexists(path):
+            looked.append(os.path.basename(path))
+            return real(path)
+        monkeypatch.setattr(segmentation_check.os.path, 'lexists', lexists)
+        segmentation_check.in_work_tree(str(tmp_path))
+        assert looked and set(looked) == {'.git'}
+
+    def test_every_uncovered_segmentation_counted(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        monkeypatch.setattr(segmentation_check, 'covers', lambda blocks, segs: False)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        # alpha: two chapters, each cut twice
+        assert out[0].endswith('; 4 segmentations do not cover their chapter exactly')
+
+    def test_first_snapshot_fails(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        calls = []
+
+        def snapshot(path):
+            calls.append(path)
+            if len(calls) == 1:
+                raise OSError('gone')
+            return []
+        monkeypatch.setattr(segmentation_check, 'snapshot', snapshot)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[0] == 'FAIL project-1: check raised OSError'
+        assert out[1].startswith('PASS project-2: ')  # the loop goes on after a failure
+
+    def test_two_failing_projects_with_two_problems(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+
+        def broken(epub):
+            raise ValueError('no')
+
+        def snapshot(path):
+            snapshot.calls += 1
+            if snapshot.calls % 2 == 0:
+                raise OSError('gone')
+            return []
+        snapshot.calls = 0
+        monkeypatch.setattr(segmentation_check, 'check_source', broken)
+        monkeypatch.setattr(segmentation_check, 'snapshot', snapshot)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines() == [
+            'FAIL project-1: check raised ValueError; project snapshot raised OSError',
+            'FAIL project-2: check raised ValueError; project snapshot raised OSError',
+            'TOTAL projects 2  segments 0 -> 0, calls 0 -> 0 (ratio -), passthrough 0, '
+            'headings merged 0 of 0  failed projects 2']
+
+    def test_counted_project_with_two_problems(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+        real = segmentation_check.check_source
+
+        def check(epub):
+            r, problems = real(epub)
+            return r, problems + ['one', 'two']
+        monkeypatch.setattr(segmentation_check, 'check_source', check)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[1] == (
+            'FAIL project-2: segments 1 -> 1, calls 1 -> 1 (ratio 1.000), passthrough 0, '
+            'headings merged 0 of 0; one; two')
+
+    def test_project_file_read_as_utf8(self, tmp_path, monkeypatch):
+        _, _, beta = _segmentation_projects(tmp_path / 'projects')
+        opened = []
+        real = open
+
+        def recording(path, mode='r', **kwargs):
+            opened.append((os.path.basename(path), mode, kwargs))
+            return real(path, mode, **kwargs)
+        monkeypatch.setattr(segmentation_check, 'open', recording, raising=False)
+        segmentation_check.source_of(beta)
+        assert opened == [('project.json', 'r', {'encoding': 'utf-8'})]
+
+
+class TestSegmentationCheckRound1:
+    """Review round 1: unreadable chapters, per-segment fingerprints, errors."""
+
+    def _book_project(self, root, chapters):
+        from tests.test_exporter import _project, _raw_book
+        root.mkdir()
+        books = root.parent / 'books'
+        books.mkdir()
+        epub = _raw_book(books, chapters, nav=None, ncx=None)
+        return _project(root, epub, {}, name='alpha')
+
+    def _main(self, root):
+        return segmentation_check.main(['--projects-dir', str(root), '--anonymize'])
+
+    def test_partly_unreadable_book_fails(self, tmp_path, capsys):
+        from tests.conftest import xhtml
+        root = tmp_path / 'projects'
+        project_dir = self._book_project(root, {'a': ('a.xhtml', xhtml('<p>One.</p>'))})
+        # a second spine chapter that is not well-formed, and one missing
+        import zipfile
+        epub = segmentation_check.source_of(project_dir)
+        with zipfile.ZipFile(epub) as z:
+            members = {n: z.read(n) for n in z.namelist()}
+        opf = members['OEBPS/content.opf'].decode()
+        opf = opf.replace('</manifest>', '<item id="b" href="Text/b.xhtml" '
+                          'media-type="application/xhtml+xml"/><item id="c" href="Text/c.xhtml" '
+                          'media-type="application/xhtml+xml"/></manifest>')
+        opf = opf.replace('</spine>', '<itemref idref="b"/><itemref idref="c"/></spine>')
+        members['OEBPS/content.opf'] = opf.encode()
+        members['OEBPS/Text/b.xhtml'] = b'<html><body><p>broken</div></body></html>'
+        with zipfile.ZipFile(epub, 'w') as z:
+            for name, data in members.items():
+                z.writestr(name, data)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[0] == (
+            'FAIL project-1: segments 1 -> 1, calls 1 -> 1 (ratio 1.000), passthrough 0, '
+            'headings merged 0 of 0; 2 chapters could not be checked')
+
+    def test_wholly_unreadable_book_fails(self, tmp_path, capsys):
+        root = tmp_path / 'projects'
+        self._book_project(root, {'a': ('a.xhtml', '<html><body><p>x</div></body></html>')})
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[0] == (
+            'FAIL project-1: segments 0 -> 0, calls 0 -> 0 (ratio -), passthrough 0, '
+            'headings merged 0 of 0; 1 chapters could not be checked; no chapter checked')
+
+    def test_book_without_chapters_fails(self, tmp_path, capsys):
+        from tests.conftest import xhtml
+        root = tmp_path / 'projects'
+        self._book_project(root, {'a': ('a.xhtml', xhtml(''))})  # no text: no chapter
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[0].endswith('; no chapter checked')
+
+    def test_covers_compares_each_segment_with_its_blocks(self):
+        from types import SimpleNamespace as N
+        blocks = [N(fingerprint='a'), N(fingerprint='b'), N(fingerprint='c')]
+        segs = [N(block_start=0, block_end=1, fingerprints=['a', 'b']),
+                N(block_start=1, block_end=3, fingerprints=['c'])]
+        assert not segmentation_check.covers(blocks, segs)
+        segs = [N(block_start=0, block_end=1, fingerprints=['a']),
+                N(block_start=1, block_end=3, fingerprints=['b', 'c'])]
+        assert segmentation_check.covers(blocks, segs)
+
+    def test_value_error_of_the_path_check(self, tmp_path, capsys, monkeypatch):
+        root, _, _ = _segmentation_projects(tmp_path / 'projects')
+
+        def commonpath(paths):
+            raise ValueError('/MARKER mixes absolute and relative')
+        monkeypatch.setattr(segmentation_check.os.path, 'commonpath', commonpath)
+        assert self._main(root) == 1
+        out, err = capsys.readouterr()
+        assert out == 'ERROR the check stopped (ValueError)\n' and err == ''
+
+
+class TestValidateCheckShebang:
+    """Phase 6 review round 2: translated code whose source starts with a shebang."""
+
+    def test_counted(self, tmp_path, capsys):
+        root, project_dir = _validate_projects(tmp_path / 'projects')
+        pm = validate_check.ProjectManager(project_dir)
+        pm.load()
+        segs = {s.segment_id: s for s in pm.data.segments}
+        segs['c_seg0003'].text = '\n\n  #!/bin/sh\n# note\nx = 1'  # blank lines, indented: counted
+        segs['d_seg0002'].text = '#!/usr/bin/env python\n' + segs['d_seg0002'].text
+        segs['c_seg0001'].text = '#! not code'                   # a text segment: not counted
+        pm.save()
+        assert validate_check.main(['--projects-dir', str(root), '--anonymize']) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert out[1].endswith('translated code starting with a shebang 2')
+        assert out[2].endswith('translated code starting with a shebang 2  failed projects 0')
+
+    def test_starts_with_shebang(self):
+        f = validate_check.starts_with_shebang
+        assert f('#!/bin/sh') and f('\n  \n#!x\ny')
+        assert f(' #!x') and f('\n    #!/bin/sh\n    ls')  # round 3: indented
+        assert not f('') and not f('x\n#!y') and not f('# !x')
+
+
+class TestSegmentationCheckRound2:
+    """Review round 2: spine documents the extractor skips silently."""
+
+    def _book(self, tmp_path, chapters):
+        from tests.test_exporter import _project, _raw_book
+        root = tmp_path / 'projects'
+        root.mkdir()
+        books = tmp_path / 'books'
+        books.mkdir()
+        _project(root, _raw_book(books, chapters, nav=None, ncx=None), {}, name='alpha')
+        return root
+
+    def test_bodyless_document_fails(self, tmp_path, capsys):
+        from tests.conftest import xhtml
+        root = self._book(tmp_path, {'a': ('a.xhtml', xhtml('<p>One.</p>')),
+                                     'b': ('b.xhtml', '<html xmlns="http://www.w3.org/1999/xhtml"/>'),
+                                     'c': ('c.xhtml', '<html/>')})
+        assert segmentation_check.main(['--projects-dir', str(root), '--anonymize']) == 1
+        assert capsys.readouterr().out.splitlines()[0] == (
+            'FAIL project-1: segments 1 -> 1, calls 1 -> 1 (ratio 1.000), passthrough 0, '
+            'headings merged 0 of 0; 2 spine documents without a body')
+
+    def test_legitimate_skips_pass(self, tmp_path, capsys):
+        from tests.conftest import RAW_NAV, xhtml
+        from tests.test_exporter import _project, _raw_book
+        root = tmp_path / 'projects'
+        root.mkdir()
+        books = tmp_path / 'books'
+        books.mkdir()
+        # the navigation document is in the spine; the cover's body has no text
+        epub = _raw_book(books, {'a': ('a.xhtml', xhtml('<p>One.</p>')),
+                                 'cover': ('cover.xhtml', xhtml('<img src="c.png" alt=""/>'))},
+                         nav=RAW_NAV, ncx=None)
+        _project(root, epub, {}, name='alpha')
+        assert segmentation_check.main(['--projects-dir', str(root), '--anonymize']) == 0
+        assert capsys.readouterr().out.splitlines()[0].startswith('PASS project-1: ')
+
+    def test_without_body_counts_only_unseen_documents(self, tmp_path):
+        from types import SimpleNamespace as N
+        from tests.conftest import xhtml
+        root = self._book(tmp_path, {'a': ('a.xhtml', '<html/>'), 'b': ('b.xhtml', '<html/>'),
+                                     'c': ('c.xhtml', xhtml(''))})
+        epub = segmentation_check.source_of(os.path.join(root, 'alpha'))
+        ex = segmentation_check.EPUBExtractor(epub)
+        ex.load()
+        assert ex.extract_chapters() == []
+        assert segmentation_check.without_body(ex, []) == 2
+        assert segmentation_check.without_body(ex, [N(id='a')]) == 1
+        ex.failed = [('b', 'x')]
+        assert segmentation_check.without_body(ex, []) == 1
+        ex.spine[0].is_nav = True
+        assert segmentation_check.without_body(ex, []) == 0

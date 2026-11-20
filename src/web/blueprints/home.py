@@ -46,10 +46,15 @@ def get_all_projects() -> list[dict]:
 
 
 def _get_status(progress: dict) -> str:
-    """Determine project status from progress."""
-    if progress['reviewed'] == progress['total']:
+    """Determine project status from progress. Passthrough segments (code
+    without comments: translated at creation, never reviewed) are left out:
+    a project is in progress once something is really translated, and
+    completed when every other segment is reviewed."""
+    total = progress['total'] - progress['passthrough']
+    translated = progress['translated'] - progress['passthrough']
+    if progress['reviewed'] == total:
         return 'completed'
-    if progress['translated'] > 0 or progress['reviewed'] > 0:
+    if translated > 0 or progress['reviewed'] > 0:
         return 'in_progress'
     return 'pending'
 

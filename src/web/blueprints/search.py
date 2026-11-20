@@ -71,6 +71,8 @@ def search_segments(project_name: str):
                 'text': seg.text,
                 'translated_text': seg.translated_text,
                 'match_in': match_in,
+                # code without comments: shown, never re-translated
+                'passthrough': seg.passthrough,
             })
 
     truncated = len(results) > MAX_RESULTS
