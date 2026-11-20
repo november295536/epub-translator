@@ -2860,6 +2860,8 @@ The run 4 table's mutant 214 (`os.umask(1)`) no longer exists: review round 2 (F
   document and NCX roots is unchanged.
 - An OPF with a DOCTYPE internal subset cannot be exported in a bilingual format (the
   stylesheet must be registered); in chinese-only it keeps its `dc:language`.
+- A UTF-32 chapter with an internal DOCTYPE subset is not detected (review round 4; UTF-32 is
+  not conforming for EPUB).
 - Export takes the project lock: it is refused while another process (a CLI translation or
   another web server) holds it.
 
@@ -2968,6 +2970,22 @@ that fails without it (H3: only on Python 3.12, see below).
 | H5 | no tests with a prefixed XHTML or OPF namespace | added; the code was already correct (no change). They kill the five no-namespace mutants, whose "equivalent" disposition (section 6) held only for default namespaces | `TestReviewRound3::test_prefixed_xhtml_without_head[*]`, `test_prefixed_opf[*]` |
 | H6 | the check script's processing-instruction survivors | focused tests with PI pseudo-attributes (`class`, `id`, `name`, `href`); the four mutants of `broken_links`, `id_counts`, `uses_bilingual`, `Archive.anchors` are killed; the remaining `_entries` ones are reworded accurately (section 6) | `TestExportCheckReviewRound3::test_pi_*` |
 | H7 | `mutation.py` cleanup | further SIGTERM/SIGHUP are ignored once cleanup starts; the recorded process group is signalled whether or not its leader has exited; members still alive after the grace period get SIGKILL; then the copy is removed | `TestMutationScript::test_stop_group_after_the_leader_exited` |
+
+### 13. Review round 4
+
+Verdicts: Opus approve, GPT approve, Gemini approve; only minors remained. Final small pass.
+
+| # | finding | action | tests |
+|---|---|---|---|
+| J1 | `mutation.py` cleanup could be cut short by Ctrl-C, and a raising `stop_group` would leave the copy | SIGINT is ignored too once cleanup starts; `stop_group` runs in `try … finally`, which removes the copy | — (two lines; the cleanup path is exercised by `test_stop_group_after_the_leader_exited` and was checked by hand in round 2) |
+| J2 | the check script removed the ZIP64 record only from the source's extra field | removed from both operands | `TestExportCheckReviewRound3::test_export_member_with_a_zip64_record_passes` |
+| J3 | `test_stop_group_after_the_leader_exited` assumed the child is reaped within one pause; `proc.stdout` left open | polls with a 10 s deadline; closes `proc.stdout` | the test itself |
+| J4 | limitation | recorded below and in section 7 | — |
+
+Known limitation (not fixed): a UTF-32 chapter with an internal DOCTYPE subset is not detected
+by `has_internal_subset` (UTF-32 is read as latin-1 there, so the subset is not seen and the
+chapter could be filled, dropping the subset). UTF-32 is not a conforming encoding for EPUB
+content documents.
 
 ### Not done
 
