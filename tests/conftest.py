@@ -1,6 +1,7 @@
 """Shared test fixtures."""
 
 import os
+import re
 import pytest
 from ebooklib import epub
 
@@ -228,9 +229,34 @@ def fake_claude_run(cmd, *args, **kwargs):
     result.returncode = 0
     result.stderr = ''
     prompt = cmd[2]
-    result.stdout = (CONTEXT_CODE + '\n') if 'CODEMARK' in prompt and '<p>' not in prompt \
-        else '<p>譯文</p>'
+    result.stdout = (CONTEXT_CODE + '\n') if 'CODEMARK' in prompt and '<p k=' not in prompt \
+        else '<p k="1">譯文</p>'
     return result
+
+
+# Where the text to translate starts in each prompt (src/core/translator.py)
+_PROMPT_TEXT_MARKERS = ('第一個字元就是 <\n\n', '不加任何說明。\n\n', '原文：\n')
+
+
+def echo_reply(prompt: str) -> str:
+    """A reply that passes the checks: the HTML (in its prompt form) or the
+    code of the prompt's first message, unchanged."""
+    for marker in _PROMPT_TEXT_MARKERS:
+        if marker in prompt:
+            return prompt.split(marker, 1)[1]
+    raise AssertionError('not a translation prompt')
+
+
+def like(request, text: str) -> str:
+    """A reply that passes the checks for a one-element segment: the
+    request's HTML (prompt form) with every text node replaced by `text`."""
+    return re.sub(r'>[^<]+<', f'>{text}<', echo_reply(request.messages[0].content))
+
+
+def echo_process(cmd, *args, **kwargs):
+    """run_process stand-in for the Claude CLI: answers with echo_reply."""
+    from src.llm.cli import ProcessResult
+    return ProcessResult(0, echo_reply(cmd[2]), '')
 
 
 def assert_context_prompts(prompts, project_dir):
@@ -238,7 +264,7 @@ def assert_context_prompts(prompts, project_dir):
     from src.core.project import ProjectManager
 
     def prompt_for(mark):
-        matches = [p for p in prompts if f'<p>{mark}' in p]
+        matches = [p for p in prompts if f'<p k="1">{mark}' in p]
         assert len(matches) == 1, mark
         return matches[0]
 

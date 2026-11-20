@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+from collections import Counter
+
 import click
 
 from src import __version__
@@ -19,6 +21,7 @@ from src.core.translator import (
 )
 from src.glossary.glossary_manager import GlossaryManager
 from src.core.migrate import MigrationError, migrate_project
+from src.core.validation import check_segment
 from src.epub.exporter import SCHEMA_1_MESSAGE, ExportError, export_project
 
 
@@ -449,6 +452,63 @@ def migrate(project_dir, dry_run):
         click.echo(line)
     if report.unmatched:
         sys.exit(1)
+
+
+@cli.command()
+@click.argument('project_dir', type=click.Path(exists=True, file_okay=False))
+@click.option('--mark-failed', is_flag=True, default=False,
+              help='Set the segments that fail the structural check to failed')
+def validate(project_dir, mark_failed):
+    """Check the stored translations with the full check of the export.
+
+    Read-only by default: prints, per rule, how many translated or reviewed
+    segments break it. With --mark-failed the segments that fail a
+    structural rule become failed, with their issues; their text is kept,
+    so start --retry-failed translates them again and a retry that fails
+    leaves the old text in place.
+    """
+    lock = ProjectLock(project_dir)
+    try:
+        if mark_failed:
+            lock.acquire()
+        report = _validate(project_dir, mark_failed)
+    except ProjectLockedError as e:
+        click.echo(str(e))
+        sys.exit(1)
+    finally:
+        lock.release()
+    for line in report:
+        click.echo(line)
+
+
+def _validate(project_dir: str, mark_failed: bool) -> list[str]:
+    pm = ProjectManager(project_dir)
+    pm.load()
+    checked, failing = 0, []
+    blocking, warnings = Counter(), Counter()
+    for seg in pm.data.segments:
+        if seg.status not in (SegmentStatus.TRANSLATED, SegmentStatus.REVIEWED) \
+                or not seg.translated_text.strip():
+            continue
+        checked += 1
+        result = check_segment(seg, seg.translated_text)
+        blocking.update({i.code for i in result.blocking})
+        warnings.update({i.code for i in result.issues if not i.blocking})
+        if result.blocking:
+            failing.append((seg.segment_id, result.blocking))
+    lines = [f"已檢查 {checked} 段譯文：{len(failing)} 段未通過結構檢查（匯出時以原文輸出），"
+             f"{checked - len(failing)} 段通過"]
+    lines += [f'  {code}：{n}' for code, n in sorted(blocking.items())]
+    if warnings:
+        lines.append('品質警告（不影響匯出）：')
+        lines += [f'  {code}：{n}' for code, n in sorted(warnings.items())]
+    if mark_failed and failing:
+        for segment_id, issues in failing:
+            pm.mark_failed(segment_id, issues)
+        pm.save()
+        lines.append(f"已將 {len(failing)} 段標為翻譯失敗（原譯文保留），"
+                     f"可用 start --retry-failed 重新翻譯。")
+    return lines
 
 
 # --- Glossary CLI commands ---

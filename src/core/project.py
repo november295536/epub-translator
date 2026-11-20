@@ -350,18 +350,29 @@ class ProjectManager:
             seg.issues = []
             seg.revision += 1
 
-    def update_translation(self, segment_id: str, text: str) -> None:
+    def update_translation(self, segment_id: str, text: str,
+                           issues: list[Issue] | None = None) -> None:
         """Update the translated text (in-memory; call save() to persist).
 
         The status is kept, except that a FAILED segment becomes TRANSLATED:
-        it now has a translation. Earlier issues are cleared."""
+        it now has a translation. Earlier issues are replaced by `issues`
+        (the new text's warnings; none by default)."""
         with self.mutex:
             seg = self._find(segment_id)
             seg.translated_text = text
             if seg.status == SegmentStatus.FAILED:
                 seg.status = SegmentStatus.TRANSLATED
-            seg.issues = []
+            seg.issues = list(issues or [])
             seg.revision += 1
+
+    def mark_failed(self, segment_id: str, issues: list[Issue]) -> None:
+        """A stored translation found broken (in-memory; call save()): the
+        segment becomes FAILED with `issues`. Its text is kept: a later
+        re-translation replaces it, a failed one leaves it (apply_outcome)."""
+        with self.mutex:
+            seg = self._find(segment_id)
+            seg.status = SegmentStatus.FAILED
+            seg.issues = list(issues)
 
     def get_segments_by_chapter(self, chapter_id: str) -> list[SegmentState]:
         """Get all segments belonging to a specific chapter."""

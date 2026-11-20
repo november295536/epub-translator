@@ -7,7 +7,10 @@ import logging
 import os
 from flask import Blueprint, render_template, request, jsonify, current_app
 
+from dataclasses import asdict
+
 from src.core.project import ProjectManager, SegmentStatus
+from src.core.validation import check_segment
 from src.core.translator import (
     AuthError, BackendUnavailableError, RateLimitError, TranslationEngine,
     record_failure_log, remove_failure_log, translate_segment,
@@ -84,13 +87,27 @@ def update_segment(project_name: str, segment_id: str):
 
     try:
         with transaction(project_name) as pm:
-            pm.update_translation(segment_id, data['text'])
+            seg = pm._find(segment_id)
+            issues = []
+            if data['text'].strip():  # an empty text clears the translation
+                result = check_segment(seg, data['text'])
+                if result.blocking:
+                    return _refused(result)
+                issues = result.issues
+            pm.update_translation(segment_id, data['text'], issues=issues)
             pm.save()
             # A person's version replaces the failed one: its diagnostics go too
             remove_failure_log(_log_dir(pm), segment_id)
     except ValueError as e:
         return jsonify({'error': str(e)}), 404
     return jsonify({'status': 'ok', 'segment_id': segment_id})
+
+
+def _refused(result):
+    """The answer to a save or approval whose text fails the structural
+    check: nothing is changed."""
+    return jsonify({'error': '譯文未通過結構檢查：' + '；'.join(i.detail for i in result.blocking),
+                    'issues': [asdict(i) for i in result.issues]}), 422
 
 
 @review_bp.route('/api/projects/<project_name>/segments/<segment_id>/approve', methods=['POST'])
@@ -101,6 +118,12 @@ def approve_segment(project_name: str, segment_id: str):
 
     try:
         with transaction(project_name) as pm:
+            seg = pm._find(segment_id)
+            approved = text or seg.translated_text
+            if approved.strip():
+                result = check_segment(seg, approved)
+                if result.blocking:
+                    return _refused(result)
             pm.mark_reviewed(segment_id, text=text)
             pm.save()
             remove_failure_log(_log_dir(pm), segment_id)
