@@ -3422,9 +3422,9 @@ deleted.
   version of this phase hid them, so their text stayed in the source language).
 - A reviewed segment marked failed by `validate --mark-failed` comes back `translated` after a
   successful retry, not `reviewed`.
-- The split's halves are checked without fingerprints; only the joined text is checked with
-  them (a half cannot be cut by the segment's fingerprint list without bookkeeping that is
-  not worth it).
+- (Superseded in review round 2: each half is now checked with its share of the
+  fingerprints.) The split's halves were checked without fingerprints; only the joined text
+  was checked with them.
 
 ### Not done
 
@@ -3493,7 +3493,7 @@ one list.
 | 10 | `_quality` word test | Done on the source text before whitespace removal (`A B` is not a word). |
 | 11 | Header bar refreshes | Also when `fetchStatus()` finds `completed`/`failed`/`stopped`, when `startTranslation()` returns `completed`, and on `rate_limit`, `auth_error`, `backend_error`. Tested by running the page's rendered `translationController` in Node (stubbed `fetch`, DOM, `EventSource`): 10 transitions refresh the bar, 7 others leave it alone; with the previous template 7 of the 10 fail. Skipped when `node` is absent. |
 | 12 | `validate` without `project.json` | `找不到專案：<dir> 裡沒有 project.json。`, exit 1, no traceback. |
-| 13 | Split diagnostics | `check_html(..., first_block=N)`; the second half starts at `mid + 1`, so its issues name the segment's block numbers. A failed outcome carries the usage of its calls (`TranslationError.usage` → `TranslationOutcome.usage`); `apply_outcome` still does not store it on the segment (the stored usage belongs to the kept text). |
+| 13 | Split diagnostics | `check_html(..., first_block=N)`; the second half starts at `mid + 1`, so its issues name the segment's block numbers (corrected in review round 2: this held only when no multi-line run precedes the split). A failed outcome carries the usage of its calls (`TranslationError.usage` → `TranslationOutcome.usage`); `apply_outcome` still does not store it on the segment (the stored usage belongs to the kept text). |
 | 14 | The 88 figure | `phase4_validate_check.py` prints "only tag rules N" per project and in the total (`TAG_RULES`: unknown_tag, key_mismatch, extra_attributes, tag_count). |
 
 Not changed, as instructed: the `not_html` rule, commented commands such as `# yum install`,
@@ -3623,3 +3623,125 @@ check rerun on the final code printed the same lines.
 - A `--mark-failed` save of a project whose stored text holds a lone surrogate (only possible
   in a hand-edited `project.json`) was not tested; `validate` without the flag and the export
   report it as `not_well_formed`.
+
+## Phase 4 — review round 2
+
+Date: 2026-11-21. Branch: `phase-4/protect-validate-retry`, same worktree and environment.
+Findings of review round 2 (items 1–8) and one added by the third reviewer (9).
+
+### Changes
+
+| # | Finding | Change |
+|---|---|---|
+| 1 | A translated `alt`/`title`/`aria-label` on a block element never reached the export | `exporter._replace_children` now also copies the values of `TRANSLATABLE_ATTRIBUTES` that the translation's block element carries onto the filled element (chinese-only) or the translated copy (bilingual); the bilingual original is the source element and keeps the source's values; machine attributes are untouched (the check guarantees both carry the same names). Tests: `TestRound2Export`, `p` with `title`, `table` with `title`, `figure` with `aria-label`, all three formats. With the previous exporter all 9 fail. |
+| 2 | Inline keys of equal attributes could move between blocks | `Key.owner`: the top-level key of the unit (block or `<run>`) a key is in, recorded by `protect`. `check_keys` requires a nested key to sit in the unit with that key (`<em k="4"> 不在原來的區塊（原文在 k="3" 內）`, `key_mismatch`). Tests: exchange between two blocks, between a block and a run, a nested block key. |
+| 3 | An emptied value showed up as a misleading stored-form mismatch | `check_keys` compares blankness (after decoding, whitespace-only counts as blank): a blank reply value for a non-blank source value is `extra_attributes` "`<img k="2"> 的 alt 不可為空`"; the reverse keeps "原文是空的". `_signature` treats a whitespace-only value as empty. |
+| 4 | Whitespace character references in translated values | `_unescape` applies attribute-value normalization first (literal tab, CR, LF, CRLF → space), then decodes references; `_escape` writes tab, LF and CR as `&#9;`, `&#10;`, `&#13;`. A value the reply repeats is still put back as its exact stored token. |
+| 5 | Split block numbers after a multi-line run | Fixed, not dropped: `validation.pieces_per_group(html, fingerprints)` gives the blocks per top-level group (a run cut by the fingerprints holds several). The halves are checked with their share of the fingerprints, the second half numbered from the number of blocks before it plus one. `<p>A</p>\nL1\nL2\n<p>B</p>`: an error in `<p>B</p>` is block 4. This also replaces the Phase 4 consequence "halves are checked without fingerprints" (marked superseded in that entry) and corrects the round 1 claim (marked in item 13 there). |
+| 6 | Approve with a body that is not a JSON object | 400 `Body must be a JSON object` for an array, a string or malformed JSON; an absent or empty body still approves the stored text. |
+| 7 | `validate` on schema 1 used the export's message | Own message: `此專案是舊格式（schema 1），無法檢查譯文。請先執行 python3 translate.py migrate <專案目錄> 再檢查。` |
+| 8 | Schema 1 text segment with empty `html` | `check_segment` returns no issue for a text segment without HTML: there is no structure to compare. Review save and approve work for such segments (test); blank text is still handled as before. |
+| 9 | Joined text failing after two passing halves was not recorded | `_translate_html` calls `session.rejected(result, joined)` before raising: the warning is logged, the attempt (with the joined text as its output) goes into the diagnostics. The failure message now counts calls made (`_Session.used`) instead of recorded attempts: "after 4 attempts" when four calls were made. Test: `TestRound2JoinedFailure` (the joined check is made to fail with a patched `check_html`, since with fingerprint shares two passing halves cannot produce a failing whole in practice). |
+
+### Known limitations (recorded, not fixed)
+
+- A top-level CDATA section that holds text is treated by the split as a separator between
+  units, not as content.
+- Whitespace written as entities (`&#10;`) between top-level blocks of a reply is refused as
+  stray text at the top level.
+- `validate --mark-failed` cannot save a hand-edited project whose stored text holds a lone
+  surrogate (the save fails encoding it); `validate` without the flag and the export report
+  the segment as `not_well_formed`.
+- Schema 1 sources were measured only on migrated copies.
+- The split assumes one top-level group per top-level unit (true for every source that can be
+  cut); were it not, the fingerprint shares would be misaligned and the halves would be
+  refused, failing the segment rather than accepting a wrong text.
+
+### Checks
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase4_validate_check.py --projects-dir <repo>/projects --anonymize
+PASS project-1: round trip 220/220, translated 220, failing the structural check 9 (key_mismatch 7, not_well_formed 2; only tag rules 7), warnings (length_ratio 1), length ratio over 205 segments: p1 0.312 p5 0.324 p50 0.359 p95 0.580 p99 0.700; outside 0.25-0.8: 1 (0.5%), sources that cannot be cut 0, with translatable attributes 0
+PASS project-2: round trip 278/278, translated 278, failing the structural check 54 (not_well_formed 10, structure_mismatch 7, tag_count 37; only tag rules 37), warnings (length_ratio 14), length ratio over 218 segments: p1 0.351 p5 0.360 p50 0.402 p95 1.104 p99 1.186; outside 0.25-0.8: 14 (6.4%), sources that cannot be cut 0, with translatable attributes 3
+PASS project-3: round trip 4385/4385, translated 36, failing the structural check 2 (structure_mismatch 1, tag_count 1; only tag rules 1), warnings (none), length ratio over 13 segments: p1 0.363 p5 0.363 p50 0.471 p95 0.580 p99 0.580; outside 0.25-0.8: 0 (0.0%), sources that cannot be cut 0, with translatable attributes 16
+PASS project-4: round trip 2236/2236, translated 1333, failing the structural check 57 (empty_block 14, key_mismatch 10, not_well_formed 2, structure_mismatch 31; only tag rules 10), warnings (untranslated 6), length ratio over 1102 segments: p1 0.342 p5 0.365 p50 0.422 p95 0.484 p99 0.514; outside 0.25-0.8: 2 (0.2%), sources that cannot be cut 0, with translatable attributes 0
+PASS project-5: round trip 839/839, translated 832, failing the structural check 38 (code_changed 19, key_mismatch 3, structure_mismatch 1, tag_count 16; only tag rules 18), warnings (none), length ratio over 430 segments: p1 0.312 p5 0.334 p50 0.394 p95 0.516 p99 0.631; outside 0.25-0.8: 0 (0.0%), sources that cannot be cut 0, with translatable attributes 0
+PASS project-6: round trip 581/581, translated 581, failing the structural check 3 (key_mismatch 3; only tag rules 3), warnings (length_ratio 16, untranslated 2), length ratio over 276 segments: p1 0.347 p5 0.381 p50 0.503 p95 0.885 p99 1.086; outside 0.25-0.8: 16 (5.8%), sources that cannot be cut 0, with translatable attributes 0
+PASS project-7: round trip 621/621, translated 551, failing the structural check 27 (key_mismatch 12, not_well_formed 6, structure_mismatch 9; only tag rules 12), warnings (length_ratio 4), length ratio over 458 segments: p1 0.321 p5 0.340 p50 0.380 p95 0.439 p99 0.732; outside 0.25-0.8: 4 (0.9%), sources that cannot be cut 0, with translatable attributes 3
+PASS project-8: round trip 331/331, translated 331, failing the structural check 16 (structure_mismatch 16; only tag rules 0), warnings (length_ratio 1), length ratio over 223 segments: p1 0.299 p5 0.308 p50 0.340 p95 0.380 p99 0.430; outside 0.25-0.8: 1 (0.4%), sources that cannot be cut 0, with translatable attributes 0
+TOTAL projects 8  round trip 9491/9491  translated 4162  failing the structural check 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 54; only tag rules 88)  warnings (length_ratio 36, untranslated 8)  length ratio over 2925 segments: p1 0.312 p5 0.333 p50 0.404 p95 0.547 p99 0.976; outside 0.25-0.8: 38 (1.3%)  sources that cannot be cut 0  with translatable attributes 22  failed projects 0
+$ echo $?
+0
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase3_export_check.py --projects-dir <repo>/projects --anonymize
+epubcheck found; errors compared by message ID (chinese-only, bilingual-horizontal, bilingual-vertical)
+PASS project-1: exports 3, translated segments 220: as translation 211, kept original 9 (key_mismatch 7, not_well_formed 2), toc labels changed 0/22 (22 into translated chapters), epubcheck errors source 51 (HTM-004:24 NCX-001:1 RSC-005:26), exports 51/51/51
+PASS project-2: exports 3, translated segments 278: as translation 224, kept original 54 (not_well_formed 10, structure_mismatch 7, tag_count 37), toc labels changed 0/35 (33 into translated chapters), epubcheck errors source 27 (OPF-034:1 RSC-005:25 RSC-020:1), exports 27/28/28
+PASS project-3: exports 3, translated segments 36: as translation 34, kept original 2 (structure_mismatch 1, tag_count 1), toc labels changed 18/1357 (22 into translated chapters), epubcheck errors source 0, exports 0/0/0
+PASS project-4: exports 3, translated segments 1333: as translation 1276, kept original 57 (empty_block 14, key_mismatch 10, not_well_formed 2, structure_mismatch 31), toc labels changed 123/144 (126 into translated chapters), epubcheck errors source 11 (RSC-012:11), exports 11/22/22
+PASS project-5: exports 3, translated segments 832: as translation 794, kept original 38 (code_changed 19, key_mismatch 3, structure_mismatch 1, tag_count 15), toc labels changed 244/245 (245 into translated chapters), epubcheck errors source 470 (HTM-004:25 NCX-001:1 PKG-006:1 RSC-005:440 RSC-007:3), exports 466/511/511
+PASS project-6: exports 3, translated segments 581: as translation 578, kept original 3 (key_mismatch 3), toc labels changed 19/19 (19 into translated chapters), epubcheck errors source 1 (RSC-005:1), exports 1/1/1
+PASS project-7: exports 3, translated segments 551: as translation 524, kept original 27 (key_mismatch 12, not_well_formed 6, structure_mismatch 9), toc labels changed 1/45 (44 into translated chapters), epubcheck errors source 151 (RSC-005:151), exports 151/183/183
+PASS project-8: exports 3, translated segments 331: as translation 315, kept original 16 (structure_mismatch 16), toc labels changed 0/18 (16 into translated chapters), epubcheck errors source 27 (RSC-005:26 RSC-007:1), exports 27/27/27
+TOTAL projects 8  exports 24  translated segments 4162  as translation 3956  kept original 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 53)  toc labels changed 405/1885 (527 into translated chapters)  exports with new epubcheck errors 0  failed projects 0
+$ echo $?
+0
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+Both outputs are identical, line for line, to review round 1's. No stored translation uses a
+translated attribute on a block element, moves a key between blocks, or blanks a value, so
+none of items 1–4 changes a count; items 5–9 do not touch stored translations. No
+`phase4-validate-*` or `phase3-export-*` directory left. Both scripts ran on the code before
+the last refactor commit, which only removed conditions that cannot change a result (suite
+green and the final mutation run below).
+
+### Tests
+
+1731 passed (round 1: 1695). New: `TestRound2Keys`, `TestRound2Values`, `TestRound2Segments`
+(`test_validation.py`); `TestRound2Split`, `TestRound2JoinedFailure` (`test_translator.py`);
+`TestRound2Review` (`test_web.py`); `TestRound2Export` (`test_exporter.py`).
+
+Tests changed, none removed:
+
+| Test | Change | Reason |
+|---|---|---|
+| `TestRound1Validate::test_schema_1_refused` | the validate message | item 7 |
+| `TestPhase4Retry::test_failing_half_fails_the_segment` | "after 4 attempts" | item 9: the message counts calls; four were made |
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, mutmut 3.8.1, parallel, about 7 minutes per run.
+
+| Run | Mutants | Killed | Survived |
+|---|---|---|---|
+| 1 | 1973 | 1959 | 14 |
+| 2 (final) | 1961 | 1953 | 8 |
+
+Run 1's survivors:
+
+| mutant(s) | done |
+|---|---|
+| `_translate_html` 51, 54, 55, 56 (the fallback when the group counts did not match the units) | code changed: the fallback is removed (a source that reaches the split can be cut, and its groups are its units) |
+| `check_keys` 51 (`top[-1] if top`) | code changed: the owner is read only below the top level, where a unit is open |
+| `_replace_children` 1 (`and` → `or`) | code changed: the value is copied when the translation's element carries it |
+| `_translate_html` 99, 102 (the joined text checked without fingerprints) | equivalent: each half has already passed with its share of the fingerprints, so the cut of the joined text is the same with or without them |
+| `_signature` 7 (`''` → `'XXXX'`), 8 (blank and non-blank swapped) | equivalent: the value only splits translatable attributes into two classes, blank and not blank; any two distinct labels, in either order, compare the same |
+| `_fill` 3 (`deepcopy` → `copy`) | equivalent: `copy.copy` of an lxml element is a deep copy |
+| `_restored_attrs` 20, `_Session.__init__` 4, `top_level_units` 39 | equivalent, as in round 1 and the Phase 4 entry |
+
+Remaining survivors (run 2), each equivalent and listed above: `_translate_html` 93 and 96
+(run 1's 99 and 102, renumbered), `_signature` 7 and 8, `_fill` 3, `_restored_attrs` 20,
+`_Session.__init__` 4, `top_level_units` 39.
+
+### Not verified
+
+- No real `claude` call: the model's handling of the owner rule and of blank values under
+  the prompt wording is untested.
+- The export of translated block-element attributes was checked by tests and by the
+  unchanged real-data export counts; no real book has such a stored translation, and the
+  output was not opened in a reader.
