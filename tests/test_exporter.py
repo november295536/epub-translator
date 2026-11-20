@@ -1991,9 +1991,10 @@ class TestRound2Survivors:
     @pytest.mark.parametrize('data', [
         b'\xef\xbb\xbf' + SUBSET.encode('utf-8'),
         SUBSET.encode('utf-16'),                                     # BOM, no declaration
+        b'\xfe\xff' + SUBSET.encode('utf-16-be'),                       # big-endian BOM
         ('<?xml version="1.0" encoding="UTF-16"?>' + SUBSET).encode('utf-16-be'),  # no BOM
         ('<?xml version="1.0" encoding="UTF-16"?>' + SUBSET).encode('utf-16-le'),
-    ], ids=['utf-8-bom', 'utf-16-bom', 'utf-16-be', 'utf-16-le'])
+    ], ids=['utf-8-bom', 'utf-16-bom', 'utf-16-be-bom', 'utf-16-be', 'utf-16-le'])
     def test_internal_subset_found_in_any_encoding(self, tmp_path, data):
         report, _ = self._one(tmp_path, data, '<p>字。</p>')
         assert report.chapters[0].kept == [('c_seg0001', CHAPTER_DOCTYPE)]
