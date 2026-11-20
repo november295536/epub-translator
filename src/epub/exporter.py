@@ -270,15 +270,17 @@ def has_internal_subset(root, data: bytes) -> bool:
     an internal subset, which `_serialize` cannot write back. lxml exposes
     no subset content (`docinfo.internalDTD` exists for any DOCTYPE), so
     the source is decoded and its prolog read, skipping comments and
-    processing instructions. The encoding: UTF-16 by byte order mark or by
-    the first character (XML 1.0, appendix F), else the one the parser
-    reports (from the declaration; UTF-8 without one)."""
-    info = root.getroottree().docinfo
-    if info.internalDTD is None:
+    processing instructions. UTF-16 is found by byte order mark or by the
+    first character (XML 1.0, appendix F); anything else is read as
+    latin-1, which decodes any bytes and keeps the prolog's ASCII
+    structure (a declared encoding Python does not know is no error)."""
+    if root.getroottree().docinfo.internalDTD is None:
         return False
+    if data.startswith(b'\xef\xbb\xbf'):
+        data = data[3:]
     codec = {b'\xff\xfe': 'utf-16', b'\xfe\xff': 'utf-16',
-             b'<\x00': 'utf-16-le', b'\x00<': 'utf-16-be'}.get(data[:2], info.encoding)
-    text = data.decode(codec, 'replace').lstrip('\ufeff')
+             b'<\x00': 'utf-16-le', b'\x00<': 'utf-16-be'}.get(data[:2], 'latin-1')
+    text = data.decode(codec, 'replace')
     return _SUBSET.match(_PROLOG_NODE.sub('', text)) is not None
 
 
@@ -330,12 +332,14 @@ def _without_zip64(extra: bytes) -> bytes:
 
 
 def _member_info(info, compress_type: int):
-    """A ZipInfo for writing `info` again: name bytes (UTF-8 when the source
-    flags it, else code page 437, as zipfile decoded it), date, attributes,
+    """A ZipInfo for writing `info` again: the stored name bytes (UTF-8 when
+    the source flags it, else code page 437, as zipfile decoded it), date, attributes,
     system, versions, extra field and comment of the source."""
     out = _ZipInfo(info.filename, date_time=info.date_time)
     try:
-        out.raw_name = info.filename.encode('utf-8' if info.flag_bits & 0x800 else 'cp437')
+        # orig_filename: the name as stored (zipfile may take `filename`
+        # from an Info-ZIP Unicode Path extra field)
+        out.raw_name = info.orig_filename.encode('utf-8' if info.flag_bits & 0x800 else 'cp437')
     except UnicodeEncodeError as e:
         raise ExportError(f'無法原樣寫回成員名稱：{info.filename!r}') from e
     out.name_flag = info.flag_bits & 0x800
@@ -645,9 +649,9 @@ def _pieces(seg, blocks: list) -> list:
     piece whose source block has text must have text. The
     stored HTML must itself split into its blocks by the same rule
     (checked by fingerprint), else the segment cannot be mapped. Finally
-    the ids (and names of <a>) inside a source block, below the block
-    element itself, must be the same values, as many times each, in that
-    block's translation; inner tags and other attributes are not checked
+    the ids inside a source block, below the block element itself, must be
+    the same values, as many times each, in that block's translation, and
+    so must the names of <a> (counted apart from the ids); inner tags and other attributes are not checked
     (Phase 4).
 
     A code segment's translation is plain text, filled into the code
@@ -679,16 +683,16 @@ def _pieces(seg, blocks: list) -> list:
     return pieces
 
 
-def _anchors(piece) -> Counter:
-    """The id values, and the name values of <a>, inside one block's piece,
-    counted: below a block element (its own attributes come from the
-    source) or in a run's nodes."""
+def _anchors(piece) -> tuple:
+    """The id values and the name values of <a> inside one block's piece,
+    counted separately: below a block element (its own attributes come
+    from the source) or in a run's nodes."""
     if isinstance(piece, list):
         elements = [e for n in piece if not isinstance(n, str) for e in n.iter(etree.Element)]
     else:
-        elements = piece.iterdescendants(etree.Element)
-    return Counter(v for e in elements
-                   for v in (e.get('id'), e.get('name') if localname(e) == 'a' else None) if v)
+        elements = list(piece.iterdescendants(etree.Element))
+    return (Counter(e.get('id') for e in elements if e.get('id')),
+            Counter(e.get('name') for e in elements if localname(e) == 'a' and e.get('name')))
 
 
 def _fragment(html: str, nsmap: dict):
