@@ -1196,3 +1196,19 @@ class TestGlossaryRound2:
                        '<p>她來了。</p>', gm) == ['Ella Vane']
         assert not validation.occurrence_pattern(GlossaryEntry('Ella Vane', '譯', 'person')) \
             .search('Ella Vanes_x')
+
+
+class TestGlossaryRound2Survivors:
+
+    def test_lower_case_work_stays_case_sensitive(self):
+        pattern = validation.occurrence_pattern(GlossaryEntry('vale road', '譯', 'work'))
+        assert pattern.search('the vale road') and not pattern.search('The Vale Road')
+
+    def test_shorter_term_at_the_same_start(self):
+        entries = glossary(('primary key', '主鍵'), ('primary', '主要')).entries.values()
+        assert [e.term for e in validation.occurring('a primary key', entries)] == ['primary key']
+
+    def test_every_longer_span_kept(self):
+        entries = glossary(('primary key', '主鍵'), ('sort order', '排序'), ('key', '鍵')).entries
+        found = validation.occurring('primary key, sort order', entries.values())
+        assert [e.term for e in found] == ['primary key', 'sort order']

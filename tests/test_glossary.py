@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -560,7 +561,7 @@ class TestRound1Survivors:
         _GM(str(tmp_path / 'glossary.json')).add_term('alpha', '甲')
         name = os.path.basename(moved[0])
         assert os.path.dirname(moved[0]) == str(tmp_path)
-        assert name.startswith('.glossary-') and name.endswith('.tmp')
+        assert re.fullmatch(r'\.glossary-[0-9a-f]{16}\.tmp', name)
         assert opened == [{'encoding': 'utf-8'}]
 
     def test_content(self, tmp_path):
@@ -636,3 +637,17 @@ class TestRound2:
         assert '"beta"' in path.read_text(encoding='utf-8')
         assert os.listdir(tmp_path) == ['glossary.json']
         assert caplog.records[-1].getMessage() == '無法沿用術語表的權限設定'
+
+
+class TestRound2Survivors:
+
+    @pytest.mark.parametrize('content,message', [
+        ('{"term": "a"}', 'the glossary is not a list'),
+        ('[{"term": 1}]', 'a glossary entry is not an object with text fields'),
+    ])
+    def test_messages(self, tmp_path, content, message):
+        path = tmp_path / 'glossary.json'
+        path.write_text(content, encoding='utf-8')
+        with pytest.raises(ValueError) as e:
+            _GM(str(path)).load()
+        assert str(e.value) == message
