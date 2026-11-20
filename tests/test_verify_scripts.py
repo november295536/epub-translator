@@ -1069,17 +1069,18 @@ class TestPhase2ScriptSurvivors:
         assert capsys.readouterr().out.startswith('PASS alpha')
 
     def test_roundtrip_counts_every_failure(self, tmp_path, capsys):
-        directory = tmp_path / 'aaa'
-        directory.mkdir()
-        (directory / 'project.json').write_text(json.dumps({'epub_path': '/gone.epub'}))
+        for name in ('aaa', 'aab'):
+            directory = tmp_path / name
+            directory.mkdir()
+            (directory / 'project.json').write_text(json.dumps({'epub_path': '/gone.epub'}))
         _roundtrip_project(str(tmp_path / 'bbb'), {'OEBPS/extra.xhtml': None})
         _roundtrip_project(str(tmp_path / 'ccc'), {'OEBPS/extra.xhtml': None})
         _roundtrip_project(str(tmp_path / 'ddd'))
         assert roundtrip_check.main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
         out = capsys.readouterr().out.splitlines()
         assert out[0] == 'FAIL project-1: cannot read the source (FileNotFoundError)'
-        assert out[3].startswith('PASS project-4')
-        assert out[4].endswith('failed projects 3')
+        assert out[4].startswith('PASS project-5')
+        assert out[5].endswith('failed projects 4')
 
     def test_roundtrip_two_problems_joined(self, tmp_path, capsys, monkeypatch):
         directory = str(tmp_path / 'p')
