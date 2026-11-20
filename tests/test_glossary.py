@@ -575,3 +575,64 @@ class TestRound1Survivors:
         path.write_text('[{"term": ', encoding='utf-8')
         assert load_glossary(str(path)) is None
         assert caplog.records[-1].getMessage() == '術語表無法讀取，略過術語檢查 (JSONDecodeError)'
+
+
+class TestRound2:
+    """Phase 5 review round 2: field types, symlinks, modes."""
+
+    @pytest.mark.parametrize('content', [
+        '{"term": "a"}', '["a"]', '[{"translation": "甲"}]', '[{"term": null, "translation": "甲"}]',
+        '[{"term": "a", "translation": null}]', '[{"term": "a", "translation": 5}]',
+        '[{"term": "a", "translation": "甲", "category": ["term"]}]',
+        '[{"term": "a", "translation": "甲", "notes": 1}]',
+        '[{"term": "a", "translation": "甲", "context": {}}]',
+    ])
+    def test_wrong_shape_is_a_value_error(self, tmp_path, content):
+        path = tmp_path / 'glossary.json'
+        path.write_text(content, encoding='utf-8')
+        gm = _GM(str(path))
+        gm.entries = {'kept': GlossaryEntry('kept', '留')}
+        with pytest.raises(ValueError):
+            gm.load()
+        assert list(gm.entries) == ['kept']  # nothing half-loaded
+
+    def test_valid_shape_loads(self, tmp_path):
+        path = tmp_path / 'glossary.json'
+        path.write_text('[{"term": "A", "translation": "甲", "category": "term", "frequency": 2}]',
+                        encoding='utf-8')
+        gm = _GM(str(path))
+        gm.load()
+        assert gm.entries == {'a': GlossaryEntry('A', '甲', 'term', 2)}
+
+    def test_symlink_stays(self, tmp_path):
+        real = tmp_path / 'store' / 'real.json'
+        real.parent.mkdir()
+        _GM(str(real)).add_term('alpha', '甲')
+        link = tmp_path / 'proj' / 'glossary.json'
+        link.parent.mkdir()
+        link.symlink_to(real)
+        _GM(str(link)).add_term('beta', '乙')
+        assert link.is_symlink()
+        assert '"beta"' in real.read_text(encoding='utf-8')
+        assert sorted(os.listdir(real.parent)) == ['real.json']
+
+    def test_new_file_mode_follows_umask(self, tmp_path):
+        old = os.umask(0o027)
+        try:
+            _GM(str(tmp_path / 'glossary.json')).add_term('alpha', '甲')
+        finally:
+            os.umask(old)
+        assert os.stat(tmp_path / 'glossary.json').st_mode & 0o777 == 0o640
+
+    def test_chmod_failure_does_not_fail_the_save(self, tmp_path, monkeypatch, caplog):
+        import src.glossary.glossary_manager as module
+        path = tmp_path / 'glossary.json'
+        _GM(str(path)).add_term('alpha', '甲')
+
+        def fchmod(fd, mode):
+            raise PermissionError('no')
+        monkeypatch.setattr(module.os, 'fchmod', fchmod)
+        _GM(str(path)).add_term('beta', '乙')
+        assert '"beta"' in path.read_text(encoding='utf-8')
+        assert os.listdir(tmp_path) == ['glossary.json']
+        assert caplog.records[-1].getMessage() == '無法沿用術語表的權限設定'

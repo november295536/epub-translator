@@ -47,6 +47,7 @@
                 <li class="issue-{{ issue.kind }}"><span class="issue-kind">{{ issue_kinds.get(issue.kind, issue.kind) }}</span>{{ issue.detail }}</li>
             {% endfor %}
             </ul>
+            <p class="glossary-notice" hidden>術語表無法讀取，這次未檢查術語。</p>
             <div class="segment-body">
                 <div class="original" x-data="{ view: 'text' }">
                     <div class="original-header">
@@ -103,16 +104,17 @@ const issueKinds = {{ issue_kinds|tojson }};
 
 // Show what the server returned for a segment (save, approve, re-translate,
 // refused save, failed re-translation): the number of segments with stored
-// issues, and the segment's issues in its badge, its list and the status
-// tooltip
+// issues, whether the glossary could be read, and the segment's issues in its
+// badge, its list and the status tooltip
 function showIssues(segId, data) {
     if (!data) return;
     if (typeof data.issue_count === 'number') {
         document.getElementById('issue-count').textContent = data.issue_count;
     }
+    const el = document.getElementById(`seg-${segId}`);
+    el.querySelector('.glossary-notice').hidden = !data.glossary_unavailable;
     const issues = data.issues;
     if (!Array.isArray(issues)) return;
-    const el = document.getElementById(`seg-${segId}`);
     const badge = el.querySelector('.issue-badge');
     const list = el.querySelector('.segment-issues');
     const status = el.querySelector('.segment-status');
