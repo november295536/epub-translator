@@ -1860,6 +1860,13 @@ Not needed for this phase (no prompt or backend change) and not made.
 - A legacy segment whose stored html has no text (for example a body-level `<script>` that
   an old segmenter stored) is folded into the neighbouring merge group; 0 such segments in
   the 8 projects (review round 3).
+- Known limitations accepted in review round 4: the migration reports an internal error of
+  the reader or walker as malformed project data (nothing is written); a process killed
+  during the backup copy can leave a stale temporary file, and one killed between backup and
+  save leaves a backup that makes the next run refuse with a message (`project.json` is
+  unchanged); a merged group of several code blocks would keep only the first block's code
+  text (0 such groups; the segmenter never builds one); archive members are read without a
+  size limit, as on `main`.
 - Migrated segments whose legacy text held comment text (Bug 5, two project-5 segments) keep
   their translation, which still contains the translated production note; it now has no
   counterpart in the segment's HTML and is exported with the segment. They need the manual
@@ -2183,6 +2190,26 @@ TOTAL mutants 43  killed 43  survived 0  timeout 0  suspicious 0  untested 0
 $ echo $?
 0
 ```
+
+### 18. Review round 4 (final)
+
+Verdicts: G approve, O approve, the third reviewer approve (no findings). No production code
+changed in this round, so no mutation run was needed.
+
+| # | finding | reviewer | ruling | what was done | tests |
+|---|---|---|---|---|---|
+| 1 | the round-3 failure tests do not check that the project lock is released | G | accepted (test only) | the malformed-input and failed-backup-copy tests also assert `lock_free_for_other_process()` afterwards. Checked by hand: with the final `lock.release()` in `migrate_project` skipped (in a scratch copy of the code), all 5 of these tests fail | `test_migrate.py::TestMigrateReview3::test_malformed_segment_field_is_a_migration_error[*]`, `test_failed_backup_copy_leaves_no_backup` |
+| 2 | the migration's error boundary can report an internal error of the reader or walker as malformed project data | O | known limitation, not fixed | costs diagnosis time; nothing is written | — |
+| 3 | a process killed during the backup copy can leave a stale temporary file; one killed between backup and save leaves a backup that makes the next run refuse with a message | O | known limitation, not fixed | fail-safe: `project.json` is unchanged, the message names the file to move | — |
+| 4 | a merged group of several code blocks would store only the first block's code text | O | known limitation, not fixed | the real data has 0 such groups and the normal segmenter never builds one | — |
+| 5 | archive members are read without a size limit | O | known limitation, not fixed | as on `main` | — |
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider
+1176 passed in 127.53s (0:02:07)
+```
+
+The real-data scripts were not run in this round (no code change since section 17).
 
 ### Not done
 
