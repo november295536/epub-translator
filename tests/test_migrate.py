@@ -277,6 +277,17 @@ class TestMigrate:
         report = migrate_project(project_dir, dry_run=True)
         assert report.unmatched == [('c1', 'unresolved entity reference')]
 
+    def test_chapters_after_an_entity_chapter_still_checked(self, tmp_path):
+        chapters = {'c0': ('<?xml version="1.0"?>\n<!DOCTYPE html [<!ENTITY t "x">]>\n'
+                           '<html xmlns="http://www.w3.org/1999/xhtml"><body><p>&t;</p>'
+                           '</body></html>'),
+                    'c1': CHAPTERS['c1']}
+        segments = [_segment('c0', 1, '<p>x</p>')] + DEFAULT_SEGMENTS[:2]
+        project_dir = _legacy_project(tmp_path, chapters, segments)
+        report = migrate_project(project_dir, dry_run=True)
+        assert report.unmatched == [('c0', 'unresolved entity reference')]
+        assert report.chapters_matched == 1
+
     def test_merge_keeps_fields(self, tmp_path):
         segments = [_segment('c2', 1, '<p>Intro line.</p>\nFirst bare sentence.', '甲',
                              'translated'),
