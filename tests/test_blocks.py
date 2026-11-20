@@ -360,7 +360,7 @@ class TestRules:
 
     def test_fresh_extractor(self):
         ex = EPUBExtractor('unused.epub')
-        assert (ex.spine, ex.failed) == ([], [])
+        assert (ex.spine, ex.not_xhtml, ex.failed) == ([], [], [])
 
 
 # --- Review round 1 -------------------------------------------------------------
@@ -519,3 +519,29 @@ class TestPackageErrors:
         ex.load()
         assert [c.id for c in ex.extract_chapters()] == ['a']
         assert ex.failed == [('h', 'media type text/html is not XHTML')]
+
+
+class TestReview1Survivors:
+    """Mutation survivors of review round 1: chapters after a reported one
+    are still read."""
+
+    def test_chapters_after_an_entity_chapter_kept(self, tmp_path):
+        items = [('b', 'b.xhtml', 'application/xhtml+xml', None),
+                 ('a', 'a.xhtml', 'application/xhtml+xml', None)]
+        members = {'OEBPS/a.xhtml': xhtml('<p>Clean.</p>'),
+                   'OEBPS/b.xhtml': ENTITY_DOCS['internal subset']}
+        path = write_raw_epub(tmp_path / 'e.epub', items, ['b', 'a'], members)
+        ex = EPUBExtractor(path)
+        ex.load()
+        assert [c.id for c in ex.extract_chapters()] == ['a']
+
+    def test_chapters_after_an_unreadable_chapter_kept(self, tmp_path):
+        items = [('b', 'b.xhtml', 'application/xhtml+xml', None),
+                 ('a', 'a.xhtml', 'application/xhtml+xml', None)]
+        path = write_raw_epub(tmp_path / 'p.epub', items, ['b', 'a'],
+                              {'OEBPS/a.xhtml': xhtml('<p>A.</p>'),
+                               'OEBPS/b.xhtml': xhtml('<p>B.</p>')})
+        ex = EPUBExtractor(path)
+        ex.load()
+        ex._zip.getinfo('OEBPS/b.xhtml').flag_bits |= 1
+        assert [c.id for c in ex.extract_chapters()] == ['a']

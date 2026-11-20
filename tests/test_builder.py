@@ -1611,3 +1611,36 @@ class TestSchema2BridgeReview1:
         assert 'Second line' in a and 'Para one.' in a and '譯' not in a
         assert '次' in b and '雲聚。' in b and '裸尾。' in b
         assert 'Clouds' not in b and 'tail' not in b
+
+
+class TestSchema2BridgeSurvivors:
+    """Mutation survivors of review round 1 in the export bridge."""
+
+    def test_element_placement_with_whitespace_around(self, tmp_path):
+        chapter = '<html><body><div class="verse">\n L1<br/>L2\n</div></body></html>'
+        states = _schema2_states(chapter, ['<div class="verse">一<br/>二</div>'])
+        soup = TestSchema2BridgeReview1._export(tmp_path, chapter, states, 'chinese-only')
+        assert len(soup.find_all('div', class_='verse')) == 1
+        assert soup.find('div', class_='verse').get_text() == '一二'
+
+    def test_no_element_placement_past_an_element_outside_the_range(self, tmp_path):
+        # the image is not in the segment's range: it must stay
+        chapter = ('<html><body><div class="verse"><img src="a.png"/><br/>L1<br/>L2</div>'
+                   '</body></html>')
+        states = _schema2_states(chapter, ['<div class="verse">一<br/>二</div>'])
+        soup = TestSchema2BridgeReview1._export(tmp_path, chapter, states, 'chinese-only')
+        assert len(soup.find_all('img')) == 1
+        assert 'L1' not in soup.get_text() and '一' in soup.get_text()
+
+    def test_whitespace_translation_removes_the_rest(self, tmp_path):
+        chapter = '<html><body><p>One.</p><br/><p>Two.</p></body></html>'
+        states = _schema2_states(chapter, ['  '])
+        soup = TestSchema2BridgeReview1._export(tmp_path, chapter, states, 'chinese-only')
+        assert [p.get_text().strip() for p in soup.find_all('p')] == ['']
+        assert soup.find('br') is None and 'One' not in soup.get_text()
+
+    def test_comment_inside_a_run_keeps_its_place(self, tmp_path):
+        chapter = '<html><body>A<!--c--> B<p>Para.</p></body></html>'
+        states = _schema2_states(chapter, ['<p>甲</p><p>段</p>'])
+        out = _transform(_schema2_builder(tmp_path), chapter, states, 'chinese-only')
+        assert '<body>甲<!--c--><p>段</p></body>' in out

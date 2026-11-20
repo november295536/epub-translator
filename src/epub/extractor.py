@@ -75,7 +75,7 @@ class SpineItem:
     id: str
     path: str          # member name inside the archive
     is_nav: bool
-    media_type: str = XHTML_MEDIA_TYPE
+    media_type: str
 
 
 @dataclass
