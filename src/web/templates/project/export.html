@@ -43,6 +43,20 @@
                 <span x-show="exportState === 'completed'" style="color: #27ae60; font-weight: 500;">產生完成</span>
             </div>
 
+            <!-- Export report -->
+            <div x-show="exportSummary" class="export-summary" style="margin-top: 1rem;">
+                <template x-if="exportSummary">
+                    <div>
+                        <div>以譯文匯出 <span x-text="exportSummary.translated"></span> 段，保留原文
+                            <span x-text="exportSummary.kept"></span> 段（未翻譯
+                            <span x-text="exportSummary.untranslated"></span> 段）</div>
+                        <template x-for="(count, reason) in exportSummary.reasons" :key="reason">
+                            <div class="text-muted"><span x-text="reason"></span>：<span x-text="count"></span></div>
+                        </template>
+                    </div>
+                </template>
+            </div>
+
             <!-- Error -->
             <div x-show="exportError" class="alert alert-error" style="margin-top: 1rem; margin-bottom: 0;">
                 <span x-text="exportError"></span>
@@ -101,6 +115,7 @@ function exportController() {
         exporting: false,
         exportState: 'idle',
         exportError: null,
+        exportSummary: null,
         files: [],
         pollTimer: null,
 
@@ -126,6 +141,7 @@ function exportController() {
         async startExport() {
             this.exporting = true;
             this.exportError = null;
+            this.exportSummary = null;
             this.exportState = 'running';
             try {
                 const res = await fetch('/api/projects/{{ project_name }}/export', {
@@ -158,6 +174,7 @@ function exportController() {
 
                     if (data.state === 'completed') {
                         this.exporting = false;
+                        this.exportSummary = data.summary;
                         clearInterval(this.pollTimer);
                         this.pollTimer = null;
                         this.refreshFiles();

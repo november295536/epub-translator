@@ -12,10 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from bs4 import NavigableString, Tag
-from bs4.element import PreformattedString
 
-from src.epub.blocks import BLOCK_TAGS, Block, element_text, localname, walk_blocks
+from src.epub.blocks import Block, element_text, localname, walk_blocks
 
 
 class SegmentType(str, Enum):
@@ -44,27 +42,6 @@ class Segment:
 MIN_WORDS = 300
 MAX_WORDS = 500
 STANDALONE_TAGS = frozenset({'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table'})
-
-
-# Used by the builder's walk for schema 1 projects
-def _is_container(tag: Tag, legacy: bool = False) -> bool:
-    """Container = only block-level children + whitespace. Content = has text or inline tags.
-
-    Comments and other non-text strings (CData, ProcessingInstruction,
-    Doctype) are ignored. ``legacy=True`` restores the old behaviour of
-    counting them as text; the builder needs it for projects that were
-    segmented before comments were skipped.
-    """
-    for child in tag.children:
-        if not legacy and isinstance(child, PreformattedString):
-            continue
-        if isinstance(child, NavigableString):
-            if child.strip():
-                return False
-        elif isinstance(child, Tag):
-            if child.name not in BLOCK_TAGS:
-                return False
-    return True
 
 
 class Segmenter:

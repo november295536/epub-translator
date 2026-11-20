@@ -931,9 +931,11 @@ class TestCLIPhase2:
         name = os.path.basename(project_dir)
         assert os.listdir(os.path.join(project_dir, 'output')) == [f'{name}-chinese-only.epub']
 
-    def test_schema_1_export_keeps_the_book_name(self, runner, sample_epub, tmp_path):
-        # Review round 1: the old rule (the book's file name) for schema 1
+    def test_schema_1_export_asks_for_migration(self, runner, sample_epub, tmp_path):
+        # Phase 3 (was test_schema_1_export_keeps_the_book_name): the old
+        # builder is gone; a schema 1 project must be migrated first
         from src.core.segmenter import Segmenter
+        from src.epub.exporter import SCHEMA_1_MESSAGE
         from src.epub.extractor import EPUBExtractor
         ex = EPUBExtractor(sample_epub)
         ex.load()
@@ -954,10 +956,10 @@ class TestCLIPhase2:
         with open(pm.project_file, 'w', encoding='utf-8') as f:
             json.dump(raw, f)
         result = runner.invoke(cli, ['export', '-p', project_dir, '-f', 'chinese-only'])
-        assert result.exit_code == 0, result.output
-        book = os.path.splitext(os.path.basename(sample_epub))[0]
-        assert book != 'review-copy'
-        assert os.listdir(os.path.join(project_dir, 'output')) == [f'{book}-chinese-only.epub']
+        assert result.exit_code == 1
+        assert result.output == SCHEMA_1_MESSAGE + '\n'
+        assert 'translate.py migrate' in SCHEMA_1_MESSAGE
+        assert not os.path.exists(os.path.join(project_dir, 'output'))
 
     @pytest.mark.parametrize('make', ['missing', 'file'])
     def test_migrate_needs_a_directory(self, runner, tmp_path, make):

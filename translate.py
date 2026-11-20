@@ -19,7 +19,7 @@ from src.core.translator import (
 )
 from src.glossary.glossary_manager import GlossaryManager
 from src.core.migrate import MigrationError, migrate_project
-from src.epub.builder import EPUBBuilder
+from src.epub.exporter import SCHEMA_1_MESSAGE, ExportError, export_project
 
 
 def _sanitize_name(name: str) -> str:
@@ -405,25 +405,27 @@ def export(project, fmt):
 
     pm = ProjectManager(project_dir)
     pm.load()
+    if pm.data.schema != 2:
+        click.echo(SCHEMA_1_MESSAGE)
+        sys.exit(1)
 
     progress = pm.get_progress()
     if progress['translated'] + progress['reviewed'] == 0:
         click.echo("尚未翻譯任何段落。請先執行 start 指令。")
         sys.exit(1)
 
-    output_dir = os.path.join(project_dir, 'output')
-    # Schema 2: named after the project (the book is the project's
-    # source.epub); schema 1 keeps the book's file name
-    if pm.data.schema == 2:
-        base_name = os.path.basename(os.path.abspath(project_dir))
-    else:
-        base_name = os.path.splitext(os.path.basename(pm.data.epub_path))[0]
-    output_path = os.path.join(output_dir, f'{base_name}-{fmt}.epub')
+    base_name = os.path.basename(os.path.abspath(project_dir))
+    output_path = os.path.join(project_dir, 'output', f'{base_name}-{fmt}.epub')
 
     click.echo(f"正在建構 {fmt} 格式的 EPUB...")
-    builder = EPUBBuilder(project_dir)
-    result_path = builder.build(output_path, fmt=fmt)
-    click.echo(f"已輸出：{result_path}")
+    try:
+        report = export_project(project_dir, output_path, fmt)
+    except ExportError as e:
+        click.echo(f"無法匯出：{e}")
+        sys.exit(1)
+    click.echo(f"已輸出：{report.output_path}")
+    for line in report.lines():
+        click.echo(line)
 
 
 @cli.command()

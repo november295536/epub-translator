@@ -1,3 +1,5 @@
 # Development-only tools. Not needed to run the application.
 # Mutation testing (scripts/verify/mutation.sh); mutmut 2.x supports Python 3.9.
 mutmut[patch]==2.5.1
+# Test fixtures (tests/conftest.py builds sample EPUBs with it); not used by src/
+ebooklib>=0.18

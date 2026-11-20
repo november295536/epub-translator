@@ -187,7 +187,7 @@ class TestMigrate:
 
     def test_partial_group_exports_in_the_original(self, tmp_path):
         import zipfile
-        from src.epub.builder import EPUBBuilder
+        from src.epub.exporter import export_project
         segments = DEFAULT_SEGMENTS[:2] + [
             _segment('c2', 1, '<p>Intro line.</p>\nFirst bare sentence.', '<p>引言。</p>\n第一句。',
                      'translated'),
@@ -195,7 +195,7 @@ class TestMigrate:
         project_dir = _legacy_project(tmp_path, segments=segments)
         migrate_project(project_dir)
         output = str(tmp_path / 'out.epub')
-        EPUBBuilder(project_dir).build(output, fmt='chinese-only')
+        export_project(project_dir, output, 'chinese-only')
         with zipfile.ZipFile(output) as z:
             member = {n.rsplit('/', 1)[-1]: n for n in z.namelist()}
             c2 = z.read(member['c2.xhtml']).decode('utf-8')
@@ -461,11 +461,11 @@ class TestMigrate:
 
     def test_migrated_project_exports(self, tmp_path):
         import zipfile
-        from src.epub.builder import EPUBBuilder
+        from src.epub.exporter import export_project
         project_dir = _legacy_project(tmp_path)
         migrate_project(project_dir)
         output = str(tmp_path / 'out.epub')
-        EPUBBuilder(project_dir).build(output, fmt='chinese-only')
+        export_project(project_dir, output, 'chinese-only')
         with zipfile.ZipFile(output) as z:
             member = {n.rsplit('/', 1)[-1]: n for n in z.namelist()}
             c1 = z.read(member['c1.xhtml']).decode('utf-8')
