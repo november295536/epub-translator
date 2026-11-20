@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import tempfile
 from dataclasses import dataclass, asdict, field
 
 
@@ -41,6 +43,22 @@ def term_pattern(term: str) -> str:
     return r'(?<!\w)' + r'\s+'.join(re.escape(part) for part in term.split())
 
 
+logger = logging.getLogger(__name__)
+
+
+def load_glossary(path: str):
+    """The glossary at `path`, or None when it cannot be read (unreadable,
+    not JSON, not a list of entries); the failure is logged. For the
+    glossary warnings, which are optional: a caller goes on without them."""
+    gm = GlossaryManager(path)
+    try:
+        gm.load()
+    except Exception as e:  # noqa: BLE001 - any damage: no glossary warnings
+        logger.warning("術語表無法讀取，略過術語檢查 (%s)", type(e).__name__)
+        return None
+    return gm
+
+
 @dataclass
 class GlossaryEntry:
     """A single glossary entry."""
@@ -73,12 +91,26 @@ class GlossaryManager:
             self.entries[key] = GlossaryEntry(**item)
 
     def save(self) -> None:
-        """Save glossary to JSON file."""
-        os.makedirs(os.path.dirname(self.glossary_path) or '.', exist_ok=True)
+        """Save glossary to JSON file, atomically: written to a temporary
+        file in the same directory and moved over the old one, so a reader
+        never sees a half-written file."""
+        directory = os.path.dirname(self.glossary_path) or '.'
+        os.makedirs(directory, exist_ok=True)
         raw = [asdict(e) for e in self.entries.values()]
         raw.sort(key=lambda x: x['term'].lower())
-        with open(self.glossary_path, 'w', encoding='utf-8') as f:
-            json.dump(raw, f, ensure_ascii=False, indent=2)
+        try:
+            mode = os.stat(self.glossary_path).st_mode & 0o777
+        except FileNotFoundError:
+            mode = 0o644  # mkstemp creates 0600: keep the mode a plain write gave
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix='.glossary-', suffix='.tmp')
+        try:
+            os.fchmod(fd, mode)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(raw, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.glossary_path)
+        except BaseException:
+            os.unlink(tmp)
+            raise
 
     def add_term(self, term: str, translation: str,
                  category: str = '', frequency: int = 0) -> GlossaryEntry:

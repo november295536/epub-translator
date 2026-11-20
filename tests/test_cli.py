@@ -1136,3 +1136,19 @@ class TestPhase5ValidateGlossary:
             '品質與術語警告（不影響匯出）：',
             '  term_not_applied：1',
         ]
+
+    def test_damaged_glossary(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.mark_translated('c1_seg0001', '<p>語句 MARK1。</p>')
+        pm.save()
+        with open(os.path.join(path, 'glossary.json'), 'w', encoding='utf-8') as f:
+            f.write('[{"term": ')
+        result = runner.invoke(cli, ['validate', path])
+        assert result.exit_code == 0, result.output
+        assert result.output.splitlines() == [
+            '已檢查 1 段譯文：0 段未通過結構檢查（匯出時以原文輸出），1 段通過',
+            '術語表無法讀取（glossary.json 損壞或格式不符），未檢查術語。',
+        ]
+        assert 'Traceback' not in result.output

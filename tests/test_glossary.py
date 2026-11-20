@@ -459,3 +459,82 @@ class TestExtractionStopKeepsTerms:
     def test_error_without_terms(self):
         from src.glossary.term_extractor import ExtractionError
         assert ExtractionError('x').terms == []
+
+
+# --- Phase 5 review round 1: atomic save, optional loading ------------------------
+
+from src.glossary.glossary_manager import GlossaryManager as _GM, load_glossary  # noqa: E402
+
+
+class TestAtomicSave:
+
+    def test_failed_write_keeps_the_old_file(self, tmp_path, monkeypatch):
+        import json as json_module
+        path = str(tmp_path / 'glossary.json')
+        gm = _GM(path)
+        gm.add_term('alpha', '甲')
+        before = open(path, encoding='utf-8').read()
+
+        def broken(*args, **kwargs):
+            args[1].write('[{"term": ')  # half of the new content
+            raise OSError('disk full')
+        monkeypatch.setattr(json_module, 'dump', broken)
+        gm.entries['beta'] = gm.entries['alpha']
+        with pytest.raises(OSError):
+            gm.save()
+        assert open(path, encoding='utf-8').read() == before
+        assert os.listdir(tmp_path) == ['glossary.json']  # the temporary file removed
+
+    def test_replaced_not_rewritten(self, tmp_path):
+        path = tmp_path / 'glossary.json'
+        gm = _GM(str(path))
+        gm.add_term('alpha', '甲')
+        inode = os.stat(path).st_ino
+        gm.add_term('beta', '乙')
+        assert os.stat(path).st_ino != inode  # a new file moved over the old one
+        assert os.listdir(tmp_path) == ['glossary.json']
+        again = _GM(str(path))
+        again.load()
+        assert sorted(again.entries) == ['alpha', 'beta']
+
+    def test_mode(self, tmp_path):
+        path = tmp_path / 'glossary.json'
+        _GM(str(path)).add_term('alpha', '甲')
+        assert os.stat(path).st_mode & 0o777 == 0o644
+        os.chmod(path, 0o640)
+        _GM(str(path)).add_term('beta', '乙')
+        assert os.stat(path).st_mode & 0o777 == 0o640
+
+    def test_creates_the_directory(self, tmp_path):
+        path = tmp_path / 'new' / 'glossary.json'
+        _GM(str(path)).add_term('alpha', '甲')
+        assert path.is_file()
+
+    def test_relative_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        _GM('glossary.json').add_term('alpha', '甲')
+        assert os.listdir(tmp_path) == ['glossary.json']
+
+
+class TestLoadGlossary:
+
+    @pytest.mark.parametrize('content', ['[{"term": ', 'null', '[{}]', '["x"]', '{"a": 1}',
+                                         '[{"term": "a", "translation": "b", "x": 1}]'])
+    def test_damaged_is_none(self, tmp_path, content, caplog):
+        path = tmp_path / 'glossary.json'
+        path.write_text(content, encoding='utf-8')
+        assert load_glossary(str(path)) is None
+        assert [r.getMessage() for r in caplog.records][-1].startswith('術語表無法讀取，略過術語檢查 (')
+
+    def test_not_utf8(self, tmp_path):
+        path = tmp_path / 'glossary.json'
+        path.write_bytes(b'\xff\xfe[')
+        assert load_glossary(str(path)) is None
+
+    def test_readable(self, tmp_path):
+        path = tmp_path / 'glossary.json'
+        path.write_text('[{"term": "Alpha", "translation": "甲"}]', encoding='utf-8')
+        gm = load_glossary(str(path))
+        assert list(gm.entries) == ['alpha'] and gm.glossary_path == str(path)
+        missing = load_glossary(str(tmp_path / 'none.json'))
+        assert missing is not None and missing.entries == {}

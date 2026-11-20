@@ -19,7 +19,7 @@ from src.core.translator import (
     AuthError, BackendUnavailableError, RateLimitError, TranslationEngine, available_models,
     UnexpectedStreak, record_failure_log, translate_segment,
 )
-from src.glossary.glossary_manager import GlossaryManager
+from src.glossary.glossary_manager import GlossaryManager, load_glossary
 from src.core.migrate import MigrationError, migrate_project
 from src.core.validation import check_segment
 from src.epub.exporter import SCHEMA_1_MESSAGE, ExportError, export_project
@@ -500,8 +500,7 @@ def _validate(project_dir: str, mark_failed: bool) -> list[str] | None:
     pm.load()
     if pm.data.schema != 2:
         return None
-    gm = GlossaryManager(_get_glossary_path(project_dir))
-    gm.load()
+    gm = load_glossary(_get_glossary_path(project_dir))  # None: unreadable, no glossary warnings
     checked, failing = 0, []
     blocking, warnings = Counter(), Counter()
     for seg in pm.data.segments:
@@ -517,6 +516,8 @@ def _validate(project_dir: str, mark_failed: bool) -> list[str] | None:
     lines = [f"已檢查 {checked} 段譯文：{len(failing)} 段未通過結構檢查（匯出時以原文輸出），"
              f"{checked - len(failing)} 段通過"]
     lines += [f'  {code}：{n}' for code, n in sorted(blocking.items())]
+    if gm is None:
+        lines.append('術語表無法讀取（glossary.json 損壞或格式不符），未檢查術語。')
     if warnings:
         lines.append('品質與術語警告（不影響匯出）：')
         lines += [f'  {code}：{n}' for code, n in sorted(warnings.items())]

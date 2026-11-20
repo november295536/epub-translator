@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -2443,7 +2444,7 @@ class TestGlossaryCheck:
         place = os.path.join(ROOT, 'src') if where == 'repository' else str(root / 'beta')
         monkeypatch.setattr(glossary_check.tempfile, 'gettempdir', lambda: place)
         assert self._main(root) == 2
-        what = 'the repository' if where == 'repository' else 'the projects directory'
+        what = 'a git work tree' if where == 'repository' else 'the projects directory'
         assert capsys.readouterr().out == \
             f'ERROR the temporary directory would be inside {what}\n'
         assert not any(n.startswith('phase5-glossary-') for n in os.listdir(place))
@@ -2454,7 +2455,7 @@ class TestGlossaryCheck:
         target = os.path.join(ROOT, 'sample-x.md') if where == 'repository' \
             else str(root / 'sample-x.md')
         assert self._main(root, '--sample-out', target) == 2
-        what = 'the repository' if where == 'repository' else 'the projects directory'
+        what = 'a git work tree' if where == 'repository' else 'the projects directory'
         assert capsys.readouterr().out == f'ERROR the sample file would be inside {what}\n'
         assert not os.path.exists(target)
 
@@ -2486,8 +2487,6 @@ class TestGlossaryCheck:
         assert glossary_check.excerpt(text, 10, 14, width=100) == text.replace('\n\n ', ' ')
         assert glossary_check.excerpt('abc', 0, 0, width=1) == 'a…'
 
-    def test_plain(self):
-        assert glossary_check.plain('<p>甲 &lt;5&gt; <b>乙</b></p>') == '甲 <5> 乙'
 
     def test_sample_item_without_term_in_source(self):
         from types import SimpleNamespace
@@ -2537,7 +2536,7 @@ class TestGlossaryCheckSurvivors:
                 '(default: projects)') in out
         assert '--anonymize Print project-N labels; omit names and paths' in out
         assert ('--sample-out FILE Write a sample of the warnings, with book text, to FILE '
-                '(outside the repository and the projects directory)') in out
+                '(outside every git work tree and the projects directory)') in out
         assert 'Copies every project' not in out  # only the docstring's first line
 
     def test_default_projects_directory(self, tmp_path, capsys, monkeypatch):
@@ -2609,12 +2608,12 @@ class TestGlossaryCheckSurvivors:
         # the file system may ignore case: the name is checked as given
         root, _ = _glossary_projects(tmp_path / 'projects')
         paths = []
-        real = glossary_check.GlossaryManager
+        real = glossary_check.load_glossary
 
         def manager(path):
             paths.append(os.path.basename(path))
             return real(path)
-        monkeypatch.setattr(glossary_check, 'GlossaryManager', manager)
+        monkeypatch.setattr(glossary_check, 'load_glossary', manager)
         assert self._main(root) == 0
         assert paths == ['glossary.json', 'glossary.json']
 
@@ -2653,11 +2652,14 @@ class TestGlossaryCheckSurvivors:
 
     def test_category_text(self):
         from src.glossary.glossary_manager import GlossaryEntry
+        # a term counted once per project; the case differs between two
+        # segments' entries only when the glossary was edited in between
         found = [(None, GlossaryEntry('Term', '詞', '')), (None, GlossaryEntry('term', '詞', '')),
                  (None, GlossaryEntry('x', '叉', 'person'))]
-        assert glossary_check.category_text(found) == \
-            'none: 2 warnings, 1 terms, person: 1 warnings, 1 terms'
-        assert glossary_check.category_text([]) == 'none'
+        issues, terms = glossary_check.category_counts(found)
+        assert glossary_check.category_text(issues, terms) == \
+            'other: 2 warnings, 1 terms, person: 1 warnings, 1 terms'
+        assert glossary_check.category_text(*glossary_check.category_counts([])) == 'none'
 
     def test_sample_item_term_case_and_no_match(self):
         from types import SimpleNamespace
@@ -2694,9 +2696,8 @@ class TestReviewSurvivors:
         from types import SimpleNamespace
         from src.web.blueprints import review
         paths = []
-        monkeypatch.setattr(review, 'GlossaryManager',
-                            lambda path: paths.append(path) or SimpleNamespace(load=lambda: None))
-        review._glossary(SimpleNamespace(project_dir='/p'))
+        monkeypatch.setattr(review, 'load_glossary', lambda path: paths.append(path))
+        review._glossary('/p')
         assert paths == [os.path.join('/p', 'glossary.json')]
 
     def test_review_tab_active(self, tmp_path):
@@ -2711,3 +2712,176 @@ class TestReviewSurvivors:
                     '/project/demo/review?issues=1'):
             html = client.get(url).get_data(as_text=True)
             assert 'class="tab active">審閱</a>' in ' '.join(html.split())
+
+
+# --- Phase 5 review round 1 -------------------------------------------------------
+
+class TestGlossaryCheckRound1:
+
+    def _main(self, root, *extra):
+        return glossary_check.main(['--projects-dir', str(root), '--anonymize', *extra])
+
+    def _checkouts(self, tmp_path):
+        """A main checkout (`.git` directory) with a linked worktree inside it
+        (`.git` file), as `git worktree add .worktree/x` makes them."""
+        main = tmp_path / 'main'
+        (main / '.git').mkdir(parents=True)
+        (main / 'docs').mkdir()
+        worktree = main / '.worktree' / 'x'
+        worktree.mkdir(parents=True)
+        (worktree / '.git').write_text('gitdir: ../../.git/worktrees/x\n')
+        (tmp_path / 'outside').mkdir()
+        (tmp_path / 'link').symlink_to(main / 'docs')
+        return main, worktree
+
+    def test_in_work_tree(self, tmp_path):
+        main, worktree = self._checkouts(tmp_path)
+        assert glossary_check.in_work_tree(str(main / 'docs' / 'new.md'))
+        assert glossary_check.in_work_tree(str(main))
+        assert glossary_check.in_work_tree(str(worktree / 'a' / 'b.md'))
+        assert glossary_check.in_work_tree(str(tmp_path / 'link' / 'new.md'))  # symlink resolved
+        assert glossary_check.in_work_tree(str(tmp_path / 'outside' / '..' / 'main' / 'x.md'))
+        assert not glossary_check.in_work_tree(str(tmp_path / 'outside' / 'x.md'))
+        assert not glossary_check.in_work_tree('/')
+
+    @pytest.mark.parametrize('target', ['main/docs/s.md', 'link/s.md', 'main/.worktree/x/s.md',
+                                        'outside/../main/s.md'])
+    def test_sample_refused_in_any_checkout(self, tmp_path, capsys, target):
+        self._checkouts(tmp_path)
+        root, _ = _glossary_projects(tmp_path / 'projects')
+        assert self._main(root, '--sample-out', str(tmp_path / target)) == 2
+        assert capsys.readouterr().out == 'ERROR the sample file would be inside a git work tree\n'
+        assert not os.path.exists(tmp_path / target)
+
+    def test_sample_refused_in_projects_directory_through_a_link(self, tmp_path, capsys):
+        root, _ = _glossary_projects(tmp_path / 'projects')
+        (tmp_path / 'plink').symlink_to(root)
+        assert self._main(root, '--sample-out', str(tmp_path / 'plink' / 's.md')) == 2
+        assert capsys.readouterr().out == \
+            'ERROR the sample file would be inside the projects directory\n'
+
+    def test_temporary_directory_refused_in_main_checkout(self, tmp_path, capsys, monkeypatch):
+        main, _ = self._checkouts(tmp_path)
+        root, _ = _glossary_projects(tmp_path / 'projects')
+        monkeypatch.setattr(glossary_check.tempfile, 'gettempdir', lambda: str(main / 'docs'))
+        assert self._main(root) == 2
+        assert capsys.readouterr().out == \
+            'ERROR the temporary directory would be inside a git work tree\n'
+        assert os.listdir(main / 'docs') == []
+
+    def test_unwritable_sample_path(self, tmp_path, capsys, monkeypatch):
+        root, _ = _glossary_projects(tmp_path / 'projects')
+        made = []
+        real = glossary_check.tempfile.mkdtemp
+        monkeypatch.setattr(glossary_check.tempfile, 'mkdtemp',
+                            lambda **kw: made.append(real(**kw)) or made[-1])
+        target = tmp_path / 'MARKERDIR' / 'missing' / 'MARKERFILE.md'
+        assert self._main(root, '--sample-out', str(target)) == 1
+        out, err = capsys.readouterr()
+        assert out.splitlines() == GLOSSARY_LINES + ['ERROR the check stopped (FileNotFoundError)']
+        assert err == ''
+        assert 'MARKER' not in out
+        assert not os.path.exists(made[0])  # removed all the same
+
+    def test_temporary_directory_cannot_be_made(self, tmp_path, capsys, monkeypatch):
+        root, _ = _glossary_projects(tmp_path / 'projects')
+
+        def mkdtemp(**kwargs):
+            raise PermissionError(13, 'denied', '/MARKER/tmp')
+        monkeypatch.setattr(glossary_check.tempfile, 'mkdtemp', mkdtemp)
+        assert self._main(root) == 1
+        out, err = capsys.readouterr()
+        assert (out, err) == ('ERROR the check stopped (PermissionError)\n', '')
+
+    def test_temporary_directory_cannot_be_removed(self, tmp_path, capsys, monkeypatch):
+        root, _ = _glossary_projects(tmp_path / 'projects')
+        made = []
+        real = glossary_check.tempfile.mkdtemp
+        monkeypatch.setattr(glossary_check.tempfile, 'mkdtemp',
+                            lambda **kw: made.append(real(**kw)) or made[-1])
+
+        real_rmtree = shutil.rmtree
+
+        def rmtree(path):
+            raise OSError(16, 'busy', '/MARKER')
+        monkeypatch.setattr(glossary_check.shutil, 'rmtree', rmtree)
+        try:
+            assert self._main(root) == 1
+        finally:
+            real_rmtree(made[0])
+        out, err = capsys.readouterr()
+        assert out.splitlines() == GLOSSARY_LINES + [
+            'ERROR cannot remove the temporary directory (OSError)']
+        assert err == '' and 'MARKER' not in out
+
+    def test_error_in_run_after_cleanup_failure(self, tmp_path, capsys, monkeypatch):
+        root, _ = _glossary_projects(tmp_path / 'projects')
+
+        def run(args, names, work):
+            shutil.rmtree(work)
+            raise RuntimeError('/MARKER')
+        monkeypatch.setattr(glossary_check, 'run', run)
+        assert self._main(root) == 1
+        assert capsys.readouterr() == (
+            'ERROR cannot remove the temporary directory (FileNotFoundError)\n'
+            'ERROR the check stopped (RuntimeError)\n', '')
+
+    def test_custom_category_printed_as_other(self, tmp_path, capsys):
+        root, beta = _glossary_projects(tmp_path / 'projects')
+        _write_glossary(beta, [('drip line', '滴水線', 'MARKER secret')])
+        assert self._main(root) == 0
+        out = capsys.readouterr().out
+        assert 'MARKER' not in out
+        assert out.splitlines()[1].endswith('by category (other: 1 warnings, 1 terms)')
+
+    def test_unreadable_glossary_fails_the_project(self, tmp_path, capsys):
+        root, beta = _glossary_projects(tmp_path / 'projects')
+        with open(os.path.join(beta, 'glossary.json'), 'w') as f:
+            f.write('[{"term": ')
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[1] == \
+            'FAIL project-2: the glossary cannot be read'
+
+    def test_distinct_terms(self):
+        from src.glossary.glossary_manager import GlossaryEntry
+        found = [(1, GlossaryEntry('Term', '詞')), (2, GlossaryEntry('term', '詞')),
+                 (3, GlossaryEntry('other', '他')),
+                 (4, GlossaryEntry('straße', '街')), (5, GlossaryEntry('strasse', '路'))]
+        # straße and strasse are two entries (keys straße, strasse); upper()
+        # would merge them
+        assert glossary_check.distinct_terms(found) == 4
+        issues, terms = glossary_check.category_counts(found)
+        assert (issues, terms) == ({'other': 5}, {'other': 4})
+
+    def test_totals_sum_the_projects(self, tmp_path, capsys):
+        # the same term in two projects counts in both, in "terms" and per category
+        root, beta = _glossary_projects(tmp_path / 'projects')
+        alpha = os.path.join(root, 'alpha')
+        _write_glossary(alpha, [('drip line', '滴水線', 'term'), ('boats', '小船', 'term')])
+        _write_glossary(beta, [('drip line', '滴水線', 'term')])
+        assert self._main(root) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert out[-1] == (
+            'TOTAL projects 2  glossary entries 3, translated 8, passing the structural check 7, '
+            'with term_not_applied 2, terms 2, by category (term: 2 warnings, 2 terms)  '
+            'failed projects 0')
+
+    def test_sample_item_work_is_case_sensitive(self):
+        from types import SimpleNamespace
+        from src.glossary.glossary_manager import GlossaryEntry
+        seg = SimpleNamespace(segment_id='x', text='a silver atlas, then Silver Atlas ' + 'z' * 80,
+                              translated_text='甲' * 10)
+        lines = glossary_check.sample_item(1, 'p', seg, GlossaryEntry('Silver Atlas', '銀', 'work'))
+        assert lines.splitlines()[4] == '- 原文：a silver atlas, then Silver Atlas ' + 'z' * 59 + '…'
+        # where the check found it: the capitalised title (at 91), not at 72
+        seg.text = 'x' * 70 + seg.text
+        lines = glossary_check.sample_item(1, 'p', seg, GlossaryEntry('Silver Atlas', '銀', 'work'))
+        assert lines.splitlines()[4].startswith('- 原文：…' + 'x' * 39 + 'a silver atlas, then Silver')
+
+    def test_sample_translation_text_parsed(self):
+        from types import SimpleNamespace
+        from src.glossary.glossary_manager import GlossaryEntry
+        seg = SimpleNamespace(segment_id='x', text='term',
+                              translated_text='<p>甲<em title="a > b">乙</em>&lt;5&gt;</p>')
+        lines = glossary_check.sample_item(1, 'p', seg, GlossaryEntry('term', '詞', 'term'))
+        assert lines.splitlines()[5] == '- 譯文（對應位置附近）：甲乙<5>'

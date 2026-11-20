@@ -15,7 +15,7 @@ from src.core.translator import (
     AuthError, BackendUnavailableError, RateLimitError, TranslationEngine,
     record_failure_log, remove_failure_log, translate_segment,
 )
-from src.glossary.glossary_manager import GlossaryManager
+from src.glossary.glossary_manager import GlossaryManager, load_glossary
 from src.web.tasks import TaskManager, setup_project_logging, teardown_project_logging
 
 logger = logging.getLogger(__name__)
@@ -103,37 +103,48 @@ def update_segment(project_name: str, segment_id: str):
     try:
         with transaction(project_name) as pm:
             seg = pm._find(segment_id)
+            gm = _glossary(pm.project_dir)
             issues = []
             if data['text'].strip():  # an empty text clears the translation
-                result = check_segment(seg, data['text'], _glossary(pm))
+                result = check_segment(seg, data['text'], gm)
                 if result.blocking:
-                    return _refused(result)
+                    return _refused(result, pm, gm)
                 issues = result.issues
             pm.update_translation(segment_id, data['text'], issues=issues)
             pm.save()
             # A person's version replaces the failed one: its diagnostics go too
             remove_failure_log(_log_dir(pm), segment_id)
+            answer = _answer(pm, gm, issues, status='ok', segment_id=segment_id)
     except ValueError as e:
         return jsonify({'error': str(e)}), 404
-    return jsonify({'status': 'ok', 'segment_id': segment_id, 'issues': _issues(issues)})
+    return jsonify(answer)
 
 
-def _glossary(pm: ProjectManager) -> GlossaryManager:
-    """The project's glossary, for the glossary warnings."""
-    gm = GlossaryManager(os.path.join(pm.project_dir, 'glossary.json'))
-    gm.load()
-    return gm
+def _glossary(project_dir: str) -> GlossaryManager | None:
+    """The project's glossary, for the glossary warnings; None when it
+    cannot be read (logged): the check and the save go on without them."""
+    return load_glossary(os.path.join(project_dir, 'glossary.json'))
 
 
 def _issues(issues: list) -> list:
     return [asdict(i) for i in issues]
 
 
-def _refused(result):
+def _answer(pm: ProjectManager, gm, issues: list, **fields) -> dict:
+    """A review response: `fields`, the issues of the text, the number of
+    segments with stored issues (for the page's count), and
+    glossary_unavailable when the glossary could not be read."""
+    fields.update(issues=_issues(issues), issue_count=len(with_issues(pm.data.segments)))
+    if gm is None:
+        fields['glossary_unavailable'] = True
+    return fields
+
+
+def _refused(result, pm: ProjectManager, gm):
     """The answer to a save or approval whose text fails the structural
     check: nothing is changed."""
-    return jsonify({'error': '譯文未通過結構檢查：' + '；'.join(i.detail for i in result.blocking),
-                    'issues': _issues(result.issues)}), 422
+    return jsonify(_answer(pm, gm, result.issues, error='譯文未通過結構檢查：'
+                           + '；'.join(i.detail for i in result.blocking))), 422
 
 
 @review_bp.route('/api/projects/<project_name>/segments/<segment_id>/approve', methods=['POST'])
@@ -156,16 +167,18 @@ def approve_segment(project_name: str, segment_id: str):
             approved = text or seg.translated_text
             if not approved.strip():
                 return jsonify({'error': '沒有譯文可以核可'}), 422
-            result = check_segment(seg, approved, _glossary(pm))
+            gm = _glossary(pm.project_dir)
+            result = check_segment(seg, approved, gm)
             if result.blocking:
-                return _refused(result)
+                return _refused(result, pm, gm)
             pm.mark_reviewed(segment_id, text=text)  # a person's decision: stored issues cleared
             pm.save()
             remove_failure_log(_log_dir(pm), segment_id)
+            # the warnings the approved text still has, for the reviewer to see
+            answer = _answer(pm, gm, result.issues, status='ok', segment_id=segment_id)
     except ValueError as e:
         return jsonify({'error': str(e)}), 404
-    # the warnings the approved text still has, for the reviewer to see
-    return jsonify({'status': 'ok', 'segment_id': segment_id, 'issues': _issues(result.issues)})
+    return jsonify(answer)
 
 
 @review_bp.route('/api/projects/<project_name>/segments/<segment_id>/retranslate', methods=['POST'])
@@ -187,10 +200,7 @@ def retranslate_segment(project_name: str, segment_id: str):
         seg = next(s for s in segments if s.segment_id == segment_id)
     project_dir = pm.project_dir
 
-    # Load glossary
-    glossary_path = os.path.join(project_dir, 'glossary.json')
-    gm = GlossaryManager(glossary_path)
-    gm.load()
+    gm = _glossary(project_dir)  # None: translated without the glossary, and said so
 
     handler = setup_project_logging(project_dir)
     try:
@@ -205,17 +215,15 @@ def retranslate_segment(project_name: str, segment_id: str):
                 return jsonify({'error': '段落已在翻譯期間被編輯，未套用新譯文'}), 409
             pm.save()
             record_failure_log(_log_dir(pm), segment_id, outcome)
+            # the stored issues: a failure keeps the old text and status
+            answer = _answer(pm, gm, outcome.issues)
         if outcome.status == SegmentStatus.FAILED:
             detail = outcome.issues[0].detail
             logger.warning("Translation error for %s: %s", segment_id, detail)
-            return jsonify({'error': detail}), 500
+            return jsonify({'error': detail, **answer}), 500
         logger.info("重新翻譯完成: %s (%s)", segment_id, engine.model)
-        return jsonify({
-            'status': 'ok',
-            'segment_id': segment_id,
-            'translated_text': outcome.text,
-            'issues': _issues(outcome.issues),
-        })
+        return jsonify({'status': 'ok', 'segment_id': segment_id,
+                        'translated_text': outcome.text, **answer})
     except AuthError as e:
         logger.warning("Auth error during retranslation: %s", e)
         return jsonify({'error': str(e), 'auth_error': True}), 401
