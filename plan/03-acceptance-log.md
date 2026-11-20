@@ -1985,9 +1985,9 @@ segment's whole node range. No migration copy was left in the temporary director
 
 ### 12. Mutation testing after review round 1
 
-`scripts/verify/mutation.sh a02587b4ae5126d4233fa55d406334b310231777` (base: the commit
-"docs: record Phase 2 in the acceptance log", so only the lines changed in this round are
-mutated). Run 2 took 22 minutes.
+`scripts/verify/mutation.sh <base>`, where `<base>` is the commit that recorded Phase 2 in
+the log ("docs: record Phase 2 in the acceptance log"), so only the lines changed in this
+round are mutated. Run 2 took 22 minutes.
 
 | run | mutants | killed | survived | timeout | suspicious |
 |---|---|---|---|---|---|
@@ -1995,7 +1995,7 @@ mutated). Run 2 took 22 minutes.
 | 2, after "test: kill the review round 1 mutation survivors" | 188 | 187 | 1 | 0 | 0 |
 
 ```
-$ scripts/verify/mutation.sh a02587b4ae5126d4233fa55d406334b310231777
+$ scripts/verify/mutation.sh <base>
 ...
 TOTAL mutants 188  killed 187  survived 1  timeout 0  suspicious 0  untested 0
 $ echo $?
