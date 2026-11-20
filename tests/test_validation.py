@@ -665,3 +665,52 @@ class TestRound1Checks:
         result = check_html('<p>A <b>b</b></p>\n<p>C</p>', '<p>甲</p>\n<p> </p>', first_block=4)
         assert [i.detail for i in result.issues] == [
             '第 5 個區塊沒有文字', '第 4 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個']
+
+
+class TestRound1Survivors:
+    """Survivors of the review round 1 mutation run."""
+
+    def test_replacements_from_the_end(self):
+        # alt comes first in the text and first by name: replacing it first
+        # would shift the position of title
+        source = '<p>A <img alt="A" title="T" src="s"/></p>'
+        p = protect(source)
+        assert restore('<p k="1">甲<img k="2" alt="長的替代文字" title="題"/></p>', p) == \
+            '<p>甲<img alt="長的替代文字" title="題" src="s"/></p>'
+
+    def test_unchanged_value_then_a_changed_one(self):
+        source = '<p>A <img alt="A" title="T" src="s"/></p>'
+        p = protect(source)
+        assert restore('<p k="1">甲<img k="2" alt="圖" title="T"/></p>', p) == \
+            '<p>甲<img alt="圖" title="T" src="s"/></p>'
+
+    def test_repeated_attribute_left_as_written(self):
+        p = protect('<p>A <img alt="A" src="s"/></p>')
+        reply = '<p k="1">甲<img k="2" alt="x" alt="y"/></p>'
+        assert restore(reply, p) == '<p>甲<img k="2" alt="x" alt="y"/></p>'
+
+    def test_kinds_are_structure(self):
+        p = protect('<p class="a">A <img alt="A" src="s"/></p>\n<p>B</p>')
+        issues = check_keys('<p k="2">乙<img k="2"/></p>\n<p k="2" x="1">甲</p>', p)
+        assert [(i.kind, i.code, i.blocking) for i in issues] == [
+            ('structure', 'structure_mismatch', True), ('structure', 'key_mismatch', True),
+            ('structure', 'extra_attributes', True)]
+        result = check_code('x', 'x\x01')
+        assert [(i.kind, i.blocking) for i in result.issues] == [('structure', True)]
+
+    def test_nothing_at_the_top_level(self):
+        p = protect('<p>A</p>')
+        assert [i.detail for i in check_keys('<!-- c -->', p)][0] == \
+            '最外層的標記與原文不同：原文為 k="1"，譯文為 （無）'
+
+    def test_attribute_problems_joined(self):
+        p = protect('<p>A <img alt="A" src="s"/></p>')
+        assert [i.detail for i in check_keys('<p k="1">甲<img k="2" src="t"/></p>', p)] == \
+            ['屬性與原文不符：<img k="2"> 多了 src 屬性；<img k="2"> 少了 alt 屬性']
+
+    def test_tags_after_a_comment_still_checked(self):
+        p = protect('<p class="a">A</p>\n<p class="a">B</p>')
+        assert [i.code for i in check_keys('<!-- c --><p k="2">乙</p>\n<p k="1">甲</p>', p)] == \
+            ['structure_mismatch']
+        assert [i.code for i in check_keys('<p k="1">甲<?pi x?><b x="1">乙</b></p>\n'
+                                           '<p k="2">丙</p>', p)] == ['extra_attributes']

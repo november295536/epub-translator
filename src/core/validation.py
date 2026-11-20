@@ -229,10 +229,8 @@ def _restored_attrs(key: Key, reply_attrs: list):
     (escaped for the stored quote; untouched when the reply repeats the
     stored value). None when the reply's attributes are not `k` plus
     translatable attributes of this key, each once."""
-    names = [n for n, *_ in reply_attrs]
-    other = [n for n in names if n != 'k']
-    if names.count('k') != 1 or len(set(other)) != len(other) or \
-            not set(other) <= set(key.shown):
+    other = [n for n, *_ in reply_attrs if n != 'k']  # the caller found one k
+    if len(set(other)) != len(other) or not set(other) <= set(key.shown):
         return None
     text = key.attrs
     replies = {n: (q, raw) for n, q, raw, _, _ in reply_attrs}
@@ -265,11 +263,10 @@ def restore(text: str, protected: Protected) -> str:
         reply_attrs = _attributes(m.group('attrs'))
         ks = [raw for n, _, raw, _, _ in reply_attrs if n == 'k']
         key = protected.keys.get(ks[0]) if len(ks) == 1 else None
-        attrs = None
-        if key is not None and key.name == name:
-            attrs = '' if key.attrs is None else _restored_attrs(key, reply_attrs)
-        drop = attrs is not None and key.attrs is None
-        if attrs is not None and not drop:
+        ours = key is not None and key.name == name
+        drop = ours and key.attrs is None
+        attrs = _restored_attrs(key, reply_attrs) if ours and not drop else None
+        if attrs is not None:
             token = f'<{name}{attrs}{m.group("close")}>'
         if not drop:
             out.append(token)
@@ -303,7 +300,7 @@ def check_keys(reply: str, protected: Protected) -> list:
         k = ks[0] if ks else None
         if depth == 0:
             top.append(k)
-        key = protected.keys.get(k) if k is not None else None
+        key = protected.keys.get(k)
         if k is None:
             if reply_attrs:
                 attrs.append(f'<{name}> 帶有原文沒有的屬性')
@@ -611,7 +608,7 @@ def check_html(source: str, translation: str, fingerprints=None, nsmap=None,
                            ''.join(map(piece_text, pieces))), pieces)
 
 
-def _compare_elements(src_pieces: list, pieces: list, first_block: int = 1) -> list:
+def _compare_elements(src_pieces: list, pieces: list, first_block: int) -> list:
     """Per block: the block element's own attributes, then the multiset of
     the elements inside it."""
     known = {e.tag for p in src_pieces for e in _elements(p)}
