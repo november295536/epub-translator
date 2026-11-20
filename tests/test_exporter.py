@@ -249,8 +249,9 @@ class TestChineseOnly:
         root = _root(z, 'OEBPS/Text/one.xhtml')
         assert root.get(XML_LANG) == 'zh-TW' and root.get('lang') is None
 
-    def test_existing_root_lang_set_in_epub2(self, tmp_path):
-        chapter = RAW_CHAPTER_TWO.replace('<html ', '<html lang="en" ')
+    @pytest.mark.parametrize('lang', ['en', 'fr'])  # fr: not rewritten as a source language
+    def test_existing_root_lang_set_in_epub2(self, tmp_path, lang):
+        chapter = RAW_CHAPTER_TWO.replace('<html ', f'<html lang="{lang}" ')
         epub = _raw_book(tmp_path, {'two': ('two.xhtml', chapter)}, nav=None, ncx=None,
                          version='2.0')
         project_dir = _project(tmp_path, epub, {'two_seg0001': '<h2>晚</h2>'})
@@ -1372,14 +1373,16 @@ class TestReviewRound1Archive:
         with pytest.raises(ExportError, match='成員名稱'):
             exporter._member_info(info, zipfile.ZIP_STORED)
 
-    def test_output_file_mode_follows_the_umask(self, tmp_path, raw_project):
-        old = os.umask(0o027)
+    @pytest.mark.parametrize('umask, mode', [(0o027, 0o640), (0, 0o666)])
+    def test_output_file_mode_follows_the_umask(self, tmp_path, raw_project, umask, mode):
+        old = os.umask(umask)
         try:
             out = str(tmp_path / 'out.epub')
             export_project(raw_project, out, 'chinese-only')
         finally:
             os.umask(old)
-        assert os.stat(out).st_mode & 0o777 == 0o640
+        assert os.stat(out).st_mode & 0o777 == mode
+        assert os.umask(old) == old  # the process umask is restored
 
     def test_corrupt_member_is_an_export_error(self, tmp_path):
         info = zipfile.ZipInfo('OEBPS/Images/pic.png')
@@ -1481,6 +1484,7 @@ class TestReviewRound1Chapters:
     @pytest.mark.parametrize('types, expected', [
         ('footnote', None), ('endnote', None), ('rearnote', None), ('note', None),
         ('rearnote footnote invented', 'invented'), ('noteref', 'noteref'),
+        ('footnote one two', 'one two'),
     ])
     def test_note_types_dropped_from_the_block_copy(self, tmp_path, fmt, types, expected):
         chapter = xhtml(f'<p epub:type="{types}" id="n">Note words.</p>')
@@ -1716,3 +1720,51 @@ def test_zero_external_attributes_kept(tmp_path):
         _, z = _export(tmp_path, project_dir, fmt)
         assert z.getinfo('OEBPS/Images/pic.png').external_attr == 0
         assert z.getinfo('OEBPS/Text/one.xhtml').external_attr == 0o600 << 16
+
+
+class TestRound1Survivors:
+    """Mutation run 4: messages and rules spelled out."""
+
+    def test_messages(self, tmp_path, raw_project):
+        source = ProjectManager(raw_project).load().epub_path
+        with pytest.raises(ExportError) as e:
+            export_project(raw_project, source, 'chinese-only')
+        assert str(e.value) == '輸出檔不能是來源 EPUB 本身'
+        (tmp_path / 'file').write_text('x')
+        with pytest.raises(ExportError) as e:
+            export_project(raw_project, str(tmp_path / 'file' / 'o.epub'), 'chinese-only')
+        assert str(e.value).startswith('無法寫出 EPUB：') and 'XX' not in str(e.value)
+        info = zipfile.ZipInfo('OEBPS/圖.png')
+        with pytest.raises(ExportError) as e:
+            exporter._member_info(info, zipfile.ZIP_STORED)
+        assert str(e.value) == "無法原樣寫回成員名稱：'OEBPS/圖.png'"
+
+    def test_opf_subset_message(self, tmp_path):
+        _, project_dir = TestReviewRound1Additions()._subset_book(tmp_path, opf=True)
+        with pytest.raises(ExportError) as e:
+            export_project(project_dir, str(tmp_path / 'o.epub'), 'bilingual-vertical')
+        assert str(e.value) == 'OPF 的 DOCTYPE 含內部子集，無法登錄雙語樣式表'
+
+    def test_two_toc_navs_both_relabelled(self, tmp_path):
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml">A</a></li></ol></nav>'
+                    '<nav epub:type="toc"><ol><li><a href="Text/c.xhtml">B</a></li></ol></nav>')
+        z, _ = TestReviewRound1Toc()._export(tmp_path, nav, None)
+        assert [_inner(a) for a in _root(z, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a')] == [
+            '標題', '標題']
+
+    def test_equal_label_compared_normalized(self, tmp_path):
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml"><span>標題</span>\n'
+                    '  <span>詞</span></a></li></ol></nav>')
+        z, src = TestReviewRound1Toc()._export(tmp_path, nav, None,
+                                               translations={'c_seg0001': '<h1>標題 詞</h1>'})
+        assert z.read('OEBPS/nav.xhtml') == src.read('OEBPS/nav.xhtml')
+
+    def test_id_holding_one_heading_of_several(self, tmp_path):
+        chapter = xhtml('<table><tr><td id="c"><h3>Alpha</h3></td><td id="d"><h3>Beta</h3></td>'
+                        '</tr></table>')
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/c.xhtml#c">C</a></li>'
+                    '<li><a href="Text/c.xhtml#d">D</a></li></ol></nav>')
+        z, _ = TestReviewRound1Toc()._export(tmp_path, nav, None, chapter, {'c_seg0001': (
+            '<table><tr><td id="c"><h3>甲</h3></td><td id="d"><h3>乙</h3></td></tr></table>')})
+        assert [_inner(a) for a in _root(z, 'OEBPS/nav.xhtml').iter(f'{XHTML_NS}a')] == [
+            '甲', '乙']

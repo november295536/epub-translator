@@ -1646,7 +1646,8 @@ class TestExportCheckReviewRound1(_ExportCheckBase):
         _tamper(monkeypatch, change, ('bilingual-vertical',))
         assert self._main(root) == 1
         line = capsys.readouterr().out.splitlines()[1]
-        assert line.split('; ', 1)[1] == 'bilingual-vertical: 2 stylesheets added'
+        # (with two added stylesheets the head check may also fail: set order)
+        assert line.split('; ')[1] == 'bilingual-vertical: 2 stylesheets added'
 
     def test_anchor_name_only_on_a(self, tmp_path):
         from tests.conftest import write_raw_epub, xhtml
