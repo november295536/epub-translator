@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
-import html as html_lib
 import os
 import re
 import logging
@@ -80,7 +80,7 @@ TRANSLATION_PROMPT = f"""你是一位專業的英文翻譯，請將以下英文�
 原文：
 {{text}}"""
 
-CODE_PROMPT = """以下是程式碼區塊，請只翻譯其中的註解行，保持其他每一行完全不變。註解行是去掉行首空白後以 // 開頭，或以 # 開頭且 # 後面是空白、! 或行尾的行（#include 這類行是程式碼，不是註解）；行尾的註解也不要翻譯。直接輸出結果，不加任何說明。
+CODE_PROMPT = """以下是程式碼區塊，請只翻譯其中的註解行，保持其他每一行完全不變。註解行是去掉行首空白後以 // 開頭，或以 # 開頭且 # 後面是空白、! 或行尾的行（#include 這類行是程式碼，不是註解；第一行的 #! 指定直譯器，也不是註解）；行尾的註解也不要翻譯。直接輸出結果，不加任何說明。
 
 {text}"""
 
@@ -161,16 +161,14 @@ def _is_empty_reply(translated: str, source: str) -> bool:
 CONTEXT_CHARS = 200
 
 
-_TAG = re.compile(r'<[^>]*>')
-
-
 def translation_text(seg) -> str:
-    """The text of a segment's accepted translation, tags removed and
-    entities decoded; '' when it has none (not translated or reviewed)."""
-    text = seg.translated_text  # read once: a worker may be storing a new one
+    """The text a reader sees in a segment's accepted translation
+    (validation.plain_text: parsed, without tags, entities decoded), all
+    whitespace collapsed to single spaces; '' when it has none (not
+    translated or reviewed)."""
     if seg.status not in (SegmentStatus.TRANSLATED, SegmentStatus.REVIEWED):
         return ''
-    return html_lib.unescape(_TAG.sub('', text)).strip()
+    return ' '.join(validation.plain_text(seg.translated_text).split())
 
 
 def get_context(segments, segment_id: str, translations: bool = False) -> tuple:
@@ -182,7 +180,9 @@ def get_context(segments, segment_id: str, translations: bool = False) -> tuple:
     except that with `translations` (projects of segmentation rules 2) the
     text before is the previous segment's translation when it has one
     (translation_text). With several workers that segment may not be
-    translated yet: its source text is used then.
+    translated yet: its source text is used then. A caller whose segments
+    another thread changes holds the project mutex around this call, so a
+    neighbour's status and text are read as one (translate_segment).
 
     Args:
         segments: All project segments in reading order (objects with
@@ -197,15 +197,19 @@ def get_context(segments, segment_id: str, translations: bool = False) -> tuple:
     idx = ids.index(segment_id)
     chapter_id = segments[idx].chapter_id
 
-    def nearest_text(step: int, translated: bool) -> str:
+    def nearest(step: int):
         i = idx + step
         while 0 <= i < len(segments) and segments[i].chapter_id == chapter_id:
             if segments[i].segment_type != SegmentType.CODE:
-                return (translated and translation_text(segments[i])) or segments[i].text
+                return segments[i]
             i += step
-        return ''
+        return None
 
-    return nearest_text(-1, translations), nearest_text(1, False)
+    before, after = nearest(-1), nearest(1)
+    text_before = ''
+    if before is not None:
+        text_before = (translations and translation_text(before)) or before.text
+    return text_before, '' if after is None else after.text
 
 
 class TranslationError(Exception):
@@ -614,7 +618,8 @@ class TranslationEngine:
 def translate_segment(engine: TranslationEngine, seg, segments,
                       glossary=None,
                       cancel: threading.Event | None = None,
-                      translations: bool = False) -> TranslationOutcome:
+                      translations: bool = False,
+                      mutex=None) -> TranslationOutcome:
     """Translate one project segment: the single entry point for the web
     worker, both CLI modes and the re-translate endpoint.
 
@@ -627,6 +632,8 @@ def translate_segment(engine: TranslationEngine, seg, segments,
     other exception also gives a FAILED outcome (issue code `unexpected`).
     `translations`: the context before is the previous segment's
     translation when it has one (get_context; projects of segmentation 2).
+    `mutex`: the project mutex, held while the context is read (other
+    threads store results in `segments`), released before the model call.
     RateLimitError, AuthError, BackendUnavailableError and CancelledError
     are raised: they concern the run, not the segment. Writes no file.
     """
@@ -639,7 +646,9 @@ def translate_segment(engine: TranslationEngine, seg, segments,
             if found:
                 glossary_text = glossary.format_for_prompt(found)
 
-        context = context_before, context_after = get_context(segments, seg.segment_id, translations)
+        with mutex if mutex is not None else contextlib.nullcontext():
+            context = get_context(segments, seg.segment_id, translations)
+        context_before, context_after = context
         reply = engine.translate_reply(
             seg.text,
             segment_type=seg.segment_type,

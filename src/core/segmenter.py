@@ -16,7 +16,7 @@ Headings and code depend on the rules (`rules`, stored as the project's
    text block after a heading always joins, whatever its size: a heading
    is left alone only when a code block, a table or the end of the chapter
    follows it. Consecutive headings share one segment. A code block
-   without a comment line (validation.COMMENT_LINE) is `passthrough`: it
+   without a comment line (validation.has_comment_line) is `passthrough`: it
    needs no model call and is left as it is.
 """
 
@@ -25,7 +25,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
-from src.core.validation import COMMENT_LINE
+from src.core.project import check_rules
+from src.core.validation import has_comment_line
 from src.epub.blocks import Block, element_text, localname, walk_blocks
 
 
@@ -62,19 +63,12 @@ STANDALONE_TAGS = HEADING_TAGS | {'table'}
 SEGMENTATION = 2
 
 
-def has_comment_line(code: str) -> bool:
-    """Whether the code has a comment line, the only lines a model translates."""
-    return any(COMMENT_LINE.match(line) for line in code.splitlines())
-
-
 class Segmenter:
     """Groups a chapter's blocks into segments of 300-500 words, by the
     segmentation rules `rules` (1 or 2, see the module docstring)."""
 
     def __init__(self, rules: int = SEGMENTATION):
-        if rules not in (1, 2):
-            raise ValueError(f'unknown segmentation rules: {rules}')
-        self.rules = rules
+        self.rules = check_rules(rules)  # the integer 1 or 2, else ValueError
 
     def segment_chapter(self, chapter_id: str, body) -> list[Segment]:
         """Segment the parsed <body> element of a chapter."""

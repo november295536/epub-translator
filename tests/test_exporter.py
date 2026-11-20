@@ -76,7 +76,8 @@ def _project(tmp_path, epub, translations, statuses=None, name='proj', rules=1):
                 for s in segmenter.segment_chapter(ch.id, ch.body)]
     project_dir = str(tmp_path / name)
     pm = ProjectManager(project_dir)
-    pm.create(epub, 'T', 'A', segments, source_sha256=sha256_file(epub), segmentation=rules)
+    pm.create(epub, 'T', 'A', segments, source_sha256=sha256_file(epub),
+              segmentation=None if rules == 1 else rules)  # 1: no marker, as before
     for seg in pm.data.segments:
         if seg.segment_id in translations:
             pm.mark_translated(seg.segment_id, translations[seg.segment_id])

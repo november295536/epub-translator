@@ -851,10 +851,23 @@ def glossary_issues(source_text: str, translation: str, glossary) -> list:
 COMMENT_LINE = re.compile(r'^\s*(?://|#(?:\s|!|$))')
 
 
+def is_comment_line(index: int, line: str) -> bool:
+    """Whether line `index` (from 0) of a code block is a comment line, the
+    only lines a model may translate. A `#!` first line (a shebang) is code."""
+    return bool(COMMENT_LINE.match(line)) and not (index == 0 and line.startswith('#!'))
+
+
+def has_comment_line(code: str) -> bool:
+    """Whether the code has a comment line (else it is passthrough under
+    segmentation rules 2)."""
+    return any(is_comment_line(i, line) for i, line in enumerate(code.splitlines()))
+
+
 def code_lines(code: str) -> list:
     """The lines of code that are not comment lines, trailing whitespace
     removed, without blank lines at either end."""
-    kept = [line.rstrip() for line in code.splitlines() if not COMMENT_LINE.match(line)]
+    kept = [line.rstrip() for i, line in enumerate(code.splitlines())
+            if not is_comment_line(i, line)]
     while kept and not kept[0]:
         kept.pop(0)
     while kept and not kept[-1]:

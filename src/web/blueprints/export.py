@@ -8,6 +8,7 @@ import time
 from flask import Blueprint, Response, jsonify, current_app, send_file
 
 from src.epub.exporter import FORMATS, export_project
+from src.web.tasks import TaskManager
 
 export_bp = Blueprint('export', __name__)
 
@@ -29,8 +30,12 @@ def start_export(project_name: str):
     projects_dir = current_app.config['PROJECTS_DIR']
     project_dir = os.path.join(projects_dir, project_name)
 
-    if not os.path.isdir(project_dir):
+    if not os.path.isfile(os.path.join(project_dir, 'project.json')):
         return jsonify({'error': '專案不存在'}), 404
+    progress = TaskManager().get_or_load_pm(project_name, projects_dir).get_progress()
+    # passthrough code is translated without a model: it is no translation
+    if progress['translated'] + progress['reviewed'] - progress['passthrough'] == 0:
+        return jsonify({'error': '尚未翻譯任何段落，請先翻譯再匯出'}), 400
 
     # Check if already exporting
     with _export_lock:

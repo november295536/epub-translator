@@ -219,7 +219,9 @@ def _export(project_dir: str, output_path: str, fmt: str) -> ExportReport:
     for seg in data.segments:
         by_chapter.setdefault(seg.chapter_id, []).append(seg)
     chapters = chapter_items(spine)
-    report = ExportReport(output_path, sum(not accepted(s) for s in data.segments))
+    # passthrough code has nothing to translate: never counted as untranslated
+    report = ExportReport(output_path, sum(not accepted(s) and not s.passthrough
+                                           for s in data.segments))
     replaced: dict = {}   # member -> new bytes
     labels: dict = {}     # chapter member -> {fragment or None: TOC label}
     for chapter_id, segments in by_chapter.items():
