@@ -748,7 +748,7 @@ class TestRetranslateModel:
         app.config['TESTING'] = True
 
         with app.test_client() as client:
-            fake = FakeBackend(['<h1>重新翻譯結果</h1>'])
+            fake = FakeBackend(['<h1 k="1">重新翻譯結果</h1>'])
             with use_fake_backend(fake):
                 response = client.post(
                     f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0001/retranslate',
@@ -1378,7 +1378,7 @@ class TestRetranslateContext:
                                      'glossary.json')).add_term('GLOSSMARK', '詞彙')
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = '<h2>第二章</h2>'
+        mock_result.stdout = '<h2 k="1">第二章</h2>'
         mock_result.stderr = ''
 
         with patch('src.llm.cli.run_process',
@@ -1620,7 +1620,7 @@ class TestRetranslateOutcome:
             SegmentStatus.FAILED
 
     def test_retranslation_records_model(self, client, project_with_translations):
-        with use_fake_backend(FakeBackend(['<p>新譯文</p>'])):
+        with use_fake_backend(FakeBackend(['<p k="1">新譯文</p>'])):
             response = client.post(
                 f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
         assert response.status_code == 200
@@ -1792,7 +1792,7 @@ class TestWorkerEventsAndLogs:
     def test_events_for_one_success_and_one_failure(self, project_with_translations, caplog):
         import logging
         caplog.set_level(logging.INFO, logger='src.web.tasks')
-        long_text = '<p>' + '譯' * 300 + '</p>'
+        long_text = '<p k="1">' + '譯' * 300 + '</p>'
 
         def respond(request):
             if '>Chapter 2<' in request.messages[-1].content:
@@ -1806,7 +1806,7 @@ class TestWorkerEventsAndLogs:
         assert events == [
             {'event': 'progress', 'data': {'completed': 1, 'total': 2, 'percent': 50.0}},
             {'event': 'segment_complete', 'data': {'segment_id': 'ch1_seg0003',
-                                                   'translated_text': long_text[:200],
+                                                   'translated_text': ('<p>' + '譯' * 300)[:200],
                                                    'model': 'sonnet'}},
             {'event': 'segment_error', 'data': {
                 'segment_id': 'ch2_seg0001',
@@ -2442,7 +2442,7 @@ class TestTemplatesHandleErrors:
         assert 'failedCount: 0,' in html
         assert 'x-show="failedCount > 0' in html
         # complete, stopped, error, and a first status of an ended task
-        assert html.count('this.refreshFailedCount();') == 4
+        assert html.count('this.refreshFailedCount();') == 9  # see TestPhase4HeaderProgress
 
     def test_backend_error_event_handled(self, client):
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
@@ -2612,7 +2612,7 @@ class TestRound1Exact:
         assert response.get_json() == {'error': 'Segment nope not found'}
 
     def test_retranslate_sends_its_own_segment(self, client):
-        fake = FakeBackend(['<p>新譯文</p>'])
+        fake = FakeBackend(['<p k="1">新譯文</p>'])
         with use_fake_backend(fake):
             client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
         assert '>Second paragraph.<' in fake.prompts[0]
@@ -2734,7 +2734,7 @@ class TestRound2TransactionAcrossProcesses:
 
     def test_retranslate_refused_before_the_call(self, client, project_with_translations):
         TaskManager._instance = None
-        fake = FakeBackend(['<p>譯</p>'])
+        fake = FakeBackend(['<p k="1">譯</p>'])
         child = hold_lock_in_child(os.path.join(project_with_translations, PROJECT_NAME))
         try:
             with use_fake_backend(fake):
@@ -3664,11 +3664,12 @@ class TestPhase4ReviewValidation:
             SegmentStatus.TRANSLATED
 
     def test_approve_without_any_text(self, client, project_with_translations):
+        # review round 1: nothing to approve is refused (was: approved empty)
+        before = self._seg(project_with_translations, 'ch1_seg0003')
         response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/approve',
                                json={})
-        assert response.status_code == 200
-        assert self._seg(project_with_translations, 'ch1_seg0003').status == \
-            SegmentStatus.REVIEWED
+        assert response.status_code == 422
+        assert self._seg(project_with_translations, 'ch1_seg0003') == before
 
     def test_clearing_is_not_checked(self, client, project_with_translations):
         response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002',
@@ -3698,6 +3699,97 @@ class TestPhase4ReviewValidation:
         assert (seg.status, seg.issues) == (SegmentStatus.TRANSLATED, [])
 
 
+class TestRound1Review:
+    """Phase 4 review round 1: request types, encoding failures, empty
+    approvals, block roots."""
+
+    def _seg(self, projects_dir, seg_id='ch1_seg0002'):
+        return _load(projects_dir)[seg_id]
+
+    @pytest.mark.parametrize('suffix', ['', '/approve'])
+    @pytest.mark.parametrize('text', [1, ['<p>甲</p>'], {'a': 1}, True])
+    def test_non_string_text_is_400(self, client, project_with_translations, suffix, text):
+        before = self._seg(project_with_translations)
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002{suffix}',
+                               json={'text': text})
+        assert response.status_code == 400
+        assert response.get_json() == {'error': 'text must be a string'}
+        assert self._seg(project_with_translations) == before
+
+    @pytest.mark.parametrize('body', ['[1, 2]', '"x"', 'not json'])
+    def test_save_without_an_object_is_400(self, client, project_with_translations, body):
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002',
+                               data=body, content_type='application/json')
+        assert response.status_code == 400
+
+    @pytest.mark.parametrize('suffix', ['', '/approve'])
+    @pytest.mark.parametrize('text', ['<p>甲\ud800</p>', '<p>甲\x01</p>'])
+    def test_encoding_failure_is_not_well_formed(self, client, project_with_translations,
+                                                 suffix, text):
+        before = self._seg(project_with_translations)
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002{suffix}',
+                               data=json.dumps({'text': text}), content_type='application/json')
+        assert response.status_code == 422
+        assert [i['code'] for i in response.get_json()['issues']] == ['not_well_formed']
+        assert self._seg(project_with_translations) == before
+
+    @pytest.mark.parametrize('text', ['   ', '\n\t', None])
+    def test_approve_whitespace_text_approves_the_stored_one(self, client,
+                                                            project_with_translations, text):
+        before = self._seg(project_with_translations)
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/approve',
+                               json={'text': text})
+        assert response.status_code == 200, response.get_json()
+        after = self._seg(project_with_translations)
+        assert (after.status, after.translated_text) == \
+            (SegmentStatus.REVIEWED, before.translated_text)
+
+    @pytest.mark.parametrize('body', [{}, {'text': ''}, {'text': '  '}])
+    def test_approve_with_nothing_to_approve_refused(self, client, project_with_translations,
+                                                     body):
+        pm = ProjectManager(os.path.join(project_with_translations, PROJECT_NAME))
+        pm.load()
+        pm.update_translation('ch1_seg0002', '')
+        pm.save()
+        before = self._seg(project_with_translations)
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/approve',
+                               json=body)
+        assert response.status_code == 422
+        assert response.get_json() == {'error': '沒有譯文可以核可'}
+        assert self._seg(project_with_translations) == before
+
+    @pytest.mark.parametrize('source, translation', [
+        ('<blockquote id="q"><blockquote>Second paragraph.</blockquote></blockquote>',
+         '<blockquote><blockquote id="q">第二段。</blockquote></blockquote>'),
+        ('<blockquote><blockquote id="q">Second paragraph.</blockquote></blockquote>',
+         '<blockquote id="q"><blockquote>第二段。</blockquote></blockquote>'),
+    ])
+    @pytest.mark.parametrize('suffix', ['', '/approve'])
+    def test_block_root_attributes_cannot_move(self, client, project_with_translations,
+                                               source, translation, suffix):
+        pm = ProjectManager(os.path.join(project_with_translations, PROJECT_NAME))
+        pm.load()
+        pm._find('ch1_seg0002').html = source
+        pm.save()
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002{suffix}',
+                               json={'text': translation})
+        assert response.status_code == 422
+        assert '第 1 個區塊的 <blockquote> 本身的屬性與原文不同' in response.get_json()['error']
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002{suffix}',
+                               json={'text': source.replace('Second paragraph.', '第二段。')})
+        assert response.status_code == 200
+
+    def test_translated_alt_accepted(self, client, project_with_translations):
+        pm = ProjectManager(os.path.join(project_with_translations, PROJECT_NAME))
+        pm.load()
+        pm._find('ch1_seg0002').html = '<p>Second <img src="a.png" alt="A map"/>paragraph.</p>'
+        pm.save()
+        for suffix in ('', '/approve'):
+            response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002{suffix}',
+                                   json={'text': '<p>第二<img src="a.png" alt="地圖"/>段。</p>'})
+            assert response.status_code == 200, response.get_json()
+
+
 class TestPhase4HeaderProgress:
 
     def test_header_bar_refreshed_when_a_run_ends(self, client):
@@ -3711,6 +3803,85 @@ class TestPhase4HeaderProgress:
         # the header the selectors point at
         assert '<div class="project-header">' in html
         assert '<div class="progress-fill" style="width:' in html
+
+    # The page's controller run in Node with stubbed fetch, DOM and
+    # EventSource: which transitions refresh the header bar
+    HARNESS = r"""
+const scenario = process.argv[1];
+const fetched = [];
+const header = {fill: {style: {width: 'old'}}, text: {textContent: 'old'}};
+const bar = {querySelector: (sel) => sel === '.progress-fill' ? header.fill : header.text};
+global.document = {
+    querySelector: (sel) => sel === '.project-header .progress-bar' ? bar : null,
+    getElementById: () => ({value: ''}),
+};
+const replies = {
+    '/translate/status': {state: scenario.startsWith('status:') ? scenario.slice(7) : 'idle',
+                          total: 4, completed: 4, percent: 100},
+    '/translate/start': {state: scenario === 'start:completed' ? 'completed' : 'running', total: 4},
+    '/progress': {failed: 1, translated: 2, reviewed: 1, total: 4, percent: 75.0},
+};
+global.fetch = async (url) => {
+    fetched.push(url);
+    const key = Object.keys(replies).find(k => url.endsWith(k));
+    return {ok: true, json: async () => key ? replies[key] : {}};
+};
+const sources = [];
+global.EventSource = class {
+    constructor(url) { this.listeners = {}; sources.push(this); }
+    addEventListener(name, fn) { this.listeners[name] = fn; }
+    close() {}
+};
+const page = require('fs').readFileSync(0, 'utf8');
+eval(page + '; global.translationController = translationController;');
+(async () => {
+    const ctrl = translationController();
+    if (scenario.startsWith('status:')) {
+        await ctrl.fetchStatus();
+    } else if (scenario.startsWith('start:')) {
+        await ctrl.startTranslation();
+    } else {  // event:<name>
+        ctrl.connectSSE();
+        sources[0].listeners[scenario.slice(6)]({data: JSON.stringify({error: 'x', total_translated: 3})});
+    }
+    await new Promise(r => setTimeout(r, 10));
+    console.log(JSON.stringify({progress: fetched.filter(u => u.endsWith('/progress')).length,
+                                width: header.fill.style.width, text: header.text.textContent,
+                                failed: ctrl.failedCount}));
+})();
+"""
+
+    def _run_page(self, client, scenario):
+        import shutil
+        import subprocess
+        node = shutil.which('node')
+        if node is None:
+            pytest.skip('node is not installed')
+        html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
+        start = html.index('<script>\nfunction translationController()') + len('<script>')
+        script = html[start:html.index('</script>', start)]
+        out = subprocess.run([node, '-e', self.HARNESS, scenario], input=script,
+                             capture_output=True, text=True, timeout=30)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)
+
+    REFRESHED = {'progress': 1, 'width': '75%', 'text': '3/4 (75%)', 'failed': 1}
+
+    @pytest.mark.parametrize('scenario', [
+        'status:completed', 'status:failed', 'status:stopped', 'start:completed',
+        'event:rate_limit', 'event:auth_error', 'event:backend_error',
+        'event:complete', 'event:stopped', 'event:error',
+    ])
+    def test_header_bar_refreshed_on_transition(self, client, scenario):
+        assert self._run_page(client, scenario) == self.REFRESHED
+
+    @pytest.mark.parametrize('scenario', [
+        'status:idle', 'status:running', 'status:paused', 'start:running',
+        'event:progress', 'event:segment_complete', 'event:paused',
+    ])
+    def test_header_bar_left_alone_otherwise(self, client, scenario):
+        result = self._run_page(client, scenario)
+        assert (result['progress'], result['width'], result['text']) == (0, 'old', 'old')
 
     def test_refusal_lists_every_problem(self, client):
         response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002',
