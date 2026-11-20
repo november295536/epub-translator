@@ -2703,6 +2703,25 @@ directories are now `<n>/project` and `<n>/exports`, which
 `TestExportCheckReviewRound1::test_scratch_directories_numbered` checks, so changing either name is
 killed.
 
+Mutation tool change (after run 5, at the owner's request): `scripts/verify/mutation.sh` now
+runs mutmut 3.8.1 through `scripts/verify/mutation.py` (Python 3.10+; the repository's venv
+interpreter 3.12 was upgraded from mutmut 2.5.1). mutmut 3 records which tests reach which
+function and runs each mutant against those tests only, on all cores, in a copy of the working
+tree (the repository is no longer edited during a run). It has more mutation operators
+(argument removal, `None` arguments, string case). Run 6 on the same commit as run 5's
+survivor tests:
+
+| run | tool | mutants | killed | survived | timeout | suspicious | time |
+|---|---|---|---|---|---|---|---|
+| 5 | mutmut 2.5.1, groups in sequence | 1259 | 1215 | 42 | 2 | 0 | about 2 h 30 min |
+| 6 | mutmut 3.8.1, one run | 2535 | 2403 | 129 | 3 | 0 | about 7 min |
+
+Run 6's 129 survivors (exporter 75, check script 54) are not triaged yet. They include the
+run 5 equivalents, new-operator equivalents (`'utf-8'` → `'UTF-8'`, a dropped default
+argument) and a known gap of the new tool: code that tests reach only through a subprocess
+(the check scripts' `--help` and command-line tests) is not linked to those tests, so e.g. the
+`--help` texts of `phase3_export_check.py` survive, although mutmut 2 killed them.
+
 ### 7. Known consequences
 
 - Schema 1 projects can no longer be exported; `translate.py migrate <project>` first (the
