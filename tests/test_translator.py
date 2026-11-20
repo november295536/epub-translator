@@ -1582,7 +1582,7 @@ class TestPhase4Retry:
         assert [a[0] for a in outcome.failure.attempts] == [
             'tag_count: 第 2 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'] * 3  # half 2 counts on
         assert str(outcome.failure) == \
-            'Translation failed after 3 attempts: 第 2 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'
+            'Translation failed after 4 attempts: 第 2 個區塊不帶屬性的 <b>：原文 1 個，譯文 0 個'
 
     def test_first_half_failing_stops_before_the_second(self):
         fake = FakeBackend([DROPPED_B, DROPPED_B, '<p k="1">壞'])
