@@ -344,7 +344,7 @@ def _relabel(zf, path: str, labels: dict, ncx: bool):
         for nav in root.iter():
             if localname(nav) != 'nav':
                 continue
-            for a in nav.iter():
+            for a in list(nav.iter()):  # a list: labels are changed while walking
                 if localname(a) != 'a' or a.get('href') is None:
                     continue
                 label = _label_for(path, a.get('href'), labels)
