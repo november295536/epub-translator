@@ -1118,10 +1118,14 @@ class TestExportCheck:
         self._fails_with(tmp_path, capsys, monkeypatch, change,
                          'chinese-only: mimetype not first and stored')
 
+    @pytest.mark.filterwarnings('ignore:Duplicate name')
     def test_member_twice(self, tmp_path, capsys, monkeypatch):
-        import warnings
-        warnings.simplefilter('ignore', UserWarning)
-        self._fails_with(tmp_path, capsys, monkeypatch, lambda m: m + m[-1:],
+        import zipfile
+
+        def change(members):
+            info, data = members[-1]
+            return members + [(zipfile.ZipInfo(info.filename), data)]
+        self._fails_with(tmp_path, capsys, monkeypatch, change,
                          'chinese-only: a member is written twice')
 
     def test_member_added(self, tmp_path, capsys, monkeypatch):
