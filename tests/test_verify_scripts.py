@@ -749,6 +749,39 @@ class TestMigrateCopiesCheck:
         monkeypatch.setattr(migrate_check, 'read_package', read_package)
         assert migrate_check.placed_chapters(directory) == (2, 1)
 
+    @pytest.mark.parametrize('change', ['nav', 'media_type', 'entity', 'not_well_formed'])
+    def test_chapters_the_exporter_refuses_not_placed(self, tmp_path, monkeypatch, change):
+        # review round 1: the exporter's own chapter filter and loader
+        import dataclasses
+        from src.epub import exporter
+        root = tmp_path / 'projects'
+        root.mkdir()
+        directory = _migratable(root, 'alpha')
+        migrate_check.migrate_project(directory)
+        real_package, real_read = migrate_check.read_package, exporter.read_member
+        paths = {}
+
+        def read_package(zf):
+            opf, manifest, spine = real_package(zf)
+            paths.update({item.id: item.path for item in spine})
+            if change == 'nav':
+                spine = [dataclasses.replace(item, is_nav=item.id == 'c1') for item in spine]
+            elif change == 'media_type':
+                spine = [dataclasses.replace(item, media_type='text/html') if item.id == 'c1'
+                         else item for item in spine]
+            return opf, manifest, spine
+
+        def read_member(zf, name):
+            data = real_read(zf, name)
+            if name == paths.get('c1'):
+                return (data.replace(b'</p>', b'&mdash;</p>', 1) if change == 'entity'
+                        else data.replace(b'</body>', b'', 1))
+            return data
+        monkeypatch.setattr(migrate_check, 'read_package', read_package)
+        if change in ('entity', 'not_well_formed'):
+            monkeypatch.setattr(exporter, 'read_member', read_member)
+        assert migrate_check.placed_chapters(directory) == (2, 1)
+
     def test_web_load_checked(self, tmp_path, capsys, monkeypatch):
         root = tmp_path / 'projects'
         root.mkdir()
@@ -1109,7 +1142,8 @@ class TestExportCheck(_ExportCheckBase):
 
     def test_mimetype_not_first(self, tmp_path, capsys, monkeypatch):
         self._fails_with(tmp_path, capsys, monkeypatch, lambda m: m[1:] + m[:1],
-                         'chinese-only: mimetype not first and stored')
+                         'chinese-only: mimetype not first and stored; '
+                         'chinese-only: member order differs')
 
     def test_mimetype_compressed(self, tmp_path, capsys, monkeypatch):
         import zipfile
@@ -1119,7 +1153,8 @@ class TestExportCheck(_ExportCheckBase):
             info.compress_type = zipfile.ZIP_DEFLATED
             return [(info, members[0][1])] + members[1:]
         self._fails_with(tmp_path, capsys, monkeypatch, change,
-                         'chinese-only: mimetype not first and stored')
+                         'chinese-only: mimetype not first and stored; '
+                         'chinese-only: 1 untouched members stored differently')
 
     @pytest.mark.filterwarnings('ignore:Duplicate name')
     def test_member_twice(self, tmp_path, capsys, monkeypatch):
@@ -1129,7 +1164,8 @@ class TestExportCheck(_ExportCheckBase):
             info, data = members[-1]
             return members + [(zipfile.ZipInfo(info.filename), data)]
         self._fails_with(tmp_path, capsys, monkeypatch, change,
-                         'chinese-only: a member is written twice')
+                         'chinese-only: a member is written twice; '
+                         'chinese-only: member order differs')
 
     def test_member_added(self, tmp_path, capsys, monkeypatch):
         import zipfile
@@ -1137,15 +1173,18 @@ class TestExportCheck(_ExportCheckBase):
                          lambda m: m + [(zipfile.ZipInfo('OEBPS/x.txt'), b'x')],
                          'chinese-only: 1 members added')
 
-    @pytest.mark.parametrize('drop', [False, True])
-    def test_member_outside_the_allowed_set_differs(self, tmp_path, capsys, monkeypatch, drop):
-        if drop:
-            def change(members):
-                return [(i, d) for i, d in members if i.filename != 'OEBPS/Styles/book.css']
-        else:
-            change = _edit('OEBPS/Styles/book.css', b'0', b'1')
-        self._fails_with(tmp_path, capsys, monkeypatch, change,
+    def test_member_outside_the_allowed_set_differs(self, tmp_path, capsys, monkeypatch):
+        self._fails_with(tmp_path, capsys, monkeypatch,
+                         _edit('OEBPS/Styles/book.css', b'0', b'1'),
                          'chinese-only: 1 members outside the allowed set differ')
+
+    @pytest.mark.parametrize('name', ['OEBPS/Styles/book.css', 'OEBPS/Text/one.xhtml'])
+    def test_source_member_missing(self, tmp_path, capsys, monkeypatch, name):
+        # review round 1: also a member the exporter may change
+        def change(members):
+            return [(i, d) for i, d in members if i.filename != name]
+        self._fails_with(tmp_path, capsys, monkeypatch, change,
+                         'chinese-only: 1 source members missing')
 
     def test_chapter_not_well_formed(self, tmp_path, capsys, monkeypatch):
         self._fails_with(tmp_path, capsys, monkeypatch,
@@ -1395,20 +1434,31 @@ class TestExportCheckSurvivors(_ExportCheckBase):
 
     def test_toc_labels(self, tmp_path):
         from tests.conftest import write_raw_epub, xhtml
-        nav = xhtml('<nav><ol><li><a href="c.xhtml"> <span>T</span>wo \n words</a></li>'
-                    '<li><a>Three</a></li></ol></nav><p><a href="c.xhtml">x</a></p>')
+        # review round 1: only the toc nav and the navMap count; an external
+        # href has no target
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="c.xhtml"> <span>T</span>wo \n words</a></li>'
+                    '<li><a>Three</a></li><li><a href="http://example.com/x">W</a></li></ol></nav>'
+                    '<nav epub:type="landmarks"><ol><li><a href="c.xhtml">L</a></li></ol></nav>'
+                    '<p><a href="c.xhtml">x</a></p>')
         ncx = ('<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/">'
-               '<navMap><navPoint><navLabel><text>One</text></navLabel></navPoint></navMap></ncx>')
+               '<docTitle><text>Title</text></docTitle>'
+               '<navMap><navPoint><navLabel><text>One</text></navLabel></navPoint></navMap>'
+               '<pageList><pageTarget><navLabel><text>1</text></navLabel>'
+               '<content src="c.xhtml"/></pageTarget></pageList></ncx>')
         epub = write_raw_epub(
             tmp_path / 'b.epub',
             [('css', 'a.css', 'text/css', None), ('nav', 'nav.xhtml', 'application/xhtml+xml', 'nav'),
              ('ncx', 'toc.ncx', 'application/x-dtbncx+xml', None),
              ('gone', 'gone.ncx', 'application/x-dtbncx+xml', None)], ['nav'],
             {'OEBPS/a.css': 'p {}', 'OEBPS/nav.xhtml': nav, 'OEBPS/toc.ncx': ncx})
-        assert export_check.toc_labels(export_check.Archive(epub)) == [
+        archive = export_check.Archive(epub)
+        assert export_check.toc_labels(archive) == [
             ('OEBPS/nav.xhtml', 0, 'Two words', 'OEBPS/c.xhtml'),
-            ('OEBPS/nav.xhtml', 1, 'Three', None),
-            ('OEBPS/nav.xhtml', 2, 'x', 'OEBPS/c.xhtml'), ('OEBPS/toc.ncx', 0, 'One', None)]
+            ('OEBPS/nav.xhtml', 1, 'Three', None), ('OEBPS/nav.xhtml', 2, 'W', None),
+            ('OEBPS/toc.ncx', 0, 'One', None)]
+        assert export_check.other_labels(archive) == [
+            ('OEBPS/nav.xhtml', 'L'), ('OEBPS/nav.xhtml', 'x'),
+            ('OEBPS/toc.ncx', 'Title'), ('OEBPS/toc.ncx', '1')]
 
     def test_bilingual_stylesheet_read_after_a_non_utf8_one(self, tmp_path, capsys):
         from tests.test_exporter import RAW_TRANSLATIONS, _project, _raw_book
@@ -1513,3 +1563,140 @@ class TestExportCheckTocDenominator(_ExportCheckBase):
         assert self._main(root) == 0
         assert capsys.readouterr().out.splitlines()[1].endswith(
             'toc labels changed 0/2 (0 into translated chapters)')
+
+
+class TestExportCheckReviewRound1(_ExportCheckBase):
+    """Review round 1: the check script's new rules."""
+
+    def test_untouched_member_date_changed(self, tmp_path, capsys, monkeypatch):
+        import zipfile
+
+        def change(members):
+            out = []
+            for info, data in members:
+                if info.filename == 'OEBPS/Styles/book.css':
+                    new = zipfile.ZipInfo(info.filename, date_time=(1999, 1, 1, 0, 0, 0))
+                    new.compress_type = info.compress_type
+                    new.external_attr = info.external_attr
+                    new.create_system = info.create_system
+                    info = new
+                out.append((info, data))
+            return out
+        self._fails_with(tmp_path, capsys, monkeypatch, change,
+                         'chinese-only: 1 untouched members stored differently')
+
+    def test_untouched_member_compression_changed(self, tmp_path, capsys, monkeypatch):
+        import zipfile
+
+        def change(members):
+            for info, _ in members:
+                if info.filename == 'OEBPS/Styles/book.css':
+                    info.compress_type = zipfile.ZIP_STORED
+            return members
+        self._fails_with(tmp_path, capsys, monkeypatch, change,
+                         'chinese-only: 1 untouched members stored differently')
+
+    def test_member_order_changed(self, tmp_path, capsys, monkeypatch):
+        def change(members):
+            return members[:1] + members[2:] + members[1:2]
+        self._fails_with(tmp_path, capsys, monkeypatch, change,
+                         'chinese-only: member order differs')
+
+    def test_label_outside_the_toc_changed(self, tmp_path, capsys, monkeypatch):
+        from tests.conftest import xhtml
+        from tests.test_exporter import RAW_TRANSLATIONS, _project, _raw_book
+        root = tmp_path / 'projects'
+        root.mkdir()
+        (tmp_path / 'b').mkdir()
+        nav = xhtml('<nav epub:type="toc"><ol><li><a href="Text/one.xhtml">One</a></li></ol></nav>'
+                    '<nav epub:type="landmarks"><ol><li><a href="Text/one.xhtml">Start</a>'
+                    '</li></ol></nav>')
+        _project(root, _raw_book(tmp_path / 'b', nav=nav), RAW_TRANSLATIONS, name='p')
+        _tamper(monkeypatch, _edit('OEBPS/nav.xhtml', b'>Start<', b'>Begin<'))
+        assert self._main(root) == 1
+        line = capsys.readouterr().out.splitlines()[1]
+        assert line.split('; ', 1)[1] == 'chinese-only: labels outside the table of contents changed'
+
+    def test_stylesheet_added_to_chinese_only(self, tmp_path, capsys, monkeypatch):
+        import zipfile
+
+        def change(members):
+            out = []
+            for info, data in members:
+                if info.filename == 'OEBPS/content.opf':
+                    data = data.replace(b'</manifest>', b'<item id="x" href="x.css" '
+                                        b'media-type="text/css"/></manifest>')
+                out.append((info, data))
+            return out + [(zipfile.ZipInfo('OEBPS/x.css'), b'p {}')]
+        self._fails_with(tmp_path, capsys, monkeypatch, change,
+                         'chinese-only: 1 stylesheets added')
+
+    def test_two_stylesheets_added_to_bilingual(self, tmp_path, capsys, monkeypatch):
+        import zipfile
+
+        def change(members):
+            out = []
+            for info, data in members:
+                if info.filename == 'OEBPS/content.opf':
+                    data = data.replace(b'</manifest>', b'<item id="x" href="x.css" '
+                                        b'media-type="text/css"/></manifest>')
+                out.append((info, data))
+            return out + [(zipfile.ZipInfo('OEBPS/x.css'), b'p {}')]
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+        _tamper(monkeypatch, change, ('bilingual-vertical',))
+        assert self._main(root) == 1
+        line = capsys.readouterr().out.splitlines()[1]
+        assert line.split('; ', 1)[1] == 'bilingual-vertical: 2 stylesheets added'
+
+    def test_anchor_name_only_on_a(self, tmp_path):
+        from tests.conftest import write_raw_epub, xhtml
+        epub = write_raw_epub(
+            tmp_path / 'b.epub', [('c', 'c.xhtml', 'application/xhtml+xml', None)], ['c'],
+            {'OEBPS/c.xhtml': xhtml('<p id="i"><a name="n"/><span name="s"/></p>')})
+        assert export_check.Archive(epub).anchors('OEBPS/c.xhtml') == {'i', 'n'}
+
+    def test_new_duplicate_of_a_duplicated_id(self):
+        from lxml import etree
+
+        def root(body):
+            return etree.fromstring(f'<html><body>{body}</body></html>')
+        src = root('<p id="d"/><p id="d"/><p id="e"/>')
+        assert export_check.new_duplicates(root('<p id="d"/><p id="d"/><p id="e"/>'), src) == set()
+        assert export_check.new_duplicates(root('<p id="d"/><p id="d"/><p id="d"/>'), src) == {'d'}
+        assert export_check.new_duplicates(root('<p id="e"/><p id="e"/>'), src) == {'e'}
+
+    def test_project_change_detected_when_the_check_raises(self, tmp_path, capsys, monkeypatch):
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+
+        def check_copy(copy_dir, out_dir):
+            (root / 'beta' / 'touched.txt').write_text('x')
+            raise RuntimeError('invented')
+        monkeypatch.setattr(export_check, 'check_copy', check_copy)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[1] == (
+            'FAIL project-1: export check raised RuntimeError; '
+            'files in the project directory changed')
+
+    def test_scratch_directories_numbered(self, tmp_path, capsys, monkeypatch):
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+        seen = []
+
+        def check_copy(copy_dir, out_dir):
+            seen.append((copy_dir, out_dir))
+            raise RuntimeError('invented')
+        monkeypatch.setattr(export_check, 'check_copy', check_copy)
+        self._main(root)
+        (copy_dir, out_dir), = seen
+        assert copy_dir.endswith(os.path.join('1', 'project'))
+        assert out_dir.endswith(os.path.join('1', 'exports'))
+        assert 'beta' not in copy_dir and 'beta' not in out_dir
+
+    def test_setup_failure_anonymized(self, tmp_path, capsys, monkeypatch):
+        root = _export_projects(tmp_path / 'projects', schema_1=False)
+
+        def copy2(src, dst):
+            raise OSError(f'invented failure on {src}')
+        monkeypatch.setattr(export_check.shutil, 'copy2', copy2)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out
+        assert 'FAIL project-1: export check raised OSError' in out and 'beta' not in out
