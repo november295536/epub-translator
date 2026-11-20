@@ -412,8 +412,12 @@ def export(project, fmt):
         sys.exit(1)
 
     output_dir = os.path.join(project_dir, 'output')
-    # Named after the project: the book itself is the project's source.epub
-    base_name = os.path.basename(os.path.abspath(project_dir))
+    # Schema 2: named after the project (the book is the project's
+    # source.epub); schema 1 keeps the book's file name
+    if pm.data.schema == 2:
+        base_name = os.path.basename(os.path.abspath(project_dir))
+    else:
+        base_name = os.path.splitext(os.path.basename(pm.data.epub_path))[0]
     output_path = os.path.join(output_dir, f'{base_name}-{fmt}.epub')
 
     click.echo(f"正在建構 {fmt} 格式的 EPUB...")
