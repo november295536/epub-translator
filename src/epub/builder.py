@@ -12,6 +12,7 @@ from bs4.element import PreformattedString
 
 from src.core.project import ProjectManager, SegmentState
 from src.core.segmenter import SegmentType, _is_container
+from src.epub.blocks import BLOCK_TAGS, DESCEND_TAGS, NO_TEXT_TAGS, fingerprint, normalize
 
 BILINGUAL_CSS = """
 .bilingual-container {
@@ -137,32 +138,94 @@ class EPUBBuilder:
         if not body:
             return
 
-        elements = self._walk_content_elements(body, legacy=self._legacy_walk())
+        if self.pm.data is not None and self.pm.data.schema == 2:
+            placed = self._place_by_blocks(body, segments)
+            if placed is None:
+                return  # the chapter stays in the original language
+        else:
+            placed = [(seg, covered, covered, covered, True)
+                      for seg, covered in self._place_by_count(body, segments)]
 
-        elem_idx = 0
-        for seg in segments:
-            if elem_idx >= len(elements):
-                break
-
-            n = self._count_segment_blocks(seg)
-            end_idx = min(elem_idx + n, len(elements))
-            covered = elements[elem_idx:end_idx]
-
-            if not covered:
-                elem_idx = end_idx
-                continue
-
-            if seg.translated_text:
+        for seg, covered, span, remove, pair in placed:
+            if covered and seg.translated_text:
                 if fmt == 'chinese-only':
-                    self._apply_chinese_only(seg, covered, soup)
+                    self._apply_chinese_only(seg, covered, soup, remove, pair)
                 elif fmt == 'bilingual-vertical':
-                    self._apply_bilingual_vertical(seg, covered, soup)
+                    self._apply_bilingual_vertical(seg, covered, soup, span, pair)
                 elif fmt == 'bilingual-horizontal':
-                    self._apply_bilingual_horizontal(seg, covered, soup)
-
-            elem_idx = end_idx
+                    self._apply_bilingual_horizontal(seg, covered, soup, span, pair)
 
         item.set_content(str(soup).encode('utf-8'))
+
+    def _place_by_count(self, body, segments: list[SegmentState]) -> list:
+        """Schema 1: (segment, elements) pairs, each segment taking as many
+        walked elements as its stored HTML has top-level nodes."""
+        elements = self._walk_content_elements(body, legacy=self._legacy_walk())
+        placed = []
+        elem_idx = 0
+        for seg in segments:  # past the last element a segment gets none
+            end_idx = min(elem_idx + self._count_segment_blocks(seg), len(elements))
+            placed.append((seg, elements[elem_idx:end_idx]))
+            elem_idx = end_idx
+        return placed
+
+    @staticmethod
+    def _place_by_blocks(body, segments: list[SegmentState]):
+        """Schema 2: (segment, covered, span, remove, pair) per segment, or
+        None when the chapter does not match what was stored: every
+        segment's range must be valid, the ranges must cover the chapter's
+        blocks exactly once, and every block's fingerprint must match.
+
+        covered: the nodes with text of the segment's blocks. span: every
+        node from its first block to its last (blocks without text
+        included); bilingual output moves it into the original. remove: what
+        a chinese-only replacement of the whole segment removes: the nodes
+        of its blocks, and the <br> and whitespace between them; other
+        blocks without text (images, anchors, <hr/>) stay. pair: the
+        translation may be placed node by node, only when every block is a
+        block element (as on main). A segment with an inline run whose
+        translation is one node and whose blocks are the whole content of
+        one element below <body> is placed on that element."""
+        entries = []
+        _soup_blocks(body, entries)
+        blocks = [i for i, entry in enumerate(entries) if normalize(_nodes_text(entry))]
+        ranges = []
+        for seg in segments:
+            start, end = seg.block_start, seg.block_end
+            if not (type(start) is int and type(end) is int and 0 <= start < end <= len(blocks)):
+                return None
+            if [fingerprint(_nodes_text(entries[i])) for i in blocks[start:end]] \
+                    != seg.fingerprints:
+                return None
+            ranges.append((start, end))
+        ranges.sort()
+        if [r[0] for r in ranges] != [0] + [r[1] for r in ranges[:-1]] \
+                or ranges[-1][1] != len(blocks):
+            return None
+
+        placed = []
+        for seg in segments:
+            indexes = blocks[seg.block_start:seg.block_end]
+            span, remove = [], []
+            for i in range(indexes[0], indexes[-1] + 1):
+                span.extend(entries[i])
+                remove.extend(n for n in entries[i] if i in indexes or _is_separator(n))
+            covered = [n for i in indexes for n in entries[i] if _nodes_text([n]).strip()]
+            pair = all(len(entries[i]) == 1 and isinstance(entries[i][0], Tag)
+                       and entries[i][0].name in BLOCK_TAGS for i in indexes)
+            parent = span[0].parent
+            in_span = {id(n) for n in span}
+            if (not pair and seg.segment_type != SegmentType.CODE
+                    and _top_level_count(seg.translated_text) == 1
+                    and len(remove) == len(span) and parent is not body
+                    and all(n.parent is parent for n in span)
+                    and all(id(c) in in_span or isinstance(c, PreformattedString)
+                            or not (isinstance(c, Tag) or c.strip())
+                            for c in parent.children)):
+                placed.append((seg, [parent], [parent], [parent], True))
+            else:
+                placed.append((seg, covered, span, remove, pair))
+        return placed
 
     def _legacy_walk(self) -> bool:
         """True when chapters must be walked as the segmenter did before it
@@ -217,12 +280,18 @@ class EPUBBuilder:
         )
         return block_count if block_count > 0 else 1
 
-    def _apply_chinese_only(self, seg: SegmentState, elements: list, soup) -> None:
-        """Replace element content with translated text, preserving tag and attributes."""
+    def _apply_chinese_only(self, seg: SegmentState, elements: list, soup,
+                            remove: list, pair: bool) -> None:
+        """Replace element content with translated text, preserving tag and attributes.
+
+        `remove` is what a replacement of the whole segment removes (for
+        schema 1: the elements); with `pair` false the elements are never
+        paired 1:1 with the translation's nodes."""
         if not elements:
             return
 
         first = elements[0]
+        rest = [n for n in remove if n is not first]
         translated = seg.translated_text
 
         if seg.segment_type == SegmentType.CODE:
@@ -236,11 +305,7 @@ class EPUBBuilder:
                 else:
                     first.clear()
                     first.append(translated)
-            for elem in elements[1:]:
-                if isinstance(elem, NavigableString):
-                    elem.extract()
-                else:
-                    elem.decompose()
+            _remove(rest)
             return
 
         # Try HTML-aware replacement for text segments
@@ -248,7 +313,7 @@ class EPUBBuilder:
         trans_tags = [c for c in trans_frag.children
                       if isinstance(c, Tag) or (isinstance(c, NavigableString) and c.strip())]
 
-        if trans_tags and len(trans_tags) == len(elements):
+        if pair and trans_tags and len(trans_tags) == len(elements):
             # HTML structure matches — replace content 1:1
             for orig_elem, trans_elem in zip(elements, trans_tags):
                 if isinstance(orig_elem, NavigableString):
@@ -267,11 +332,7 @@ class EPUBBuilder:
             # Translation has HTML but count doesn't match — replace all with parsed HTML
             for child in list(trans_frag.children):
                 first.insert_before(child.extract())
-            for elem in elements:
-                if isinstance(elem, NavigableString):
-                    elem.extract()
-                else:
-                    elem.decompose()
+            _remove([first] + rest)
             return
 
         # Fallback: plain text replacement (backward compatible with old translations)
@@ -282,19 +343,20 @@ class EPUBBuilder:
             first.append(translated)
 
         # Remove remaining elements (they were merged into this segment)
-        for elem in elements[1:]:
-            if isinstance(elem, NavigableString):
-                elem.extract()
-            else:
-                elem.decompose()
+        _remove(rest)
 
-    def _apply_bilingual_vertical(self, seg: SegmentState, elements: list, soup) -> None:
-        """Keep original elements, add translation block after them."""
+    def _apply_bilingual_vertical(self, seg: SegmentState, elements: list, soup,
+                                  span: list, pair: bool) -> None:
+        """Keep original elements, add translation block after them.
+
+        `span` (for schema 1: the elements) is moved into the original as
+        a whole when the translation is not paired 1:1 (never with `pair`
+        false)."""
         if not elements:
             return
 
         # When translation has matching element count, pair them 1:1
-        paired = self._try_pair_translations(seg, elements)
+        paired = self._try_pair_translations(seg, elements) if pair else None
         if paired is not None:
             for orig_elem, trans_elem in zip(elements, paired):
                 wrapper = soup.new_tag('div', attrs={'class': 'bilingual-vertical'})
@@ -314,13 +376,13 @@ class EPUBBuilder:
                 wrapper.append(trans_div)
             return
 
-        first = elements[0]
+        first = span[0]
 
         wrapper = soup.new_tag('div', attrs={'class': 'bilingual-vertical'})
         first.insert_before(wrapper)
 
         original_div = soup.new_tag('div', attrs={'class': 'original'})
-        for elem in elements:
+        for elem in span:
             original_div.append(elem.extract())
         wrapper.append(original_div)
 
@@ -328,13 +390,15 @@ class EPUBBuilder:
         self._fill_translation(trans_div, seg, elements, soup)
         wrapper.append(trans_div)
 
-    def _apply_bilingual_horizontal(self, seg: SegmentState, elements: list, soup) -> None:
-        """Wrap original + translation in a flex container."""
+    def _apply_bilingual_horizontal(self, seg: SegmentState, elements: list, soup,
+                                    span: list, pair: bool) -> None:
+        """Wrap original + translation in a flex container (`span` and
+        `pair` as for the vertical format)."""
         if not elements:
             return
 
         # When translation has matching element count, pair them 1:1
-        paired = self._try_pair_translations(seg, elements)
+        paired = self._try_pair_translations(seg, elements) if pair else None
         if paired is not None:
             for orig_elem, trans_elem in zip(elements, paired):
                 container = soup.new_tag('div', attrs={'class': 'bilingual-container'})
@@ -354,13 +418,13 @@ class EPUBBuilder:
                 container.append(trans_div)
             return
 
-        first = elements[0]
+        first = span[0]
 
         container = soup.new_tag('div', attrs={'class': 'bilingual-container'})
         first.insert_before(container)
 
         original_div = soup.new_tag('div', attrs={'class': 'original'})
-        for elem in elements:
+        for elem in span:
             original_div.append(elem.extract())
         container.append(original_div)
 
@@ -479,3 +543,64 @@ class EPUBBuilder:
             plain = BeautifulSoup(target.translated_text, 'html.parser').get_text()
             if plain.strip():
                 link.title = plain.strip()
+
+
+
+def _remove(nodes: list) -> None:
+    for node in nodes:
+        if isinstance(node, Tag):
+            node.decompose()
+        else:
+            node.extract()
+
+
+def _top_level_count(html: str) -> int:
+    frag = BeautifulSoup(html, 'html.parser')
+    return sum(1 for c in frag.children
+               if isinstance(c, Tag) or (isinstance(c, NavigableString) and c.strip()))
+
+
+def _is_separator(node) -> bool:
+    """A <br> or a whitespace string."""
+    if isinstance(node, Tag):
+        return node.name == 'br'
+    return not node.strip()
+
+
+def _nodes_text(nodes: list) -> str:
+    """Text as the XML walker counts it: no comments, processing
+    instructions or CDATA, nothing inside script or style."""
+    out = []
+    for node in nodes:
+        if isinstance(node, Tag):
+            if node.name not in NO_TEXT_TAGS:
+                out.append(_nodes_text(list(node.children)))
+        elif not isinstance(node, PreformattedString):
+            out.append(str(node))
+    return ''.join(out)
+
+
+def _soup_blocks(parent, out: list) -> None:
+    """The block walk of src/epub/blocks.py on a BeautifulSoup tree: appends
+    each block (a list of nodes) under `parent`, empty ones included, and
+    each <br> as an entry of its own."""
+    run: list = []
+    for child in list(parent.children):
+        if isinstance(child, PreformattedString):
+            continue  # comment, processing instruction
+        if isinstance(child, Tag) and child.name == 'br':
+            out.append(run)
+            out.append([child])
+            run = []
+        elif isinstance(child, Tag) and child.name in BLOCK_TAGS:
+            out.append(run)
+            run = []
+            if child.name in DESCEND_TAGS and any(
+                    isinstance(c, Tag) and (c.name in BLOCK_TAGS or c.name == 'br')
+                    for c in child.children):
+                _soup_blocks(child, out)
+            else:
+                out.append([child])
+        else:
+            run.append(child)
+    out.append(run)

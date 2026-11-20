@@ -71,7 +71,47 @@ class TestCLIInit:
         full_path = os.path.join(str(tmp_path), project_dir)
         assert os.path.isfile(os.path.join(full_path, 'project.json'))
         with open(os.path.join(full_path, 'project.json'), encoding='utf-8') as f:
-            assert json.load(f)['segmenter_version'] == 2
+            raw = json.load(f)
+        # Phase 2: schema 2 (was segmenter_version 2), and the project owns
+        # a copy of the book whose hash it records
+        assert raw['schema'] == 2
+        assert 'segmenter_version' not in raw
+        copy = os.path.join(full_path, 'source.epub')
+        assert raw['epub_path'] == copy
+        with open(copy, 'rb') as a, open(sample_epub, 'rb') as b:
+            data = a.read()
+            assert data == b.read()
+        import hashlib
+        assert raw['source_sha256'] == hashlib.sha256(data).hexdigest()
+
+    def test_init_reports_unparsed_chapter(self, runner, tmp_path, monkeypatch):
+        from tests.conftest import write_raw_epub, xhtml
+        monkeypatch.chdir(tmp_path)
+        items = [('a', 'a.xhtml', 'application/xhtml+xml', None),
+                 ('b', 'b.xhtml', 'application/xhtml+xml', None)]
+        members = {'OEBPS/a.xhtml': xhtml('<p>The tide came in.</p>'),
+                   'OEBPS/b.xhtml': xhtml('<p>Unclosed paragraph.</div>')}
+        epub_path = write_raw_epub(tmp_path / 'bad.epub', items, ['a', 'b'], members)
+
+        result = runner.invoke(cli, ['init', epub_path])
+
+        assert result.exit_code == 0, result.output
+        unparsed = [line for line in result.output.splitlines() if 'not well-formed' in line]
+        assert len(unparsed) == 1
+        assert unparsed[0].startswith('無法解析的章節（不分段）：b：not well-formed XML')
+        assert unparsed[0].endswith(')')  # the parser's message, nothing appended
+        assert '分段完成：共 1 個段落' in result.output
+
+    def test_init_unreadable_epub_gives_a_message(self, runner, tmp_path, monkeypatch):
+        # Review round 1: one clear error, no traceback, no copy left behind
+        monkeypatch.chdir(tmp_path)
+        bad = tmp_path / 'broken.epub'
+        bad.write_bytes(b'not a zip archive')
+        result = runner.invoke(cli, ['init', str(bad)])
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert result.output.splitlines()[-1] == '無法解析 EPUB：無法讀取 EPUB：File is not a zip file'
+        assert os.listdir(tmp_path / _get_project_dir(str(bad))) == []
 
     def test_init_duplicate_project(self, runner, sample_epub, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -866,3 +906,68 @@ class TestCLIRound3UnexpectedStreak:
         statuses = _statuses(path)
         assert list(statuses.values()).count(SegmentStatus.FAILED) >= 5
         assert statuses['c1_seg0008'] == SegmentStatus.PENDING
+
+
+class TestCLIPhase2:
+    """Phase 2: init into an existing directory, export file name, migrate options."""
+
+    def test_init_into_existing_empty_directory(self, runner, sample_epub, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        os.makedirs(_get_project_dir(sample_epub))
+        result = runner.invoke(cli, ['init', sample_epub])
+        assert result.exit_code == 0, result.output
+        assert os.path.isfile(os.path.join(_get_project_dir(sample_epub), 'project.json'))
+
+    def test_export_named_after_the_project(self, runner, sample_epub, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        runner.invoke(cli, ['init', sample_epub])
+        project_dir = _get_project_dir(sample_epub)
+        pm = ProjectManager(project_dir)
+        pm.load()
+        pm.mark_translated(pm.data.segments[0].segment_id, '<h1>譯</h1>')
+        pm.save()
+        result = runner.invoke(cli, ['export', '-p', project_dir, '-f', 'chinese-only'])
+        assert result.exit_code == 0, result.output
+        name = os.path.basename(project_dir)
+        assert os.listdir(os.path.join(project_dir, 'output')) == [f'{name}-chinese-only.epub']
+
+    def test_schema_1_export_keeps_the_book_name(self, runner, sample_epub, tmp_path):
+        # Review round 1: the old rule (the book's file name) for schema 1
+        from src.core.segmenter import Segmenter
+        from src.epub.extractor import EPUBExtractor
+        ex = EPUBExtractor(sample_epub)
+        ex.load()
+        segments = [s for ch in ex.extract_chapters()
+                    for s in Segmenter().segment_chapter(ch.id, ch.body)]
+        project_dir = str(tmp_path / 'review-copy')
+        pm = ProjectManager(project_dir)
+        pm.create(sample_epub, 'T', 'A', segments)
+        pm.mark_translated(pm.data.segments[0].segment_id, '<h1>譯</h1>')
+        pm.save()
+        with open(pm.project_file, encoding='utf-8') as f:
+            raw = json.load(f)
+        for key in ('schema', 'source_sha256'):
+            raw.pop(key, None)
+        for seg in raw['segments']:
+            for key in ('block_start', 'block_end', 'fingerprints'):
+                seg.pop(key, None)
+        with open(pm.project_file, 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+        result = runner.invoke(cli, ['export', '-p', project_dir, '-f', 'chinese-only'])
+        assert result.exit_code == 0, result.output
+        book = os.path.splitext(os.path.basename(sample_epub))[0]
+        assert book != 'review-copy'
+        assert os.listdir(os.path.join(project_dir, 'output')) == [f'{book}-chinese-only.epub']
+
+    @pytest.mark.parametrize('make', ['missing', 'file'])
+    def test_migrate_needs_a_directory(self, runner, tmp_path, make):
+        path = tmp_path / 'p'
+        if make == 'file':
+            path.write_text('x')
+        result = runner.invoke(cli, ['migrate', str(path)])
+        assert result.exit_code == 2
+        assert ('does not exist' if make == 'missing' else 'is a file') in result.output
+
+    def test_migrate_help(self, runner):
+        result = runner.invoke(cli, ['migrate', '--help'])
+        assert '--dry-run  Only report; write nothing' in result.output

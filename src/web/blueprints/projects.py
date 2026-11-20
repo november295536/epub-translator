@@ -8,9 +8,11 @@ import shutil
 import uuid
 from flask import Blueprint, render_template, redirect, request, jsonify, current_app
 
-from src.core.project import ProjectLock, ProjectLockedError, ProjectManager, project_mutex
+from src.core.project import (
+    ProjectLock, ProjectLockedError, ProjectManager, project_mutex, sha256_file,
+)
 from src.core.segmenter import Segmenter
-from src.epub.extractor import EPUBExtractor
+from src.epub.extractor import EPUBError, EPUBExtractor
 from src.web.tasks import TaskManager
 
 
@@ -141,7 +143,7 @@ def create_project():
         segmenter = Segmenter()
         all_segments = []
         for chapter in chapters:
-            segments = segmenter.segment_chapter(chapter.id, chapter.html_content)
+            segments = segmenter.segment_chapter(chapter.id, chapter.body)
             all_segments.extend(segments)
 
         # Create project
@@ -178,7 +180,8 @@ def create_project():
                         epub_path=final_epub_path,
                         title=metadata.get('title', '未知書名'),
                         author=metadata.get('author', '未知作者'),
-                        segments=all_segments
+                        segments=all_segments,
+                        source_sha256=sha256_file(tmp_epub_path),
                     )
                     os.replace(tmp_epub_path, final_epub_path)
                 except BaseException:
@@ -198,8 +201,12 @@ def create_project():
             'status': 'ok',
             'name': project_name,
             'title': pm.data.title,
-            'segments': len(all_segments)
+            'segments': len(all_segments),
+            # Chapters that could not be parsed and were not segmented
+            'unparsed_chapters': [chapter_id for chapter_id, _ in extractor.failed],
         })
+    except EPUBError as e:
+        return jsonify({'error': f'無法解析 EPUB：{e}'}), 400
     except Exception as e:
         return jsonify({'error': f'建立專案失敗：{str(e)}'}), 500
 

@@ -1,5 +1,6 @@
 """Tests for EPUB builder module."""
 
+import copy
 import json
 import os
 import pytest
@@ -29,7 +30,7 @@ def translated_project(tmp_path, sample_epub):
     segmenter = Segmenter()
     all_segments = []
     for ch in chapters:
-        segs = segmenter.segment_chapter(ch.id, ch.html_content)
+        segs = segmenter.segment_chapter(ch.id, ch.body)
         all_segments.extend(segs)
 
     pm = ProjectManager(project_dir)
@@ -65,7 +66,7 @@ def rich_translated_project(tmp_path, rich_sample_epub):
     segmenter = Segmenter()
     all_segments = []
     for ch in chapters:
-        segs = segmenter.segment_chapter(ch.id, ch.html_content)
+        segs = segmenter.segment_chapter(ch.id, ch.body)
         all_segments.extend(segs)
 
     pm = ProjectManager(project_dir)
@@ -227,7 +228,7 @@ class TestHTMLAwareTranslation:
         segmenter = Segmenter()
         all_segments = []
         for ch in chapters:
-            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            segs = segmenter.segment_chapter(ch.id, ch.body)
             all_segments.extend(segs)
 
         pm = ProjectManager(project_dir)
@@ -280,7 +281,7 @@ class TestHTMLAwareTranslation:
         segmenter = Segmenter()
         all_segments = []
         for ch in chapters:
-            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            segs = segmenter.segment_chapter(ch.id, ch.body)
             all_segments.extend(segs)
 
         pm = ProjectManager(project_dir)
@@ -321,7 +322,7 @@ class TestHTMLAwareTranslation:
         segmenter = Segmenter()
         all_segments = []
         for ch in chapters:
-            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            segs = segmenter.segment_chapter(ch.id, ch.body)
             all_segments.extend(segs)
 
         pm = ProjectManager(project_dir)
@@ -371,7 +372,8 @@ class TestHTMLAwareTranslation:
             translated_text='<p class="author">作者 <span>Name</span></p><p class="copyright">版權</p><p class="loc">地點</p>',
         )
 
-        builder._apply_chinese_only(seg, elements, soup)
+        # Review round 2: remove and pair are required (schema 1 passes these)
+        builder._apply_chinese_only(seg, elements, soup, elements, True)
         result = str(body)
         # HTML tags should be rendered, not escaped
         assert '&lt;' not in result, "HTML should not be escaped"
@@ -524,7 +526,7 @@ class TestHTMLPreservation:
         segmenter = Segmenter()
         all_segments = []
         for ch in chapters:
-            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            segs = segmenter.segment_chapter(ch.id, ch.body)
             all_segments.extend(segs)
 
         pm = ProjectManager(project_dir)
@@ -612,7 +614,7 @@ class TestTOCTranslation:
         segmenter = Segmenter()
         all_segments = []
         for ch in chapters:
-            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            segs = segmenter.segment_chapter(ch.id, ch.body)
             all_segments.extend(segs)
 
         pm = ProjectManager(project_dir)
@@ -668,7 +670,7 @@ class TestTOCTranslation:
         segmenter = Segmenter()
         all_segments = []
         for ch in chapters:
-            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            segs = segmenter.segment_chapter(ch.id, ch.body)
             all_segments.extend(segs)
 
         pm = ProjectManager(project_dir)
@@ -740,7 +742,7 @@ class TestTOCTranslation:
         segmenter = Segmenter()
         all_segments = []
         for ch in chapters:
-            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            segs = segmenter.segment_chapter(ch.id, ch.body)
             all_segments.extend(segs)
 
         pm = ProjectManager(project_dir)
@@ -832,7 +834,7 @@ class TestTOCTranslation:
         segmenter = Segmenter()
         all_segments = []
         for ch in chapters:
-            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            segs = segmenter.segment_chapter(ch.id, ch.body)
             all_segments.extend(segs)
 
         pm = ProjectManager(project_dir)
@@ -932,7 +934,7 @@ class TestContentDivAlignment:
         segmenter = Segmenter()
         all_segments = []
         for ch in chapters:
-            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            segs = segmenter.segment_chapter(ch.id, ch.body)
             all_segments.extend(segs)
 
         pm = ProjectManager(project_dir)
@@ -1000,7 +1002,7 @@ class TestContentDivAlignment:
         segmenter = Segmenter()
         all_segments = []
         for ch in chapters:
-            segs = segmenter.segment_chapter(ch.id, ch.html_content)
+            segs = segmenter.segment_chapter(ch.id, ch.body)
             all_segments.extend(segs)
 
         pm = ProjectManager(project_dir)
@@ -1070,16 +1072,20 @@ def _transform(builder, chapter, segments, fmt):
     return item.get_content().decode('utf-8')
 
 
-def _current_states(chapter, translations):
-    """Segments as the current extractor and segmenter store them."""
-    from src.core.segmenter import Segmenter
-    from src.epub.extractor import _serialize
-    body = BeautifulSoup(chapter, 'html.parser').body
-    body_html = ''.join(_serialize(c) for c in body.children)
-    segs = Segmenter().segment_chapter('ch1', body_html)
+def _phase0_segments():
+    """Per scenario of TestVersion2Export, the segments the Phase 0 extractor
+    and segmenter stored (recorded from main before Phase 2 replaced them)."""
+    path = os.path.join(os.path.dirname(__file__), 'data', 'phase0_segments.json')
+    with open(path, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _current_states(scenario, translations):
+    """Segments as the Phase 0 extractor and segmenter stored them."""
+    from src.core.project import SegmentState
+    segs = _phase0_segments()[scenario]
     assert len(segs) == len(translations)
-    return [_seg_state(s.id, s.html, s.text, t, s.segment_type)
-            for s, t in zip(segs, translations)]
+    return [SegmentState(**s, translated_text=t) for s, t in zip(segs, translations)]
 
 
 def _pairs(soup):
@@ -1103,16 +1109,28 @@ class TestWalkByMarker:
         pm.create(sample_epub, 'T', 'A', [])
         with open(pm.project_file, encoding='utf-8') as f:
             raw = json.load(f)
-        del raw['segmenter_version']
+        # Phase 2: create() writes schema 2; a pre-Phase-0 file has neither
+        # schema nor segmenter_version
+        del raw['schema'], raw['source_sha256']
         with open(pm.project_file, 'w', encoding='utf-8') as f:
             json.dump(raw, f)
 
         builder = EPUBBuilder(str(tmp_path))
         builder.pm.load()
+        assert builder.pm.data.schema == 1
         assert builder._legacy_walk() is True
 
-    def test_new_project_uses_current_walk(self, tmp_path, sample_epub):
-        ProjectManager(str(tmp_path)).create(sample_epub, 'T', 'A', [])
+    def test_phase_0_project_uses_current_walk(self, tmp_path, sample_epub):
+        # Phase 2: was "new project"; new projects are schema 2 now, so the
+        # Phase 0 marker is written by hand
+        pm = ProjectManager(str(tmp_path))
+        pm.create(sample_epub, 'T', 'A', [])
+        with open(pm.project_file, encoding='utf-8') as f:
+            raw = json.load(f)
+        del raw['schema'], raw['source_sha256']
+        raw['segmenter_version'] = 2
+        with open(pm.project_file, 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
         builder = EPUBBuilder(str(tmp_path))
         builder.pm.load()
         assert builder._legacy_walk() is False
@@ -1129,8 +1147,10 @@ class TestWalkByMarker:
 
 
 class TestVersion2Export:
-    """Projects segmented with comments skipped (segmenter_version 2) line up
-    in every format, including the reviewers' scenarios."""
+    """Schema 1 projects segmented with comments skipped (segmenter_version 2,
+    Phase 0) line up in every format, including the reviewers' scenarios.
+    Phase 2: the segments are read from tests/data/phase0_segments.json, as
+    the Phase 0 segmenter no longer exists; expectations unchanged."""
 
     @staticmethod
     def _export(tmp_path, chapter, states, fmt):
@@ -1142,7 +1162,7 @@ class TestVersion2Export:
 
     @pytest.mark.parametrize('fmt', FORMATS)
     def test_comment_between_blocks(self, tmp_path, fmt):
-        states = _current_states(self.CHAPTER, ['<h1>T0</h1>', '<p>T1</p>', 'T2'])
+        states = _current_states('CHAPTER', ['<h1>T0</h1>', '<p>T1</p>', 'T2'])
         soup = self._export(tmp_path, self.CHAPTER, states, fmt)
 
         if fmt == 'chinese-only':
@@ -1157,7 +1177,7 @@ class TestVersion2Export:
 
     @pytest.mark.parametrize('fmt', FORMATS)
     def test_comment_equal_to_visible_text(self, tmp_path, fmt):
-        states = _current_states(self.COMMENT_EQUALS_TEXT, ['註', '<h1>標題</h1>'])
+        states = _current_states('COMMENT_EQUALS_TEXT', ['註', '<h1>標題</h1>'])
         soup = self._export(tmp_path, self.COMMENT_EQUALS_TEXT, states, fmt)
 
         assert [c.strip() for c in soup.find_all(string=lambda s: isinstance(s, Comment))] \
@@ -1174,7 +1194,7 @@ class TestVersion2Export:
 
     @pytest.mark.parametrize('fmt', FORMATS)
     def test_equal_count_nested_comment_keeps_heading(self, tmp_path, fmt):
-        states = _current_states(self.EQUAL_COUNT, ['<h2 id="s">標題</h2>'])
+        states = _current_states('EQUAL_COUNT', ['<h2 id="s">標題</h2>'])
         soup = self._export(tmp_path, self.EQUAL_COUNT, states, fmt)
 
         if fmt == 'chinese-only':
@@ -1193,7 +1213,7 @@ class TestVersion2Export:
 
     @pytest.mark.parametrize('fmt', FORMATS)
     def test_scenario_a(self, tmp_path, fmt):
-        states = _current_states(self.SCENARIO_A, ['<p>甲</p>', '<p>乙</p>丙', '丁'])
+        states = _current_states('SCENARIO_A', ['<p>甲</p>', '<p>乙</p>丙', '丁'])
         soup = self._export(tmp_path, self.SCENARIO_A, states, fmt)
 
         comments = soup.find_all(string=lambda s: isinstance(s, Comment))
@@ -1210,10 +1230,9 @@ class TestVersion2Export:
 
     @pytest.mark.parametrize('fmt', FORMATS)
     def test_scenario_b_wrapper_div_with_comment(self, tmp_path, fmt):
-        from src.core.segmenter import Segmenter
-        n = len(Segmenter().segment_chapter('ch1', self.SCENARIO_B))
+        n = len(_phase0_segments()['SCENARIO_B'])
         translations = ['<h1>標題</h1>'] + [f'<p>T{i}</p>' for i in range(1, n)]
-        states = _current_states(self.SCENARIO_B, translations)
+        states = _current_states('SCENARIO_B', translations)
         soup = self._export(tmp_path, self.SCENARIO_B, states, fmt)
 
         assert soup.find('div', class_='chapter') is not None
@@ -1254,3 +1273,490 @@ class TestVersion1ExportMatchesMain:
         states = [SegmentState(**s) for s in case['segments']]
         html = _transform(_builder(tmp_path, version), case['chapter'], states, fmt)
         assert html == case['exports'][fmt]
+
+
+# --- Phase 2: schema 2 projects are placed by block range ---------------------
+
+def _schema2_states(chapter, translations):
+    """Segments as the Phase 2 segmenter stores them, with translations."""
+    from src.core.project import SegmentState
+    from src.core.segmenter import Segmenter
+    from tests.conftest import body_of
+    segs = Segmenter().segment_chapter('ch1', body_of(chapter))
+    assert len(segs) == len(translations)
+    return [SegmentState(segment_id=s.id, chapter_id='ch1', html=s.html, text=s.text,
+                         word_count=s.word_count, segment_type=s.segment_type,
+                         translated_text=t, block_start=s.block_start,
+                         block_end=s.block_end, fingerprints=s.fingerprints)
+            for s, t in zip(segs, translations)]
+
+
+def _schema2_builder(tmp_path):
+    from src.core.project import ProjectData
+    builder = EPUBBuilder(str(tmp_path))
+    builder.pm.data = ProjectData(epub_path='', project_dir=str(tmp_path), schema=2)
+    return builder
+
+
+class TestSchema2Export:
+    """The builder places schema 2 segments on their block ranges, in every
+    format, and leaves a chapter whose blocks do not match untouched."""
+
+    @staticmethod
+    def _export(tmp_path, chapter, states, fmt):
+        return BeautifulSoup(_transform(_schema2_builder(tmp_path), chapter, states, fmt),
+                             'html.parser')
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_comment_between_blocks(self, tmp_path, fmt):
+        chapter = TestVersion2Export.CHAPTER
+        states = _schema2_states(chapter, ['<h1>T0</h1>', '<p>T1</p>', 'T2'])
+        soup = self._export(tmp_path, chapter, states, fmt)
+        if fmt == 'chinese-only':
+            assert [soup.find(t).get_text() for t in ('h1', 'p', 'pre')] == ['T0', 'T1', 'T2']
+        else:
+            assert _pairs(soup) == [('Title', 'T0'), ('Para one.', 'T1'), ('x = 1', 'T2')]
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_comment_equal_to_visible_text(self, tmp_path, fmt):
+        chapter = TestVersion2Export.COMMENT_EQUALS_TEXT
+        states = _schema2_states(chapter, ['註', '<h1>標題</h1>'])
+        soup = self._export(tmp_path, chapter, states, fmt)
+        assert [c.strip() for c in soup.find_all(string=lambda s: isinstance(s, Comment))] \
+            == ['note']
+        if fmt == 'chinese-only':
+            assert soup.find('h1').get_text() == '標題'
+            assert 'note' not in soup.get_text()
+        else:
+            assert _pairs(soup) == [('note', '註'), ('Title', '標題')]
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_br_separated_runs(self, tmp_path, fmt):
+        # Review round 2: a segment with inline runs is never paired node by
+        # node; it is replaced (chinese-only) or wrapped (bilingual) whole
+        chapter = ('<html><body><div class="verse">Line one<br/>Line two</div>'
+                   '<p>After.</p></body></html>')
+        states = _schema2_states(chapter, ['<p>一</p><p>二</p><p>後</p>'])
+        soup = self._export(tmp_path, chapter, states, fmt)
+        if fmt == 'chinese-only':
+            assert [p.get_text() for p in soup.find_all('p')] == ['一', '二', '後']
+            assert soup.find('br') is None and 'Line' not in soup.get_text()
+        else:
+            assert _pairs(soup) == [('Line oneLine twoAfter.', '一二後')]
+            assert len(soup.find('div', class_='original').find_all('br')) == 1
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_text_mixed_with_blocks(self, tmp_path, fmt):
+        chapter = ('<html><body><div class="box">Intro text<p>Inner para.</p></div>'
+                   '<h2>Next</h2></body></html>')
+        states = _schema2_states(chapter, ['<p>引</p><p>內</p>', '<h2>次</h2>'])
+        soup = self._export(tmp_path, chapter, states, fmt)
+        if fmt == 'chinese-only':
+            box = soup.find('div', class_='box')
+            assert [p.get_text() for p in box.find_all('p')] == ['引', '內']
+            assert 'Intro' not in soup.get_text()
+            assert soup.find('h2').get_text() == '次'
+        else:   # review round 2: the run's segment is wrapped whole
+            assert _pairs(soup) == [('Intro textInner para.', '引內'), ('Next', '次')]
+
+    def test_untranslated_segment_left_alone(self, tmp_path):
+        chapter = '<html><body><h1>Title</h1><p>Para.</p></body></html>'
+        states = _schema2_states(chapter, ['', '<p>段</p>'])
+        soup = self._export(tmp_path, chapter, states, 'chinese-only')
+        assert soup.find('h1').get_text() == 'Title'
+        assert soup.find('p').get_text() == '段'
+
+    @pytest.mark.parametrize('change', ['fingerprint', 'range', 'source'])
+    def test_mismatch_leaves_chapter_unchanged(self, tmp_path, change):
+        chapter = '<html><body><h1>Title</h1><p>Para.</p></body></html>'
+        states = _schema2_states(chapter, ['<h1>標題</h1>', '<p>段</p>'])
+        if change == 'fingerprint':
+            states[1].fingerprints = ['0' * 16]
+        elif change == 'range':
+            states[1].block_start, states[1].block_end = 2, 3
+        else:
+            chapter = chapter.replace('Para.', 'Changed para.')
+        item = _FakeItem(chapter)
+        _schema2_builder(tmp_path)._transform_chapter(item, states, 'chinese-only')
+        assert item.get_content() == chapter.encode('utf-8')
+
+    def test_raw_epub_end_to_end(self, tmp_path, raw_epub):
+        from src.core.segmenter import Segmenter
+        from src.epub.extractor import EPUBExtractor
+        ex = EPUBExtractor(raw_epub)
+        ex.load()
+        segments = [s for ch in ex.extract_chapters()
+                    for s in Segmenter().segment_chapter(ch.id, ch.body)]
+        project_dir = str(tmp_path / 'p')
+        pm = ProjectManager(project_dir)
+        pm.create(raw_epub, 'T', 'A', segments)
+        translations = {
+            'one_seg0001': '<h1>守燈人</h1>',
+            'one_seg0002': ('<p>米拉爬上螺旋梯。</p><p>正文下的一行。</p>'
+                            '<p>歌一</p><p>歌二</p><p>歌三</p>'),
+            'two_seg0001': '<h2>第二夜</h2>',
+            'two_seg0002': '<p>港口鐘響兩次。</p>',
+        }
+        assert [s.segment_id for s in pm.data.segments] == list(translations)
+        for seg_id, text in translations.items():
+            pm.mark_translated(seg_id, text)
+        pm.save()
+
+        output = str(tmp_path / 'out.epub')
+        EPUBBuilder(project_dir).build(output, fmt='chinese-only')
+        book = epub.read_epub(output)
+        one = BeautifulSoup(book.get_item_with_id('one').get_content().decode('utf-8'),
+                            'html.parser')
+        assert one.find('h1').get_text() == '守燈人'
+        # review round 2: the segment holds inline runs, so it is replaced whole
+        assert [p.get_text() for p in one.find_all('p')] == [
+            '米拉爬上螺旋梯。', '正文下的一行。', '歌一', '歌二', '歌三']
+        assert one.find('br') is None
+        assert 'Mira' not in one.get_text() and 'song' not in one.get_text()
+        assert '正文下的一行。' in one.get_text() and 'bare text' not in one.get_text()
+        two = BeautifulSoup(book.get_item_with_id('two').get_content().decode('utf-8'),
+                            'html.parser')
+        assert two.find('h2').get_text() == '第二夜'
+
+    def test_run_with_inline_element_placed(self, tmp_path):
+        chapter = '<html><body>Bare <em>marked</em> words.<p>Para.</p></body></html>'
+        states = _schema2_states(chapter, ['裸<em>標</em>字。\n<p>段</p>'])
+        soup = self._export(tmp_path, chapter, states, 'chinese-only')
+        assert soup.find('em').get_text() == '標'
+        assert soup.find('p').get_text() == '段'
+        assert 'Bare' not in soup.get_text()
+
+    def test_content_div_placed_as_one_element(self, tmp_path):
+        chapter = ('<html><body><div class="note"><em>Note:</em> keep it.</div>'
+                   '</body></html>')
+        states = _schema2_states(chapter, ['<div class="note">譯</div>'])
+        soup = self._export(tmp_path, chapter, states, 'chinese-only')
+        note = soup.find('div', class_='note')
+        assert note.find('div') is None and note.get_text() == '譯'
+
+
+class TestSchema2BridgeReview1:
+    """Review round 1: a segment's whole node range is consumed once, a run
+    is one unit, and a chapter is placed only when it matches what was
+    stored as a whole."""
+
+    @staticmethod
+    def _export(tmp_path, chapter, states, fmt):
+        return BeautifulSoup(_transform(_schema2_builder(tmp_path), chapter, states, fmt),
+                             'html.parser')
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_image_in_a_run_kept_once(self, tmp_path, fmt):
+        chapter = '<html><body><h1>T</h1>A<img src="x.png"/>B</body></html>'
+        states = _schema2_states(chapter, ['<h1>標</h1>', '甲<img src="x.png"/>乙'])
+        soup = self._export(tmp_path, chapter, states, fmt)
+        if fmt == 'chinese-only':
+            assert len(soup.find_all('img')) == 1
+            assert 'A' not in soup.body.get_text() and '甲' in soup.body.get_text()
+        else:
+            original = soup.find_all('div', class_='original')[1]
+            assert len(original.find_all('img')) == 1
+            assert len(soup.find_all('img')) == 2   # one in the original, one in the translation
+        assert soup.find('epub-translator-run') is None
+
+    VERSE = '<html><body><div class="verse">L1<br/>L2<br/>L3</div></body></html>'
+
+    def test_br_div_single_wrapper_translation_chinese_only(self, tmp_path):
+        states = _schema2_states(self.VERSE, ['<div class="verse">一<br/>二<br/>三</div>'])
+        soup = self._export(tmp_path, self.VERSE, states, 'chinese-only')
+        verses = soup.find_all('div', class_='verse')
+        assert len(verses) == 1
+        assert [str(c) for c in verses[0].children] == ['一', '<br/>', '二', '<br/>', '三']
+
+    @pytest.mark.parametrize('fmt', ['bilingual-horizontal', 'bilingual-vertical'])
+    def test_br_div_single_wrapper_translation_bilingual(self, tmp_path, fmt):
+        states = _schema2_states(self.VERSE, ['<div class="verse">一<br/>二<br/>三</div>'])
+        soup = self._export(tmp_path, self.VERSE, states, fmt)
+        original = soup.find('div', class_='original')
+        translation = soup.find('div', class_='translation')
+        assert [str(c) for c in original.find('div', class_='verse').children] == \
+            ['L1', '<br/>', 'L2', '<br/>', 'L3']
+        assert len(translation.find_all('br')) == 2
+        assert len(soup.find_all('br')) == 4   # none left behind
+
+    @pytest.mark.parametrize('fmt', ['bilingual-horizontal', 'bilingual-vertical'])
+    def test_br_run_mismatch_keeps_brs_in_the_original(self, tmp_path, fmt):
+        chapter = ('<html><body><div class="verse">L1<br/>L2<br/>L3</div>'
+                   '<p>After.</p></body></html>')
+        states = _schema2_states(chapter, ['<p>一二三</p><p>後</p>'])
+        soup = self._export(tmp_path, chapter, states, fmt)
+        original = soup.find('div', class_='original')
+        assert len(original.find_all('br')) == 2
+        assert len(soup.find_all('br')) == 2
+        assert original.get_text() == 'L1L2L3After.'
+
+    def test_br_run_mismatch_chinese_only_leaves_no_br(self, tmp_path):
+        chapter = ('<html><body><div class="verse">L1<br/>L2<br/>L3</div>'
+                   '<p>After.</p></body></html>')
+        states = _schema2_states(chapter, ['<p>一二三</p><p>後</p>'])
+        soup = self._export(tmp_path, chapter, states, 'chinese-only')
+        assert soup.find('br') is None
+        assert [p.get_text() for p in soup.find_all('p')] == ['一二三', '後']
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_br_div_line_by_line_translation_replaced_whole(self, tmp_path, fmt):
+        # review round 2 (was ..._one_to_one_still_placed_line_by_line): runs
+        # are never paired node by node; the div and its class stay
+        states = _schema2_states(self.VERSE, ['<p>一</p><p>二</p><p>三</p>'])
+        soup = self._export(tmp_path, self.VERSE, states, fmt)
+        verse = soup.find('div', class_='verse')
+        if fmt == 'chinese-only':
+            assert [str(c) for c in verse.children] == ['<p>一</p>', '<p>二</p>', '<p>三</p>']
+        else:
+            assert _pairs(soup) == [('L1L2L3', '一二三')]
+            assert len(soup.find('div', class_='original').find_all('br')) == 2
+
+    def test_reordered_inline_tag(self, tmp_path):
+        chapter = '<html><body>Read <em>carefully</em></body></html>'
+        states = _schema2_states(chapter, ['<em>仔細</em>閱讀'])
+        soup = self._export(tmp_path, chapter, states, 'chinese-only')
+        assert soup.find('em').get_text() == '仔細'
+        assert soup.body.get_text() == '仔細閱讀'
+
+    @pytest.mark.parametrize('fmt', ['bilingual-horizontal', 'bilingual-vertical'])
+    def test_run_and_paragraph_one_row(self, tmp_path, fmt):
+        chapter = '<html><body>Bare <em>marked</em> words.<p>Para.</p></body></html>'
+        states = _schema2_states(chapter, ['<p>裸標字。</p><p>段</p>'])
+        soup = self._export(tmp_path, chapter, states, fmt)
+        # review round 2: one row for the whole segment (a run is never
+        # paired node by node); the run's nodes stay together in it
+        assert _pairs(soup) == [('Bare marked words.Para.', '裸標字。段')]
+        assert soup.find('div', class_='original').find('em').get_text() == 'marked'
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_script_text_not_counted(self, tmp_path, fmt):
+        chapter = '<html><body><script>run()</script><pre>run()</pre></body></html>'
+        states = _schema2_states(chapter, ['run() # 譯'])
+        soup = self._export(tmp_path, chapter, states, fmt)
+        assert soup.find('script').get_text() == 'run()'
+        if fmt == 'chinese-only':
+            assert soup.find('pre').get_text() == 'run() # 譯'
+        else:
+            assert soup.find('div', class_='translation').get_text() == 'run() # 譯'
+            assert soup.find('div', class_='original').find('pre') is not None
+            assert soup.find('div', class_='original').find('script') is None
+
+    CHAPTER = '<html><body><h1>Title</h1><p>Para.</p><p>More.</p></body></html>'
+
+    def _unchanged(self, tmp_path, chapter, states):
+        item = _FakeItem(chapter)
+        _schema2_builder(tmp_path)._transform_chapter(item, states, 'chinese-only')
+        return item.get_content() == chapter.encode('utf-8')
+
+    def test_matching_chapter_is_placed(self, tmp_path):
+        states = _schema2_states(self.CHAPTER, ['<h1>標</h1>', '<p>段</p><p>多</p>'])
+        assert not self._unchanged(tmp_path, self.CHAPTER, states)
+
+    def test_block_not_covered_by_any_segment(self, tmp_path):
+        states = _schema2_states(self.CHAPTER, ['<h1>標</h1>', '<p>段</p><p>多</p>'])
+        states[1].block_end, states[1].fingerprints = 2, states[1].fingerprints[:1]
+        assert self._unchanged(tmp_path, self.CHAPTER, states)
+
+    def test_extra_block_in_the_source(self, tmp_path):
+        states = _schema2_states(self.CHAPTER, ['<h1>標</h1>', '<p>段</p><p>多</p>'])
+        chapter = self.CHAPTER.replace('</body>', '<p>Added.</p></body>')
+        assert self._unchanged(tmp_path, chapter, states)
+
+    def test_overlapping_ranges(self, tmp_path):
+        states = _schema2_states(self.CHAPTER, ['<h1>標</h1>', '<p>段</p><p>多</p>'])
+        states[0].block_end = 2
+        states[0].fingerprints = states[0].fingerprints + states[1].fingerprints[:1]
+        assert self._unchanged(tmp_path, self.CHAPTER, states)
+
+    def test_missing_segment(self, tmp_path):
+        states = _schema2_states(self.CHAPTER, ['<h1>標</h1>', '<p>段</p><p>多</p>'])
+        assert self._unchanged(tmp_path, self.CHAPTER, states[1:])
+
+    @pytest.mark.parametrize('start, end, prints', [
+        (None, None, 'none'), (-1, None, 'last'), (3, 3, 'none'), (2, 4, 'last'),
+        (1, 1, 'none'), (True, 2, 'first'),
+    ])
+    def test_invalid_range(self, tmp_path, start, end, prints):
+        states = _schema2_states(self.CHAPTER, ['<h1>標</h1>', '<p>段</p><p>多</p>'])
+        fps = [fp for s in states for fp in s.fingerprints]
+        states.append(copy.deepcopy(states[1]))
+        states[-1].block_start, states[-1].block_end = start, end
+        states[-1].fingerprints = {'last': fps[-1:], 'first': fps[1:2], 'none': []}[prints]
+        assert self._unchanged(tmp_path, self.CHAPTER, states)
+
+    def test_through_ebooklib_leading_body_text_stays_original(self, tmp_path):
+        from src.core.segmenter import Segmenter
+        from src.epub.extractor import EPUBExtractor
+        from tests.conftest import RAW_NCX, write_raw_epub, xhtml
+        items = [('ncx', 'toc.ncx', 'application/x-dtbncx+xml', None),
+                 ('a', 'a.xhtml', 'application/xhtml+xml', None),
+                 ('b', 'b.xhtml', 'application/xhtml+xml', None)]
+        members = {'OEBPS/toc.ncx': RAW_NCX,
+                   'OEBPS/a.xhtml': xhtml('Opening line<br/>Second line<p>Para one.</p>'),
+                   'OEBPS/b.xhtml': xhtml('<h1>Next</h1><p>Clouds <em>gathered</em>.</p>'
+                                          'Bare <em>tail</em> text.')}
+        epub_path = write_raw_epub(tmp_path / 'lead.epub', items, ['a', 'b'], members)
+        ex = EPUBExtractor(epub_path)
+        ex.load()
+        segments = [s for ch in ex.extract_chapters()
+                    for s in Segmenter().segment_chapter(ch.id, ch.body)]
+        project_dir = str(tmp_path / 'p')
+        pm = ProjectManager(project_dir)
+        pm.create(epub_path, 'T', 'A', segments)
+        translations = {'a_seg0001': '<p>譯一</p><p>譯二</p><p>譯三</p>',
+                        'b_seg0001': '<h1>次</h1>', 'b_seg0002': '<p>雲聚。</p>\n裸尾。'}
+        assert [s.segment_id for s in pm.data.segments] == list(translations)
+        for seg_id, text in translations.items():
+            pm.mark_translated(seg_id, text)
+        pm.save()
+        output = str(tmp_path / 'out.epub')
+        EPUBBuilder(project_dir).build(output, fmt='chinese-only')
+        book = epub.read_epub(output)
+        a = book.get_item_with_id('a').get_content().decode('utf-8')
+        b = book.get_item_with_id('b').get_content().decode('utf-8')
+        # ebooklib drops the text before the body's first child, so the
+        # chapter no longer matches its blocks and stays in the original
+        assert 'Second line' in a and 'Para one.' in a and '譯' not in a
+        assert '次' in b and '雲聚。' in b and '裸尾。' in b
+        assert 'Clouds' not in b and 'tail' not in b
+
+
+class TestSchema2BridgeSurvivors:
+    """Mutation survivors of review round 1 in the export bridge."""
+
+    def test_element_placement_with_whitespace_around(self, tmp_path):
+        chapter = '<html><body><div class="verse">\n L1<br/>L2\n</div></body></html>'
+        states = _schema2_states(chapter, ['<div class="verse">一<br/>二</div>'])
+        soup = TestSchema2BridgeReview1._export(tmp_path, chapter, states, 'chinese-only')
+        assert len(soup.find_all('div', class_='verse')) == 1
+        assert soup.find('div', class_='verse').get_text() == '一二'
+
+    def test_no_element_placement_past_an_element_outside_the_range(self, tmp_path):
+        # the image is not in the segment's range: it must stay
+        chapter = ('<html><body><div class="verse"><img src="a.png"/><br/>L1<br/>L2</div>'
+                   '</body></html>')
+        states = _schema2_states(chapter, ['<div class="verse">一<br/>二</div>'])
+        soup = TestSchema2BridgeReview1._export(tmp_path, chapter, states, 'chinese-only')
+        assert len(soup.find_all('img')) == 1
+        assert 'L1' not in soup.get_text() and '一' in soup.get_text()
+
+    def test_whitespace_translation_removes_the_rest(self, tmp_path):
+        chapter = '<html><body><p>One.</p><br/><p>Two.</p></body></html>'
+        states = _schema2_states(chapter, ['  '])
+        soup = TestSchema2BridgeReview1._export(tmp_path, chapter, states, 'chinese-only')
+        assert [p.get_text().strip() for p in soup.find_all('p')] == ['']
+        assert soup.find('br') is None and 'One' not in soup.get_text()
+
+    def test_comment_inside_a_run_kept_once(self, tmp_path):
+        # review round 2 (was ..._keeps_its_place: the run wrapper is gone)
+        chapter = '<html><body>A<!--c--> B<p>Para.</p></body></html>'
+        states = _schema2_states(chapter, ['<p>甲</p><p>段</p>'])
+        out = _transform(_schema2_builder(tmp_path), chapter, states, 'chinese-only')
+        assert '<body><p>甲</p><p>段</p><!--c--></body>' in out
+
+
+class TestSchema2BridgeReview2:
+    """Review round 2: a segment with an inline run is never paired node by
+    node; a whole-segment replacement keeps the blocks without text it
+    never saw; the enclosing element is used only for a one-node
+    translation of runs."""
+
+    @staticmethod
+    def _export(tmp_path, chapter, states, fmt):
+        return BeautifulSoup(_transform(_schema2_builder(tmp_path), chapter, states, fmt),
+                             'html.parser')
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_textless_blocks_between_units_kept_once(self, tmp_path, fmt):
+        chapter = ('<html><body><p>A one.</p><p class="fig"><img src="f.png"/></p>'
+                   '<a id="p12"></a><hr/><p>B two.</p></body></html>')
+        states = _schema2_states(chapter, ['<p>甲乙</p>'])
+        soup = self._export(tmp_path, chapter, states, fmt)
+        assert len(soup.find_all('img')) == 1 and len(soup.find_all('p', class_='fig')) == 1
+        assert len(soup.find_all('a', id='p12')) == 1 and len(soup.find_all('hr')) == 1
+        if fmt == 'chinese-only':
+            assert 'A one' not in soup.get_text() and '甲乙' in soup.get_text()
+        else:
+            assert _pairs(soup) == [('A one.B two.', '甲乙')]
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_two_runs_not_paired_by_count(self, tmp_path, fmt):
+        chapter = '<html><body><div><em>First</em> line<br/>Second</div></body></html>'
+        states = _schema2_states(chapter, ['<em>第一</em>行\n第二'])
+        soup = self._export(tmp_path, chapter, states, fmt)
+        if fmt == 'chinese-only':
+            assert soup.body.get_text() == '第一行\n第二'
+            assert soup.find('em').get_text() == '第一' and soup.find('br') is None
+        else:
+            assert _pairs(soup) == [('First lineSecond', '第一行\n第二')]
+            assert soup.find('div', class_='original').find('br') is not None
+
+    @pytest.mark.parametrize('fmt', FORMATS)
+    def test_enclosing_element_kept_for_a_multi_node_translation(self, tmp_path, fmt):
+        chapter = ('<html><body><div class="note" id="fn1">L1<br/>L2<br/>L3</div>'
+                   '</body></html>')
+        states = _schema2_states(chapter, ['<p>一</p><p>二三</p>'])
+        soup = self._export(tmp_path, chapter, states, fmt)
+        note = soup.find('div', id='fn1')
+        assert note is not None and note['class'] == ['note']
+        assert '一' in note.get_text() and '二三' in note.get_text()
+        if fmt == 'chinese-only':
+            assert [p.get_text() for p in note.find_all('p')] == ['一', '二三']
+
+    @pytest.mark.parametrize('translation, expected', [
+        ('<p>一二。</p>', ['一二。']),
+        ('<p>一。</p><p>二。</p><p>三。</p>', ['一。', '二。', '三。']),
+    ])
+    def test_structural_container_kept_chinese_only(self, tmp_path, translation, expected):
+        chapter = ('<html><body><div class="chapter" id="c1"><p>One.</p><p>Two.</p></div>'
+                   '</body></html>')
+        states = _schema2_states(chapter, [translation])
+        soup = self._export(tmp_path, chapter, states, 'chinese-only')
+        div = soup.find('div', id='c1')
+        assert div is not None and div['class'] == ['chapter']
+        assert [p.get_text() for p in div.find_all('p')] == expected
+        assert div.find(string=True, recursive=False) is None   # no bare text in it
+
+    def test_structural_container_of_one_paragraph_kept(self, tmp_path):
+        chapter = '<html><body><div class="chapter"><p>Only paragraph.</p></div></body></html>'
+        states = _schema2_states(chapter, ['<p>第一段。</p><p>第二段。</p>'])
+        soup = self._export(tmp_path, chapter, states, 'chinese-only')
+        div = soup.find('div', class_='chapter')
+        assert [p.get_text() for p in div.find_all('p')] == ['第一段。', '第二段。']
+
+    def test_inline_element_run_and_paragraph(self, tmp_path):
+        chapter = '<html><body>\n  <em>Hello</em>\n  <p>Para.</p></body></html>'
+        states = _schema2_states(chapter, ['<em>你好</em><p>段</p>'])
+        soup = self._export(tmp_path, chapter, states, 'chinese-only')
+        assert soup.find('em').get_text() == '你好'
+        assert soup.find('p').get_text() == '段'
+        assert 'Hello' not in soup.get_text()
+
+
+class TestSchema2BridgeReview2Survivors:
+    """Mutation survivors of review round 2."""
+
+    @staticmethod
+    def _export(tmp_path, chapter, states, fmt):
+        return BeautifulSoup(_transform(_schema2_builder(tmp_path), chapter, states, fmt),
+                             'html.parser')
+
+    def test_enclosing_element_keeps_its_tag_for_a_one_node_translation(self, tmp_path):
+        chapter = '<html><body><div class="note" id="fn1">L1<br/>L2</div></body></html>'
+        states = _schema2_states(chapter, ['<p>一<br/>二</p>'])
+        soup = self._export(tmp_path, chapter, states, 'chinese-only')
+        note = soup.find('div', id='fn1')
+        assert note is not None and [str(c) for c in note.children] == ['一', '<br/>', '二']
+
+    @pytest.mark.parametrize('fmt', ['bilingual-horizontal', 'bilingual-vertical'])
+    def test_block_only_segment_paired_in_bilingual(self, tmp_path, fmt):
+        chapter = '<html><body><p>A one.</p><p>B two.</p></body></html>'
+        states = _schema2_states(chapter, ['<p>甲</p><p>乙</p>'])
+        soup = self._export(tmp_path, chapter, states, fmt)
+        assert _pairs(soup) == [('A one.', '甲'), ('B two.', '乙')]
+
+    def test_whitespace_between_blocks_removed_with_them(self, tmp_path):
+        chapter = '<html><body><p>A one.</p>\n<p>B two.</p></body></html>'
+        states = _schema2_states(chapter, ['<p>甲乙</p>'])
+        out = _transform(_schema2_builder(tmp_path), chapter, states, 'chinese-only')
+        assert '<body><p>甲乙</p></body>' in out

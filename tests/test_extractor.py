@@ -10,7 +10,7 @@ class TestEPUBExtractor:
     def test_load_valid_epub(self, sample_epub):
         extractor = EPUBExtractor(sample_epub)
         extractor.load()
-        assert extractor.book is not None
+        assert extractor.opf is not None  # Phase 2: no ebooklib book any more
 
     def test_load_nonexistent_file(self, tmp_path):
         extractor = EPUBExtractor(str(tmp_path / 'nonexistent.epub'))
@@ -54,9 +54,9 @@ class TestEPUBExtractor:
         extractor.load()
         chapters = extractor.extract_chapters()
 
-        # HTML content should contain tags
+        # Phase 2: the chapter holds its parsed body instead of an HTML string
         for chapter in chapters:
-            assert '<' in chapter.html_content
+            assert len(chapter.body) > 0
             assert len(chapter.text_content) > 0
 
     def test_chapter_order(self, sample_epub):
@@ -126,7 +126,7 @@ class TestCommentsThroughPipeline:
         assert len(chapters) == 1
         assert 'hiddennote' not in chapters[0].text_content
 
-        segments = Segmenter().segment_chapter(chapters[0].id, chapters[0].html_content)
+        segments = Segmenter().segment_chapter(chapters[0].id, chapters[0].body)
         assert segments
         for seg in segments:
             assert 'hiddennote' not in seg.text

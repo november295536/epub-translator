@@ -1531,3 +1531,714 @@ No mutation run was needed in this round (no code change). The test count is unc
   `Thread.start`. The page change (closing the stream on an ended first status) was checked
   as rendered text, not in a browser. The load check was run after the mutation run, on
   unmutated code.
+
+---
+
+## Phase 2 — Document and block model
+
+Date: 2026-11-20. Branch: `phase-2/block-model`, from `main` after Phase 1. No new runtime
+dependency (ebooklib stays for the export only). Commands run in the worktree of the branch
+with `source <repo>/venv/bin/activate` (Python 3.9.6 for the suite and the scripts, 3.12.7
+for mutmut, as in Phases 0 and 1). The real projects are read from `<repo>/projects`; nothing
+under it was written (see section 9).
+
+### 1. What was built
+
+| Item | Where | Main names |
+|---|---|---|
+| Raw package reader | `src/epub/extractor.py` | `read_package` (container.xml → OPF → manifest with URL-decoded hrefs relative to the OPF directory → spine of XHTML items, duplicates removed), `parse_xml` (`lxml.etree`, XML mode: no entity expansion, no network, no recovery), `EPUBExtractor` (same API; `Chapter.body` is the parsed `<body>` instead of `html_content`; `failed` lists chapters missing from the archive or not well-formed) |
+| Block walker | `src/epub/blocks.py` | `walk_blocks`, `Block` (`index`, `tag`, `text`, `html`, `fingerprint`), `fingerprint` (first 16 hex digits of the SHA-256 of the text with all whitespace removed), `serialize` |
+| Segmenter, schema 2 | `src/core/segmenter.py` | `Segmenter.segment_chapter(chapter_id, body)`, `segment_from_blocks`; `Segment.block_start/block_end/fingerprints` |
+| `project.json` schema 2 | `src/core/project.py` | `ProjectData.schema`, `ProjectData.source_sha256`, `SegmentState.block_start/block_end/fingerprints`, `sha256_file` |
+| Source copy and hash | `translate.py` (`init`), `src/web/blueprints/projects.py` | CLI `init` copies the book to `<project>/source.epub` and stores that path; both creation paths store `source_sha256`; both report unparsed chapters (CLI line, web `unparsed_chapters`) |
+| Migration | `src/core/migrate.py`, `translate.py` | `migrate_project`, `plan_migration`, `MigrationReport`; `translate.py migrate <project> [--dry-run]` |
+| Export bridge | `src/epub/builder.py` | `_place_by_blocks` (schema 2), `_place_by_count` (schema 1, the unchanged walk), `_soup_blocks` |
+| Check scripts | `scripts/verify/` | `phase2_roundtrip.py`, `phase2_migrate_copies.py` |
+
+How each part behaves, where the plan left room:
+
+- **Blocks.** Exactly as plan 4.2 and the dry-run prototype: comments and processing
+  instructions ignored; `div`/`section`/`article` descended into when a child is a block
+  element or `<br>`; a block is a non-descended block child or a maximal inline run between
+  block children and `<br>`; lists single blocks; blocks without text (whitespace only, an
+  image, `<hr/>`) are dropped and get no index. Text excludes comments, processing
+  instructions, `script` and `style`. Re-segmenting gives the same indexes and fingerprints
+  (test below).
+- **Segment HTML.** The blocks' serializations joined by a newline. A block element is
+  serialized by lxml without its tail and **without the namespace declarations it only
+  inherits** from its parent: lxml repeats every in-scope declaration (`xmlns`, `xmlns:epub`)
+  on each serialized element, which would put them in every prompt. Declarations made on the
+  element itself (an inline `<svg xmlns=…>`) are kept. A run is its text (escaped) and inline
+  elements, comments left out, outer whitespace stripped.
+- **Segmentation.** Headings, tables and code (a `<pre>`, or a run that is a single `<code>`
+  element, as `main` treated a body-level `<code>`) are segments of their own; other blocks
+  are grouped until a segment reaches 300 words, starting a new segment when the next block
+  would pass 500. A block is never divided; the sentence splitting, the small-segment merge
+  pass and the large-segment split pass are gone (with whole blocks the first pass already
+  gives what they produced). Segment IDs keep the `<chapter>_segNNNN` form.
+- **Schema.** New projects write `schema: 2`, `source_sha256`, and per segment `block_start`,
+  `block_end`, `fingerprints`; `segmenter_version` is not written for schema 2. For a schema 1
+  project none of these keys is written (they are left out when they hold their defaults),
+  so a schema 1 project saves byte-for-byte in the same layout as before; Phase 0's
+  `segmenter_version` rule is unchanged for it. `load()` only reads.
+- **Migration.** `translate.py migrate <project>` (and `--dry-run`, which reads only and does
+  not even take the lock). Source: the project's own `source.epub`, else the stored
+  `epub_path`. Per chapter: the legacy segments' text (from the stored `html`) must equal the
+  blocks' text, first without and then with the comments that are direct children of walked
+  elements; legacy segments are grouped into the smallest groups that start and end on block
+  boundaries (a segment without text joins the next group, or the last one at the end of the
+  chapter); a group of several becomes one segment: first ID, translations joined in order
+  with nothing between them, lowest status (pending < failed < translated < reviewed), issues
+  concatenated, latest `translated_at`, highest `revision`, first non-empty model, no usage.
+  A group that is not uniformly translated is listed in the report (status before and after;
+  its partial translation is kept). Segment HTML, text and word count are replaced by those of
+  the new blocks; the segment type is kept. A group that covers only comment text, a chapter
+  not in the spine, missing, not well-formed, without body or without text makes the chapter
+  unmatched. Fail-closed: any unmatched chapter → nothing written, report printed, exit 1. On
+  success: the source is copied into the project if it was outside, `project.json` is copied
+  to `project.schema1.json`, and the new file is written with `save()` (atomic, under the
+  project lock, which the command takes first; a web task holds that lock, so migration is
+  refused while one runs). The report gives chapters and segments matched, chapters matched
+  with comment text, merge groups with their segment IDs, the notes, unmatched chapters with
+  reasons, and the non-blocking count of translated text segments whose top-level node count
+  differs from the new block HTML.
+- **Export (item 7) — decision.** Schema 1 projects go through the old path unchanged
+  (`_place_by_count` is the old loop; the golden tests `TestVersion1ExportMatchesMain` pass
+  unchanged). For schema 2 the smallest bridge that keeps the existing builder: the builder
+  still reads each chapter through ebooklib and BeautifulSoup; `_soup_blocks` repeats the
+  block walk on that tree (about 25 lines), the chapter's blocks are checked against every
+  segment's stored fingerprints, and each segment gets the text-bearing nodes of its block
+  range; the existing apply functions then work as before. If any fingerprint differs or a
+  range is out of bounds, the chapter is left in the original language. I chose this over
+  walking the raw XML for export because the apply functions operate on BeautifulSoup nodes;
+  placing on lxml nodes would be the Phase 3 writer. Cost: the walk rules exist twice until
+  Phase 3 replaces the builder; the fingerprint check makes any disagreement visible as an
+  untranslated chapter, never as a misplaced translation. On the real data the bridge accepts
+  2155 of 2155 migrated chapters (section 4). Fidelity is otherwise today's (ebooklib
+  round trip, heads lost, Bugs 1 and 2 unchanged). One difference: inline runs are placed node
+  by node, so a run translation is placed in place only when the model returns one top-level
+  node per run node (with today's prompt, usually one `<p>` per line of a `<br>`-separated
+  text); otherwise the existing whole-segment fallback applies, as it does today for any count
+  mismatch. (Changed in review rounds 1 and 2, sections 10 and 13: a chapter is placed only
+  when it matches as a whole, and only segments of block elements are paired node by node.)
+
+### 2. Test suite
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -W ignore
+1072 passed in 136.83s (0:02:16)
+```
+
+869 before the phase. New files `tests/test_blocks.py` (walker, schema 2 segments, raw
+package reader, rules spelled out for mutation testing) and `tests/test_migrate.py`; new
+classes in `test_builder.py` (`TestSchema2Export`), `test_project.py`
+(`TestPhase2ProjectFields`), `test_cli.py` (`TestCLIPhase2`), `test_verify_scripts.py`
+(`TestRoundtripCheck`, `TestMigrateCopiesCheck`, `TestPhase2ScriptSurvivors`). Raw-ZIP
+fixtures (`write_raw_epub`, `xhtml`, `raw_epub`, `body_of` in `tests/conftest.py`) write the
+archive with `zipfile`, invented text only. The `raw_epub` fixture has an `OEBPS/` folder,
+chapters in `Text/`, a percent-encoded href (`Text/chapter%20two.xhtml`), a head with
+`<link>` and `<style>`, NCX plus a navigation document that is in the spine, inline SVG with
+`viewBox`, text directly under `<body>`, `<br>`-separated runs, a body comment and a
+duplicated spine entry.
+
+Acceptance item → tests:
+
+| Item | Tests |
+|---|---|
+| bare text with `<br>` | `test_blocks.py::TestWalk::test_br_splits_runs`, `test_br_directly_under_body`, `TestSchema2Segments::test_bare_text_with_br`, `test_builder.py::TestSchema2Export::test_br_separated_runs[*]` |
+| long bare text | `TestSchema2Segments::test_long_bare_text_is_one_block`, `test_long_bare_text_with_br_grouped_by_blocks` |
+| body-level comment | `TestWalk::test_body_level_comment_ignored`, `test_comment_inside_run_not_text_nor_html`, `TestSchema2Segments::test_body_level_comment`, `TestSchema2Export::test_comment_between_blocks[*]` |
+| chapter that fails to match: reported, nothing written | `test_migrate.py::TestMigrate::test_unmatched_chapter_writes_nothing`, `test_segment_of_only_comment_text_unmatched`, `test_chapter_problems_reported[*]`, `TestMigrateCLI::test_unmatched_exits_non_zero` |
+| percent-encoded href, chapters in a subfolder | `TestRawPackage::test_subfolder_and_percent_encoded_href` |
+| nav document in the spine, duplicated spine entry | `TestRawPackage::test_spine_order_nav_skipped_duplicates_removed`, `TestRules::test_spine_entries_after_skipped_ones_kept` |
+| unparseable chapter reported, not segmented | `TestRawPackage::test_unparseable_and_missing_chapters_reported`, `test_cli.py::TestCLIInit::test_init_reports_unparsed_chapter`, `test_web.py::TestCreateProjectMarker::test_unparsed_chapter_reported` |
+| determinism of indexes and fingerprints | `TestSchema2Segments::test_resegmenting_is_deterministic` |
+| migration rules (html text, comments both ways, merge, lowest status, partial group, lock, backup, dry run, schema 2 refused) | `test_migrate.py::TestMigrate` (28 tests), `TestGroups`, `TestMigrateSurvivors` |
+| schema 1 saves without new keys | `test_project.py::TestModelField::test_saving_schema_1_project_adds_no_keys`, `test_project_without_schema_loads_as_1_unchanged` |
+| source copy and hash | `test_cli.py::TestCLIInit::test_init_creates_project_json`, `test_web.py::TestCreateProjectMarker::test_web_created_project_records_schema_2_and_source_hash` |
+| export of schema 2 and of migrated projects | `TestSchema2Export` (19 tests incl. `test_raw_epub_end_to_end`, `test_mismatch_leaves_chapter_unchanged[*]`), `test_migrate.py::TestMigrate::test_migrated_project_exports` |
+
+No test was removed. Tests whose expectations changed, and why:
+
+- `test_segmenter.py`: the fixture now passes each HTML string through `body_of` (the
+  segmenter takes a parsed body); all 46 other tests unchanged.
+  `test_single_large_element_kept_by_split_step` called the removed
+  `_split_large_segments`; replaced by `test_single_large_element_kept_whole` (same intent:
+  one 800-word `<p>` stays one segment). `test_breaks_at_sentence_boundary` still passes
+  (segments end at block boundaries).
+- `test_project.py`: the four Phase 0 `segmenter_version` tests became schema tests with the
+  same intent (`test_new_project_records_schema_2`,
+  `test_project_without_schema_loads_as_1_unchanged`, `test_saving_schema_1_project_adds_no_keys`,
+  `test_phase_0_project_keeps_segmenter_version_through_save`); new projects are schema 2,
+  so a schema 1 file is produced by rewriting a created one.
+- `test_cli.py::test_init_creates_project_json` and
+  `test_web.py::test_web_created_project_records_segmenter_version_2` (renamed
+  `…_schema_2_and_source_hash`): assert `schema: 2`, no `segmenter_version`, the hash, and
+  for the CLI the project-owned copy.
+- `test_extractor.py`: `test_load_valid_epub` checks the OPF instead of the ebooklib book;
+  `test_chapter_has_html_structure` checks `body` instead of `html_content`; the comment
+  pipeline test segments `body`.
+- `test_builder.py`: fixtures segment `ch.body`; `TestVersion2Export` (Phase 0 projects,
+  schema 1 with `segmenter_version 2`) reads the segments the Phase 0 extractor and
+  segmenter stored from `tests/data/phase0_segments.json`, recorded once by running `main`'s
+  `src/` on the test's own invented scenarios (that segmenter no longer exists); the
+  expectations are unchanged. In `TestWalkByMarker` the schema 1 file is made by removing
+  `schema`; "new project uses current walk" became "Phase 0 project uses current walk".
+
+### 3. Check: every chapter re-serializes unchanged
+
+```
+$ python3 scripts/verify/phase2_roundtrip.py --projects-dir <repo>/projects --anonymize
+PASS project-1: chapters 24, round trip equal 24, whole-document equal 0
+PASS project-2: chapters 35, round trip equal 35, whole-document equal 35
+PASS project-3: chapters 41, round trip equal 41, whole-document equal 41
+PASS project-4: chapters 1764, round trip equal 1764, whole-document equal 1764
+PASS project-5: chapters 36, round trip equal 36, whole-document equal 36
+PASS project-6: chapters 109, round trip equal 109, whole-document equal 109
+PASS project-7: chapters 71, round trip equal 71, whole-document equal 71
+PASS project-8: chapters 90, round trip equal 90, whole-document equal 90
+TOTAL projects 8  chapters 2170  round trip equal 2170  whole-document equal 2146  failed projects 0
+$ echo $?
+0
+```
+
+Two findings against the plan's wording:
+
+- The 2170 are the XHTML items of the 8 manifests. Spine chapters (duplicates removed) are
+  2169: project-3 has one XHTML item outside its spine. The script checks all 2170.
+- "Re-serialized without edits" holds only when the root element is serialized in a document
+  of its own (`copy.deepcopy(root)`). Serializing the parsed document itself (`tostring` of
+  the tree) makes libxml2 use its XHTML 1.0 output mode for documents with an XHTML 1.0
+  DOCTYPE and add `<meta http-equiv="Content-Type" content="text/html; charset=…"/>` to
+  `<head>`: all 24 chapters of project-1 change that way. The Phase 3 writer must not
+  serialize whole documents (or must remove what libxml2 adds). Comparison: C14N 2.0 with
+  comments kept on both sides.
+
+### 4. Check: migration of copies of the real projects
+
+```
+$ python3 scripts/verify/phase2_migrate_copies.py --projects-dir <repo>/projects --anonymize
+PASS project-1: chapters 22/22, segments 220/220, merge groups 0 (0 segments), count differs 0, translated chars 211044 -> 211044, export places 22/22, web load ok
+PASS project-2: chapters 33/33, segments 291/291, merge groups 13 (26 segments), count differs 16, translated chars 302113 -> 302113, export places 33/33, web load ok
+PASS project-3: chapters 39/39, segments 4385/4385, merge groups 0 (0 segments), count differs 1, translated chars 15637 -> 15637, export places 39/39, web load ok
+PASS project-4: chapters 1763/1763, segments 2236/2236, merge groups 0 (0 segments), count differs 32, translated chars 746052 -> 746052, export places 1763/1763, web load ok
+PASS project-5: chapters 35/35, segments 840/840, merge groups 1 (2 segments), count differs 1, translated chars 462908 -> 462908, export places 35/35, web load ok
+PASS project-6: chapters 108/108, segments 581/581, merge groups 0 (0 segments), count differs 0, translated chars 356677 -> 356677, export places 108/108, web load ok
+PASS project-7: chapters 68/68, segments 637/637, merge groups 15 (31 segments), count differs 13, translated chars 471477 -> 471477, export places 68/68, web load ok
+PASS project-8: chapters 87/87, segments 331/331, merge groups 0 (0 segments), count differs 16, translated chars 159747 -> 159747, export places 87/87, web load ok
+TOTAL projects 8  chapters 2155/2155  segments 9521/9521  merge groups 29 (59 segments)  count differs 79  translated chars unchanged 8  export places 2155/2155  web loads 8  failed projects 0
+$ echo $?
+0
+```
+
+The script copies `project.json`, `source.epub` and `glossary.json` of each project into a
+new `mktemp` directory under the system temporary directory (it refuses one inside the
+repository), migrates the copies with `migrate_project` (the code of the `migrate`
+command), and removes the directory at the end (checked: no `phase2-migrate-*` directory
+left). Per project it checks: all chapters and segments matched and the copy written; the
+characters of translated text unchanged (translations are joined without separators);
+`EPUBBuilder._place_by_blocks` accepts every chapter with segments, on the chapters as
+ebooklib serves them (the export bridge's check); the Flask test client on the copies
+answers 200 for `/`, `/api/projects/<name>` (with the migrated segment count) and
+`/project/<name>/review`. A project also FAILs if any file under its real directory changed.
+
+As predicted by the dry run: 2155/2155 chapters, 9521/9521 segments, 29 merge groups of 59
+segments (project-2 26, project-5 2, project-7 31). All 29 groups are uniformly translated
+(no note in any report). The non-blocking "count differs" count is 79 translated text
+segments (of 4188) whose top-level node count differs from the new block HTML; Phase 4's
+validation decides what happens to them. Chapters that matched only with comment text: 2
+(project-5), as Bug 5 says.
+
+### 5. Dry run still holds
+
+```
+$ cd <repo> && python3 plan/experiments/migrate_dryrun.py --strict | tail -1
+TOTAL chapters 2155/2155  segments 9521/9521  on-boundary 9462  to-merge 59 in 29 groups  largest block 7899 chars
+$ python3 plan/experiments/migrate_dryrun.py --strict > /dev/null; echo $?
+0
+```
+
+The prototype is unchanged. The new walker gives the same normalized block texts as the
+prototype's walker for all 2169 spine chapters (checked once with a throw-away script, not
+kept).
+
+### 6. Mutation testing
+
+`scripts/verify/mutation.sh` groups: core now also mutates `src/core/migrate.py` and
+`src/epub/blocks.py` and runs `tests/test_blocks.py tests/test_migrate.py` in addition; cli
+also runs `tests/test_migrate.py` (the `migrate` command tests); scripts also mutates
+`phase2_roundtrip.py` and `phase2_migrate_copies.py`. Only lines changed versus `main` are
+mutated (the block tag set counts as changed: it moved from `segmenter.py` to `blocks.py`).
+Each full run took about 70 minutes, so no scoping was needed.
+
+| run | mutants | killed | survived | timeout | suspicious |
+|---|---|---|---|---|---|
+| 1, after "chore: cover the Phase 2 modules…" | 839 | 723 | 115 | 1 | 0 |
+| 2, after "test: kill the Phase 2 mutation survivors" | 821 | 806 | 14 | 1 | 0 |
+
+```
+$ scripts/verify/mutation.sh main
+...
+TOTAL mutants 821  killed 806  survived 14  timeout 1  suspicious 0  untested 0
+$ echo $?
+1
+```
+
+Run 1's survivors and what was done (mutmut ids of run 1):
+
+| survivors (run 1) | disposition |
+|---|---|
+| `blocks.py` 257–290 (32 entries of the block tag set renamed), 294 (`article` not descended), `segmenter.py` 47–50 (`h3`–`h6` not standalone) | killed: `TestRules::test_block_tag_ends_a_run[*]`, `test_descended_tags[*]`, `test_standalone_tags[*]` |
+| `segmenter.py` 64, 65 (`pending + words > MAX_WORDS` → `-`, `>=`) | killed: `test_block_that_would_pass_max_starts_a_new_segment`, `test_block_reaching_exactly_max_joins` |
+| `blocks.py` 317, 318 (`>` escape), 340 (empty comment text) | killed: `test_greater_than_escaped`, `test_empty_comment_is_no_comment_run` |
+| `blocks.py` 333 (`replace(…, 1)` → `2`) | code changed: the count argument removed (a declaration occurs at most once in a start tag) |
+| `extractor.py` 416, 419 (`resolve_entities=True`, default parser) | killed: `test_entities_not_expanded` |
+| `extractor.py` 457, 460 (`continue` → `break` in the spine loop) | killed: `test_spine_entries_after_skipped_ones_kept` |
+| `extractor.py` 465, 466 (init values) | killed: `test_fresh_extractor` |
+| `extractor.py` 492, 493, 501 (whitespace regexes), 499 (`h3` title) | code changed (chapter text is the blocks' texts joined by spaces; titles use `split`), killed by `test_text_content_and_title`. This found a real defect: chapter text joined adjacent blocks without a space (commit "fix: separate block texts…") |
+| `builder.py` 389, 390 (early `break` of the schema 1 placement) | code changed: the check removed; segments past the last element already got an empty list, which the apply loop skips (equivalent, golden tests unchanged) |
+| `builder.py` 407, 414 (`and` → `or` in `_soup_blocks`) | killed: `TestSchema2Export::test_run_with_inline_element_placed`, `test_content_div_placed_as_one_element` |
+| `migrate.py` 103, 104, 109, 110, 116, 117 (report defaults) | code changed: `chapters` and `segments` are constructor arguments; `count_differs` is summed per chapter (killed by `test_count_differs_summed_over_chapters`) |
+| `migrate.py` 119 (`written` default `None`), 131, 202 (note text), 246 (message) | killed: exact assertions in `test_dry_run_writes_nothing`, `test_merged_status_is_lowest[*]`, `test_missing_source_refused` |
+| `migrate.py` 141, 142 (`_top_level_count`), 163 (`groups[-1]` → `[+1]`), 171 (model default) | killed: `TestMigrateSurvivors::test_top_level_count`, `test_trailing_segment_joins_the_last_of_several_groups`, `test_no_model_stays_empty` |
+| `migrate.py` 216, 219, 222, 225 (`continue` → `break` per chapter) | killed: `test_chapters_after_an_unmatched_one_are_still_checked[*]` |
+| `project.py` 6 (`1 >> 20`: reads nothing) | killed: `TestPhase2ProjectFields::test_sha256_file_of_a_large_file` |
+| `project.py` 27, 28, 29, `segmenter.py` 41, 43 (defaults) | killed: `test_schema_1_project_has_no_source_hash`, `test_create_without_hash_or_ranges` |
+| `translate.py` 1 (`exist_ok=False`), 4 (message), 8, 9 (`exists`, `file_okay`), 14 (help) | killed: `TestCLIPhase2::test_init_into_existing_empty_directory`, exact line in `test_init_reports_unparsed_chapter`, `test_migrate_needs_a_directory[*]`, `test_migrate_help` |
+| `phase2_roundtrip.py` 6, 14, 21, 27, 42, 66, 70, 83, 88; `phase2_migrate_copies.py` 115, 124, 168, 173, 181, 230, 287 | killed by `TestPhase2ScriptSurvivors` and the reordered fixture items, or code changed (`s['translated_text']`; `if report.unmatched:` — `written` is always true otherwise) |
+| `phase2_migrate_copies.py` 198, 199, 202–204 (`ignore_errors`, copies sub-directory name, `TESTING`) | code changed: removed (no effect on the result) |
+| the rest | equivalent, same as run 2 below |
+
+Run 2's 14 survivors (ids of run 2) and the timeout:
+
+| id | location | mutation | disposition |
+|---|---|---|---|
+| 164 | `migrate.py:110` | `standalone=False` → `True` | equivalent: `_merge` reads only `html`, `text`, `word_count`, the block range and the fingerprints of the `Segment`; `standalone` is not part of `SegmentState` |
+| 5, 7 | `project.py:45` | read chunk `1 << 20` → `2 << 20`, `1 << 21` | performance-only: chunk size of the hash |
+| 20, 22, 40, 42, 459 | `project.py:85-86`, `segmenter.py:39-40`, `extractor.py:102` | `X \| None` → `X & None` in annotations | equivalent: annotations are strings under `from __future__ import annotations` and never evaluated (as in Phase 1) |
+| 409 | `extractor.py:24` | `no_network=True` → `False` | equivalent: with `load_dtd` off (lxml default) and `resolve_entities=False` the parser never fetches anything, so the network flag is never consulted |
+| 437 | `extractor.py:72` | properties default `''` → `'XXXX'` | equivalent: `'XXXX'.split()` does not contain `nav`, as `''.split()` does not |
+| 102, 1 | `phase2_migrate_copies.py:47`, `phase2_roundtrip.py:44` | `sys.path.insert(0, …)` → `insert(1, …)` | equivalent under default interpreter path settings, the condition stated for Phase 0's survivor 113 |
+| 31 | `phase2_roundtrip.py:94` | `copy.deepcopy(root)` → `copy.copy(root)` | equivalent: lxml's `_Element.__copy__` also copies the whole subtree into a new document (checked: same bytes, no added `<meta>`) |
+| 66 | `phase2_roundtrip.py:125` | `failed += 1` → `= 1` for an unreadable source | killed after run 2 by `test_roundtrip_counts_every_failure` (now two unreadable sources): the test passes on the code and fails with the mutant applied by hand (checked once, file restored); no third full run |
+| timeout 9 | `project.py:45` | sentinel `b''` → `b'XXXX'` | detected: the hash never ends, the tests do not finish |
+
+### 7. One real call
+
+Not needed for this phase (no prompt or backend change) and not made.
+
+### 8. Known consequences
+
+- New projects are schema 2 and cannot be loaded by code before this phase (`ProjectData`
+  there has no `schema` field: `TypeError`). Schema 1 projects stay loadable by `main` as
+  long as they are not migrated; a migrated project keeps its old file as
+  `project.schema1.json`.
+- Segmentation of new projects differs from before: no sentence splitting; `<br>`-separated
+  text and text mixed with block children become separate blocks; segments are between 300
+  and 500 words unless one block is larger (largest real block: 7899 characters). A chapter
+  that is not well-formed XML is no longer segmented (ebooklib and BeautifulSoup used to accept
+  it); it is reported. No existing book has one.
+- CLI `init` copies the book into the project; `epub_path` is that copy. CLI `export` names
+  the file of a schema 2 project after the project directory (`<project>-<format>.epub`), as
+  the web export does; a schema 1 project keeps the old name (after the book's file name).
+- Chapter titles and metadata come from the raw XHTML and the OPF: a missing `dc:title` or
+  `dc:creator` is `Unknown` (as before).
+- The web create response has `unparsed_chapters`; the new project page shows them in an
+  alert before it redirects (review round 1).
+- Named entity references are not supported: a chapter whose body holds an unresolved
+  entity reference (an internal-subset entity, or `&mdash;` under an XHTML DOCTYPE, which
+  lxml parses without error when no DTD is loaded) is not segmented and is reported; entity
+  expansion and DTD loading stay off. 0 of the real chapters have one; a lenient path is
+  added only when a real book needs it. A spine entry that is not XHTML and an unreadable
+  chapter are reported the same way; a package that cannot be read is one error with a
+  message.
+- Migration: a merge group that is not wholly translated (a member pending, failed or with
+  an empty translation) loses its partial translation (kept in `project.schema1.json`, named
+  in the report); a group whose status is changed is always named; a group that mixes code and text
+  segments makes its chapter unmatched (0 such groups in the real data); an existing
+  `project.schema1.json` blocks the migration.
+- A legacy segment whose stored html has no text (for example a body-level `<script>` that
+  an old segmenter stored) is folded into the neighbouring merge group; 0 such segments in
+  the 8 projects (review round 3).
+- Known limitations accepted in review round 4: the migration reports an internal error of
+  the reader or walker as malformed project data (nothing is written); a process killed
+  during the backup copy can leave a stale temporary file, and one killed between backup and
+  save leaves a backup that makes the next run refuse with a message (`project.json` is
+  unchanged); a merged group of several code blocks would keep only the first block's code
+  text (0 such groups; the segmenter never builds one); archive members are read without a
+  size limit, as on `main`.
+- Migrated segments whose legacy text held comment text (Bug 5, two project-5 segments) keep
+  their translation, which still contains the translated production note; it now has no
+  counterpart in the segment's HTML and is exported with the segment. They need the manual
+  edit Bug 5 mentions.
+- 82 translated segments of the migrated real projects are not paired node by node and are
+  replaced (chinese-only) or wrapped (bilingual) as a whole (section 14; the earlier "79
+  export through the fallback, as today" was not proven and is corrected in section 11).
+  A chinese-only replacement removes the segment's blocks and the `<br>` and whitespace
+  between them; images, anchors and `<hr/>` between them stay, after the translation.
+  For 26 of the 82 the blocks have more than one parent element (project-2 2, project-3 1,
+  project-7 8, project-8 15; section 17): the whole translation, and in bilingual output
+  the originals too, go into the first block's parent, so text can move into or out of a
+  container (its class and id then no longer apply as in the source). `main` does the same
+  for schema 1; Phase 3 places per block on the source tree.
+- Schema 2 export pairs node by node only segments made of block elements, as `main` did; a
+  segment with an inline run (text directly in a `div` or under `<body>`, `<br>`-separated
+  lines) is always replaced or wrapped as a whole, so such text loses its line structure in
+  chinese-only output unless the translation is one node for a whole element (section 13).
+  A chapter whose blocks do not match its stored ranges and fingerprints as a whole is
+  exported untranslated, silently in this phase (the export report is Phase 3). Chapters where the
+  bridge's walk and the XML walk cannot agree are listed in section 10 (text directly under
+  `<body>` before its first element, a block inside `<p>`, CDATA); none of the real
+  chapters.
+- Test fixtures built with ebooklib remain; the new raw-ZIP fixtures exist alongside them. A
+  raw EPUB without NCX produces an export that ebooklib itself cannot read back (the spine's
+  `toc` attribute names a missing item); this is the current builder's behaviour, seen while
+  writing a test, not changed here.
+
+### 9. `projects/` untouched
+
+Before the work and after every run of the real-project scripts:
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+The same digest before review round 1 and after every real-data run in it (sections 10 and
+11). Both Phase 2 scripts also fail a project when any file under its directory changes.
+The migration was only ever run on copies in a temporary directory, deleted afterwards; no
+lock file or backup was created under `projects/`.
+
+### 10. Review round 1
+
+Three static reviews (G, O and the third reviewer, whose verdict was approve with minors).
+Each accepted item got a test that fails on the code before the round (checked by running the
+new tests against an export of the branch before the round, `git archive` of the commit "docs:
+record Phase 2 in the acceptance log", in a scratch directory; where a new name did not exist
+there, only that import was stubbed in the scratch copy). The exceptions are named in the
+table ("guard": the case already held). Line numbers in the reviews were checked against the
+code; every accepted claim reproduced.
+
+| # | finding | reviewer | ruling | what was done | tests |
+|---|---|---|---|---|---|
+| 1 | a merge group not uniformly translated keeps a joined partial translation; export applies any non-empty text | O | accepted | a group of several whose lowest status is pending or failed keeps no translation (the backup keeps it) and is named in the report ("部分譯文已清除（保留於 project.schema1.json）"); a group of mixed status that is wholly translated keeps the joined text, as before | `test_migrate.py::TestMigrate::test_partial_group_loses_its_translation` (was `…_keeps_its_translation`), `test_failed_group_of_one_status_cleared_and_named`, `test_partial_group_exports_in_the_original`, `test_merged_status_is_lowest[*]` (changed: expects the cleared text and the new note); `test_untranslated_group_has_no_note` (guard); `TestMigrateSurvivors::test_count_differs_summed_over_chapters` (changed: its partial group now has no text to count, so the second segment is translated) |
+| 2 | a merge group keeps the first segment's type when code and text segments merge | G, O | accepted, fail closed | real data first (read-only, scratch script): the 29 groups are 28 of 2 text segments and 1 of 3 text segments, **0 mixed**. Such a group now makes its chapter unmatched (`<id> merges code and text segments`), nothing written | `TestMigrate::test_group_mixing_code_and_text_unmatched` |
+| 3 | export bridge: covered nodes leave out `<img>`/`<br>` between runs, so the fallback duplicates images, leaves stray `<br>`s or nests a duplicate wrapper | G, O | accepted | `_place_by_blocks` returns (segment, units, span): the span is every node from the first unit to the last, `<br>` and blocks without text included; a whole-segment replacement removes the whole span (chinese-only) or moves it into `div.original` (bilingual). When the translation's top-level node count differs from the units and the span is the whole content of one element below `<body>`, that element is the one unit (no nested duplicate wrapper). 1:1 placement unchanged | `test_builder.py::TestSchema2BridgeReview1::test_image_in_a_run_kept_once[*]`, `test_br_div_single_wrapper_translation_chinese_only`, `test_br_div_single_wrapper_translation_bilingual[*]`, `test_br_run_mismatch_keeps_brs_in_the_original[*]`, `test_br_run_mismatch_chinese_only_leaves_no_br`; `test_br_div_one_to_one_still_placed_line_by_line[*]` (guard) and `TestSchema2Export::test_br_separated_runs[*]` unchanged |
+| 4 | the bridge counts script/style text the XML walker excludes and never checks complete coverage | G, O | accepted, fail closed | before placing anything in a chapter: every range valid, the ranges (sorted) contiguous from 0 to the bridge's block count, every fingerprint equal; otherwise the chapter stays in the original language. The bridge's text rule is the walker's: nothing inside `script`/`style`, no comments, processing instructions or CDATA | `TestSchema2BridgeReview1::test_script_text_not_counted[*]`, `test_block_not_covered_by_any_segment`, `test_extra_block_in_the_source`, `test_overlapping_ranges`, `test_missing_segment`, `test_matching_chapter_is_placed` (guard); through real ebooklib: `test_through_ebooklib_leading_body_text_stays_original` (passes on the old code too: the old fingerprint check already refused that chapter) |
+| 5 | unresolved entity references are dropped silently from text and run HTML | G, O, the third reviewer | accepted | observed with `PARSER` (`resolve_entities=False`, no DTD loading): (a) an entity declared in an internal subset parses, the reference stays an `_Entity` node (`&term;`), its text is in neither `itertext()` nor the block text; (b) `&mdash;`/`&rsquo;` under the XHTML 1.1 DOCTYPE with no DTD loaded parse **without error**, same `_Entity` nodes; (c) the same without a DOCTYPE is an `XMLSyntaxError` (already reported). Now a chapter whose body holds an entity reference node is not segmented and is in `failed` (`unresolved entity reference: &mdash;, &rsquo;`); migration reports such a chapter unmatched. Entity expansion and DTD loading stay off. Real data: 0 of the 2170 XHTML items contain an entity reference node | `test_blocks.py::TestEntities::test_chapter_reported[*]`, `test_entity_outside_body_ignored` (guard), `TestRules::test_entities_not_expanded` (replaced: it asserted the silent drop; now asserts the reference is reported and not expanded), `test_migrate.py::TestMigrate::test_chapter_with_entity_reference_unmatched` |
+| 6 | an existing `project.schema1.json` is overwritten; the source copy is not atomic and a corrupt copy gives a traceback | G, O, the third reviewer | accepted | migration refuses when `project.schema1.json` exists ("已存在，不會覆寫；請先移走它", nothing written); the source is copied to `source.epub.<hex>.tmp` and `os.replace`d (the temporary file removed on failure); an unreadable source is a `MigrationError` ("來源 EPUB 無法讀取：…") | `TestMigrate::test_existing_backup_refused`, `test_restored_schema_1_after_migration_refused`, `test_source_copied_through_a_temporary_file`, `test_corrupt_source_is_a_migration_error` |
+| 7 | package reader: no rootfile, item without `href`, bad or encrypted ZIP crash; a non-XHTML spine document is dropped silently | O | accepted | one `EPUBError` (new, `src/epub/extractor.py`) with a message for: not a ZIP or unreadable file, missing `container.xml` or OPF, no rootfile or no `full-path`, container/OPF not well-formed, a manifest item without `href`, an encrypted or otherwise unreadable package member. CLI `init` prints "無法解析 EPUB：…", removes its copy of the book and exits 1; the web create path answers 400 with the message. A spine entry whose media type is not exactly `application/xhtml+xml` is in `failed` ("media type … is not XHTML"); an unreadable chapter member is in `failed` ("unreadable: …") | `test_blocks.py::TestPackageErrors` (11), `TestRawPackage::test_unparseable_and_missing_chapters_reported` (changed: the image in that spine is now reported), `test_cli.py::TestCLIInit::test_init_unreadable_epub_gives_a_message`, `test_web.py::TestCreateProjectMarker::test_unreadable_epub_gives_a_message` |
+| 8 | the web create page ignores `unparsed_chapters` | G | accepted | the page alerts "以下章節無法解析，未分段，將以原文保留：" with the chapter ids before redirecting | `test_web.py::TestCreateProjectMarker::test_new_project_page_shows_unparsed_chapters` (rendered page text); JSON: `test_unparsed_chapter_reported` (unchanged) |
+| 9 | CLI export name changed for schema 1 projects | G | accepted | schema 1: the book's file name, as before; schema 2: the project directory name | `test_cli.py::TestCLIPhase2::test_schema_1_export_keeps_the_book_name`; `test_export_named_after_the_project` unchanged |
+| 10 | check script: temporary directory not checked against `--projects-dir`; "count differs" is not the bridge's count | G, O | accepted | `phase2_migrate_copies.py` checks the resolved `tempfile.gettempdir()` against the repository and `--projects-dir` before creating anything, then creates its directory there; new column "export fallback": translated text segments whose translation's top-level node count differs from the units the bridge places them on (those replaced or wrapped as a whole); "count differs" kept | `test_verify_scripts.py::TestMigrateCopiesCheck::test_refuses_temporary_directory_inside_repository` (changed: patches `gettempdir`, checks nothing is created), `test_refuses_temporary_directory_inside_projects_dir[*]`, `test_export_fallback_counted`; exact-output tests updated for the column |
+| 11 | a multi-node run is flattened into separate entries: reordered inline tags land on the wrong word, a run becomes several bilingual rows | the third reviewer | accepted, with 3 | each block is one unit: a run of several nodes is wrapped in a temporary `epub-translator-run` element while placing and unwrapped afterwards | `TestSchema2BridgeReview1::test_reordered_inline_tag`, `test_run_and_paragraph_one_row_per_block[*]` |
+| 12 | `block_start`/`block_end` not validated (missing, negative, empty, out of range) | the third reviewer | accepted, with 4 | both must be `int` (not `bool`) with `0 <= start < end <= blocks` | `TestSchema2BridgeReview1::test_invalid_range[*]` (6; `None`/`None` passes on the old code too) |
+| 13 | `migrate` on a directory that is not a project leaves a `project.lock` and gives a traceback | the third reviewer | accepted | `project.json` must exist before the lock is taken ("不是專案目錄（沒有 project.json）：…"); an unreadable or malformed project file is a `MigrationError` ("無法讀取 project.json：…"); an unreadable EPUB see 6 | `TestMigrate::test_not_a_project_refused_without_a_lock_file`, `test_corrupt_project_file_is_a_migration_error`, `TestMigrateCLI::test_not_a_project_gives_a_message` |
+| 14 | the OPF path from `container.xml` is not percent-decoded | the third reviewer | accepted (first half) | `unquote()` on `full-path` | `TestPackageErrors::test_percent_encoded_opf_path` |
+| — | a manifest href with a fragment is not split | G, the third reviewer (second half) | rejected | a fragment is not valid in a manifest href; such a chapter is already reported as missing from the archive | — |
+
+Also checked before fixing, read-only on the real data (scratch script, not kept): the
+types of the 29 merge groups (item 2) and the number of XHTML items whose parsed tree holds
+an entity reference node (item 5, 0 of 2170).
+
+Where the two walks cannot agree (for Phase 3; checked once through real ebooklib with
+invented chapters, scratch script not kept): the bridge walks ebooklib's regenerated
+`get_content()`, so these chapters no longer match their stored blocks and are exported
+**untranslated**, silently in this phase:
+
+- text directly under `<body>` before its first child element (ebooklib keeps only the
+  body's children; `test_through_ebooklib_leading_body_text_stays_original`);
+- a block element inside `<p>` (the HTML parser closes the `<p>` before it);
+- CDATA sections (text for lxml in XML mode; ignored by the bridge).
+
+Checked and agreeing: upper-case tag names, `<ruby>`/`<rt>` text, `<script>` inside a run
+(after this round). None of the 2155 real chapters is affected (section 11).
+
+### 11. Review round 1: checks after the last code change
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider
+1142 passed in 136.30s (0:02:16)
+```
+
+1072 before the round. Tests changed, and why: listed in the table above
+(`test_entities_not_expanded`, `test_unparseable_and_missing_chapters_reported`,
+`test_merged_status_is_lowest`, `test_partial_group_keeps_its_translation` → `…_loses_…`,
+`test_count_differs_summed_over_chapters`, `test_refuses_temporary_directory_inside_repository`,
+exact-output tests of the migration check for the new column, `test_fresh_extractor` for the
+new `not_xhtml` attribute). None removed.
+
+```
+$ python3 scripts/verify/phase2_roundtrip.py --projects-dir <repo>/projects --anonymize | tail -1
+TOTAL projects 8  chapters 2170  round trip equal 2170  whole-document equal 2146  failed projects 0
+$ echo $?    # of the unpiped run
+0
+$ python3 scripts/verify/phase2_migrate_copies.py --projects-dir <repo>/projects --anonymize
+PASS project-1: chapters 22/22, segments 220/220, merge groups 0 (0 segments), count differs 0, export fallback 0, translated chars 211044 -> 211044, export places 22/22, web load ok
+PASS project-2: chapters 33/33, segments 291/291, merge groups 13 (26 segments), count differs 16, export fallback 16, translated chars 302113 -> 302113, export places 33/33, web load ok
+PASS project-3: chapters 39/39, segments 4385/4385, merge groups 0 (0 segments), count differs 1, export fallback 1, translated chars 15637 -> 15637, export places 39/39, web load ok
+PASS project-4: chapters 1763/1763, segments 2236/2236, merge groups 0 (0 segments), count differs 32, export fallback 32, translated chars 746052 -> 746052, export places 1763/1763, web load ok
+PASS project-5: chapters 35/35, segments 840/840, merge groups 1 (2 segments), count differs 1, export fallback 1, translated chars 462908 -> 462908, export places 35/35, web load ok
+PASS project-6: chapters 108/108, segments 581/581, merge groups 0 (0 segments), count differs 0, export fallback 0, translated chars 356677 -> 356677, export places 108/108, web load ok
+PASS project-7: chapters 68/68, segments 637/637, merge groups 15 (31 segments), count differs 13, export fallback 12, translated chars 471477 -> 471477, export places 68/68, web load ok
+PASS project-8: chapters 87/87, segments 331/331, merge groups 0 (0 segments), count differs 16, export fallback 15, translated chars 159747 -> 159747, export places 87/87, web load ok
+TOTAL projects 8  chapters 2155/2155  segments 9521/9521  merge groups 29 (59 segments)  count differs 79  export fallback 77  translated chars unchanged 8  export places 2155/2155  web loads 8  failed projects 0
+$ echo $?
+0
+$ cd <repo> && python3 plan/experiments/migrate_dryrun.py --strict | tail -1
+TOTAL chapters 2155/2155  segments 9521/9521  on-boundary 9462  to-merge 59 in 29 groups  largest block 7899 chars
+$ python3 plan/experiments/migrate_dryrun.py --strict > /dev/null; echo $?
+0
+```
+
+As before the round: 2155/2155 chapters, 9521/9521 segments, 29 merge groups (59
+segments), translated characters unchanged in all 8, every project loads. The export
+placement now also requires complete, non-overlapping coverage of every chapter and still
+accepts 2155/2155. **Correction of section 4:** "count differs 79" compared the translation
+with the new block HTML, not with what the export places, and the claim that those segments
+export "through the existing fallback, as today" was not proven and was wrong for
+`<br>`-separated runs (the fallback left the `<br>`s behind or nested a duplicate wrapper,
+item 3). The new column counts what the export does: **77** translated text segments
+(project-2 16, project-3 1, project-4 32, project-5 1, project-7 12, project-8 15) have a
+top-level node count different from the units the bridge places them on and are replaced
+(chinese-only) or wrapped (bilingual) as a whole; that replacement now consumes the
+segment's whole node range. No migration copy was left in the temporary directory.
+
+### 12. Mutation testing after review round 1
+
+`scripts/verify/mutation.sh <base>`, where `<base>` is the commit that recorded Phase 2 in
+the log ("docs: record Phase 2 in the acceptance log"), so only the lines changed in this
+round are mutated. Run 2 took 22 minutes.
+
+| run | mutants | killed | survived | timeout | suspicious |
+|---|---|---|---|---|---|
+| 1, after "fix: count export fallbacks…" | 189 | 179 | 10 | 0 | 0 |
+| 2, after "test: kill the review round 1 mutation survivors" | 188 | 187 | 1 | 0 | 0 |
+
+```
+$ scripts/verify/mutation.sh <base>
+...
+TOTAL mutants 188  killed 187  survived 1  timeout 0  suspicious 0  untested 0
+$ echo $?
+1
+```
+
+Run 1's survivors (ids of run 1); each kill was also checked by applying the mutant by hand
+to a copy of the code and running the test file:
+
+| id | location | mutation | disposition |
+|---|---|---|---|
+| 24 | `migrate.py:209` | `continue` → `break` after an entity chapter | killed: `test_migrate.py::TestMigrate::test_chapters_after_an_entity_chapter_still_checked` |
+| 79, 80 | `builder.py:216` | the "nothing else in the element" condition of the element placement negated / `or` → `and` | killed: `TestSchema2BridgeSurvivors::test_no_element_placement_past_an_element_outside_the_range` (an image outside the range stays); `test_element_placement_with_whitespace_around` added alongside |
+| 88 | `builder.py:338` | `_remove(rest)` → `_remove(None)` in the plain-text fallback | killed: `test_whitespace_translation_removes_the_rest` |
+| 102 | `builder.py:559` | run wrapper inserted before the run's second node | killed: `test_comment_inside_a_run_keeps_its_place` (a comment between the run's nodes would move) |
+| 110 | `extractor.py:78` | `SpineItem.media_type` default → `None` | code changed: the default removed (every caller passes the media type) |
+| 132 | `extractor.py:143` | `not_xhtml` initial value → `None` | killed: `TestRules::test_fresh_extractor` (now also checks `not_xhtml`) |
+| 143, 149 | `extractor.py:195, 206` | `continue` → `break` after an unreadable / entity chapter | killed: `TestReview1Survivors::test_chapters_after_an_unreadable_chapter_kept`, `test_chapters_after_an_entity_chapter_kept` |
+| 91 | `builder.py:537` | `RUN_TAG` renamed | survives run 2, see below |
+
+Run 2's survivor:
+
+| id | location | mutation | disposition |
+|---|---|---|---|
+| 91 | `builder.py:537` | `RUN_TAG = 'epub-translator-run'` → `'XXepub-translator-runXX'` | equivalent: the name of the temporary wrapper only has to differ from every element name in the chapter, since every wrapper is unwrapped before the chapter is written; it holds for both names unless a source chapter uses one of them as an element name |
+
+### 13. Review round 2
+
+Three static reviews again (G, O, the third reviewer: approve with minors). Direction set by
+the orchestrator for the temporary bridge: simpler and safer, not smarter. Each accepted
+item got a test that fails on the code before the round (checked against a `git archive` of
+the commit that recorded round 1 in the log, in a scratch directory); exceptions are marked
+"guard". Every accepted claim reproduced.
+
+| # | finding | reviewer | ruling | what was done | tests |
+|---|---|---|---|---|---|
+| 1 | the round-1 span made chinese-only whole-segment replacements delete blocks without text between the first and last unit (an image-only `<p>`, `<hr/>`, `<a id>` anchors) that the model never saw | O | accepted | a chinese-only replacement removes only the nodes of the segment's blocks and the `<br>` and whitespace strings between them; other nodes stay in place. Bilingual output still moves the whole span into `div.original` | `test_builder.py::TestSchema2BridgeReview2::test_textless_blocks_between_units_kept_once[*]` (the two bilingual cases are guards: they already kept them) |
+| 2 | pairing by node count is not valid when a unit is an inline run (`<div><em>First</em> line<br/>Second</div>` + `<em>第一</em>行\n第二` is mis-paired) | G, the third reviewer | accepted | a segment is paired node by node only when every one of its blocks is a block element, as on `main`; a segment with any inline run is replaced (chinese-only) or wrapped (bilingual) as a whole. The temporary run wrapper of round 1 (items 3 and 11 there) is removed | `TestSchema2BridgeReview2::test_two_runs_not_paired_by_count[*]`, `test_inline_element_run_and_paragraph` (the third reviewer's `<em>Hello</em>` case). Changed, because runs are no longer paired: `TestSchema2Export::test_br_separated_runs[*]`, `test_text_mixed_with_blocks[*]`, `test_raw_epub_end_to_end`, `TestSchema2BridgeReview1::test_br_div_one_to_one_still_placed_line_by_line` → `test_br_div_line_by_line_translation_replaced_whole`, `test_run_and_paragraph_one_row_per_block` → `test_run_and_paragraph_one_row`, `TestSchema2BridgeSurvivors::test_comment_inside_a_run_keeps_its_place` → `…_kept_once` |
+| 3 | placement on the enclosing element when the translation's count is neither 1 nor the unit count drops the element's `class`/`id` | O | accepted | the enclosing element is used only when the translation has exactly one top-level node | `TestSchema2BridgeReview2::test_enclosing_element_kept_for_a_multi_node_translation[*]` |
+| 4 | migration: the partial-group guard looks at statuses only; the review editor can save an empty translation without changing the status | G | accepted | a member with an empty (or whitespace) translation makes the group not wholly translated: joined translation cleared, status pending when it would have been translated or reviewed, named in the report | `test_migrate.py::TestMigrateReview2::test_translation_cleared_in_the_review_editor` (cleared through the review API), `test_empty_member_of_one_status_named` |
+| 5 | migration: valid JSON of the wrong shape (`null`, a segment that is not an object, `epub_path` null) gives a traceback | G, O, the third reviewer | accepted | loading the project and finding its source are inside one `try` at the migration boundary that also catches `AttributeError`; the message is "無法讀取 project.json：…", nothing written | `TestMigrateReview2::test_wrong_json_shape_is_a_migration_error[*]` (the top-level list case is a guard: it was already a `TypeError`), `test_null_epub_path_is_a_migration_error`, `test_wrong_shape_through_the_cli` |
+| 6 | a failing save leaves the backup behind, so the next run is refused | O | accepted | the backup is removed when the save raises (`project.json` is unchanged: the save is atomic) | `TestMigrateReview2::test_failed_save_removes_the_backup` |
+| 7 | commit hash in the log (round-1 mutation base) | orchestrator | accepted | replaced by a description and `<base>` | — |
+| 8 | the enclosing element replaces a structural container of block elements (`<div class="chapter"><p>One.</p><p>Two.</p></div>` + `<p>一二。</p>` leaves bare text in the div; a two-paragraph translation of a one-paragraph div deletes it) | the third reviewer | accepted | the enclosing element is used only for a segment with an inline run (with item 3: and a one-node translation) | `TestSchema2BridgeReview2::test_structural_container_kept_chinese_only[*]`, `test_structural_container_of_one_paragraph_kept` |
+| — | the third reviewer's #2 (an inline translation tag lost in the run wrapper's 1:1 path) | the third reviewer | covered by 2 | the wrapper and run pairing are gone | `test_inline_element_run_and_paragraph` |
+
+The placement rules of the bridge after this round, in full: a chapter is placed only when
+its blocks match the stored ranges and fingerprints as a whole (round 1); a segment whose
+blocks are all block elements is paired node by node when the translation has as many
+top-level nodes, otherwise replaced or wrapped as a whole; a segment with an inline run is
+always replaced or wrapped as a whole, except that a one-node translation of runs that are
+the whole content of one element below `<body>` goes into that element.
+
+### 14. Review round 2: checks after the last code change
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider
+1168 passed in 133.71s (0:02:13)
+$ python3 scripts/verify/phase2_roundtrip.py --projects-dir <repo>/projects --anonymize | tail -1
+TOTAL projects 8  chapters 2170  round trip equal 2170  whole-document equal 2146  failed projects 0
+$ echo $?    # of the unpiped run
+0
+$ python3 scripts/verify/phase2_migrate_copies.py --projects-dir <repo>/projects --anonymize
+PASS project-1: chapters 22/22, segments 220/220, merge groups 0 (0 segments), count differs 0, export fallback 0, translated chars 211044 -> 211044, export places 22/22, web load ok
+PASS project-2: chapters 33/33, segments 291/291, merge groups 13 (26 segments), count differs 16, export fallback 16, translated chars 302113 -> 302113, export places 33/33, web load ok
+PASS project-3: chapters 39/39, segments 4385/4385, merge groups 0 (0 segments), count differs 1, export fallback 1, translated chars 15637 -> 15637, export places 39/39, web load ok
+PASS project-4: chapters 1763/1763, segments 2236/2236, merge groups 0 (0 segments), count differs 32, export fallback 32, translated chars 746052 -> 746052, export places 1763/1763, web load ok
+PASS project-5: chapters 35/35, segments 840/840, merge groups 1 (2 segments), count differs 1, export fallback 1, translated chars 462908 -> 462908, export places 35/35, web load ok
+PASS project-6: chapters 108/108, segments 581/581, merge groups 0 (0 segments), count differs 0, export fallback 0, translated chars 356677 -> 356677, export places 108/108, web load ok
+PASS project-7: chapters 68/68, segments 637/637, merge groups 15 (31 segments), count differs 13, export fallback 17, translated chars 471477 -> 471477, export places 68/68, web load ok
+PASS project-8: chapters 87/87, segments 331/331, merge groups 0 (0 segments), count differs 16, export fallback 15, translated chars 159747 -> 159747, export places 87/87, web load ok
+TOTAL projects 8  chapters 2155/2155  segments 9521/9521  merge groups 29 (59 segments)  count differs 79  export fallback 82  translated chars unchanged 8  export places 2155/2155  web loads 8  failed projects 0
+$ echo $?
+0
+$ cd <repo> && python3 plan/experiments/migrate_dryrun.py --strict | tail -1
+TOTAL chapters 2155/2155  segments 9521/9521  on-boundary 9462  to-merge 59 in 29 groups  largest block 7899 chars
+$ python3 plan/experiments/migrate_dryrun.py --strict > /dev/null; echo $?
+0
+```
+
+Same totals as before the round. "export fallback" now counts the translated text segments
+that are not paired node by node: **82** (was 77). The 5 more are all in project-7: segments
+with an inline run whose translation happened to have one top-level node per block, which
+round 1 paired node by node and which are now replaced or wrapped as a whole (item 2). The
+`projects/` digest was `a7197555c962562a530d6de80fa045af` before the round and after every
+real-data run; no migration copy was left in the temporary directory.
+
+### 15. Mutation testing after review round 2
+
+`scripts/verify/mutation.sh <base>`, where `<base>` is the commit that recorded round 1 in
+the log, so only the lines changed in this round are mutated.
+
+| run | mutants | killed | survived | timeout | suspicious |
+|---|---|---|---|---|---|
+| 1, after "docs: name the round 1 mutation base…" | 65 | 55 | 10 | 0 | 0 |
+| 2, after "test: kill the review round 2 mutation survivors" | 59 | 59 | 0 | 0 | 0 |
+
+```
+$ scripts/verify/mutation.sh <base>
+...
+TOTAL mutants 59  killed 59  survived 0  timeout 0  suspicious 0  untested 0
+$ echo $?
+0
+```
+
+Run 1's survivors (ids of run 1); the kills were also checked by applying each mutant by
+hand to a copy of the code:
+
+| id | location | mutation | disposition |
+|---|---|---|---|
+| 10 | `migrate.py:175` | `cleared = False` → `None` | code changed: `cleared` is one expression (`incomplete and …`) |
+| 39 | `builder.py:225` | enclosing-element placement not paired | killed: `TestSchema2BridgeReview2Survivors::test_enclosing_element_keeps_its_tag_for_a_one_node_translation` |
+| 40, 46, 51 | `builder.py:284, 349, 394` | default `pair=True` → `False` | code changed: `remove`/`span` and `pair` are required (both schemas pass them; one older test that called `_apply_chinese_only` with three arguments passes them now) |
+| 48, 53 | `builder.py:379, 421` | `span is None` → `is not None` | code changed: the `None` default and its handling are gone |
+| 47, 52 | `builder.py:359, 401` | bilingual pairing disabled | killed: `test_block_only_segment_paired_in_bilingual[*]` |
+| 58 | `builder.py:567` | whitespace separator test negated | killed: `test_whitespace_between_blocks_removed_with_them` |
+
+### 16. Review round 3
+
+Verdicts: G changes requested, O approve, the third reviewer approve (no findings). A small
+round by decision: no new placement rules in the bridge. Each fix got a test that fails on
+the code before the round (checked against a `git archive` of the commit that recorded round
+2 in the log, in a scratch directory).
+
+| # | finding | reviewer | ruling | what was done | tests |
+|---|---|---|---|---|---|
+| 1 | migration: a whole-segment placement whose blocks sit in different parent elements puts the whole translation (bilingual: also the originals) into the first block's parent | G (major), O (minor) | accepted as known consequence, measured | no code change; `main` does the same for schema 1, and Phase 3 places per block on the source tree. The migration check counts these segments ("cross-parent"): **26** of the 82 whole-segment placements (project-2 2, project-3 1, project-7 8, project-8 15; 0 elsewhere) | `test_verify_scripts.py::TestMigrateCopiesCheck::test_cross_parent_fallback_counted` |
+| 2 | migration: malformed segment fields (`translated_text` null, non-string `html`, unknown `segment_type`, null `translated_at` in a group) give a traceback | G, O | accepted | one error boundary around planning: `TypeError`, `ValueError`, `AttributeError`, `KeyError` there are a `MigrationError` ("project.json 的段落資料格式不正確：…"), nothing written | `test_migrate.py::TestMigrateReview3::test_malformed_segment_field_is_a_migration_error[*]` (4), `test_malformed_segment_through_the_cli` |
+| 3 | the backup copy is not atomic; a partial backup refuses later runs | G, O | accepted | the backup is copied to `project.schema1.json.<hex>.tmp` and `os.replace`d; the temporary file is removed on failure | `TestMigrateReview3::test_failed_backup_copy_leaves_no_backup` |
+| 4 | a group demoted to pending because its members have no translation is not named when no text was cleared | O | accepted | a note whenever the status is changed ("…合併後為 pending，譯文為空") | `TestMigrateReview3::test_demoted_group_without_text_named` |
+| 5 | a legacy segment whose stored html has no text is folded into the neighbouring group | O | accepted as known limitation, measured | real data (read-only, scratch script not kept): **0** such legacy segments in the 8 projects; no code change | — |
+
+### 17. Review round 3: checks after the last code change
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider
+1176 passed in 126.27s (0:02:06)
+$ python3 scripts/verify/phase2_roundtrip.py --projects-dir <repo>/projects --anonymize | tail -1
+TOTAL projects 8  chapters 2170  round trip equal 2170  whole-document equal 2146  failed projects 0
+$ echo $?    # of the unpiped run
+0
+$ python3 scripts/verify/phase2_migrate_copies.py --projects-dir <repo>/projects --anonymize
+PASS project-1: chapters 22/22, segments 220/220, merge groups 0 (0 segments), count differs 0, export fallback 0 (cross-parent 0), translated chars 211044 -> 211044, export places 22/22, web load ok
+PASS project-2: chapters 33/33, segments 291/291, merge groups 13 (26 segments), count differs 16, export fallback 16 (cross-parent 2), translated chars 302113 -> 302113, export places 33/33, web load ok
+PASS project-3: chapters 39/39, segments 4385/4385, merge groups 0 (0 segments), count differs 1, export fallback 1 (cross-parent 1), translated chars 15637 -> 15637, export places 39/39, web load ok
+PASS project-4: chapters 1763/1763, segments 2236/2236, merge groups 0 (0 segments), count differs 32, export fallback 32 (cross-parent 0), translated chars 746052 -> 746052, export places 1763/1763, web load ok
+PASS project-5: chapters 35/35, segments 840/840, merge groups 1 (2 segments), count differs 1, export fallback 1 (cross-parent 0), translated chars 462908 -> 462908, export places 35/35, web load ok
+PASS project-6: chapters 108/108, segments 581/581, merge groups 0 (0 segments), count differs 0, export fallback 0 (cross-parent 0), translated chars 356677 -> 356677, export places 108/108, web load ok
+PASS project-7: chapters 68/68, segments 637/637, merge groups 15 (31 segments), count differs 13, export fallback 17 (cross-parent 8), translated chars 471477 -> 471477, export places 68/68, web load ok
+PASS project-8: chapters 87/87, segments 331/331, merge groups 0 (0 segments), count differs 16, export fallback 15 (cross-parent 15), translated chars 159747 -> 159747, export places 87/87, web load ok
+TOTAL projects 8  chapters 2155/2155  segments 9521/9521  merge groups 29 (59 segments)  count differs 79  export fallback 82 (cross-parent 26)  translated chars unchanged 8  export places 2155/2155  web loads 8  failed projects 0
+$ echo $?
+0
+$ cd <repo> && python3 plan/experiments/migrate_dryrun.py --strict | tail -1
+TOTAL chapters 2155/2155  segments 9521/9521  on-boundary 9462  to-merge 59 in 29 groups  largest block 7899 chars
+$ python3 plan/experiments/migrate_dryrun.py --strict > /dev/null; echo $?
+0
+```
+
+Same totals as before the round; the new number is the cross-parent count (26). The
+`projects/` digest was `a7197555c962562a530d6de80fa045af` before the round and after every
+real-data run; no migration copy was left in the temporary directory.
+
+Mutation testing: `scripts/verify/mutation.sh <base>`, where `<base>` is the commit that
+recorded round 2 in the log.
+
+```
+$ scripts/verify/mutation.sh <base>
+...
+TOTAL mutants 43  killed 43  survived 0  timeout 0  suspicious 0  untested 0
+$ echo $?
+0
+```
+
+### 18. Review round 4 (final)
+
+Verdicts: G approve, O approve, the third reviewer approve (no findings). No production code
+changed in this round, so no mutation run was needed.
+
+| # | finding | reviewer | ruling | what was done | tests |
+|---|---|---|---|---|---|
+| 1 | the round-3 failure tests do not check that the project lock is released | G | accepted (test only) | the malformed-input and failed-backup-copy tests also assert `lock_free_for_other_process()` afterwards. Checked by hand: with the final `lock.release()` in `migrate_project` skipped (in a scratch copy of the code), all 5 of these tests fail | `test_migrate.py::TestMigrateReview3::test_malformed_segment_field_is_a_migration_error[*]`, `test_failed_backup_copy_leaves_no_backup` |
+| 2 | the migration's error boundary can report an internal error of the reader or walker as malformed project data | O | known limitation, not fixed | costs diagnosis time; nothing is written | — |
+| 3 | a process killed during the backup copy can leave a stale temporary file; one killed between backup and save leaves a backup that makes the next run refuse with a message | O | known limitation, not fixed | fail-safe: `project.json` is unchanged, the message names the file to move | — |
+| 4 | a merged group of several code blocks would store only the first block's code text | O | known limitation, not fixed | the real data has 0 such groups and the normal segmenter never builds one | — |
+| 5 | archive members are read without a size limit | O | known limitation, not fixed | as on `main` | — |
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider
+1176 passed in 127.53s (0:02:07)
+```
+
+The real-data scripts were not run in this round (no code change since section 17).
+
+### Not done
+
+- Export does not verify `source_sha256` (plan 4.2 "Export verifies the hash"): that is
+  part of the Phase 3 exporter.
+- The plan's "confirm that each stored translation still passes structural validation
+  against the new block HTML" is reported only as the non-blocking count (Phase 4 has the
+  validator).
+- No lenient-HTML fallback (no real chapter needs it).
+- `CLAUDE.md` and `README.md` are not updated.
+
+### Not verified
+
+- A full export of a migrated real project was not built; the scripts check only that the
+  export's placement accepts every chapter. Exports were not opened in a reader.
+- The `migrate` CLI was not run on the real copies (the script calls `migrate_project`, the
+  function the command calls); the CLI wrapper is covered by tests.
+- The web pages of migrated projects were checked through the Flask test client (status
+  codes and the segment count), not in a browser.
+- The determinism of indexes and fingerprints was tested on the raw-ZIP fixture, not on the
+  real books (the round-trip and migration scripts walk each real chapter once per run).
+- Mutation testing ran on Python 3.12.7, the suite on 3.9.6. Mutant 66 of run 2 was killed
+  by a test written after the run, verified by applying that one mutant by hand.
+- Review round 1: the encrypted-archive tests set the "encrypted" flag bit of the ZIP
+  entries; no archive encrypted by a real tool was tried. The alert on the new project page
+  was checked as rendered page text, not in a browser. The walk-disagreement cases of
+  section 10 and the real-data counts of items 2 and 5 come from throw-away scripts (not
+  kept). A full export of a migrated real project was still not built.
+- Review round 2: the check script counts the segments that are not paired; it does not
+  compare images or ids before and after an export (the tests do, on invented chapters).
+  The explanation of the 5 more fallbacks (section 14) follows from the rule; the 5
+  segments were not listed individually.

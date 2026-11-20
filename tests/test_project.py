@@ -238,43 +238,60 @@ class TestModelField:
         pm2.load()
         assert pm2.data.model == 'sonnet'
 
-    def test_new_project_records_segmenter_version_2(self, project_dir, sample_segments):
-        ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments)
-        with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
-            assert json.load(f)['segmenter_version'] == 2
-        pm = ProjectManager(project_dir)
-        pm.load()
-        assert pm.data.segmenter_version == 2
-
-    def test_project_without_segmenter_version_loads_as_1_unchanged(
-            self, project_dir, sample_segments):
-        ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments)
+    @staticmethod
+    def _as_schema_1(project_dir, segmenter_version=None):
+        """Rewrite a created project.json as a schema 1 project wrote it:
+        no schema, no source hash, no block fields; segmenter_version only
+        when given (Phase 0 projects have 2, older ones none)."""
         path = os.path.join(project_dir, 'project.json')
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        del data['segmenter_version']
+        del data['schema'], data['source_sha256']
+        for seg in data['segments']:
+            for key in ('block_start', 'block_end', 'fingerprints'):
+                seg.pop(key, None)
+        if segmenter_version is not None:
+            data['segmenter_version'] = segmenter_version
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f)
+        return path
+
+    # Phase 2: schema 2 supersedes segmenter_version; these four tests replace
+    # the Phase 0 segmenter_version tests with the same intent.
+    def test_new_project_records_schema_2(self, project_dir, sample_segments):
+        ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments,
+                                           source_sha256='ab' * 32)
+        with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+        assert raw['schema'] == 2
+        assert raw['source_sha256'] == 'ab' * 32
+        assert 'segmenter_version' not in raw
+        pm = ProjectManager(project_dir)
+        pm.load()
+        assert pm.data.schema == 2
+        assert pm.data.source_sha256 == 'ab' * 32
+
+    def test_project_without_schema_loads_as_1_unchanged(
+            self, project_dir, sample_segments):
+        ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments)
+        path = self._as_schema_1(project_dir)
         with open(path, 'rb') as f:
             before = f.read()
 
         pm = ProjectManager(project_dir)
         pm.load()
 
+        assert pm.data.schema == 1
         assert pm.data.segmenter_version == 1
         with open(path, 'rb') as f:
             assert f.read() == before
 
-    def test_saving_project_without_segmenter_version_keeps_it_absent(
-            self, project_dir, sample_segments):
-        # Pre-Phase-0 code cannot load a project.json that has the field
+    def test_saving_schema_1_project_adds_no_keys(self, project_dir, sample_segments):
+        # Pre-Phase-0 code cannot load a project.json that has these fields
         ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments)
-        path = os.path.join(project_dir, 'project.json')
+        path = self._as_schema_1(project_dir)
         with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        del data['segmenter_version']
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f)
+            before = json.load(f)
 
         pm = ProjectManager(project_dir)
         pm.load()
@@ -283,25 +300,47 @@ class TestModelField:
 
         with open(path, 'r', encoding='utf-8') as f:
             saved = json.load(f)
-        assert 'segmenter_version' not in saved
+        assert set(saved) == set(before)
+        assert [set(s) for s in saved['segments']] == [set(s) for s in before['segments']]
         assert saved['model'] == 'opus'
         pm2 = ProjectManager(project_dir)
         pm2.load()
-        assert pm2.data.segmenter_version == 1
+        assert (pm2.data.schema, pm2.data.segmenter_version) == (1, 1)
 
-    def test_version_2_project_keeps_segmenter_version_through_save(
+    def test_phase_0_project_keeps_segmenter_version_through_save(
             self, project_dir, sample_segments):
         ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments)
+        self._as_schema_1(project_dir, segmenter_version=2)
         pm = ProjectManager(project_dir)
         pm.load()
         pm.set_model('opus')
         pm.save()
 
         with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
-            assert json.load(f)['segmenter_version'] == 2
+            raw = json.load(f)
+        assert raw['segmenter_version'] == 2
+        assert 'schema' not in raw
         pm2 = ProjectManager(project_dir)
         pm2.load()
-        assert pm2.data.segmenter_version == 2
+        assert (pm2.data.schema, pm2.data.segmenter_version) == (1, 2)
+
+    def test_schema_2_project_keeps_block_fields_through_save(self, project_dir):
+        from src.core.segmenter import Segment
+        seg = Segment(id='ch1_seg0001', html='<p>A</p>', text='A', word_count=1,
+                      segment_type=SegmentType.TEXT, block_start=0, block_end=1,
+                      fingerprints=['0123456789abcdef'])
+        ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', [seg])
+        pm = ProjectManager(project_dir)
+        pm.load()
+        pm.save()
+
+        with open(os.path.join(project_dir, 'project.json'), 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+        assert raw['schema'] == 2
+        stored = raw['segments'][0]
+        assert (stored['block_start'], stored['block_end'], stored['fingerprints']) == \
+            (0, 1, ['0123456789abcdef'])
+        assert pm.data.segments[0].block_start == 0
 
     def test_set_model_without_load(self, project_dir):
         pm = ProjectManager(project_dir)
@@ -989,3 +1028,30 @@ class TestRound2DescriptorLeaks:
             child.stdin.close()
             child.wait(timeout=10)
         assert '（PID �12）' in str(info.value)
+
+
+class TestPhase2ProjectFields:
+    """Mutation survivors of the Phase 2 project fields."""
+
+    def test_sha256_file_of_a_large_file(self, tmp_path):
+        import hashlib
+        from src.core.project import sha256_file
+        data = os.urandom(3 * (1 << 20) + 17)
+        path = tmp_path / 'big.bin'
+        path.write_bytes(data)
+        assert sha256_file(str(path)) == hashlib.sha256(data).hexdigest()
+
+    def test_schema_1_project_has_no_source_hash(self, project_dir):
+        with open(os.path.join(project_dir, 'project.json'), 'w', encoding='utf-8') as f:
+            json.dump({'epub_path': '/b.epub', 'project_dir': project_dir, 'segments': []}, f)
+        pm = ProjectManager(project_dir)
+        pm.load()
+        assert (pm.data.schema, pm.data.source_sha256) == (1, '')
+
+    def test_create_without_hash_or_ranges(self, project_dir, sample_segments):
+        ProjectManager(project_dir).create('/path/to/book.epub', 'T', 'A', sample_segments)
+        with open(os.path.join(project_dir, 'project.json'), encoding='utf-8') as f:
+            raw = json.load(f)
+        assert raw['source_sha256'] == ''
+        assert all(not ({'block_start', 'block_end', 'fingerprints'} & set(s))
+                   for s in raw['segments'])
