@@ -311,7 +311,6 @@ def check_keys(reply: str, protected: Protected) -> list:
         if depth == 0:
             top.append(k)
         key = protected.keys.get(k)
-        owner = top[-1] if top else None
         if k is None:
             if reply_attrs:
                 attrs.append(f'<{name}> 帶有原文沒有的屬性')
@@ -321,7 +320,7 @@ def check_keys(reply: str, protected: Protected) -> list:
             seen[k] += 1
             if key.attrs is None and depth:
                 misplaced.append(f'<{WRAPPER} k="{k}"> 不在最外層')
-            elif depth and owner != key.owner:
+            elif depth and top[-1] != key.owner:  # depth > 0: a top-level unit is open
                 misplaced.append(f'<{name} k="{k}"> 不在原來的區塊（原文在 k="{key.owner}" 內）')
             given = {n: raw for n, _, raw, _, _ in reply_attrs if n != 'k'}
             for n in sorted(set(given) - set(key.shown)):
