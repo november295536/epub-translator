@@ -1854,9 +1854,12 @@ Not needed for this phase (no prompt or backend change) and not made.
   message.
 - Migration: a merge group that is not wholly translated (a member pending, failed or with
   an empty translation) loses its partial translation (kept in `project.schema1.json`, named
-  in the report); a group that mixes code and text
+  in the report); a group whose status is changed is always named; a group that mixes code and text
   segments makes its chapter unmatched (0 such groups in the real data); an existing
   `project.schema1.json` blocks the migration.
+- A legacy segment whose stored html has no text (for example a body-level `<script>` that
+  an old segmenter stored) is folded into the neighbouring merge group; 0 such segments in
+  the 8 projects (review round 3).
 - Migrated segments whose legacy text held comment text (Bug 5, two project-5 segments) keep
   their translation, which still contains the translated production note; it now has no
   counterpart in the segment's HTML and is exported with the segment. They need the manual
@@ -1866,6 +1869,11 @@ Not needed for this phase (no prompt or backend change) and not made.
   export through the fallback, as today" was not proven and is corrected in section 11).
   A chinese-only replacement removes the segment's blocks and the `<br>` and whitespace
   between them; images, anchors and `<hr/>` between them stay, after the translation.
+  For 26 of the 82 the blocks have more than one parent element (project-2 2, project-3 1,
+  project-7 8, project-8 15; section 17): the whole translation, and in bilingual output
+  the originals too, go into the first block's parent, so text can move into or out of a
+  container (its class and id then no longer apply as in the source). `main` does the same
+  for schema 1; Phase 3 places per block on the source tree.
 - Schema 2 export pairs node by node only segments made of block elements, as `main` did; a
   segment with an inline run (text directly in a `div` or under `<body>`, `<br>`-separated
   lines) is always replaced or wrapped as a whole, so such text loses its line structure in
@@ -2118,6 +2126,63 @@ hand to a copy of the code:
 | 48, 53 | `builder.py:379, 421` | `span is None` → `is not None` | code changed: the `None` default and its handling are gone |
 | 47, 52 | `builder.py:359, 401` | bilingual pairing disabled | killed: `test_block_only_segment_paired_in_bilingual[*]` |
 | 58 | `builder.py:567` | whitespace separator test negated | killed: `test_whitespace_between_blocks_removed_with_them` |
+
+### 16. Review round 3
+
+Verdicts: G changes requested, O approve, the third reviewer approve (no findings). A small
+round by decision: no new placement rules in the bridge. Each fix got a test that fails on
+the code before the round (checked against a `git archive` of the commit that recorded round
+2 in the log, in a scratch directory).
+
+| # | finding | reviewer | ruling | what was done | tests |
+|---|---|---|---|---|---|
+| 1 | migration: a whole-segment placement whose blocks sit in different parent elements puts the whole translation (bilingual: also the originals) into the first block's parent | G (major), O (minor) | accepted as known consequence, measured | no code change; `main` does the same for schema 1, and Phase 3 places per block on the source tree. The migration check counts these segments ("cross-parent"): **26** of the 82 whole-segment placements (project-2 2, project-3 1, project-7 8, project-8 15; 0 elsewhere) | `test_verify_scripts.py::TestMigrateCopiesCheck::test_cross_parent_fallback_counted` |
+| 2 | migration: malformed segment fields (`translated_text` null, non-string `html`, unknown `segment_type`, null `translated_at` in a group) give a traceback | G, O | accepted | one error boundary around planning: `TypeError`, `ValueError`, `AttributeError`, `KeyError` there are a `MigrationError` ("project.json 的段落資料格式不正確：…"), nothing written | `test_migrate.py::TestMigrateReview3::test_malformed_segment_field_is_a_migration_error[*]` (4), `test_malformed_segment_through_the_cli` |
+| 3 | the backup copy is not atomic; a partial backup refuses later runs | G, O | accepted | the backup is copied to `project.schema1.json.<hex>.tmp` and `os.replace`d; the temporary file is removed on failure | `TestMigrateReview3::test_failed_backup_copy_leaves_no_backup` |
+| 4 | a group demoted to pending because its members have no translation is not named when no text was cleared | O | accepted | a note whenever the status is changed ("…合併後為 pending，譯文為空") | `TestMigrateReview3::test_demoted_group_without_text_named` |
+| 5 | a legacy segment whose stored html has no text is folded into the neighbouring group | O | accepted as known limitation, measured | real data (read-only, scratch script not kept): **0** such legacy segments in the 8 projects; no code change | — |
+
+### 17. Review round 3: checks after the last code change
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider
+1176 passed in 126.27s (0:02:06)
+$ python3 scripts/verify/phase2_roundtrip.py --projects-dir <repo>/projects --anonymize | tail -1
+TOTAL projects 8  chapters 2170  round trip equal 2170  whole-document equal 2146  failed projects 0
+$ echo $?    # of the unpiped run
+0
+$ python3 scripts/verify/phase2_migrate_copies.py --projects-dir <repo>/projects --anonymize
+PASS project-1: chapters 22/22, segments 220/220, merge groups 0 (0 segments), count differs 0, export fallback 0 (cross-parent 0), translated chars 211044 -> 211044, export places 22/22, web load ok
+PASS project-2: chapters 33/33, segments 291/291, merge groups 13 (26 segments), count differs 16, export fallback 16 (cross-parent 2), translated chars 302113 -> 302113, export places 33/33, web load ok
+PASS project-3: chapters 39/39, segments 4385/4385, merge groups 0 (0 segments), count differs 1, export fallback 1 (cross-parent 1), translated chars 15637 -> 15637, export places 39/39, web load ok
+PASS project-4: chapters 1763/1763, segments 2236/2236, merge groups 0 (0 segments), count differs 32, export fallback 32 (cross-parent 0), translated chars 746052 -> 746052, export places 1763/1763, web load ok
+PASS project-5: chapters 35/35, segments 840/840, merge groups 1 (2 segments), count differs 1, export fallback 1 (cross-parent 0), translated chars 462908 -> 462908, export places 35/35, web load ok
+PASS project-6: chapters 108/108, segments 581/581, merge groups 0 (0 segments), count differs 0, export fallback 0 (cross-parent 0), translated chars 356677 -> 356677, export places 108/108, web load ok
+PASS project-7: chapters 68/68, segments 637/637, merge groups 15 (31 segments), count differs 13, export fallback 17 (cross-parent 8), translated chars 471477 -> 471477, export places 68/68, web load ok
+PASS project-8: chapters 87/87, segments 331/331, merge groups 0 (0 segments), count differs 16, export fallback 15 (cross-parent 15), translated chars 159747 -> 159747, export places 87/87, web load ok
+TOTAL projects 8  chapters 2155/2155  segments 9521/9521  merge groups 29 (59 segments)  count differs 79  export fallback 82 (cross-parent 26)  translated chars unchanged 8  export places 2155/2155  web loads 8  failed projects 0
+$ echo $?
+0
+$ cd <repo> && python3 plan/experiments/migrate_dryrun.py --strict | tail -1
+TOTAL chapters 2155/2155  segments 9521/9521  on-boundary 9462  to-merge 59 in 29 groups  largest block 7899 chars
+$ python3 plan/experiments/migrate_dryrun.py --strict > /dev/null; echo $?
+0
+```
+
+Same totals as before the round; the new number is the cross-parent count (26). The
+`projects/` digest was `a7197555c962562a530d6de80fa045af` before the round and after every
+real-data run; no migration copy was left in the temporary directory.
+
+Mutation testing: `scripts/verify/mutation.sh <base>`, where `<base>` is the commit that
+recorded round 2 in the log.
+
+```
+$ scripts/verify/mutation.sh <base>
+...
+TOTAL mutants 43  killed 43  survived 0  timeout 0  suspicious 0  untested 0
+$ echo $?
+0
+```
 
 ### Not done
 
