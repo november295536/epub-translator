@@ -1899,7 +1899,11 @@ class TestRetranslateDetails:
         with use_fake_backend(FakeBackend([TransientError('boom')] * 4)):
             response = client.post(
                 f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
-        assert response.get_json() == {'error': 'Translation failed after 4 attempts: boom'}
+        # Phase 5 review round 1: the stored issues and the count come along
+        assert response.get_json() == {
+            'error': 'Translation failed after 4 attempts: boom', 'issue_count': 1,
+            'issues': [{'kind': 'backend', 'code': 'transient', 'blocking': True,
+                        'detail': 'Translation failed after 4 attempts: boom'}]}
         log_dir = os.path.join(project_with_translations, PROJECT_NAME, 'log', 'failed')
         assert os.listdir(log_dir) == ['ch1_seg0003-5e7e0f7e3d.txt']
         assert 'Translation error for ch1_seg0003: Translation failed after 4 attempts: boom' \
@@ -2603,10 +2607,12 @@ class TestRound1Exact:
 
     def test_review_responses_exact(self, client):
         url = f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002'
+        # Phase 5: both return the check's issues (none here) and the number
+        # of segments with stored issues
         assert client.post(url, json={'text': '<p>改</p>'}).get_json() == \
-            {'status': 'ok', 'segment_id': 'ch1_seg0002'}
+            {'status': 'ok', 'segment_id': 'ch1_seg0002', 'issues': [], 'issue_count': 0}
         assert client.post(url + '/approve', json={}).get_json() == \
-            {'status': 'ok', 'segment_id': 'ch1_seg0002'}
+            {'status': 'ok', 'segment_id': 'ch1_seg0002', 'issues': [], 'issue_count': 0}
         response = client.post(f'/api/projects/{PROJECT_NAME}/segments/nope/retranslate')
         assert response.status_code == 404
         assert response.get_json() == {'error': 'Segment nope not found'}
@@ -3926,3 +3932,391 @@ eval(page + '; global.translationController = translationController;');
         assert response.status_code == 422
         assert response.get_json()['error'] == \
             '譯文未通過結構檢查：第 1 個區塊沒有文字；出現原文沒有的標籤：<b>'
+
+
+# --- Phase 5: glossary warnings and issues in the review ---------------------------
+
+from src.glossary.glossary_manager import GlossaryManager  # noqa: E402
+
+
+class TestReviewIssues:
+
+    def _project_dir(self, projects_dir):
+        return os.path.join(projects_dir, PROJECT_NAME)
+
+    def _glossary(self, projects_dir):
+        gm = GlossaryManager(os.path.join(self._project_dir(projects_dir), 'glossary.json'))
+        gm.add_term('paragraph', '段落', 'term')
+
+    def _stored(self, projects_dir, seg_id):
+        pm = ProjectManager(self._project_dir(projects_dir))
+        pm.load()
+        return pm._find(seg_id)
+
+    def _issues(self, projects_dir, which):
+        """ch1_seg0002: a glossary warning; ch1_seg0003: failed; ch2_seg0002:
+        a quality warning (which: the segments to give issues)."""
+        pm = ProjectManager(self._project_dir(projects_dir))
+        pm.load()
+        if 'glossary' in which:
+            pm.update_translation('ch1_seg0002', '<p>第一段。</p>', issues=[
+                Issue('glossary', 'term_not_applied', 'GLOSSDETAIL', False)])
+        if 'failed' in which:
+            pm.mark_failed('ch1_seg0003', [Issue('structure', 'tag_count', 'FAILDETAIL', True)])
+        if 'quality' in which:
+            pm.update_translation('ch2_seg0002', '<p>Chapter 2 content.</p>', issues=[
+                Issue('quality', 'untranslated', 'QUALDETAIL', False)])
+        pm.save()
+
+    def test_update_returns_and_stores_glossary_warning(self, client, project_with_translations):
+        self._glossary(project_with_translations)
+        url = f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002'
+        data = client.post(url, json={'text': '<p>第一節。</p>'}).get_json()
+        warning = {'kind': 'glossary', 'code': 'term_not_applied',
+                   'detail': '術語「paragraph」未譯為「段落」', 'blocking': False}
+        assert data == {'status': 'ok', 'segment_id': 'ch1_seg0002', 'issues': [warning],
+                        'issue_count': 1}
+        seg = self._stored(project_with_translations, 'ch1_seg0002')
+        assert seg.translated_text == '<p>第一節。</p>'
+        assert [i.code for i in seg.issues] == ['term_not_applied']
+        data = client.post(url, json={'text': '<p>第一段落。</p>'}).get_json()
+        assert data['issues'] == []
+        assert self._stored(project_with_translations, 'ch1_seg0002').issues == []
+
+    def test_approve_returns_warning_and_clears_stored(self, client, project_with_translations):
+        self._glossary(project_with_translations)
+        url = f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002'
+        client.post(url, json={'text': '<p>第一節。</p>'})
+        data = client.post(url + '/approve', json={}).get_json()
+        assert [i['code'] for i in data['issues']] == ['term_not_applied']
+        seg = self._stored(project_with_translations, 'ch1_seg0002')
+        assert seg.status == SegmentStatus.REVIEWED and seg.issues == []
+
+    def test_refused_save_returns_issues(self, client):
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002',
+                               json={'text': '<p>第一段<b>x</b>。</p>'})
+        assert response.status_code == 422
+        assert [i['code'] for i in response.get_json()['issues']] == ['unknown_tag']
+
+    def test_retranslate_returns_issues(self, client, project_with_translations):
+        self._glossary(project_with_translations)
+        with use_fake_backend(FakeBackend(['<p k="1">第二節。</p>'])):
+            data = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate').get_json()
+        assert data['translated_text'] == '<p>第二節。</p>'
+        assert [i['code'] for i in data['issues']] == ['term_not_applied']
+
+    def test_filter_lists_exactly_the_segments_with_issues(self, client, project_with_translations):
+        self._issues(project_with_translations, ('glossary', 'failed', 'quality'))
+        html = client.get(f'/project/{PROJECT_NAME}/review?issues=1').get_data(as_text=True)
+        shown = [s for s in ('ch1_seg0001', 'ch1_seg0002', 'ch1_seg0003', 'ch2_seg0001',
+                             'ch2_seg0002') if f'id="seg-{s}"' in html]
+        assert shown == ['ch1_seg0002', 'ch1_seg0003', 'ch2_seg0002']
+        for detail in ('GLOSSDETAIL', 'FAILDETAIL', 'QUALDETAIL'):
+            assert detail in html
+        # each listed segment links to its chapter
+        assert f'href="/project/{PROJECT_NAME}/review/chapter/ch2#seg-ch2_seg0002"' in html
+        html = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1?issues=1').get_data(
+            as_text=True)
+        assert [s for s in ('ch1_seg0001', 'ch1_seg0002', 'ch1_seg0003', 'ch2_seg0002')
+                if f'id="seg-{s}"' in html] == ['ch1_seg0002', 'ch1_seg0003']
+        assert '顯示全部' in html
+
+    def test_without_filter_all_segments(self, client, project_with_translations):
+        self._issues(project_with_translations, ('glossary',))
+        html = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1').get_data(as_text=True)
+        assert all(f'id="seg-{s}"' in html for s in ('ch1_seg0001', 'ch1_seg0002', 'ch1_seg0003'))
+        assert f'href="/project/{PROJECT_NAME}/review/chapter/ch1?issues=1"' in html
+        html = client.get(f'/project/{PROJECT_NAME}/review').get_data(as_text=True)
+        assert 'id="seg-' not in html  # the index lists chapters only
+        assert '請從左側選擇一個章節開始審閱。' in html
+
+    def test_no_segment_with_issues(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/review?issues=1').get_data(as_text=True)
+        assert 'id="seg-' not in html
+        assert '沒有有問題的段落。' in html
+        assert '有問題的段落\n            <span class="badge" id="issue-count">0</span>' in html
+
+    def test_badge_and_details(self, client, project_with_translations):
+        self._issues(project_with_translations, ('glossary', 'failed'))
+        html = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1').get_data(as_text=True)
+        assert '有問題的段落\n            <span class="badge" id="issue-count">2</span>' in html
+        assert html.count('<span class="issue-badge">1 個問題</span>') == 2
+        assert html.count('<span class="issue-badge" hidden>0 個問題</span>') == 1
+        assert '<li class="issue-glossary"><span class="issue-kind">術語</span>GLOSSDETAIL</li>' \
+            in html
+        assert '<li class="issue-structure"><span class="issue-kind">結構</span>FAILDETAIL</li>' \
+            in html
+        # the script shows what a save, an approval, a re-translation (also a
+        # failed one) or a refused save returns (TestReviewPageScript runs it)
+        assert html.count('showIssues(segId, data);') == 5
+        from src.web.blueprints.review import ISSUE_KINDS
+        assert ISSUE_KINDS == {'structure': '結構', 'quality': '品質', 'glossary': '術語',
+                               'backend': '模型回覆'}
+        assert f'const issueKinds = {json.dumps(ISSUE_KINDS, sort_keys=True)};' in html
+
+    def test_search_hint_mentions_failed(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/search').get_data(as_text=True)
+        assert '搜尋已翻譯、已審閱和翻譯失敗段落的原文及譯文' in html
+
+
+# --- Phase 5 review round 1 -------------------------------------------------------
+
+DAMAGED_GLOSSARIES = {
+    'not json': '[{"term": "paragraph", "transl',          # half-written
+    'null': 'null',
+    'empty entry': '[{}]',
+    'not a list of objects': '["paragraph"]',
+    'unknown field': '[{"term": "paragraph", "translation": "段落", "x": 1}]',
+    'not utf-8': b'\xff\xfe[',
+    # round 2: wrong field types
+    'term null': '[{"term": null, "translation": "段落"}]',
+    'category list': '[{"term": "paragraph", "translation": "段落", "category": ["term"]}]',
+    'translation null': '[{"term": "paragraph", "translation": null}]',
+    'translation number': '[{"term": "paragraph", "translation": 5}]',
+    'notes number': '[{"term": "paragraph", "translation": "段落", "notes": 1}]',
+}
+
+
+class TestDamagedGlossary:
+    """Item 1: the glossary warnings are optional; a damaged glossary.json
+    never breaks save, approve or re-translate."""
+
+    def _write(self, projects_dir, content):
+        path = os.path.join(projects_dir, PROJECT_NAME, 'glossary.json')
+        mode = 'wb' if isinstance(content, bytes) else 'w'
+        with open(path, mode, **({} if isinstance(content, bytes) else {'encoding': 'utf-8'})) as f:
+            f.write(content)
+        return path
+
+    @pytest.mark.parametrize('content', list(DAMAGED_GLOSSARIES.values()),
+                             ids=list(DAMAGED_GLOSSARIES))
+    def test_save_and_approve_go_on(self, client, project_with_translations, content, caplog):
+        self._write(project_with_translations, content)
+        url = f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002'
+        response = client.post(url, json={'text': '<p>第一節。</p>'})
+        assert response.status_code == 200
+        assert response.get_json() == {'status': 'ok', 'segment_id': 'ch1_seg0002', 'issues': [],
+                                       'issue_count': 0, 'glossary_unavailable': True}
+        response = client.post(url + '/approve', json={})
+        assert response.status_code == 200
+        assert response.get_json()['glossary_unavailable'] is True
+        # the structural check still runs
+        response = client.post(url, json={'text': '<p>第一節<b>x</b>。</p>'})
+        assert response.status_code == 422
+        assert response.get_json()['glossary_unavailable'] is True
+        assert [i['code'] for i in response.get_json()['issues']] == ['unknown_tag']
+        assert any('術語表無法讀取' in r.getMessage() for r in caplog.records)
+
+    def test_unreadable(self, client, project_with_translations):
+        path = self._write(project_with_translations, '[]')
+        os.chmod(path, 0)
+        try:
+            data = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002',
+                               json={'text': '<p>第一節。</p>'}).get_json()
+        finally:
+            os.chmod(path, 0o644)
+        assert data['status'] == 'ok' and data['glossary_unavailable'] is True
+
+    @pytest.mark.parametrize('content', ['null', DAMAGED_GLOSSARIES['term null'],
+                                         DAMAGED_GLOSSARIES['category list']])
+    def test_retranslate_goes_on(self, client, project_with_translations, content):
+        self._write(project_with_translations, content)
+        with use_fake_backend(FakeBackend(['<p k="1">第二節。</p>'])):
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate')
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['translated_text'] == '<p>第二節。</p>'
+        assert data['glossary_unavailable'] is True
+
+    @pytest.mark.parametrize('translation', ['""', '"  "'])
+    def test_entry_without_translation_skipped(self, client, project_with_translations,
+                                                translation):
+        self._write(project_with_translations,
+                    f'[{{"term": "paragraph", "translation": {translation}}}, '
+                    '{"term": "first", "translation": "首"}]')
+        data = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002',
+                           json={'text': '<p>第一節。</p>'}).get_json()
+        assert 'glossary_unavailable' not in data
+        assert [i['detail'] for i in data['issues']] == ['術語「first」未譯為「首」']
+
+    def test_available_glossary_not_flagged(self, client, project_with_translations):
+        self._write(project_with_translations, '[]')
+        data = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002',
+                           json={'text': '<p>第一節。</p>'}).get_json()
+        assert 'glossary_unavailable' not in data
+        # no file at all: no glossary, nothing unavailable
+        os.remove(os.path.join(project_with_translations, PROJECT_NAME, 'glossary.json'))
+        data = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002',
+                           json={'text': '<p>第一節。</p>'}).get_json()
+        assert 'glossary_unavailable' not in data
+
+
+class TestIssueCount:
+    """Item 8: the count of segments with stored issues comes from the server."""
+
+    def test_count_follows_the_stored_issues(self, client, project_with_translations):
+        GlossaryManager(os.path.join(project_with_translations, PROJECT_NAME,
+                                     'glossary.json')).add_term('paragraph', '段落', 'term')
+        url = f'/api/projects/{PROJECT_NAME}/segments'
+        assert client.post(f'{url}/ch1_seg0002', json={'text': '<p>一節。</p>'}).get_json()[
+            'issue_count'] == 1
+        assert client.post(f'{url}/ch1_seg0003', json={'text': '<p>二節。</p>'}).get_json()[
+            'issue_count'] == 2
+        # approve: warnings returned, not stored
+        data = client.post(f'{url}/ch1_seg0003/approve', json={}).get_json()
+        assert (len(data['issues']), data['issue_count']) == (1, 1)
+        refused = client.post(f'{url}/ch1_seg0002', json={'text': '<p>x<b>y</b></p>'})
+        assert refused.status_code == 422 and refused.get_json()['issue_count'] == 1
+        with use_fake_backend(FakeBackend(['<p k="1">第一段落。</p>'])):
+            data = client.post(f'{url}/ch1_seg0002/retranslate').get_json()
+        assert (data['issues'], data['issue_count']) == ([], 0)
+
+    def test_failed_retranslation_keeps_text_and_returns_issues(self, client,
+                                                               project_with_translations):
+        from src.llm import RefusalError
+        with use_fake_backend(FakeBackend([RefusalError('no')])):
+            response = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002/retranslate')
+        assert response.status_code == 500
+        data = response.get_json()
+        assert [i['code'] for i in data['issues']] == ['refusal'] and data['issue_count'] == 1
+        pm = ProjectManager(os.path.join(project_with_translations, PROJECT_NAME))
+        pm.load()
+        seg = pm._find('ch1_seg0002')
+        assert (seg.translated_text, seg.status) == ('<p>第一段。</p>', SegmentStatus.TRANSLATED)
+        assert [i.code for i in seg.issues] == ['refusal']
+
+
+class TestReviewPageScript:
+    """Item 9: the review page's script run in Node with a small DOM stub."""
+
+    HARNESS = r"""
+const [scenario, payload] = [process.argv[1], JSON.parse(process.argv[2])];
+class Node_ {
+    constructor(tag) { this.tag = tag; this.children = []; this.attrs = {}; this.hidden = false;
+                       this.textContent = ''; this.className = ''; this.title = ''; }
+    append(...items) { for (const i of items) this.children.push(i); }
+    replaceChildren(...items) { this.children = items; }
+    removeAttribute(name) { if (name === 'title') this.title = null; }
+    querySelector(sel) { return this.parts[sel]; }
+}
+const seg = new Node_('div');
+seg.parts = {'.issue-badge': new Node_('span'), '.segment-issues': new Node_('ul'),
+             '.segment-status': new Node_('span'), '.btn-retranslate': new Node_('button'),
+             '.glossary-notice': new Node_('p')};
+seg.parts['.glossary-notice'].hidden = scenario.endsWith('-notice-shown');
+seg.parts['.segment-status'].title = 'OLD';
+const textarea = new Node_('textarea');
+textarea.value = 'KEPT';
+seg.parts['textarea[data-id="s1"]'] = textarea;
+const count = new Node_('span');
+count.textContent = '7';
+const alerts = [];
+global.alert = (m) => alerts.push(m);
+global.document = {
+    getElementById: (id) => id === 'issue-count' ? count : id === 'seg-s1' ? seg : null,
+    createElement: (tag) => new Node_(tag),
+    querySelector: (sel) => sel === 'textarea[data-id="s1"]' ? textarea : null,
+    querySelectorAll: () => [],
+};
+global.fetch = async () => ({ok: scenario !== 'retranslate-failed', status: 500,
+                             json: async () => payload});
+const page = require('fs').readFileSync(0, 'utf8');
+eval(page);
+(async () => {
+    if (scenario.startsWith('show')) showIssues('s1', payload);
+    else if (scenario === 'save') saveSegment('s1');
+    else if (scenario === 'approve') approveSegment('s1');
+    else retranslateSegment('s1');
+    await new Promise(r => setTimeout(r, 10));
+    const show = (n) => typeof n === 'string' ? n : {tag: n.tag, className: n.className,
+        text: n.textContent, children: n.children.map(show)};
+    const p = seg.parts;
+    console.log(JSON.stringify({
+        count: String(count.textContent), badge: p['.issue-badge'].textContent,
+        badgeHidden: p['.issue-badge'].hidden, listHidden: p['.segment-issues'].hidden,
+        items: p['.segment-issues'].children.map(show), title: p['.segment-status'].title,
+        status: p['.segment-status'].textContent, text: textarea.value, alerts,
+        notice: !p['.glossary-notice'].hidden}));
+})();
+"""
+
+    def _run(self, client, scenario, payload):
+        import shutil
+        import subprocess
+        node = shutil.which('node')
+        if node is None:
+            pytest.skip('node is not installed')
+        html = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1').get_data(as_text=True)
+        start = html.index("<script>\nconst projectName") + len('<script>')
+        script = html[start:html.index('</script>', start)]
+        out = subprocess.run([node, '-e', self.HARNESS, scenario, json.dumps(payload)],
+                             input=script, capture_output=True, text=True, timeout=30)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)
+
+    ISSUES = [{'kind': 'glossary', 'code': 'term_not_applied', 'blocking': False,
+               'detail': '術語「a」未譯為「<b>甲</b>」'},
+              {'kind': 'other-kind', 'code': 'x', 'blocking': False, 'detail': 'D2'}]
+
+    def test_show_issues(self, client):
+        result = self._run(client, 'show', {'issues': self.ISSUES, 'issue_count': 3})
+        assert result['count'] == '3'
+        assert (result['badge'], result['badgeHidden'], result['listHidden']) == \
+            ('2 個問題', False, False)
+        # the detail is text, never markup; an unknown kind shows its key
+        assert result['items'] == [
+            {'tag': 'li', 'className': 'issue-glossary', 'text': '', 'children': [
+                {'tag': 'span', 'className': 'issue-kind', 'text': '術語', 'children': []},
+                '術語「a」未譯為「<b>甲</b>」']},
+            {'tag': 'li', 'className': 'issue-other-kind', 'text': '', 'children': [
+                {'tag': 'span', 'className': 'issue-kind', 'text': 'other-kind', 'children': []},
+                'D2']}]
+        assert result['title'] == '術語「a」未譯為「<b>甲</b>」; D2'
+
+    def test_no_issues_hides_and_clears(self, client):
+        result = self._run(client, 'show', {'issues': [], 'issue_count': 0})
+        assert (result['count'], result['badge'], result['badgeHidden'], result['listHidden'],
+                result['items'], result['title']) == ('0', '0 個問題', True, True, [], None)
+
+    def test_absent_issues_change_nothing(self, client):
+        result = self._run(client, 'show', {'error': 'x'})
+        assert (result['count'], result['badge'], result['title'], result['items']) == \
+            ('7', '', 'OLD', [])
+
+    def test_save_and_approve_show_the_response(self, client):
+        for scenario in ('save', 'approve'):
+            result = self._run(client, scenario, {'status': 'ok', 'issues': self.ISSUES[:1],
+                                                  'issue_count': 4})
+            assert (result['count'], result['badge']) == ('4', '1 個問題')
+
+    def test_failed_retranslation_shows_issues_and_keeps_text(self, client):
+        result = self._run(client, 'retranslate-failed', {
+            'error': 'ERR', 'issue_count': 1,
+            'issues': [{'kind': 'backend', 'code': 'refusal', 'blocking': True, 'detail': 'NO'}]})
+        assert result['text'] == 'KEPT' and result['alerts'] == ['ERR']
+        assert (result['count'], result['badge'], result['title']) == ('1', '1 個問題', 'NO')
+        assert result['status'] == ''  # the status text is left as it was
+
+
+class TestReviewPageGlossaryNotice(TestReviewPageScript):
+    """Round 2, item 9: the page says when the glossary could not be read."""
+
+    def test_notice_shown_and_hidden(self, client):
+        assert self._run(client, 'show', {'issues': [], 'glossary_unavailable': True})['notice']
+        # a later answer with the glossary read hides it again
+        assert not self._run(client, 'show-notice-shown', {'issues': []})['notice']
+        assert not self._run(client, 'show', {'error': 'x'})['notice']
+
+    def test_save_approve_retranslate_show_it(self, client):
+        for scenario in ('save', 'approve', 'retranslate', 'retranslate-failed'):
+            result = self._run(client, scenario, {'status': 'ok', 'issues': [],
+                                                  'translated_text': 'T', 'error': 'E',
+                                                  'glossary_unavailable': True})
+            assert result['notice'], scenario
+
+    def test_notice_in_the_page(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1').get_data(as_text=True)
+        assert html.count('<p class="glossary-notice" hidden>術語表無法讀取，這次未檢查術語。</p>') == 3

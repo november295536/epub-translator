@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import secrets
 from dataclasses import dataclass, asdict, field
 
 
@@ -24,7 +26,7 @@ CATEGORY_LABELS = {
 FULL_GLOSSARY_MAX_TERMS = 150
 
 
-def _term_pattern(term: str) -> str:
+def term_pattern(term: str) -> str:
     """Regex for a glossary term: it starts at a word boundary, with any
     continuation, case-insensitive.
 
@@ -39,6 +41,25 @@ def _term_pattern(term: str) -> str:
     does not match its singular.
     """
     return r'(?<!\w)' + r'\s+'.join(re.escape(part) for part in term.split())
+
+
+logger = logging.getLogger(__name__)
+
+# The fields of a stored entry that must be strings where present
+TEXT_FIELDS = ('term', 'translation', 'category', 'notes', 'context')
+
+
+def load_glossary(path: str):
+    """The glossary at `path`, or None when it cannot be read (unreadable,
+    not JSON, not a list of entries); the failure is logged. For the
+    glossary warnings, which are optional: a caller goes on without them."""
+    gm = GlossaryManager(path)
+    try:
+        gm.load()
+    except Exception as e:  # noqa: BLE001 - any damage: no glossary warnings
+        logger.warning("術語表無法讀取，略過術語檢查 (%s)", type(e).__name__)
+        return None
+    return gm
 
 
 @dataclass
@@ -62,23 +83,53 @@ class GlossaryManager:
         self.entries: dict[str, GlossaryEntry] = {}
 
     def load(self) -> None:
-        """Load glossary from JSON file."""
+        """Load glossary from JSON file. Raises ValueError (also for JSON
+        that does not decode) when the file is not a list of entries whose
+        text fields (TEXT_FIELDS) are strings where present."""
         if not os.path.isfile(self.glossary_path):
             return
         with open(self.glossary_path, 'r', encoding='utf-8') as f:
             raw = json.load(f)
-        self.entries = {}
+        if not isinstance(raw, list):
+            raise ValueError('the glossary is not a list')
+        entries = {}
         for item in raw:
-            key = item['term'].lower()
-            self.entries[key] = GlossaryEntry(**item)
+            if not isinstance(item, dict) or not isinstance(item.get('term'), str) \
+                    or any(not isinstance(item[k], str) for k in TEXT_FIELDS if k in item):
+                raise ValueError('a glossary entry is not an object with text fields')
+            entries[item['term'].lower()] = GlossaryEntry(**item)
+        self.entries = entries
 
     def save(self) -> None:
-        """Save glossary to JSON file."""
-        os.makedirs(os.path.dirname(self.glossary_path) or '.', exist_ok=True)
+        """Save glossary to JSON file, atomically: written to a temporary
+        file in the directory of the real file (a symlinked glossary.json
+        stays a symlink) and moved over it, so a reader never sees a
+        half-written file. The old file's mode is kept; a new file is created
+        with 0o666, so the kernel applies the umask (no os.umask call: it is
+        process-wide)."""
+        target = os.path.realpath(self.glossary_path)
+        directory = os.path.dirname(target)
+        os.makedirs(directory, exist_ok=True)
         raw = [asdict(e) for e in self.entries.values()]
         raw.sort(key=lambda x: x['term'].lower())
-        with open(self.glossary_path, 'w', encoding='utf-8') as f:
-            json.dump(raw, f, ensure_ascii=False, indent=2)
+        try:
+            mode = os.stat(target).st_mode & 0o777
+        except FileNotFoundError:
+            mode = None
+        tmp = os.path.join(directory, f'.glossary-{secrets.token_hex(8)}.tmp')
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                if mode is not None:
+                    try:
+                        os.fchmod(f.fileno(), mode)
+                    except OSError:  # the file is still written, with the default mode
+                        logger.warning("無法沿用術語表的權限設定")
+                json.dump(raw, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, target)
+        except BaseException:
+            os.unlink(tmp)
+            raise
 
     def add_term(self, term: str, translation: str,
                  category: str = '', frequency: int = 0) -> GlossaryEntry:
@@ -124,12 +175,12 @@ class GlossaryManager:
         return sorted(self.entries.values(), key=lambda e: e.term.lower())
 
     def find_terms_in_text(self, text: str) -> list[GlossaryEntry]:
-        """Find all glossary terms that appear in the given text (see _term_pattern).
+        """Find all glossary terms that appear in the given text (see term_pattern).
 
         An empty or whitespace-only term never matches."""
         found = []
         for entry in self.entries.values():
-            if entry.term.strip() and re.search(_term_pattern(entry.term), text, re.IGNORECASE):
+            if entry.term.strip() and re.search(term_pattern(entry.term), text, re.IGNORECASE):
                 found.append(entry)
         return sorted(found, key=lambda e: e.term.lower())
 
