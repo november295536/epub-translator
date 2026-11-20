@@ -32,7 +32,12 @@ def start_export(project_name: str):
 
     if not os.path.isfile(os.path.join(project_dir, 'project.json')):
         return jsonify({'error': '專案不存在'}), 404
-    progress = TaskManager().get_or_load_pm(project_name, projects_dir).get_progress()
+    try:
+        progress = TaskManager().get_or_load_pm(project_name, projects_dir).get_progress()
+    except FileNotFoundError:  # removed since the check above
+        return jsonify({'error': '專案不存在'}), 404
+    except Exception as e:  # noqa: BLE001 - a project file that cannot be read
+        return jsonify({'error': f'無法讀取專案：{type(e).__name__}: {e}'}), 500
     # passthrough code is translated without a model: it is no translation
     if progress['translated'] + progress['reviewed'] - progress['passthrough'] == 0:
         return jsonify({'error': '尚未翻譯任何段落，請先翻譯再匯出'}), 400

@@ -851,23 +851,29 @@ def glossary_issues(source_text: str, translation: str, glossary) -> list:
 COMMENT_LINE = re.compile(r'^\s*(?://|#(?:\s|!|$))')
 
 
-def is_comment_line(index: int, line: str) -> bool:
-    """Whether line `index` (from 0) of a code block is a comment line, the
-    only lines a model may translate. A `#!` first line (a shebang) is code."""
-    return bool(COMMENT_LINE.match(line)) and not (index == 0 and line.startswith('#!'))
+def comment_flags(code: str) -> list:
+    """(line, is a comment line) for each line of a code block; comment
+    lines are the only lines a model may translate. The first non-blank
+    line is code when it starts with `#!` (a shebang): leading blank lines
+    are not counted, since the source keeps a newline after `<pre>` that a
+    cleaned reply has lost."""
+    lines = code.splitlines()
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    return [(line, bool(COMMENT_LINE.match(line))
+             and not (i == first and line.startswith('#!')))
+            for i, line in enumerate(lines)]
 
 
 def has_comment_line(code: str) -> bool:
     """Whether the code has a comment line (else it is passthrough under
     segmentation rules 2)."""
-    return any(is_comment_line(i, line) for i, line in enumerate(code.splitlines()))
+    return any(comment for _, comment in comment_flags(code))
 
 
 def code_lines(code: str) -> list:
     """The lines of code that are not comment lines, trailing whitespace
     removed, without blank lines at either end."""
-    kept = [line.rstrip() for i, line in enumerate(code.splitlines())
-            if not is_comment_line(i, line)]
+    kept = [line.rstrip() for line, comment in comment_flags(code) if not comment]
     while kept and not kept[0]:
         kept.pop(0)
     while kept and not kept[-1]:

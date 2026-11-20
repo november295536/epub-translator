@@ -16,17 +16,21 @@ both rules (segments that are not passthrough); passthrough code segments;
 headings merged into a text segment, of all heading blocks; the ratio of
 new to old calls; and whether both segmentations cover the chapter's blocks
 exactly: every segment's range starts where the previous one ended, the
-last one ends at the last block, and the fingerprints of all segments, in
-order, are the fingerprints of the blocks.
+last one ends at the last block, and each segment's fingerprints are those
+of its own blocks.
 
-A project PASSes when every chapter of its spine could be read and
-segmented (the extractor's failures: missing, unreadable or not well-formed
-chapters, chapters that are not XHTML, unresolved entities; a book with no
-chapter at all also FAILs), both segmentations of every chapter cover its
-blocks exactly (contiguous ranges from the first block to the last, each
-segment's fingerprints equal to those of its own blocks), and the new rules
-need no more calls than the old ones. The plan's acceptance
-(project-3: fewer than half the calls) is read from the printed ratio.
+A project PASSes when every document of its spine could be read and
+segmented. Skipped legitimately: the navigation document (never segmented)
+and a document whose body has no text (nothing to translate, as for a cover
+page with only an image). Everything else FAILs: the extractor's failures
+(missing, unreadable or not well-formed documents, entries that are not
+XHTML, unresolved entities), a document without a body, which the extractor
+skips without recording it, and a book with no chapter at all. Further,
+both segmentations of every chapter must cover its blocks exactly
+(contiguous ranges from the first block to the last, each segment's
+fingerprints equal to those of its own blocks), and the new rules must
+need no more calls than the old ones. The plan's acceptance (project-3:
+fewer than half the calls) is read from the printed ratio.
 
 Only counts are printed, never book text. Everything in the temporary
 directory is removed at the end. The projects directory is only read: a
@@ -58,7 +62,9 @@ sys.path.insert(0, ROOT)
 
 from src.core.segmenter import HEADING_TAGS, Segmenter  # noqa: E402
 from src.epub.blocks import walk_blocks  # noqa: E402
-from src.epub.extractor import EPUBExtractor  # noqa: E402
+from src.epub.extractor import (  # noqa: E402
+    EPUBExtractor, find_body, parse_xml, read_member,
+)
 
 PROJECT_FILE = 'project.json'
 SOURCE_FILE = 'source.epub'
@@ -100,6 +106,15 @@ def covers(blocks: list, segments: list) -> bool:
     return position == len(blocks)
 
 
+def without_body(extractor, chapters: list) -> int:
+    """The spine documents the extractor neither returned nor recorded as
+    failed, other than the navigation document, that have no body (the
+    other silent skip, a body without text, is legitimate)."""
+    seen = {c.id for c in chapters} | {item_id for item_id, _ in extractor.failed}
+    return sum(find_body(parse_xml(read_member(extractor._zip, item.path))) is None
+               for item in extractor.spine if not item.is_nav and item.id not in seen)
+
+
 def check_source(epub: str) -> tuple[dict, list[str]]:
     """The counts of one EPUB, and its problems."""
     extractor = EPUBExtractor(epub)
@@ -127,6 +142,9 @@ def check_source(epub: str) -> tuple[dict, list[str]]:
     problems = []
     if extractor.failed:
         problems.append(f'{len(extractor.failed)} chapters could not be checked')
+    bodyless = without_body(extractor, chapters)
+    if bodyless:
+        problems.append(f'{bodyless} spine documents without a body')
     if not chapters:
         problems.append('no chapter checked')
     if uncovered:
