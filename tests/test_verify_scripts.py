@@ -2134,11 +2134,20 @@ class TestValidateCheckSurvivors:
         assert ('--projects-dir PROJECTS_DIR Directory that holds the project folders '
                 '(default: projects)') in out
         assert '--anonymize Print project-N labels; omit names and paths' in out
+        assert 'Copies every project' not in out  # only the docstring's first line
 
     def test_default_projects_directory(self, tmp_path, capsys, monkeypatch):
         _validate_projects(tmp_path / 'projects')
         monkeypatch.chdir(tmp_path)
+        listed = []
+        real = validate_check.os.listdir
+
+        def listdir(path):
+            listed.append(path)
+            return real(path)
+        monkeypatch.setattr(validate_check.os, 'listdir', listdir)
         assert validate_check.main(['--anonymize']) == 0
+        assert listed == ['projects']
         assert capsys.readouterr().out.splitlines()[0].startswith('PASS project-1: ')
 
     def test_work_directory_under_the_resolved_temporary_directory(self, tmp_path, capsys,
