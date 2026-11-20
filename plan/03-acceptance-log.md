@@ -2242,3 +2242,413 @@ The real-data scripts were not run in this round (no code change since section 1
   compare images or ids before and after an export (the tests do, on invented chapters).
   The explanation of the 5 more fallbacks (section 14) follows from the rule; the 5
   segments were not listed individually.
+
+---
+
+## Phase 3 — ZIP export
+
+Date: 2026-11-20. Branch: `phase-3/zip-export`, from `main` after Phase 2. No new runtime
+dependency; ebooklib is no longer a runtime dependency (moved to `requirements-dev.txt`: only
+the test fixtures in `tests/conftest.py` still build EPUBs with it). Commands run in the
+worktree of the branch with `source <repo>/venv/bin/activate` (Python 3.9.6 for the suite and
+the scripts, 3.12.7 for mutmut, as before). The real projects are read from `<repo>/projects`;
+nothing under it was written (section 9). EPUBCheck v5.4.0 is installed on this machine and was
+run (section 5).
+
+### 1. What was built
+
+| Item | Where | Main names |
+|---|---|---|
+| Exporter | `src/epub/exporter.py` (new) | `export_project(project_dir, output_path, fmt)` → `ExportReport` (`chapters`: `ChapterReport` per chapter with translations — `translated`, `kept` as (segment id, reason); `untranslated`; `summary()`, `lines()`); `ExportError`; reasons `chapter_unreadable`, `chapter_mismatch`, `not_well_formed`, `structure_mismatch`, `ambiguous_source`, `code_markup` |
+| Run positions | `src/epub/blocks.py` | `Block.parent` (the walked element), `Block.prev` (for a run: the child whose tail begins it) |
+| OPF path | `src/epub/extractor.py` | `package_path(zf)` (container.xml → OPF member), used by `read_package` |
+| CLI | `translate.py export` | schema 1 → the migrate message, exit 1; prints the report lines; output `<project>/output/<project dir name>-<format>.epub` |
+| Web | `src/web/blueprints/export.py`, `templates/project/export.html` | status carries `summary` (`translated`, `kept`, `untranslated`, `reasons`); the export tab shows it in one line plus one line per reason; a schema 1 project fails with the migrate message |
+| Removed | `src/epub/builder.py`, `_is_container` in `src/core/segmenter.py`, `scripts/verify/phase0_builder_alignment.py`, `tests/test_builder.py`, `tests/data/*.json` | the ebooklib builder, its schema 1 walk and the Phase 2 bridge |
+| Changed check | `scripts/verify/phase2_migrate_copies.py` | "export places" now uses the exporter's chapter check (`_matches`); the bridge-only "export fallback (cross-parent)" columns are gone |
+| Check script | `scripts/verify/phase3_export_check.py` (new) | see section 4 |
+
+Per item of the brief:
+
+1. **Archive.** The source hash (`source_sha256`) is checked first; a missing or different
+   source, or an empty stored hash, is an `ExportError` and nothing is written. The output is
+   written to a temporary file next to the target and `os.replace`d. `mimetype` first, stored
+   (the source's bytes; `application/epub+zip` when it has none); then every source member
+   once, in source order (a duplicated name is written once). Untouched members are copied
+   with their bytes, date, external attributes and compression (stored or deflated; anything
+   else becomes deflated). Replaced: chapters with at least one segment filled, the OPF, the
+   NCX and the navigation document when a label changed, plus the bilingual stylesheet.
+2. **Per chapter.** The chapter is parsed from the source archive (same strict parser as the
+   segmenter), walked with `walk_blocks`, and accepted only when every stored range is valid
+   (`int`, `0 <= start < end <= blocks`), the ranges cover the blocks exactly once and every
+   fingerprint is equal (the bridge's rule, now on the XML tree). Accepted translations
+   (status translated or reviewed, non-empty text) then go through the reduced check (3) and
+   are filled on the tree: a block element keeps its tag and attributes and gets the
+   translation element's content; a run is replaced by the translation's inline content in
+   place (parent text / previous child's tail, then the nodes). Blocks are filled in reverse
+   document order, so a filled run never moves a later block's anchor. The head is never
+   touched (bilingual adds one `<link>` last). Serialization: XML declaration, the source's
+   DOCTYPE, comments and processing instructions before the root, then the root element
+   serialized in a document of its own (Phase 2 fact (a): no `<meta>` is added). lxml in XML
+   mode keeps SVG attribute case and namespace declarations.
+3. **Reduced check** — section 2.
+4. **Bilingual identity.** Each block becomes one row `div.bilingual-container` (horizontal)
+   or `div.bilingual-vertical` (vertical) holding `div.original` (the source element, or the
+   run's text and nodes, moved) and `div.translation` (a copy of the source element with the
+   translation's content, or the run's translated inline content). In the copy, `id` and
+   `name` are removed from every element of its subtree (the translation's inner elements
+   included), so ids exist only on the originals; the copy (for a run: `div.translation`)
+   gets `xml:lang="zh-TW"`, and `lang="zh-TW"` as well in EPUB 3 packages (XHTML 1.1 of
+   EPUB 2 has no `lang` attribute). The stylesheet is `bilingual.css` in the OPF's directory,
+   or `bilingual-N.css` when a member of that name exists (compared without case); manifest
+   id `bilingual-css` or `bilingual-css-N`; linked from each filled chapter with
+   `quote(relpath(stylesheet, chapter directory))`. Not added when no chapter was filled.
+   Wrapper elements use the namespace (and prefix) of the chapter's `<body>`.
+5. **TOC labels.** For every NCX `navPoint`/`navTarget`/`pageTarget` (`content@src`,
+   `navLabel/text`) and every `a` inside a `nav` of a navigation document: the href is
+   resolved relative to the file holding the entry (percent-decoded; an href with a scheme
+   or a network path is skipped); the target is the element with that `id` in the chapter's
+   source tree, or the chapter's first `h1`–`h6` without fragment; the block must be a block
+   element that is the target or contains it, its segment must have been filled, and the
+   translated block must hold a heading (the block itself or its first heading descendant);
+   the label is that heading's text, whitespace-normalized, non-empty. Any failed step: label
+   unchanged. A nav `a` gets the label as its only content. Applied in all three formats.
+6. **Language.** chinese-only: the first `dc:language` becomes `zh-TW`; the root of each
+   filled chapter gets `xml:lang="zh-TW"` (and `lang` when the package is EPUB 3 or the root
+   already has one); inside filled blocks every `lang`/`xml:lang` whose primary subtag equals
+   that of the package's first `dc:language` becomes `zh-TW` (others, e.g. `fr`, stay).
+   Bilingual: package and roots unchanged; the copies are marked as in 4.
+7. **Failures.** A chapter that is not in the spine, missing, not well-formed, without body,
+   with an unresolved entity, or that does not match its segments keeps its bytes; a segment
+   that fails the check keeps its blocks; both are in the report with the reason. A bad
+   chapter or segment never fails the export. CLI output (invented example):
+   ```
+   已輸出：<dir>/output/<name>-chinese-only.epub
+   以譯文匯出 2 段，保留原文 2 段（另有 0 段未翻譯或翻譯失敗，以原文匯出）
+     譯文不是格式正確的 XML（not_well_formed）：1
+     譯文的頂層結構與原文區塊不符（structure_mismatch）：1
+     章節 two：譯文 0，原文 2（not_well_formed, structure_mismatch）
+   ```
+8. **Schema 1.** `export_project` raises `ExportError(SCHEMA_1_MESSAGE)`: 「此專案是舊格式
+   （schema 1），無法匯出。請先執行 python3 translate.py migrate <專案目錄> 再匯出。」 The CLI
+   prints it and exits 1 before writing anything; the web export fails with it. `src/` no
+   longer imports ebooklib.
+
+### 2. The reduced structural check and the mapping rule
+
+A segment's stored html is its blocks' serializations joined by `\n` (Phase 2). The
+translation must:
+
+1. **be well-formed**: parsed with the strict parser as the content of a wrapper element that
+   declares the namespaces in scope at the first block's parent (so `epub:type` parses; named
+   entities such as `&nbsp;` do not);
+2. **have the blocks' top-level structure**: its top-level nodes are grouped — each element
+   whose name is a block tag is a group of its own; a top-level `<br>` is refused; the text and
+   inline elements between block elements form one inline group (whitespace, comments and
+   processing instructions alone form none). The groups must correspond one to one to the
+   blocks, with each maximal sequence of consecutive runs of the source taken as one entry: a
+   block element ↔ an element with the same (namespaced) name; a sequence of one run ↔ the whole
+   inline group; a sequence of k > 1 runs (lines separated by `<br>` in the source, the only way
+   two runs can be adjacent) ↔ the inline group split at the newlines of its top-level text,
+   which must give exactly k pieces with content.
+3. The same split is applied to the stored html itself, and each source piece's text must have
+   the fingerprint of its block; otherwise the segment is `ambiguous_source` (a run whose own
+   top-level text holds a newline, next to another run).
+
+Why this rule: it uses only what the segmenter guarantees (a block element is one element, a
+run is inline content, blocks are joined by newlines), so the split of the source is exact and
+checkable, and a translation is either mapped block by block or not at all. It accepts no
+translation whose structure has to be guessed: a run wrapped by the model in `<p>`, merged or
+split paragraphs, text outside the elements, a `<br>` for a newline — all stay in the original
+language. Inner structure (inline tags, their attributes, ids) is not checked: that is Phase
+4's keyed validation; inner attributes come from the translation until then.
+
+Code segments: the translation is plain text. The target is the `<pre>` (or the `<code>` of a
+code run), or its only child when that is a `<code>` with no text around it; a target that
+holds child elements (syntax highlighting) is `code_markup`. A translation equal to the source
+code leaves the block untouched in every format (it appears once in bilingual output) and
+counts as exported.
+
+### 3. Test suite
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider
+1210 passed in 131.57s (0:02:11)
+```
+
+1176 before the phase. New: `tests/test_exporter.py` (raw-ZIP fixtures, every assertion reads
+the output members from the ZIP), `TestExportCheck`, `TestExportCheckEpubcheck`,
+`TestExportCheckSurvivors`, `TestExportCheckEpubcheckSurvivors` in
+`tests/test_verify_scripts.py`. `write_raw_epub` (conftest) takes the package `version`.
+
+| Acceptance item | Tests |
+|---|---|
+| mimetype first and stored; members once | `TestArchive::test_mimetype_first_and_stored_members_once[*]`, `test_duplicate_member_written_once`, `test_missing_mimetype_written` |
+| members outside the allowed set identical | `TestArchive::test_members_outside_the_allowed_set_identical[*]`, `test_stored_member_stays_stored`, `TestSurvivors::test_mimetype_bytes_and_member_attributes_copied`, `TestChineseOnly::test_untranslated_chapter_and_package_kept` |
+| head links and `<style>` equal the source's | `TestChineseOnly::test_head_unchanged`, `TestBilingual::test_stylesheet_added_registered_and_linked[*]` |
+| no duplicate id; bilingual copies without id | `TestBilingual::test_identity_ids_only_on_the_original[*]`, `TestProjectLevel::test_no_duplicate_ids_in_raw_fixture` |
+| bilingual chapter links an existing, registered stylesheet | `TestBilingual::test_stylesheet_added_registered_and_linked[*]`, `test_stylesheet_name_and_id_do_not_collide`, `test_stylesheet_href_relative_and_encoded`, `test_head_created_when_missing`, `TestSurvivors::test_first_free_names`, `test_package_and_chapter_at_the_archive_root` |
+| SVG attribute case | `TestSvg::test_viewbox_case_kept[*]` |
+| well-formed output | `TestProjectLevel::test_every_output_chapter_well_formed`, `TestChineseOnly::test_xhtml_10_doctype_gets_no_meta` |
+| failed-fingerprint chapter kept original and reported | `TestChapterVerification::test_mismatched_chapter_kept_and_reported[*]` (7 kinds × 3 formats), `test_chapter_not_in_the_spine`, `test_unreadable_chapter_kept[*]`, `TestSurvivors::test_empty_range_is_a_mismatch` |
+| segment failing the reduced check kept original | `TestReducedCheck::test_kept_original_and_reported[*]` (9 translations × 3 formats), `test_run_wrapped_in_a_paragraph_kept`, `test_br_runs_need_one_line_each[*]`, `test_ambiguous_source_kept`, `test_one_failing_segment_does_not_stop_the_chapter`, `TestCode::test_code_with_markup_kept[*]` |
+| what the rule accepts | `TestReducedCheck::test_whitespace_and_comments_between_blocks_accepted`, `test_br_runs_split_at_newlines[*]`, `test_newline_inside_an_inline_element_does_not_split`, `test_single_run_keeps_its_newlines`, `test_runs_and_elements_mixed`, `test_epub_prefix_in_translation_parses` |
+| TOC label from the translated heading; unchanged on failure | `TestToc::test_labels_from_translated_headings[*]` (first heading, target heading, `<p>` target, unknown id, container target, external, untranslated chapter, no href, link outside a nav), `test_target_inside_a_heading_and_header_block`, `test_label_unchanged_when_the_heading_segment_fails`, `test_label_unchanged_for_an_empty_heading`, `test_toc_files_kept_when_no_label_changes`, `test_unreadable_toc_kept`, `test_relative_to_the_toc_file`, `TestSurvivors::test_every_heading_level_labels[*]`, `test_nav_list_targets_relabelled` |
+| language | `TestChineseOnly::test_language`, `test_explicit_source_language_rewritten`, `test_epub2_root_gets_only_xml_lang`, `test_existing_root_lang_set_in_epub2`, `TestBilingual::test_epub2_copy_gets_only_xml_lang`, `test_copy_source_language_rewritten`, `TestSurvivors::test_source_language_with_region` |
+| schema 1 message | `TestProjectLevel::test_schema_1_message`, `TestCLIAndWeb::test_web_schema_1_message`, `test_cli.py::TestCLIPhase2::test_schema_1_export_asks_for_migration` |
+| export of a project with failed segments | `TestProjectLevel::test_failed_and_pending_segments_exported_in_the_original[*]` |
+| source hash | `TestProjectLevel::test_source_hash_verified[*]`, `test_unreadable_package_is_an_export_error` |
+| report, CLI, web | `TestProjectLevel::test_report_lines`, `TestCLIAndWeb` (6) |
+| check script | `test_verify_scripts.py::TestExportCheck` (one test per check, each failing on a tampered export), `TestExportCheckEpubcheck`, the two survivor classes |
+
+Tests removed or changed, and why:
+
+| Group | Tests | Reason |
+|---|---|---|
+| `tests/test_builder.py` | all 164 (`TestEPUBBuilder` 9, `TestHTMLAwareTranslation` 4, `TestNavigableStringCounting` 3, `TestHTMLPreservation` 9, `TestTOCTranslation` 4, `TestContentDivAlignment` 2, `TestWalkByMarker` 6, `TestVersion2Export` 15, `TestVersion1ExportMatchesMain` 42 (schema 1 golden tests), `TestSchema2Export` 19, `TestSchema2BridgeReview1` 30, `TestSchema2BridgeSurvivors` 4, `TestSchema2BridgeReview2` 13, `TestSchema2BridgeReview2Survivors` 4) | they test `EPUBBuilder`, which is removed: the schema 1 walk and golden exports (schema 1 is no longer exported), the Phase 2 bridge, the ebooklib read-back helper (`_get_chapter_html`), the test accepting mismatched element counts (`test_chinese_only_html_mismatched_count`: the whole-segment replace path is removed; a count mismatch is now kept original, `TestReducedCheck`), and the metadata test expecting `en` for chinese-only (`test_metadata_preserved`; now `TestChineseOnly::test_language` expects `zh-TW`, `TestBilingual::test_stylesheet_added_registered_and_linked` keeps `en`). The behaviours still wanted are covered in `tests/test_exporter.py` (formats build, invalid format, translation present, both texts in bilingual, output directory created, HTML structure kept, TOC labels) |
+| `tests/data/legacy_walk_main.json`, `phase0_segments.json` | data of the golden and Phase 0 builder tests | nothing reads them any more |
+| `test_verify_scripts.py::TestAlignmentCheck` (5), `TestAlignmentOutput` (13) | tests of `phase0_builder_alignment.py` | the script checked which walk the builder chooses; the builder and both walks are gone, so it is removed |
+| `test_segmenter.py::TestIsContainer` (7), `test_is_container_ignores_comment`, `test_is_container_legacy_counts_comment` | `_is_container` | only the builder's schema 1 walk used it |
+| `test_verify_scripts.py::TestMigrateCopiesCheck::test_export_fallback_counted`, `test_cross_parent_fallback_counted` | the bridge's "export fallback" columns | the bridge is gone; Phase 3's reasons replace these counts |
+| `TestMigrateCopiesCheck` (exact-line tests, `test_changed_translation_fails`, `test_unplaced_chapter_fails`, `test_chapter_missing_from_book_not_placed`), `TestPhase2ScriptSurvivors::test_partly_placed_count` | changed | lines without the removed columns; they patch the exporter's `_matches` / `read_package` instead of `EPUBBuilder._place_by_blocks` / ebooklib |
+| `test_cli.py::test_schema_1_export_keeps_the_book_name` | changed to `test_schema_1_export_asks_for_migration` | schema 1 projects are no longer exported |
+| `test_migrate.py::test_partial_group_exports_in_the_original`, `test_migrated_project_exports` | changed | call `export_project` instead of `EPUBBuilder.build`; same assertions |
+
+### 4. Check: exports of the 8 projects in all three formats
+
+```
+$ python3 scripts/verify/phase3_export_check.py --projects-dir <repo>/projects --anonymize
+epubcheck found; errors compared by message ID (chinese-only, bilingual-horizontal, bilingual-vertical)
+PASS project-1: exports 3, translated segments 220: as translation 218, kept original 2 (not_well_formed 2), toc labels changed 0/23, epubcheck errors source 51 (HTM-004:24 NCX-001:1 RSC-005:26), exports 51/51/51
+FAIL project-2: exports 3, translated segments 278: as translation 261, kept original 17 (not_well_formed 10, structure_mismatch 7), toc labels changed 0/37, epubcheck errors source 27 (OPF-034:1 RSC-005:25 RSC-020:1), exports 27/28/28; bilingual-horizontal: epubcheck new errors RSC-020 1; bilingual-vertical: epubcheck new errors RSC-020 1
+PASS project-3: exports 3, translated segments 36: as translation 35, kept original 1 (structure_mismatch 1), toc labels changed 0/1358, epubcheck errors source 0, exports 0/0/0
+FAIL project-4: exports 3, translated segments 1333: as translation 1300, kept original 33 (not_well_formed 2, structure_mismatch 31), toc labels changed 123/145, epubcheck errors source 11 (RSC-012:11), exports 11/22/22; bilingual-horizontal: epubcheck new errors RSC-012 11; bilingual-vertical: epubcheck new errors RSC-012 11
+FAIL project-5: exports 3, translated segments 832: as translation 831, kept original 1 (structure_mismatch 1), toc labels changed 0/247, epubcheck errors source 470 (HTM-004:25 NCX-001:1 PKG-006:1 RSC-005:440 RSC-007:3), exports 467/509/509; chinese-only: 1 fragment links do not resolve; chinese-only: epubcheck new errors RSC-012 1; bilingual-horizontal: epubcheck new errors RSC-005 40; bilingual-vertical: epubcheck new errors RSC-005 40
+PASS project-6: exports 3, translated segments 581: as translation 581, kept original 0, toc labels changed 19/20, epubcheck errors source 1 (RSC-005:1), exports 1/1/1
+FAIL project-7: exports 3, translated segments 551: as translation 536, kept original 15 (not_well_formed 6, structure_mismatch 9), toc labels changed 1/46, epubcheck errors source 151 (RSC-005:151), exports 157/187/187; chinese-only: 6 fragment links do not resolve; chinese-only: epubcheck new errors RSC-012 6; bilingual-horizontal: epubcheck new errors RSC-005 36; bilingual-vertical: epubcheck new errors RSC-005 36
+PASS project-8: exports 3, translated segments 331: as translation 315, kept original 16 (structure_mismatch 16), toc labels changed 0/19, epubcheck errors source 27 (RSC-005:26 RSC-007:1), exports 27/27/27
+TOTAL projects 8  exports 24  translated segments 4162  as translation 4077  kept original 85 (not_well_formed 20, structure_mismatch 65)  toc labels changed 143/1895  exports with new epubcheck errors 10  failed projects 4
+$ echo $?
+1
+```
+
+The script copies `project.json`, `source.epub` and `glossary.json` of each project into a new
+`mktemp` directory under the system temporary directory (refused before anything is created
+when that would be inside the repository or the projects directory), migrates the copies
+(all 8 are schema 1), writes the 3 exports of each project into the same directory (24 files),
+and removes the directory at the end (checked: no `phase3-export-*` directory left). Checks per
+export: `mimetype` first and stored, no member twice, nothing added but the stylesheet, every
+member outside the allowed set byte-identical, every XHTML member well-formed, head
+`<link>`/`<style>` equal to the source's (bilingual: plus the one added link), no id
+duplicated that the source does not duplicate, internal fragment links (any `href`, NCX `src`)
+resolve unless they already fail in the source, bilingual chapters link a stylesheet that is
+in the archive and the manifest and defines both classes, SVG attribute names a subset of the
+source chapter's, the three formats give the same counts, epubcheck (section 5). A project
+also FAILs when any file under its real directory changed.
+
+Translated segments (status translated or reviewed) per project: exported as translation /
+kept in the original language, by reason (the same in all three formats):
+
+| project | translated | as translation | kept | not_well_formed | structure_mismatch |
+|---|---|---|---|---|---|
+| project-1 | 220 | 218 | 2 | 2 | 0 |
+| project-2 | 278 | 261 | 17 | 10 | 7 |
+| project-3 | 36 | 35 | 1 | 0 | 1 |
+| project-4 | 1333 | 1300 | 33 | 2 | 31 |
+| project-5 | 832 | 831 | 1 | 0 | 1 |
+| project-6 | 581 | 581 | 0 | 0 | 0 |
+| project-7 | 551 | 536 | 15 | 6 | 9 |
+| project-8 | 331 | 315 | 16 | 0 | 16 |
+| total | 4162 | 4077 (98.0%) | 85 (2.0%) | 20 | 65 |
+
+No chapter is kept for `chapter_mismatch` or `chapter_unreadable` (all 2155 chapters with
+segments match), and no segment is `ambiguous_source` or `code_markup`. What the 85 are (shapes
+only, from a read-only scratch script on the same copies, not kept): `not_well_formed` — an
+unclosed `<p>` or mismatched end tag (18), a bare `&` (2); `structure_mismatch` — the model
+merged or split paragraphs (count of top-level elements differs by 1 to 20; most of the 31 in
+project-4 have one element fewer), wrapped a run in `<p>` or `<div>` (project-7, project-8: 16
+in project-8 alone, where `<br>`-separated runs between `div`s came back as `div`s), or left
+text outside a heading (3). None is a false rejection of a translation whose structure matches.
+
+The check FAILs on 4 projects; the failures are real and are not caused by the mapping rule:
+
+- **chinese-only, fragment links (project-5 1, project-7 6) and the matching epubcheck
+  RSC-012 (1, 6):** 5 accepted segments (project-5 1, project-7 4) whose translation dropped 6
+  ids of inner elements (footnote anchors); links to them break. The reduced check does not
+  look inside blocks (by design until Phase 4's required keys). Measured: adding "every id of
+  the source block occurs in the translation" to the gate would keep these 5 more segments in
+  the original language (85 → 90) and remove all 7 broken links.
+- **bilingual, epubcheck RSC-005 (project-5 40, project-7 36), RSC-012 (project-4 11), RSC-020
+  (project-2 1):** every one is a source error repeated in the translated copy: the copy takes
+  the source element's attributes and the translation's inner markup, so an attribute or
+  element the source already gets wrong (HTML5 attributes and elements in an EPUB 2 book in
+  project-5, invalid attribute names in project-7, an href with a space in project-2, links to
+  ids that do not exist in project-4) appears twice. Compared as sets of (message ID, message
+  text), bilingual exports add no new message except two RSC-005 of project-5 whose text
+  differs only in the "expected" element list, because the same disallowed `figure`/`aside`
+  now sits inside `div.original` instead of `<body>`. Counting by ID and location count, as
+  the plan says, they are new errors.
+
+TOC labels changed: 143 of 1895 entries (project-4 123/145, project-6 19/20, project-7 1/46,
+all others 0). **The plan's element-based rule does not hold on most real books** (read-only
+scratch count over the same copies, entries pointing at chapters that have translations):
+project-5 245 entries and project-3 18 point at a `div` that contains the heading (the target
+is a container, not inside a block); project-8 17 point at `<body>`; project-1 22, project-7 40
+point at a block without a heading (`p` or `blockquote` styled as a heading); project-2 32
+point at chapters without any `h1`–`h6`. Per the brief the rule was implemented as written
+(any failed step leaves the label unchanged). An extension that would add 263 labels
+(project-5 245, project-3 18) with no guessing: when the target element contains blocks, use
+its first block if that is a heading.
+
+### 5. epubcheck
+
+EPUBCheck v5.4.0 (`/opt/homebrew/bin/epubcheck`) was on PATH, so the check script ran it on
+each source and on each of the 24 exports (JSON report written to a temporary file outside the
+repository, deleted after reading; only message IDs and counts are printed, never messages).
+ERROR and FATAL counts by ID, source → chinese-only / bilingual-horizontal / bilingual-vertical
+(one count per reported location):
+
+| project | source | exports | new in the export |
+|---|---|---|---|
+| project-1 | 51 (HTM-004 24, NCX-001 1, RSC-005 26) | 51 / 51 / 51 | — |
+| project-2 | 27 (OPF-034 1, RSC-005 25, RSC-020 1) | 27 / 28 / 28 | bilingual: RSC-020 +1 |
+| project-3 | 0 | 0 / 0 / 0 | — |
+| project-4 | 11 (RSC-012 11) | 11 / 22 / 22 | bilingual: RSC-012 +11 |
+| project-5 | 470 (HTM-004 25, NCX-001 1, PKG-006 1, RSC-005 440, RSC-007 3) | 467 / 509 / 509 | chinese-only: RSC-012 +1; bilingual: RSC-005 +40 |
+| project-6 | 1 (RSC-005 1) | 1 / 1 / 1 | — |
+| project-7 | 151 (RSC-005 151) | 157 / 187 / 187 | chinese-only: RSC-012 +6; bilingual: RSC-005 +36 |
+| project-8 | 27 (RSC-005 26, RSC-007 1) | 27 / 27 / 27 | — |
+
+10 of the 24 exports have an error count above the source's for some ID; section 4 explains
+each. The chinese-only export of project-5 has 3 errors fewer than its source.
+
+### 6. Mutation testing
+
+`scripts/verify/mutation.sh` groups: core no longer mutates `src/epub/builder.py` (removed)
+and also runs `tests/test_exporter.py` (it is the only user of the run positions in
+`blocks.py`); new group export mutates `src/epub/exporter.py` and
+`src/web/blueprints/export.py` with `tests/test_exporter.py tests/test_migrate.py
+tests/test_cli.py`; cli also runs `tests/test_exporter.py` (the CLI export tests); scripts
+mutates `phase3_export_check.py` instead of the removed `phase0_builder_alignment.py`. Only
+lines changed versus `main` are mutated. Each full run took about 2 hours.
+
+| run | mutants | killed | survived | timeout | suspicious |
+|---|---|---|---|---|---|
+| 1, after "chore: mutate the exporter and the Phase 3 check script" | 1059 | 933 | 124 | 2 | 0 |
+| 2, after "test: kill the Phase 3 mutation survivors of run 1" | 1011 | 978 | 31 | 2 | 0 |
+
+```
+$ scripts/verify/mutation.sh main
+...
+TOTAL mutants 1011  killed 978  survived 31  timeout 2  suspicious 0  untested 0
+$ echo $?
+1
+```
+
+Run 1's survivors (core 2, export 72, scripts 50) and what was done:
+
+| survivors (run 1) | disposition |
+|---|---|
+| `blocks.py` `parent`/`prev` defaults | code changed: both are required; every block records its walked parent (`_parent()` in the exporter removed) |
+| exporter constants: `HEADINGS` h4–h6, `WRAPPER_CLASS`, the six reason codes, `REASON_TEXT`, `SCHEMA_1_MESSAGE`, the `ValueError` and hash messages | killed: `TestSurvivors::test_every_heading_level_labels[*]`, `test_report_codes_texts_and_messages`; the bilingual rows test now spells the class names |
+| `ExportReport.untranslated` default, `export_project` default format | code changed: no defaults (every caller passes them) |
+| `epub3` from `version or ''`; `css_href` default; `chapter.kept +=` (3); the `path in replaced or path not in names` skip and its `continue`; `changed = False`; `result is None or …`; `source = None` in the except branch; `'summary': None` in the web task | code changed: `str(version)`, the href computed where it is used, assignments, the skip removed (a missing or unreadable TOC file already returns no change), a counter, `if not block.tag`, `raise _Kept(AMBIGUOUS_SOURCE)` in the except branch, the key dropped (`task.get('summary')`) |
+| nav/non-XHTML chapter ids (`and not is_nav` → `or`), `continue` → `break` for a chapter without translation, chapter and OPF at the archive root (`or '.'`), first free names (`n = 1`, `n += 1`, for files and ids), source `mimetype` bytes, `external_attr`, only the first `dc:language`, `navTarget`, links only (`or a.get('href') is None` → `and`), prefixed XHTML namespace (`ns`), empty range (`<` → `<=`), malformed stored html, top-level `<br>` in a single run, run with an inline `<script>` (`_text`), tail after a bilingual element (`wrapper.tail`), run starting with an element (`parent.text or ''`), `en-US` source language (`split('-')`) | killed: the corresponding tests in `test_exporter.py::TestSurvivors` (the `href is None` part of the nav condition was removed instead: `_label_for` already refuses an empty href) |
+| check script: `COPIED`, anchors (`root`, `id`, `name`), `_resolve` (`scheme or netloc`, `target = base`), `href`, `resolved[0]`/`[1]`, `duplicate_ids` key, TOC label walk and normalization, epubcheck command and `capture_output`/`text`, per-ID `+=`, per-chapter `+= 1` (3), the chapter loop's `continue`s, non-UTF-8 stylesheet (`'replace'`), `--projects-dir` default, failure counting and `'; '` join in the unmatched branch, `totals['kept'] +=`, source ID list join | killed: `TestExportCheckSurvivors` (default directory, copied files, new valid links and ids, a link after an unparsed member, two chapters per problem, `toc_labels`, non-UTF-8 stylesheet, two unmatched projects with a changed directory, totals over two projects) and `TestExportCheckEpubcheckSurvivors` |
+| check script: SVG names through `QName`; `result` initial keys; `epubcheck.get(fmt, '-')` | code changed: attribute names compared as stored; the chinese-only counts are taken in the loop (no initial values); plain indexing |
+| the rest (exporter 101/103, 106, 166, 169, 175/176, 475/485, 477/487/522, 502/503, 532/539/544; script 21, 90, 107, 188, 236, 241, 383) | equivalent, same as run 2 below |
+
+Run 2's survivors (ids of run 2) and timeouts:
+
+| id | location | mutation | disposition |
+|---|---|---|---|
+| 96, 98 | `exporter.py:185` | the source language `''` → `'XXXX'` when `dc:language` is empty or missing | equivalent unless an element carries `lang="XXXX"`: the value is only compared with `lang` attributes by primary subtag, and `XXXX` is not a language tag |
+| 101 | `exporter.py:187` | `css_path = None` → `""` | equivalent: only its truth value is used |
+| 152 | `exporter.py:249` | the nodes before the root serialized `with_tail=True` | equivalent: lxml keeps no text outside the root element, so they have no tail |
+| 155, 455, 465 | `exporter.py:250, 599, 619` | `copy.deepcopy` → `copy.copy` of an element | equivalent: lxml's `_Element.__copy__` copies the whole subtree as well (checked in Phase 2, mutant 31 there) |
+| 161, 162 | `exporter.py:257` | the temporary file's prefix or suffix | equivalent: only its uniqueness in the output directory matters; it is replaced or removed on every path (`test_output_directory_created_and_no_temporary_file`, `test_failed_write_leaves_nothing`) |
+| 244–246, 260–262 | `exporter.py:337, 350` | `changed += 1` → `= 1`, `-= 1`, `+= 2` | equivalent: `changed` starts at 0 and is only used for its truth value, which each of these makes true (the initial value and the increment as such are killed) |
+| 457, 467, 502 | `exporter.py:600, 620, 678` | `tail = None` → `""` | equivalent: an empty tail and no tail serialize the same |
+| 482, 483 | `exporter.py:641, 642` | `_put(div, 0, …)` → `_put(div, 1, …)` | equivalent: the two divs are new and empty, and inserting at an index past the end appends |
+| 512, 519, 524 | `exporter.py:694, 696, 698` | `''.join` → `'XXXX'.join` of the strings between two nodes | equivalent: the item lists alternate strings and nodes by construction (`_split`, `_lines`, `_take_run`, the code piece), so each joined list holds at most one string |
+| timeout 139, 201 | `exporter.py:233, 304` | `while … in` → `not in` for the free stylesheet name / manifest id | detected: the loop never ends |
+| 21 | `phase3_export_check.py:66` | `sys.path.insert(0, …)` → `insert(1, …)` | equivalent under default interpreter path settings (as Phase 0 survivor 113 and Phase 2 102) |
+| 60 | `phase3_export_check.py:141` | `continue` → `break` after an unparsed member in `broken_links` | killed after run 2: `TestExportCheckSurvivors::test_link_checked_after_an_unparsed_member` now breaks a member that sorts before the one with the link (the nav document of the first version sorted last). The test passes on the code and fails with the mutant applied by hand to a `git archive` copy; no third full run |
+| 89, 222 | `phase3_export_check.py:167, 279` | missing `class` / `rel` read as `'XXXX'` | equivalent unless a chapter uses the class or rel value `XXXX` |
+| 200, 227 | `phase3_export_check.py:263, 281` | missing `href` of a head `<link>` read as `'XXXX'` | equivalent unless a member is named `XXXX` next to the chapter: without an href the link resolves to the chapter itself, which is not the stylesheet and does not define the bilingual classes |
+| 106 | `phase3_export_check.py:191` | the epubcheck report file's suffix | equivalent: a temporary file in the system temporary directory, removed after reading (`test_report_file_removed_and_not_next_to_the_book`) |
+| 358 | `phase3_export_check.py:375` | the exports directory name inside the work directory | equivalent: any name inside the work directory that differs from the copy's (`test_work_directory_removed_and_outside_repository` checks that every export lies in the work directory) |
+
+### 7. Known consequences
+
+- Schema 1 projects can no longer be exported; `translate.py migrate <project>` first (the
+  8 real projects are all schema 1).
+- The exporter needs `source_sha256`: a schema 2 project without a stored hash (none is
+  created that way by the CLI, the web UI or the migration) cannot be exported.
+- 85 of 4162 translated segments of the real projects are exported in the original language
+  (section 4) until they are re-translated or edited, or Phase 4 brings retries.
+- Inner markup comes from the translation: inline elements, their attributes and their ids are
+  the model's (Phase 4). In chinese-only, 6 inner ids are lost in 5 real segments and 7 links
+  break (section 4); the bilingual copies keep the model's inner hrefs, so a broken link of the
+  source is broken twice.
+- Bilingual output repeats the source's markup errors in the translated copies (section 4).
+- Bilingual runs separated by `<br>` become one row each; the `<br>` elements stay between the
+  rows (an extra line break each). Comments inside a run move into `div.original`
+  (bilingual) or are dropped (chinese-only). The newlines that the rule splits on are not kept
+  in the output.
+- TOC labels follow the element rule only: 143 of 1895 real entries change (section 4).
+- In chinese-only a block's own attributes are the source's even when the model changed them
+  (e.g. `class`, `id` on the top-level element); the language attributes that matched the
+  source language become `zh-TW`.
+- `epub3` is decided by the OPF `version` starting with `3`; EPUB 2 copies get only
+  `xml:lang` (deviation from the plan's wording `lang="zh-TW"`, which is not valid XHTML 1.1).
+- The first commit of the branch ("feat: record where an inline run sits …") also carries the
+  deletion of the builder, its tests and their data, which had been staged earlier by mistake;
+  the tree builds and passes from the third commit on. History was not rewritten (no amend or
+  rebase).
+- `CLAUDE.md` and `README.md` still describe the ebooklib builder (not edited by this phase).
+
+### 8. Command for exports of one project copy
+
+Produces the three exports of one real project in a directory of one's choice, without
+touching `projects/` (`<name>` is the project's directory, `<dir>` the chosen directory):
+
+```
+D=<dir>/copy; mkdir -p "$D"
+for f in project.json source.epub glossary.json; do [ -f "<repo>/projects/<name>/$f" ] && cp "<repo>/projects/<name>/$f" "$D/"; done
+cd <repo> && source venv/bin/activate
+python3 translate.py migrate "$D"
+for f in chinese-only bilingual-horizontal bilingual-vertical; do python3 translate.py export -p "$D" -f $f; done
+ls "$D/output"    # copy-chinese-only.epub copy-bilingual-horizontal.epub copy-bilingual-vertical.epub
+```
+
+### 9. `projects/` untouched
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+Before the work and after every run of the check script. The script also FAILs a project when
+any file under its directory changes. Exports, migrations, lock files and epubcheck reports
+were only written in temporary directories, deleted afterwards. The read-only scratch
+diagnostics of sections 4 (reasons, TOC steps, ids, epubcheck messages) ran on a separate copy
+in the session's scratch directory, deleted at the end.
+
+### Not done
+
+- The full structural validation (keyed, required ids) is Phase 4; the reduced check is the
+  gate until then.
+- TOC rule extension for container targets (section 4): reported, not implemented.
+- `CLAUDE.md` and `README.md` are not updated.
+
+### Not verified
+
+- No export was opened in a reader application or a browser (styling, side-by-side layout,
+  table of contents, footnote links): left to the orchestrator's rendered-export check, with
+  the command of section 8.
+- The web export tab's summary was checked as rendered page source and through the status
+  API with the Flask test client, not in a browser.
+- epubcheck's message-level comparison (section 4, sets of ID and text) was a read-only
+  scratch script on copies, not kept; the kept script compares by ID and count only.
+- Mutation testing ran on Python 3.12.7, the suite on 3.9.6 (both pass).
