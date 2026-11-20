@@ -2029,3 +2029,13 @@ class TestTranslateSegmentGlossaryRound1:
                                     seg, [seg], gm)
         assert outcome.status == SegmentStatus.TRANSLATED
         assert [i.detail for i in outcome.issues] == ['術語「drip line」未譯為「滴水線」']
+
+    def test_check_failure_logged(self, caplog):
+        class Broken:
+            entries = property(lambda self: (_ for _ in ()).throw(RuntimeError('x')))
+        from src.core.translator import _glossary_warnings
+        seg = _seg(seg_id='c1_seg0042', text='Words.')
+        assert _glossary_warnings(seg, '<p>字</p>', Broken()) == []
+        record = caplog.records[-1]
+        assert record.getMessage() == '術語檢查失敗，略過術語警告: c1_seg0042'
+        assert record.exc_info is not None and record.exc_info[0] is RuntimeError

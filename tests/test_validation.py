@@ -1060,10 +1060,10 @@ class TestGlossaryRound1:
         ('render', 'term', 'Rendering and rendered.', True),  # inflected verbs
         ('render', 'term', 'Renders.', True),
         ('render', 'term', 'A renderer.', False),
-        ('activate', 'term', 'It activates.', True),          # a final e
-        ('activate', 'term', 'It activated.', True),
-        ('activate', 'term', 'Activating it.', True),
-        ('activate', 'term', 'An activator.', False),
+        ('calibrate', 'term', 'It calibrates.', True),        # a final e
+        ('calibrate', 'term', 'It calibrated.', True),
+        ('calibrate', 'term', 'Calibrating it.', True),
+        ('calibrate', 'term', 'A calibrator.', False),
         ('Bolt', 'person', 'Bolting.', False),               # names take no -ing
         ('Bolt', 'person', 'Bolted.', False),
         ('Bolt', 'organization', 'Bolts.', True),
@@ -1100,3 +1100,27 @@ class TestGlossaryRound1:
         # start matches; the check needs the full occurrence
         gm = glossary(*[(f'word{i:03d}', f'詞{i}') for i in range(FULL_GLOSSARY_MAX_TERMS + 1)])
         assert missing('Only word007x here.', '無。', gm) == []
+
+
+class TestGlossaryRound1Survivors:
+    """Mutation testing, Phase 5 review round 1."""
+
+    @pytest.mark.parametrize('term,source,found', [
+        ('de', 'The ding.', True),            # a two-letter term with a final e
+        ('TAX', 'The TAX.', True),            # a final X is not an e
+        ('CODE', 'Coding it.', True),         # a capital final E
+        ('X1 rate', 'X1 rating.', True),      # the letter before the e decides
+        ('Q-te', 'Q-ting.', True),
+    ])
+    def test_final_e(self, term, source, found):
+        entry = GlossaryEntry(term, '譯', 'term')
+        assert bool(validation.occurrence_pattern(entry).search(source)) is found
+
+    def test_work_plural_case_sensitive(self):
+        entry = GlossaryEntry('Silver Atlas', '譯', 'work')
+        assert validation.occurrence_pattern(entry).search('Two Silver Atlases.')
+
+    def test_sorted_by_lower_case(self):
+        # '_' sorts after capitals and before small letters
+        gm = glossary(('ab', '甲'), ('_x', '乙'))
+        assert missing('ab and _x.', '無。', gm) == ['_x', 'ab']

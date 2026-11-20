@@ -783,7 +783,7 @@ def occurrence_pattern(entry) -> re.Pattern:
     category = entry.category if isinstance(entry.category, str) else ''
     if category in NAME_CATEGORIES:
         body = term_pattern(term) + '(?:e?s)?'
-    elif len(term) > 1 and term[-1] in 'eE' and term[-2].isalpha():  # activate -> activating
+    elif len(term) > 1 and term[-1] in 'eE' and term[-2].isalpha():  # calibrate -> calibrating
         body = term_pattern(term[:-1]) + '(?:e(?:s|d)?|ing)'
     else:
         body = term_pattern(term) + '(?:e?s|ed|ing)?'
