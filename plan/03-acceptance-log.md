@@ -3745,3 +3745,120 @@ Remaining survivors (run 2), each equivalent and listed above: `_translate_html`
 - The export of translated block-element attributes was checked by tests and by the
   unchanged real-data export counts; no real book has such a stored translation, and the
   output was not opened in a reader.
+
+## Phase 4 — review round 3
+
+Date: 2026-11-21. Branch: `phase-4/protect-validate-retry`, same worktree and environment.
+Minor findings of review round 3; no redesign.
+
+### Changes
+
+| # | Finding | Change |
+|---|---|---|
+| 1 | Quality text joined blocks without a separator | `check_html` joins the blocks' texts with a line break before `_quality`: an unchanged `<p>A</p>\n<p>B</p>` no longer reads as the word `AB` (no `untranslated` warning); the length ratio is unchanged (whitespace is removed before it). Test through `check_html`, with and without fingerprints. |
+| 2 | `not_well_formed` detail carried lxml's position inside the fragment wrapper | `validation.xml_error(e)`: the parser's reason without `line N` / `column N` (e.g. `不是格式正確的 XML：Opening and ending tag mismatch: p and fragment`), used by `check_html` and by the reply check in the translator (so also by the follow-up message). |
+| 3 | A blank translatable value in the stored form gave `key_mismatch` + `extra_attributes` | `_compare_elements` pairs a source element with a translation element whose signatures differ only in translatable values left blank (`_emptied`), on a block element itself and inside a block, and reports one `extra_attributes` issue with the keyed check's wording: `第 1 個區塊的 <img> 的 alt 不可為空`. Any other difference is reported as before. |
+
+Round 2's justification of the two `_translate_html` survivors (the joined text checked with or
+without fingerprints) was wrong before item 1: for `<p>1</p>\nA\nB`, the fingerprint cut turned
+the run into the pieces `A` and `B`, joined without a separator into `1AB`, so the
+fingerprinted check could warn `untranslated` where the other did not. With item 1 the two
+texts are both `1\nA\nB` and the halves have already passed the structural rules with their
+shares of the fingerprints, so the two calls give the same result; the survivors are
+equivalent again (re-examined below).
+
+### Known limitations (recorded, not fixed)
+
+- Quality warnings of accepted split halves are not carried to the joined result (only the
+  joined text's own check gives warnings).
+- When the call budget runs out during the split because of transient errors, the segment's
+  issue is `transient`; the structural cause is only in the attempt records (diagnostics).
+- An unterminated inline element in a stored source (`<em>x`) does not round-trip through
+  protect/restore; such a source is refused before any call (`ambiguous_source`), and none
+  exists in the measured data (round trip 9491/9491).
+- Approve requires `Content-Type: application/json` when a body is sent (a body with another
+  type is "not a JSON object", 400).
+
+### Checks
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase4_validate_check.py --projects-dir <repo>/projects --anonymize
+PASS project-1: round trip 220/220, translated 220, failing the structural check 9 (key_mismatch 7, not_well_formed 2; only tag rules 7), warnings (length_ratio 1), length ratio over 205 segments: p1 0.312 p5 0.324 p50 0.359 p95 0.580 p99 0.700; outside 0.25-0.8: 1 (0.5%), sources that cannot be cut 0, with translatable attributes 0
+PASS project-2: round trip 278/278, translated 278, failing the structural check 54 (not_well_formed 10, structure_mismatch 7, tag_count 37; only tag rules 37), warnings (length_ratio 14), length ratio over 218 segments: p1 0.351 p5 0.360 p50 0.402 p95 1.104 p99 1.186; outside 0.25-0.8: 14 (6.4%), sources that cannot be cut 0, with translatable attributes 3
+PASS project-3: round trip 4385/4385, translated 36, failing the structural check 2 (structure_mismatch 1, tag_count 1; only tag rules 1), warnings (none), length ratio over 13 segments: p1 0.363 p5 0.363 p50 0.471 p95 0.580 p99 0.580; outside 0.25-0.8: 0 (0.0%), sources that cannot be cut 0, with translatable attributes 16
+PASS project-4: round trip 2236/2236, translated 1333, failing the structural check 57 (empty_block 14, key_mismatch 10, not_well_formed 2, structure_mismatch 31; only tag rules 10), warnings (untranslated 6), length ratio over 1102 segments: p1 0.342 p5 0.365 p50 0.422 p95 0.484 p99 0.514; outside 0.25-0.8: 2 (0.2%), sources that cannot be cut 0, with translatable attributes 0
+PASS project-5: round trip 839/839, translated 832, failing the structural check 38 (code_changed 19, key_mismatch 3, structure_mismatch 1, tag_count 16; only tag rules 18), warnings (none), length ratio over 430 segments: p1 0.312 p5 0.334 p50 0.394 p95 0.516 p99 0.631; outside 0.25-0.8: 0 (0.0%), sources that cannot be cut 0, with translatable attributes 0
+PASS project-6: round trip 581/581, translated 581, failing the structural check 3 (key_mismatch 3; only tag rules 3), warnings (length_ratio 16, untranslated 2), length ratio over 276 segments: p1 0.347 p5 0.381 p50 0.503 p95 0.885 p99 1.086; outside 0.25-0.8: 16 (5.8%), sources that cannot be cut 0, with translatable attributes 0
+PASS project-7: round trip 621/621, translated 551, failing the structural check 27 (key_mismatch 12, not_well_formed 6, structure_mismatch 9; only tag rules 12), warnings (length_ratio 4), length ratio over 458 segments: p1 0.321 p5 0.340 p50 0.380 p95 0.439 p99 0.732; outside 0.25-0.8: 4 (0.9%), sources that cannot be cut 0, with translatable attributes 3
+PASS project-8: round trip 331/331, translated 331, failing the structural check 16 (structure_mismatch 16; only tag rules 0), warnings (length_ratio 1), length ratio over 223 segments: p1 0.299 p5 0.308 p50 0.340 p95 0.380 p99 0.430; outside 0.25-0.8: 1 (0.4%), sources that cannot be cut 0, with translatable attributes 0
+TOTAL projects 8  round trip 9491/9491  translated 4162  failing the structural check 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 54; only tag rules 88)  warnings (length_ratio 36, untranslated 8)  length ratio over 2925 segments: p1 0.312 p5 0.333 p50 0.404 p95 0.547 p99 0.976; outside 0.25-0.8: 38 (1.3%)  sources that cannot be cut 0  with translatable attributes 22  failed projects 0
+$ echo $?
+0
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase3_export_check.py --projects-dir <repo>/projects --anonymize
+epubcheck found; errors compared by message ID (chinese-only, bilingual-horizontal, bilingual-vertical)
+PASS project-1: exports 3, translated segments 220: as translation 211, kept original 9 (key_mismatch 7, not_well_formed 2), toc labels changed 0/22 (22 into translated chapters), epubcheck errors source 51 (HTM-004:24 NCX-001:1 RSC-005:26), exports 51/51/51
+PASS project-2: exports 3, translated segments 278: as translation 224, kept original 54 (not_well_formed 10, structure_mismatch 7, tag_count 37), toc labels changed 0/35 (33 into translated chapters), epubcheck errors source 27 (OPF-034:1 RSC-005:25 RSC-020:1), exports 27/28/28
+PASS project-3: exports 3, translated segments 36: as translation 34, kept original 2 (structure_mismatch 1, tag_count 1), toc labels changed 18/1357 (22 into translated chapters), epubcheck errors source 0, exports 0/0/0
+PASS project-4: exports 3, translated segments 1333: as translation 1276, kept original 57 (empty_block 14, key_mismatch 10, not_well_formed 2, structure_mismatch 31), toc labels changed 123/144 (126 into translated chapters), epubcheck errors source 11 (RSC-012:11), exports 11/22/22
+PASS project-5: exports 3, translated segments 832: as translation 794, kept original 38 (code_changed 19, key_mismatch 3, structure_mismatch 1, tag_count 15), toc labels changed 244/245 (245 into translated chapters), epubcheck errors source 470 (HTM-004:25 NCX-001:1 PKG-006:1 RSC-005:440 RSC-007:3), exports 466/511/511
+PASS project-6: exports 3, translated segments 581: as translation 578, kept original 3 (key_mismatch 3), toc labels changed 19/19 (19 into translated chapters), epubcheck errors source 1 (RSC-005:1), exports 1/1/1
+PASS project-7: exports 3, translated segments 551: as translation 524, kept original 27 (key_mismatch 12, not_well_formed 6, structure_mismatch 9), toc labels changed 1/45 (44 into translated chapters), epubcheck errors source 151 (RSC-005:151), exports 151/183/183
+PASS project-8: exports 3, translated segments 331: as translation 315, kept original 16 (structure_mismatch 16), toc labels changed 0/18 (16 into translated chapters), epubcheck errors source 27 (RSC-005:26 RSC-007:1), exports 27/27/27
+TOTAL projects 8  exports 24  translated segments 4162  as translation 3956  kept original 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 53)  toc labels changed 405/1885 (527 into translated chapters)  exports with new epubcheck errors 0  failed projects 0
+$ echo $?
+0
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+Both outputs are identical, line for line, to round 2's. The warnings stay `length_ratio 36,
+untranslated 8`: the count did not change, so none of the 8 `untranslated` warnings was a
+false positive of the missing separator, and the length ratio does not
+see the separator. No stored translation has a blank translatable value, and the
+not_well_formed detail is not printed by either script. No `phase4-validate-*` or
+`phase3-export-*` directory left. The scripts ran on the code of the first round-3 commit;
+the later commits change only tests and remove one always-true condition (suite green, final
+mutation run below).
+
+### Tests
+
+1748 passed (round 2: 1731). New: `TestRound3`, `TestRound3Survivors`
+(`test_validation.py`), `TestRound3Translator` (`test_translator.py`).
+
+Tests changed, none removed:
+
+| Test | Change | Reason |
+|---|---|---|
+| `TestTranslatableAttributes::test_empty_value_stays_empty`, `TestRound2Values::test_whitespace_only_is_empty_in_the_stored_form` | an emptied value is one `extra_attributes` issue | item 3 |
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, mutmut 3.8.1, parallel, about 7 minutes per run.
+
+| Run | Mutants | Killed | Survived |
+|---|---|---|---|
+| 1 | 2035 | 2022 | 13 |
+| 2 | 2035 | 2026 | 9 |
+| 3 (final) | 2033 | 2026 | 7 |
+
+| mutant(s) | done |
+|---|---|
+| `_html_check` 36 (`xml_error(None)`) | killed: `TestRound3Translator::test_not_well_formed_reply_detail` |
+| `_compare_elements` 29 (the join of two emptied names), 54 (`>=` for the source element), 64 (`want[sg] = 1`) | killed: `TestRound3Survivors` |
+| `_compare_elements` 55 (`>=` for the translation element) | code changed: the condition was always true (the excess elements are recomputed for every source element, and one translation signature is paired at most once per source element); `test_a_balanced_element_is_not_paired` covers what it seemed to guard |
+| `_compare_elements` 44 (`want + got` for the source elements) | equivalent: the loop body requires `want[sw] > got[sw]`, which holds exactly for the elements of `want - got` |
+| `_translate_html` 93, 96 | equivalent after item 1 (see above) |
+| `_fill` 3, `_restored_attrs` 20, `_Session.__init__` 4, `top_level_units` 39 | equivalent, as in the earlier rounds |
+
+Remaining survivors (run 3), each equivalent and listed above: `_translate_html` 93 and 96,
+`_compare_elements` 44, `_fill` 3, `_restored_attrs` 20, `_Session.__init__` 4,
+`top_level_units` 39.
+
+### Not verified
+
+- No real `claude` call; the follow-up message's not_well_formed wording was not seen by the
+  model.
