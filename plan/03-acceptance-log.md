@@ -1619,8 +1619,8 @@ How each part behaves, where the plan left room:
   by node, so a run translation is placed in place only when the model returns one top-level
   node per run node (with today's prompt, usually one `<p>` per line of a `<br>`-separated
   text); otherwise the existing whole-segment fallback applies, as it does today for any count
-  mismatch. (Changed in review round 1, section 10: a run is one unit, the fallback consumes
-  the segment's whole node range, and a chapter is placed only when it matches as a whole.)
+  mismatch. (Changed in review rounds 1 and 2, sections 10 and 13: a chapter is placed only
+  when it matches as a whole, and only segments of block elements are paired node by node.)
 
 ### 2. Test suite
 
@@ -1852,20 +1852,26 @@ Not needed for this phase (no prompt or backend change) and not made.
   added only when a real book needs it. A spine entry that is not XHTML and an unreadable
   chapter are reported the same way; a package that cannot be read is one error with a
   message.
-- Migration: a merge group that is not wholly translated loses its partial translation
-  (kept in `project.schema1.json`, named in the report); a group that mixes code and text
+- Migration: a merge group that is not wholly translated (a member pending, failed or with
+  an empty translation) loses its partial translation (kept in `project.schema1.json`, named
+  in the report); a group that mixes code and text
   segments makes its chapter unmatched (0 such groups in the real data); an existing
   `project.schema1.json` blocks the migration.
 - Migrated segments whose legacy text held comment text (Bug 5, two project-5 segments) keep
   their translation, which still contains the translated production note; it now has no
   counterpart in the segment's HTML and is exported with the segment. They need the manual
   edit Bug 5 mentions.
-- 77 translated segments of the migrated real projects take the export's whole-segment path
-  (section 11; the earlier "79 export through the fallback, as today" was not proven and is
-  corrected there). That path now consumes the segment's whole node range, `<br>` included.
-- Schema 2 export places each block as one unit (a run's nodes together); a chapter whose
-  blocks do not match its stored ranges and fingerprints as a whole is exported
-  untranslated, silently in this phase (the export report is Phase 3). Chapters where the
+- 82 translated segments of the migrated real projects are not paired node by node and are
+  replaced (chinese-only) or wrapped (bilingual) as a whole (section 14; the earlier "79
+  export through the fallback, as today" was not proven and is corrected in section 11).
+  A chinese-only replacement removes the segment's blocks and the `<br>` and whitespace
+  between them; images, anchors and `<hr/>` between them stay, after the translation.
+- Schema 2 export pairs node by node only segments made of block elements, as `main` did; a
+  segment with an inline run (text directly in a `div` or under `<body>`, `<br>`-separated
+  lines) is always replaced or wrapped as a whole, so such text loses its line structure in
+  chinese-only output unless the translation is one node for a whole element (section 13).
+  A chapter whose blocks do not match its stored ranges and fingerprints as a whole is
+  exported untranslated, silently in this phase (the export report is Phase 3). Chapters where the
   bridge's walk and the XML walk cannot agree are listed in section 10 (text directly under
   `<body>` before its first element, a block inside `<p>`, CDATA); none of the real
   chapters.
@@ -2022,6 +2028,97 @@ Run 2's survivor:
 |---|---|---|---|
 | 91 | `builder.py:537` | `RUN_TAG = 'epub-translator-run'` → `'XXepub-translator-runXX'` | equivalent: the name of the temporary wrapper only has to differ from every element name in the chapter, since every wrapper is unwrapped before the chapter is written; it holds for both names unless a source chapter uses one of them as an element name |
 
+### 13. Review round 2
+
+Three static reviews again (G, O, the third reviewer: approve with minors). Direction set by
+the orchestrator for the temporary bridge: simpler and safer, not smarter. Each accepted
+item got a test that fails on the code before the round (checked against a `git archive` of
+the commit that recorded round 1 in the log, in a scratch directory); exceptions are marked
+"guard". Every accepted claim reproduced.
+
+| # | finding | reviewer | ruling | what was done | tests |
+|---|---|---|---|---|---|
+| 1 | the round-1 span made chinese-only whole-segment replacements delete blocks without text between the first and last unit (an image-only `<p>`, `<hr/>`, `<a id>` anchors) that the model never saw | O | accepted | a chinese-only replacement removes only the nodes of the segment's blocks and the `<br>` and whitespace strings between them; other nodes stay in place. Bilingual output still moves the whole span into `div.original` | `test_builder.py::TestSchema2BridgeReview2::test_textless_blocks_between_units_kept_once[*]` (the two bilingual cases are guards: they already kept them) |
+| 2 | pairing by node count is not valid when a unit is an inline run (`<div><em>First</em> line<br/>Second</div>` + `<em>第一</em>行\n第二` is mis-paired) | G, the third reviewer | accepted | a segment is paired node by node only when every one of its blocks is a block element, as on `main`; a segment with any inline run is replaced (chinese-only) or wrapped (bilingual) as a whole. The temporary run wrapper of round 1 (items 3 and 11 there) is removed | `TestSchema2BridgeReview2::test_two_runs_not_paired_by_count[*]`, `test_inline_element_run_and_paragraph` (the third reviewer's `<em>Hello</em>` case). Changed, because runs are no longer paired: `TestSchema2Export::test_br_separated_runs[*]`, `test_text_mixed_with_blocks[*]`, `test_raw_epub_end_to_end`, `TestSchema2BridgeReview1::test_br_div_one_to_one_still_placed_line_by_line` → `test_br_div_line_by_line_translation_replaced_whole`, `test_run_and_paragraph_one_row_per_block` → `test_run_and_paragraph_one_row`, `TestSchema2BridgeSurvivors::test_comment_inside_a_run_keeps_its_place` → `…_kept_once` |
+| 3 | placement on the enclosing element when the translation's count is neither 1 nor the unit count drops the element's `class`/`id` | O | accepted | the enclosing element is used only when the translation has exactly one top-level node | `TestSchema2BridgeReview2::test_enclosing_element_kept_for_a_multi_node_translation[*]` |
+| 4 | migration: the partial-group guard looks at statuses only; the review editor can save an empty translation without changing the status | G | accepted | a member with an empty (or whitespace) translation makes the group not wholly translated: joined translation cleared, status pending when it would have been translated or reviewed, named in the report | `test_migrate.py::TestMigrateReview2::test_translation_cleared_in_the_review_editor` (cleared through the review API), `test_empty_member_of_one_status_named` |
+| 5 | migration: valid JSON of the wrong shape (`null`, a segment that is not an object, `epub_path` null) gives a traceback | G, O, the third reviewer | accepted | loading the project and finding its source are inside one `try` at the migration boundary that also catches `AttributeError`; the message is "無法讀取 project.json：…", nothing written | `TestMigrateReview2::test_wrong_json_shape_is_a_migration_error[*]` (the top-level list case is a guard: it was already a `TypeError`), `test_null_epub_path_is_a_migration_error`, `test_wrong_shape_through_the_cli` |
+| 6 | a failing save leaves the backup behind, so the next run is refused | O | accepted | the backup is removed when the save raises (`project.json` is unchanged: the save is atomic) | `TestMigrateReview2::test_failed_save_removes_the_backup` |
+| 7 | commit hash in the log (round-1 mutation base) | orchestrator | accepted | replaced by a description and `<base>` | — |
+| 8 | the enclosing element replaces a structural container of block elements (`<div class="chapter"><p>One.</p><p>Two.</p></div>` + `<p>一二。</p>` leaves bare text in the div; a two-paragraph translation of a one-paragraph div deletes it) | the third reviewer | accepted | the enclosing element is used only for a segment with an inline run (with item 3: and a one-node translation) | `TestSchema2BridgeReview2::test_structural_container_kept_chinese_only[*]`, `test_structural_container_of_one_paragraph_kept` |
+| — | the third reviewer's #2 (an inline translation tag lost in the run wrapper's 1:1 path) | the third reviewer | covered by 2 | the wrapper and run pairing are gone | `test_inline_element_run_and_paragraph` |
+
+The placement rules of the bridge after this round, in full: a chapter is placed only when
+its blocks match the stored ranges and fingerprints as a whole (round 1); a segment whose
+blocks are all block elements is paired node by node when the translation has as many
+top-level nodes, otherwise replaced or wrapped as a whole; a segment with an inline run is
+always replaced or wrapped as a whole, except that a one-node translation of runs that are
+the whole content of one element below `<body>` goes into that element.
+
+### 14. Review round 2: checks after the last code change
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider
+1168 passed in 133.71s (0:02:13)
+$ python3 scripts/verify/phase2_roundtrip.py --projects-dir <repo>/projects --anonymize | tail -1
+TOTAL projects 8  chapters 2170  round trip equal 2170  whole-document equal 2146  failed projects 0
+$ echo $?    # of the unpiped run
+0
+$ python3 scripts/verify/phase2_migrate_copies.py --projects-dir <repo>/projects --anonymize
+PASS project-1: chapters 22/22, segments 220/220, merge groups 0 (0 segments), count differs 0, export fallback 0, translated chars 211044 -> 211044, export places 22/22, web load ok
+PASS project-2: chapters 33/33, segments 291/291, merge groups 13 (26 segments), count differs 16, export fallback 16, translated chars 302113 -> 302113, export places 33/33, web load ok
+PASS project-3: chapters 39/39, segments 4385/4385, merge groups 0 (0 segments), count differs 1, export fallback 1, translated chars 15637 -> 15637, export places 39/39, web load ok
+PASS project-4: chapters 1763/1763, segments 2236/2236, merge groups 0 (0 segments), count differs 32, export fallback 32, translated chars 746052 -> 746052, export places 1763/1763, web load ok
+PASS project-5: chapters 35/35, segments 840/840, merge groups 1 (2 segments), count differs 1, export fallback 1, translated chars 462908 -> 462908, export places 35/35, web load ok
+PASS project-6: chapters 108/108, segments 581/581, merge groups 0 (0 segments), count differs 0, export fallback 0, translated chars 356677 -> 356677, export places 108/108, web load ok
+PASS project-7: chapters 68/68, segments 637/637, merge groups 15 (31 segments), count differs 13, export fallback 17, translated chars 471477 -> 471477, export places 68/68, web load ok
+PASS project-8: chapters 87/87, segments 331/331, merge groups 0 (0 segments), count differs 16, export fallback 15, translated chars 159747 -> 159747, export places 87/87, web load ok
+TOTAL projects 8  chapters 2155/2155  segments 9521/9521  merge groups 29 (59 segments)  count differs 79  export fallback 82  translated chars unchanged 8  export places 2155/2155  web loads 8  failed projects 0
+$ echo $?
+0
+$ cd <repo> && python3 plan/experiments/migrate_dryrun.py --strict | tail -1
+TOTAL chapters 2155/2155  segments 9521/9521  on-boundary 9462  to-merge 59 in 29 groups  largest block 7899 chars
+$ python3 plan/experiments/migrate_dryrun.py --strict > /dev/null; echo $?
+0
+```
+
+Same totals as before the round. "export fallback" now counts the translated text segments
+that are not paired node by node: **82** (was 77). The 5 more are all in project-7: segments
+with an inline run whose translation happened to have one top-level node per block, which
+round 1 paired node by node and which are now replaced or wrapped as a whole (item 2). The
+`projects/` digest was `a7197555c962562a530d6de80fa045af` before the round and after every
+real-data run; no migration copy was left in the temporary directory.
+
+### 15. Mutation testing after review round 2
+
+`scripts/verify/mutation.sh <base>`, where `<base>` is the commit that recorded round 1 in
+the log, so only the lines changed in this round are mutated.
+
+| run | mutants | killed | survived | timeout | suspicious |
+|---|---|---|---|---|---|
+| 1, after "docs: name the round 1 mutation base…" | 65 | 55 | 10 | 0 | 0 |
+| 2, after "test: kill the review round 2 mutation survivors" | 59 | 59 | 0 | 0 | 0 |
+
+```
+$ scripts/verify/mutation.sh <base>
+...
+TOTAL mutants 59  killed 59  survived 0  timeout 0  suspicious 0  untested 0
+$ echo $?
+0
+```
+
+Run 1's survivors (ids of run 1); the kills were also checked by applying each mutant by
+hand to a copy of the code:
+
+| id | location | mutation | disposition |
+|---|---|---|---|
+| 10 | `migrate.py:175` | `cleared = False` → `None` | code changed: `cleared` is one expression (`incomplete and …`) |
+| 39 | `builder.py:225` | enclosing-element placement not paired | killed: `TestSchema2BridgeReview2Survivors::test_enclosing_element_keeps_its_tag_for_a_one_node_translation` |
+| 40, 46, 51 | `builder.py:284, 349, 394` | default `pair=True` → `False` | code changed: `remove`/`span` and `pair` are required (both schemas pass them; one older test that called `_apply_chinese_only` with three arguments passes them now) |
+| 48, 53 | `builder.py:379, 421` | `span is None` → `is not None` | code changed: the `None` default and its handling are gone |
+| 47, 52 | `builder.py:359, 401` | bilingual pairing disabled | killed: `test_block_only_segment_paired_in_bilingual[*]` |
+| 58 | `builder.py:567` | whitespace separator test negated | killed: `test_whitespace_between_blocks_removed_with_them` |
+
 ### Not done
 
 - Export does not verify `source_sha256` (plan 4.2 "Export verifies the hash"): that is
@@ -2049,3 +2146,7 @@ Run 2's survivor:
   was checked as rendered page text, not in a browser. The walk-disagreement cases of
   section 10 and the real-data counts of items 2 and 5 come from throw-away scripts (not
   kept). A full export of a migrated real project was still not built.
+- Review round 2: the check script counts the segments that are not paired; it does not
+  compare images or ids before and after an export (the tests do, on invented chapters).
+  The explanation of the 5 more fallbacks (section 14) follows from the rule; the 5
+  segments were not listed individually.
