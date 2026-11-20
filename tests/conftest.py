@@ -335,3 +335,102 @@ def no_real_model_calls(monkeypatch):
         return ProcessResult(1, '', 'tests do not run the real CLI')
 
     monkeypatch.setattr('src.llm.cli.run_process', refuse)
+
+
+# --- Parsed chapter bodies -----------------------------------------------------
+
+def body_of(html: str):
+    """The <body> element of `html` parsed as XML, as the extractor parses a
+    chapter; a fragment without <body> is put into one."""
+    from src.epub.extractor import find_body, parse_xml
+    if '<body' not in html:
+        html = f'<html><body>{html}</body></html>'
+    return find_body(parse_xml(html.encode('utf-8')))
+
+
+# --- EPUBs written as raw ZIP archives (plan section 7) -----------------------
+
+def xhtml(body: str, head: str = '<title>Chapter</title>') -> str:
+    """An XHTML chapter with the given head and body content."""
+    return ('<?xml version="1.0" encoding="utf-8"?>\n'
+            '<html xmlns="http://www.w3.org/1999/xhtml" '
+            'xmlns:epub="http://www.idpf.org/2007/ops">\n'
+            f'<head>{head}</head>\n<body>{body}</body>\n</html>\n')
+
+
+def write_raw_epub(path, items, spine, members, opf_path='OEBPS/content.opf',
+                   title='The Lantern Keeper', author='Invented Author'):
+    """Write an EPUB as a plain ZIP archive, without ebooklib.
+
+    items: (id, href, media type, properties or None) for the manifest;
+    spine: item ids in order; members: archive name -> content.
+    """
+    import zipfile
+    from xml.sax.saxutils import quoteattr
+    manifest = ''.join(
+        f'<item id={quoteattr(i)} href={quoteattr(h)} media-type={quoteattr(m)}'
+        + (f' properties={quoteattr(p)}' if p else '') + '/>'
+        for i, h, m, p in items)
+    refs = ''.join(f'<itemref idref={quoteattr(i)}/>' for i in spine)
+    toc = ' toc="ncx"' if any(item[0] == 'ncx' for item in items) else ''
+    opf = ('<?xml version="1.0" encoding="utf-8"?>\n'
+           '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" '
+           'unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
+           f'<dc:identifier id="uid">invented-0001</dc:identifier><dc:title>{title}</dc:title>'
+           f'<dc:creator>{author}</dc:creator><dc:language>en</dc:language></metadata>'
+           f'<manifest>{manifest}</manifest><spine{toc}>{refs}</spine></package>')
+    container = ('<?xml version="1.0"?>\n<container version="1.0" '
+                 'xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
+                 f'<rootfile full-path="{opf_path}" media-type="application/oebps-package+xml"/>'
+                 '</rootfiles></container>')
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr(zipfile.ZipInfo('mimetype'), 'application/epub+zip',
+                   compress_type=zipfile.ZIP_STORED)
+        z.writestr('META-INF/container.xml', container)
+        z.writestr(opf_path, opf)
+        for name, content in members.items():
+            z.writestr(name, content)
+    return str(path)
+
+
+RAW_NAV = xhtml('<nav epub:type="toc"><ol><li><a href="Text/one.xhtml">One</a></li>'
+                '</ol></nav>', head='<title>Contents</title>')
+RAW_NCX = ('<?xml version="1.0" encoding="utf-8"?>\n'
+           '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><navMap>'
+           '<navPoint id="n1"><navLabel><text>One</text></navLabel>'
+           '<content src="Text/one.xhtml"/></navPoint></navMap></ncx>')
+RAW_CHAPTER_ONE = xhtml(
+    '<h1 id="c1">The Lantern Keeper</h1>'
+    '<p class="first">Mira climbed the <em>spiral</em> stairs at dusk.</p>'
+    '<!-- editor note: check spelling -->'
+    'A line of bare text under the body.'
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="5" height="5"/></svg>'
+    '<div class="verse">First line of the song<br/>Second line of the song<br/>'
+    'Third line of the song</div>',
+    head='<title>One</title><link rel="stylesheet" type="text/css" href="../Styles/book.css"/>'
+         '<style>p.first { text-indent: 0; }</style>')
+RAW_CHAPTER_TWO = xhtml('<h2>Second Evening</h2><p>The harbour bells rang twice.</p>')
+
+
+@pytest.fixture
+def raw_epub(tmp_path):
+    """An EPUB written as a raw ZIP: OEBPS/ folder, chapters in a subfolder,
+    a percent-encoded href, a head with <link> and <style>, NCX plus a
+    navigation document that is also in the spine, inline SVG with viewBox,
+    text directly under <body>, <br>-separated runs, a comment under <body>,
+    and a duplicated spine entry."""
+    items = [
+        ('nav', 'nav.xhtml', 'application/xhtml+xml', 'nav'),
+        ('ncx', 'toc.ncx', 'application/x-dtbncx+xml', None),
+        ('css', 'Styles/book.css', 'text/css', None),
+        ('one', 'Text/one.xhtml', 'application/xhtml+xml', None),
+        ('two', 'Text/chapter%20two.xhtml', 'application/xhtml+xml', None),
+    ]
+    members = {
+        'OEBPS/nav.xhtml': RAW_NAV,
+        'OEBPS/toc.ncx': RAW_NCX,
+        'OEBPS/Styles/book.css': 'p { margin: 0; }',
+        'OEBPS/Text/one.xhtml': RAW_CHAPTER_ONE,
+        'OEBPS/Text/chapter two.xhtml': RAW_CHAPTER_TWO,
+    }
+    return write_raw_epub(tmp_path / 'raw.epub', items, ['nav', 'one', 'two', 'one'], members)

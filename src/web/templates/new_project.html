@@ -199,6 +199,9 @@ function uploadManager() {
                 }
 
                 const data = await response.json();
+                if (data.unparsed_chapters && data.unparsed_chapters.length) {
+                    alert('以下章節無法解析，未分段，將以原文保留：\n' + data.unparsed_chapters.join('\n'));
+                }
                 window.location.href = '/project/' + data.name;
             } catch (e) {
                 this.error = e.message;

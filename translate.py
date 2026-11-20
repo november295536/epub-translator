@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import click
 
 from src import __version__
-from src.epub.extractor import EPUBExtractor
+from src.epub.extractor import EPUBError, EPUBExtractor
 from src.core.segmenter import Segmenter, SegmentType
-from src.core.project import ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus
+from src.core.project import (
+    ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus, sha256_file,
+)
 from src.core.translator import (
     AuthError, BackendUnavailableError, RateLimitError, TranslationEngine, available_models,
     UnexpectedStreak, record_failure_log, translate_segment,
 )
 from src.glossary.glossary_manager import GlossaryManager
+from src.core.migrate import MigrationError, migrate_project
 from src.epub.builder import EPUBBuilder
 
 
@@ -51,9 +55,9 @@ def cli():
 def init(epub_file):
     """Initialize a translation project from an EPUB file.
 
-    Extracts chapters, segments content, and creates a project file.
+    Copies the EPUB into the project, extracts chapters, segments content,
+    and creates a project file.
     """
-    epub_path = os.path.abspath(epub_file)
     project_dir = _get_project_dir(epub_file)
 
     pm = ProjectManager(project_dir)
@@ -62,9 +66,19 @@ def init(epub_file):
         click.echo("如需重新初始化，請先刪除專案目錄。")
         sys.exit(1)
 
+    # The project owns its copy of the book
+    os.makedirs(project_dir, exist_ok=True)
+    epub_path = os.path.abspath(os.path.join(project_dir, 'source.epub'))
+    shutil.copy2(epub_file, epub_path)
+
     click.echo(f"正在解析 EPUB：{epub_file}")
     extractor = EPUBExtractor(epub_path)
-    extractor.load()
+    try:
+        extractor.load()
+    except EPUBError as e:
+        os.remove(epub_path)
+        click.echo(f"無法解析 EPUB：{e}")
+        sys.exit(1)
     metadata = extractor.get_metadata()
 
     click.echo(f"書名：{metadata['title']}")
@@ -72,11 +86,13 @@ def init(epub_file):
 
     chapters = extractor.extract_chapters()
     click.echo(f"提取了 {len(chapters)} 個章節")
+    for chapter_id, reason in extractor.failed:
+        click.echo(f"無法解析的章節（不分段）：{chapter_id}：{reason}")
 
     segmenter = Segmenter()
     all_segments = []
     for chapter in chapters:
-        segs = segmenter.segment_chapter(chapter.id, chapter.html_content)
+        segs = segmenter.segment_chapter(chapter.id, chapter.body)
         all_segments.extend(segs)
 
     click.echo(f"分段完成：共 {len(all_segments)} 個段落")
@@ -86,6 +102,7 @@ def init(epub_file):
         title=metadata['title'],
         author=metadata['author'],
         segments=all_segments,
+        source_sha256=sha256_file(epub_path),
     )
 
     click.echo(f"專案已建立：{project_dir}")
@@ -395,13 +412,38 @@ def export(project, fmt):
         sys.exit(1)
 
     output_dir = os.path.join(project_dir, 'output')
-    base_name = os.path.splitext(os.path.basename(pm.data.epub_path))[0]
+    # Schema 2: named after the project (the book is the project's
+    # source.epub); schema 1 keeps the book's file name
+    if pm.data.schema == 2:
+        base_name = os.path.basename(os.path.abspath(project_dir))
+    else:
+        base_name = os.path.splitext(os.path.basename(pm.data.epub_path))[0]
     output_path = os.path.join(output_dir, f'{base_name}-{fmt}.epub')
 
     click.echo(f"正在建構 {fmt} 格式的 EPUB...")
     builder = EPUBBuilder(project_dir)
     result_path = builder.build(output_path, fmt=fmt)
     click.echo(f"已輸出：{result_path}")
+
+
+@cli.command()
+@click.argument('project_dir', type=click.Path(exists=True, file_okay=False))
+@click.option('--dry-run', is_flag=True, default=False, help='Only report; write nothing')
+def migrate(project_dir, dry_run):
+    """Migrate a project to the block model (schema 2), once.
+
+    Writes nothing unless every chapter matches; keeps the previous
+    project.json as project.schema1.json.
+    """
+    try:
+        report = migrate_project(project_dir, dry_run=dry_run)
+    except (MigrationError, ProjectLockedError) as e:
+        click.echo(str(e))
+        sys.exit(1)
+    for line in report.lines():
+        click.echo(line)
+    if report.unmatched:
+        sys.exit(1)
 
 
 # --- Glossary CLI commands ---

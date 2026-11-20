@@ -1424,16 +1424,61 @@ class TestWorkerContext:
 
 class TestCreateProjectMarker:
 
-    def test_web_created_project_records_segmenter_version_2(self, tmp_path, sample_epub):
+    # Phase 2: schema 2 replaces the segmenter_version marker (same intent)
+    def test_web_created_project_records_schema_2_and_source_hash(self, tmp_path, sample_epub):
+        import hashlib
         app = create_app(projects_dir=str(tmp_path / 'projects'))
         app.config['TESTING'] = True
         with app.test_client() as client:
             response = client.post('/api/projects', json={
                 'epub_path': sample_epub, 'project_name': 'marker'})
         assert response.status_code == 200, response.get_json()
+        assert response.get_json()['unparsed_chapters'] == []
         path = tmp_path / 'projects' / 'marker' / 'project.json'
-        assert json.loads(path.read_text(encoding='utf-8'))['segmenter_version'] == 2
+        raw = json.loads(path.read_text(encoding='utf-8'))
+        assert raw['schema'] == 2
+        assert 'segmenter_version' not in raw
+        with open(sample_epub, 'rb') as f:
+            assert raw['source_sha256'] == hashlib.sha256(f.read()).hexdigest()
+        assert raw['segments'][0]['block_start'] == 0
 
+    def test_unparsed_chapter_reported(self, tmp_path):
+        from tests.conftest import write_raw_epub, xhtml
+        items = [('a', 'a.xhtml', 'application/xhtml+xml', None),
+                 ('b', 'b.xhtml', 'application/xhtml+xml', None)]
+        members = {'OEBPS/a.xhtml': xhtml('<p>The tide came in.</p>'),
+                   'OEBPS/b.xhtml': xhtml('<p>Unclosed paragraph.</div>')}
+        epub_path = write_raw_epub(tmp_path / 'bad.epub', items, ['a', 'b'], members)
+        app = create_app(projects_dir=str(tmp_path / 'projects'))
+        app.config['TESTING'] = True
+        with app.test_client() as client:
+            response = client.post('/api/projects', json={
+                'epub_path': epub_path, 'project_name': 'bad'})
+        assert response.status_code == 200, response.get_json()
+        assert response.get_json()['unparsed_chapters'] == ['b']
+        assert response.get_json()['segments'] == 1
+
+
+    def test_unreadable_epub_gives_a_message(self, tmp_path):
+        # Review round 1: a clear error, not a server error
+        bad = tmp_path / 'broken.epub'
+        bad.write_bytes(b'not a zip archive')
+        app = create_app(projects_dir=str(tmp_path / 'projects'))
+        app.config['TESTING'] = True
+        with app.test_client() as client:
+            response = client.post('/api/projects', json={'epub_path': str(bad)})
+        assert response.status_code == 400
+        assert response.get_json() == {
+            'error': '無法解析 EPUB：無法讀取 EPUB：File is not a zip file'}
+
+    def test_new_project_page_shows_unparsed_chapters(self, tmp_path):
+        # Review round 1: the page tells the user before it redirects
+        app = create_app(projects_dir=str(tmp_path / 'projects'))
+        app.config['TESTING'] = True
+        with app.test_client() as client:
+            page = client.get('/new').get_data(as_text=True)
+        assert 'data.unparsed_chapters.length' in page
+        assert "alert('以下章節無法解析，未分段，將以原文保留：\\n'" in page
 
 # --- Phase 1: failed segments, revision, lock, extraction model ----------------
 
