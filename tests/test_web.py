@@ -2603,10 +2603,11 @@ class TestRound1Exact:
 
     def test_review_responses_exact(self, client):
         url = f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002'
+        # Phase 5: both return the check's issues (none here)
         assert client.post(url, json={'text': '<p>改</p>'}).get_json() == \
-            {'status': 'ok', 'segment_id': 'ch1_seg0002'}
+            {'status': 'ok', 'segment_id': 'ch1_seg0002', 'issues': []}
         assert client.post(url + '/approve', json={}).get_json() == \
-            {'status': 'ok', 'segment_id': 'ch1_seg0002'}
+            {'status': 'ok', 'segment_id': 'ch1_seg0002', 'issues': []}
         response = client.post(f'/api/projects/{PROJECT_NAME}/segments/nope/retranslate')
         assert response.status_code == 404
         assert response.get_json() == {'error': 'Segment nope not found'}
@@ -3926,3 +3927,128 @@ eval(page + '; global.translationController = translationController;');
         assert response.status_code == 422
         assert response.get_json()['error'] == \
             '譯文未通過結構檢查：第 1 個區塊沒有文字；出現原文沒有的標籤：<b>'
+
+
+# --- Phase 5: glossary warnings and issues in the review ---------------------------
+
+from src.glossary.glossary_manager import GlossaryManager  # noqa: E402
+
+
+class TestReviewIssues:
+
+    def _project_dir(self, projects_dir):
+        return os.path.join(projects_dir, PROJECT_NAME)
+
+    def _glossary(self, projects_dir):
+        gm = GlossaryManager(os.path.join(self._project_dir(projects_dir), 'glossary.json'))
+        gm.add_term('paragraph', '段落', 'term')
+
+    def _stored(self, projects_dir, seg_id):
+        pm = ProjectManager(self._project_dir(projects_dir))
+        pm.load()
+        return pm._find(seg_id)
+
+    def _issues(self, projects_dir, which):
+        """ch1_seg0002: a glossary warning; ch1_seg0003: failed; ch2_seg0002:
+        a quality warning (which: the segments to give issues)."""
+        pm = ProjectManager(self._project_dir(projects_dir))
+        pm.load()
+        if 'glossary' in which:
+            pm.update_translation('ch1_seg0002', '<p>第一段。</p>', issues=[
+                Issue('glossary', 'term_not_applied', 'GLOSSDETAIL', False)])
+        if 'failed' in which:
+            pm.mark_failed('ch1_seg0003', [Issue('structure', 'tag_count', 'FAILDETAIL', True)])
+        if 'quality' in which:
+            pm.update_translation('ch2_seg0002', '<p>Chapter 2 content.</p>', issues=[
+                Issue('quality', 'untranslated', 'QUALDETAIL', False)])
+        pm.save()
+
+    def test_update_returns_and_stores_glossary_warning(self, client, project_with_translations):
+        self._glossary(project_with_translations)
+        url = f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002'
+        data = client.post(url, json={'text': '<p>第一節。</p>'}).get_json()
+        warning = {'kind': 'glossary', 'code': 'term_not_applied',
+                   'detail': '術語「paragraph」未譯為「段落」', 'blocking': False}
+        assert data == {'status': 'ok', 'segment_id': 'ch1_seg0002', 'issues': [warning]}
+        seg = self._stored(project_with_translations, 'ch1_seg0002')
+        assert seg.translated_text == '<p>第一節。</p>'
+        assert [i.code for i in seg.issues] == ['term_not_applied']
+        data = client.post(url, json={'text': '<p>第一段落。</p>'}).get_json()
+        assert data['issues'] == []
+        assert self._stored(project_with_translations, 'ch1_seg0002').issues == []
+
+    def test_approve_returns_warning_and_clears_stored(self, client, project_with_translations):
+        self._glossary(project_with_translations)
+        url = f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002'
+        client.post(url, json={'text': '<p>第一節。</p>'})
+        data = client.post(url + '/approve', json={}).get_json()
+        assert [i['code'] for i in data['issues']] == ['term_not_applied']
+        seg = self._stored(project_with_translations, 'ch1_seg0002')
+        assert seg.status == SegmentStatus.REVIEWED and seg.issues == []
+
+    def test_refused_save_returns_issues(self, client):
+        response = client.post(f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0002',
+                               json={'text': '<p>第一段<b>x</b>。</p>'})
+        assert response.status_code == 422
+        assert [i['code'] for i in response.get_json()['issues']] == ['unknown_tag']
+
+    def test_retranslate_returns_issues(self, client, project_with_translations):
+        self._glossary(project_with_translations)
+        with use_fake_backend(FakeBackend(['<p k="1">第二節。</p>'])):
+            data = client.post(
+                f'/api/projects/{PROJECT_NAME}/segments/ch1_seg0003/retranslate').get_json()
+        assert data['translated_text'] == '<p>第二節。</p>'
+        assert [i['code'] for i in data['issues']] == ['term_not_applied']
+
+    def test_filter_lists_exactly_the_segments_with_issues(self, client, project_with_translations):
+        self._issues(project_with_translations, ('glossary', 'failed', 'quality'))
+        html = client.get(f'/project/{PROJECT_NAME}/review?issues=1').get_data(as_text=True)
+        shown = [s for s in ('ch1_seg0001', 'ch1_seg0002', 'ch1_seg0003', 'ch2_seg0001',
+                             'ch2_seg0002') if f'id="seg-{s}"' in html]
+        assert shown == ['ch1_seg0002', 'ch1_seg0003', 'ch2_seg0002']
+        for detail in ('GLOSSDETAIL', 'FAILDETAIL', 'QUALDETAIL'):
+            assert detail in html
+        # each listed segment links to its chapter
+        assert f'href="/project/{PROJECT_NAME}/review/chapter/ch2#seg-ch2_seg0002"' in html
+        html = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1?issues=1').get_data(
+            as_text=True)
+        assert [s for s in ('ch1_seg0001', 'ch1_seg0002', 'ch1_seg0003', 'ch2_seg0002')
+                if f'id="seg-{s}"' in html] == ['ch1_seg0002', 'ch1_seg0003']
+        assert '顯示全部' in html
+
+    def test_without_filter_all_segments(self, client, project_with_translations):
+        self._issues(project_with_translations, ('glossary',))
+        html = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1').get_data(as_text=True)
+        assert all(f'id="seg-{s}"' in html for s in ('ch1_seg0001', 'ch1_seg0002', 'ch1_seg0003'))
+        assert f'href="/project/{PROJECT_NAME}/review/chapter/ch1?issues=1"' in html
+        html = client.get(f'/project/{PROJECT_NAME}/review').get_data(as_text=True)
+        assert 'id="seg-' not in html  # the index lists chapters only
+        assert '請從左側選擇一個章節開始審閱。' in html
+
+    def test_no_segment_with_issues(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/review?issues=1').get_data(as_text=True)
+        assert 'id="seg-' not in html
+        assert '沒有有問題的段落。' in html
+        assert '有問題的段落\n            <span class="badge">0</span>' in html
+
+    def test_badge_and_details(self, client, project_with_translations):
+        self._issues(project_with_translations, ('glossary', 'failed'))
+        html = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1').get_data(as_text=True)
+        assert '有問題的段落\n            <span class="badge">2</span>' in html
+        assert html.count('<span class="issue-badge">1 個問題</span>') == 2
+        assert html.count('<span class="issue-badge" hidden>0 個問題</span>') == 1
+        assert '<li class="issue-glossary"><span class="issue-kind">術語</span>GLOSSDETAIL</li>' \
+            in html
+        assert '<li class="issue-structure"><span class="issue-kind">結構</span>FAILDETAIL</li>' \
+            in html
+        # the script shows the issues a save, an approval, a re-translation or a
+        # refused save returns
+        assert html.count('showIssues(segId, data.issues);') == 4
+        from src.web.blueprints.review import ISSUE_KINDS
+        assert ISSUE_KINDS == {'structure': '結構', 'quality': '品質', 'glossary': '術語',
+                               'backend': '模型回覆'}
+        assert f'const issueKinds = {json.dumps(ISSUE_KINDS, sort_keys=True)};' in html
+
+    def test_search_hint_mentions_failed(self, client):
+        html = client.get(f'/project/{PROJECT_NAME}/search').get_data(as_text=True)
+        assert '搜尋已翻譯、已審閱和翻譯失敗段落的原文及譯文' in html

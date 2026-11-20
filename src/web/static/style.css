@@ -150,6 +150,45 @@ header .subtitle {
 .status-reviewed { background: #27ae60; color: white; }
 .status-failed { background: #c0392b; color: white; }
 
+.issue-badge {
+    background: #fdebd0;
+    color: #a04000;
+    padding: 0.1rem 0.5rem;
+    border-radius: 3px;
+    font-weight: 600;
+}
+
+.segment-issues {
+    list-style: none;
+    margin: 0;
+    padding: 0.5rem 1rem;
+    background: #fef9e7;
+    border-bottom: 1px solid #eee;
+    font-size: 0.85rem;
+}
+
+.segment-issues li + li { margin-top: 0.25rem; }
+
+.issue-kind {
+    display: inline-block;
+    margin-right: 0.5rem;
+    padding: 0 0.4rem;
+    border-radius: 3px;
+    background: #ecf0f1;
+    font-size: 0.75rem;
+}
+
+.issue-structure .issue-kind, .issue-backend .issue-kind { background: #c0392b; color: white; }
+
+.issue-badge[hidden], .segment-issues[hidden] { display: none; }
+
+.issue-filter {
+    margin-bottom: 1rem;
+    font-size: 0.85rem;
+}
+
+.segment-chapter { font-family: monospace; }
+
 .segment-body {
     display: flex;
     gap: 1rem;
@@ -803,6 +842,10 @@ button {
     padding: 1rem;
     overflow-y: auto;
     flex-shrink: 0;
+}
+
+.review-sidebar a.issues-link {
+    margin-bottom: 1rem;
 }
 
 .review-sidebar h3 {

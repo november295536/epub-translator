@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 review_bp = Blueprint('review', __name__)
 
+# The label a reviewer reads for each kind of issue
+ISSUE_KINDS = {'structure': '結構', 'quality': '品質', 'glossary': '術語', 'backend': '模型回覆'}
+
 
 @review_bp.errorhandler(FileNotFoundError)
 def project_missing(e):
@@ -38,35 +41,45 @@ def get_pm(project_name: str) -> ProjectManager:
 
 @review_bp.route('/project/<project_name>/review')
 def index(project_name: str):
-    """Show review index with chapter list."""
+    """Show review index with chapter list; with ?issues=1, every segment
+    that has issues."""
     pm = get_pm(project_name)
-    progress = pm.get_progress()
-    chapters = pm.get_chapters()
-    return render_template('project/review.html',
-                           project_name=project_name,
-                           title=pm.data.title,
-                           author=pm.data.author,
-                           progress=progress,
-                           chapters=chapters,
-                           active_tab='review')
+    issues_only = _issues_only()
+    return _render(pm, project_name, segments=with_issues(pm.data.segments) if issues_only else None,
+                   issues_only=issues_only)
 
 
 @review_bp.route('/project/<project_name>/review/chapter/<chapter_id>')
 def chapter_view(project_name: str, chapter_id: str):
-    """Show segments for a specific chapter."""
+    """Show segments for a specific chapter (?issues=1: only those with issues)."""
     pm = get_pm(project_name)
     segments = pm.get_segments_by_chapter(chapter_id)
-    progress = pm.get_progress()
-    chapters = pm.get_chapters()
+    issues_only = _issues_only()
+    return _render(pm, project_name, segments=with_issues(segments) if issues_only else segments,
+                   issues_only=issues_only, current_chapter=chapter_id)
+
+
+def _issues_only() -> bool:
+    return request.args.get('issues') == '1'
+
+
+def with_issues(segments: list) -> list:
+    """The segments that have stored issues: a failure, quality or glossary
+    warnings."""
+    return [s for s in segments if s.issues]
+
+
+def _render(pm: ProjectManager, project_name: str, **page):
     return render_template('project/review.html',
                            project_name=project_name,
                            title=pm.data.title,
                            author=pm.data.author,
-                           progress=progress,
-                           chapters=chapters,
-                           current_chapter=chapter_id,
-                           segments=segments,
-                           active_tab='review')
+                           progress=pm.get_progress(),
+                           chapters=pm.get_chapters(),
+                           issue_count=len(with_issues(pm.data.segments)),
+                           issue_kinds=ISSUE_KINDS,
+                           active_tab='review',
+                           **page)
 
 
 def transaction(project_name: str):
@@ -92,7 +105,7 @@ def update_segment(project_name: str, segment_id: str):
             seg = pm._find(segment_id)
             issues = []
             if data['text'].strip():  # an empty text clears the translation
-                result = check_segment(seg, data['text'])
+                result = check_segment(seg, data['text'], _glossary(pm))
                 if result.blocking:
                     return _refused(result)
                 issues = result.issues
@@ -102,14 +115,25 @@ def update_segment(project_name: str, segment_id: str):
             remove_failure_log(_log_dir(pm), segment_id)
     except ValueError as e:
         return jsonify({'error': str(e)}), 404
-    return jsonify({'status': 'ok', 'segment_id': segment_id})
+    return jsonify({'status': 'ok', 'segment_id': segment_id, 'issues': _issues(issues)})
+
+
+def _glossary(pm: ProjectManager) -> GlossaryManager:
+    """The project's glossary, for the glossary warnings."""
+    gm = GlossaryManager(os.path.join(pm.project_dir, 'glossary.json'))
+    gm.load()
+    return gm
+
+
+def _issues(issues: list) -> list:
+    return [asdict(i) for i in issues]
 
 
 def _refused(result):
     """The answer to a save or approval whose text fails the structural
     check: nothing is changed."""
     return jsonify({'error': '譯文未通過結構檢查：' + '；'.join(i.detail for i in result.blocking),
-                    'issues': [asdict(i) for i in result.issues]}), 422
+                    'issues': _issues(result.issues)}), 422
 
 
 @review_bp.route('/api/projects/<project_name>/segments/<segment_id>/approve', methods=['POST'])
@@ -132,15 +156,16 @@ def approve_segment(project_name: str, segment_id: str):
             approved = text or seg.translated_text
             if not approved.strip():
                 return jsonify({'error': '沒有譯文可以核可'}), 422
-            result = check_segment(seg, approved)
+            result = check_segment(seg, approved, _glossary(pm))
             if result.blocking:
                 return _refused(result)
-            pm.mark_reviewed(segment_id, text=text)
+            pm.mark_reviewed(segment_id, text=text)  # a person's decision: stored issues cleared
             pm.save()
             remove_failure_log(_log_dir(pm), segment_id)
     except ValueError as e:
         return jsonify({'error': str(e)}), 404
-    return jsonify({'status': 'ok', 'segment_id': segment_id})
+    # the warnings the approved text still has, for the reviewer to see
+    return jsonify({'status': 'ok', 'segment_id': segment_id, 'issues': _issues(result.issues)})
 
 
 @review_bp.route('/api/projects/<project_name>/segments/<segment_id>/retranslate', methods=['POST'])
@@ -189,6 +214,7 @@ def retranslate_segment(project_name: str, segment_id: str):
             'status': 'ok',
             'segment_id': segment_id,
             'translated_text': outcome.text,
+            'issues': _issues(outcome.issues),
         })
     except AuthError as e:
         logger.warning("Auth error during retranslation: %s", e)
