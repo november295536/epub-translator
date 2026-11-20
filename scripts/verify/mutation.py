@@ -59,7 +59,7 @@ MUTMUT_VERSION = '3.8.1'
 RENAMED = 'epubtr'
 FILES = [
     'src/__init__.py', 'src/core/project.py', 'src/core/segmenter.py', 'src/core/translator.py',
-    'src/core/migrate.py', 'src/epub/blocks.py', 'src/epub/extractor.py', 'src/epub/exporter.py',
+    'src/core/migrate.py', 'src/core/validation.py', 'src/epub/blocks.py', 'src/epub/extractor.py', 'src/epub/exporter.py',
     'src/glossary/glossary_manager.py', 'src/glossary/term_extractor.py',
     'src/llm/__init__.py', 'src/llm/base.py', 'src/llm/cli.py', 'src/llm/claude_cli.py',
     'src/llm/fake.py', 'src/web/tasks.py', 'src/web/server.py', 'src/web/blueprints/export.py',
@@ -68,7 +68,7 @@ FILES = [
     'src/web/blueprints/translation.py', 'translate.py',
     'scripts/verify/phase0_code_segments.py', 'scripts/verify/phase1_load_projects.py',
     'scripts/verify/phase2_roundtrip.py', 'scripts/verify/phase2_migrate_copies.py',
-    'scripts/verify/phase3_export_check.py',
+    'scripts/verify/phase3_export_check.py', 'scripts/verify/phase4_validate_check.py',
 ]
 MODULE_REF = re.compile(r'\bsrc\.(core|epub|web|glossary|llm)\b')
 OK = ('killed',)  # any other status, known or not, fails the run

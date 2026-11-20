@@ -1914,3 +1914,196 @@ class TestMutationScript:
             time.sleep(0.1)
         with pytest.raises(ProcessLookupError):
             os.killpg(proc.pid, 0)
+
+
+# --- Phase 4: protection round trip and the full check --------------------------
+
+validate_check = _load('phase4_validate_check')
+
+LONG_EN = 'Words of the long paragraph go on here. ' * 6       # 192 characters without spaces
+
+
+def _validate_projects(root):
+    """Projects for the Phase 4 check: the schema 1 legacy project (migrated
+    by the check) and a schema 2 project with translations that fail and
+    pass, one of them long enough for the length ratio."""
+    from tests.conftest import xhtml
+    from tests.test_exporter import _project, _raw_book
+    from tests.test_migrate import _legacy_project
+    root.mkdir()
+    _legacy_project(root, name='alpha')
+    book_dir = root.parent / 'books'
+    book_dir.mkdir()
+    chapter = xhtml(f'<h1>Head words</h1><p>A <em>b</em> c.</p><p>Plain one.</p>'
+                    f'<p>{LONG_EN}</p><pre># note\nx = 1</pre><p>Same words.</p>')
+    epub = _raw_book(book_dir, {'c': ('c.xhtml', chapter)}, nav=None, ncx=None)
+    project_dir = _project(root, epub, {
+        'c_seg0001': '<h1>標題</h1>',
+        'c_seg0002': '<p>甲乙丙。</p>\n<p>普通。</p>\n<p>' + '長' * 100 + '</p>',
+        'c_seg0003': '# 註\nx = 2',
+        'c_seg0004': '<p>Same words.</p>'}, name='beta')
+    return root, project_dir
+
+
+class TestValidateCheck:
+
+    def _main(self, root, anonymize=True):
+        return validate_check.main(['--projects-dir', str(root)]
+                                   + (['--anonymize'] if anonymize else []))
+
+    def test_lines(self, tmp_path, capsys):
+        root, _ = _validate_projects(tmp_path / 'projects')
+        (root / 'not-a-project').mkdir()
+        before = roundtrip_check.snapshot(str(root))
+        assert self._main(root) == 0
+        assert capsys.readouterr().out.splitlines() == [
+            'PASS project-1: round trip 3/3, translated 3, failing the structural check 0 '
+            '(none), warnings (none), length ratio: no segment',
+            'PASS project-2: round trip 4/4, translated 4, failing the structural check 2 '
+            '(code_changed 1, tag_count 1), warnings (untranslated 1), length ratio: no segment',
+            'TOTAL projects 2  round trip 7/7  translated 7  failing the structural check 2 '
+            '(code_changed 1, tag_count 1)  warnings (untranslated 1)  length ratio: no segment  '
+            'failed projects 0',
+        ]
+        assert roundtrip_check.snapshot(str(root)) == before
+
+    def test_length_ratio_counted(self, tmp_path, capsys):
+        root, project_dir = _validate_projects(tmp_path / 'projects')
+        pm = validate_check.ProjectManager(project_dir)
+        pm.load()
+        pm.mark_translated('c_seg0002', '<p>甲<em>乙</em>丙。</p>\n<p>普通。</p>\n<p>'
+                           + '長' * 100 + '</p>')
+        pm.save()
+        assert self._main(root) == 0
+        out = capsys.readouterr().out.splitlines()
+        # the second segment: 3 paragraphs, 107 / 205 characters; the others are short
+        assert out[1].endswith('length ratio over 1 segments: p1 0.522 p5 0.522 p50 0.522 '
+                               'p95 0.522 p99 0.522; outside 0.25-0.8: 0 (0.0%)')
+
+    def test_names_without_anonymize(self, tmp_path, capsys):
+        root, _ = _validate_projects(tmp_path / 'projects')
+        assert self._main(root, anonymize=False) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert out[0].startswith('PASS alpha: ') and out[1].startswith('PASS beta: ')
+
+    def test_round_trip_failure_fails(self, tmp_path, capsys, monkeypatch):
+        root, _ = _validate_projects(tmp_path / 'projects')
+        monkeypatch.setattr(validate_check, 'restore', lambda text, p: text + ' ')
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[0].startswith('FAIL project-1: round trip 0/3, ')
+        assert out[0].endswith('; round trip fails for 3 segments')
+        assert out[2].startswith('TOTAL projects 2  round trip 0/7  ')
+        assert out[2].endswith('failed projects 2')
+
+    def test_unmatched_migration_fails(self, tmp_path, capsys, monkeypatch):
+        root, _ = _validate_projects(tmp_path / 'projects')
+
+        class Report:
+            unmatched = ['x', 'y']
+        monkeypatch.setattr(validate_check, 'migrate_project', lambda d: Report())
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[0] == 'FAIL project-1: 2 chapters unmatched by the migration'
+        assert out[1].startswith('PASS project-2: ')
+
+    def test_exception_is_a_fail(self, tmp_path, capsys, monkeypatch):
+        root, _ = _validate_projects(tmp_path / 'projects')
+
+        def boom(*a):
+            raise KeyError('secret text')
+        monkeypatch.setattr(validate_check, 'check_segment', boom)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out
+        assert 'FAIL project-1: check raised KeyError' in out and 'secret' not in out
+
+    def test_changed_project_directory_fails(self, tmp_path, capsys, monkeypatch):
+        root, project_dir = _validate_projects(tmp_path / 'projects')
+        real = validate_check.check_copy
+
+        def touch(copy_dir):
+            with open(os.path.join(project_dir, 'extra.txt'), 'w') as f:
+                f.write('x')
+            return real(copy_dir)
+        monkeypatch.setattr(validate_check, 'check_copy', touch)
+        assert self._main(root) == 1
+        out = capsys.readouterr().out.splitlines()
+        assert out[1].startswith('FAIL project-2: ')
+        assert out[1].endswith('; files in the project directory changed')
+
+    def test_snapshot_error_is_a_fail(self, tmp_path, capsys, monkeypatch):
+        root, _ = _validate_projects(tmp_path / 'projects')
+        calls = []
+
+        def snapshot(path):
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError('gone')
+            return []
+        monkeypatch.setattr(validate_check, 'snapshot', snapshot)
+        assert self._main(root) == 1
+        assert capsys.readouterr().out.splitlines()[0] == \
+            'FAIL project-1: project snapshot raised OSError'
+
+    def test_work_directory_removed_and_outside_repository(self, tmp_path, capsys, monkeypatch):
+        root, _ = _validate_projects(tmp_path / 'projects')
+        made, copies = [], []
+        real = validate_check.tempfile.mkdtemp
+        real_check = validate_check.check_copy
+
+        def mkdtemp(**kwargs):
+            made.append(real(**kwargs))
+            return made[-1]
+
+        def check(copy_dir):
+            copies.append((copy_dir, sorted(os.listdir(copy_dir))))
+            return real_check(copy_dir)
+        monkeypatch.setattr(validate_check.tempfile, 'mkdtemp', mkdtemp)
+        monkeypatch.setattr(validate_check, 'check_copy', check)
+        assert self._main(root) == 0
+        assert len(made) == 1 and not os.path.exists(made[0])
+        assert os.path.basename(made[0]).startswith('phase4-validate-')
+        assert not os.path.realpath(made[0]).startswith(ROOT)
+        assert [c[0] for c in copies] == [os.path.join(made[0], '1'), os.path.join(made[0], '2')]
+        assert copies[0][1] == ['project.json', 'source.epub']
+        assert copies[1][1] == ['project.json']  # the second has its source outside
+
+    @pytest.mark.parametrize('where', ['repository', 'projects'])
+    def test_refuses_temporary_directory_inside(self, tmp_path, capsys, monkeypatch, where):
+        root, _ = _validate_projects(tmp_path / 'projects')
+        place = os.path.join(ROOT, 'src') if where == 'repository' else str(root / 'beta')
+        monkeypatch.setattr(validate_check.tempfile, 'gettempdir', lambda: place)
+        assert self._main(root) == 2
+        what = 'the repository' if where == 'repository' else 'the projects directory'
+        assert capsys.readouterr().out == f'ERROR the temporary directory would be inside {what}\n'
+        assert not any(n.startswith('phase4-validate-') for n in os.listdir(place))
+
+    def test_missing_directory(self, tmp_path, capsys):
+        assert self._main(tmp_path / 'nope') == 2
+        assert capsys.readouterr().out == (
+            'ERROR cannot list projects directory <projects-dir> (FileNotFoundError)\n')
+        assert self._main(tmp_path / 'nope', anonymize=False) == 2
+        assert str(tmp_path / 'nope') in capsys.readouterr().out
+
+    def test_percentile_nearest_rank(self):
+        values = [5, 1, 4, 2, 3]
+        assert [validate_check.percentile(values, p) for p in (1, 20, 21, 50, 99, 100)] == \
+            [1, 1, 2, 3, 5, 5]
+        assert validate_check.percentile([7], 1) == 7
+
+    def test_ratio_text(self):
+        ratios = [0.1, 0.25, 0.5, 0.8, 0.9]
+        assert validate_check.ratio_text(ratios) == (
+            'length ratio over 5 segments: p1 0.100 p5 0.100 p50 0.500 p95 0.900 p99 0.900; '
+            'outside 0.25-0.8: 2 (40.0%)')
+        assert validate_check.ratio_text([]) == 'length ratio: no segment'
+
+    def test_counts_text(self):
+        from collections import Counter
+        assert validate_check.counts_text(Counter({'b': 2, 'a': 1})) == 'a 1, b 2'
+        assert validate_check.counts_text(Counter()) == 'none'
+
+    def test_help(self, tmp_path):
+        result = _run_script('phase4_validate_check', ['--help'], str(tmp_path))
+        assert result.returncode == 0
+        assert 'Phase 4 check: protection round trip' in result.stdout
