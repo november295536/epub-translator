@@ -931,6 +931,34 @@ class TestCLIPhase2:
         name = os.path.basename(project_dir)
         assert os.listdir(os.path.join(project_dir, 'output')) == [f'{name}-chinese-only.epub']
 
+    def test_schema_1_export_keeps_the_book_name(self, runner, sample_epub, tmp_path):
+        # Review round 1: the old rule (the book's file name) for schema 1
+        from src.core.segmenter import Segmenter
+        from src.epub.extractor import EPUBExtractor
+        ex = EPUBExtractor(sample_epub)
+        ex.load()
+        segments = [s for ch in ex.extract_chapters()
+                    for s in Segmenter().segment_chapter(ch.id, ch.body)]
+        project_dir = str(tmp_path / 'review-copy')
+        pm = ProjectManager(project_dir)
+        pm.create(sample_epub, 'T', 'A', segments)
+        pm.mark_translated(pm.data.segments[0].segment_id, '<h1>譯</h1>')
+        pm.save()
+        with open(pm.project_file, encoding='utf-8') as f:
+            raw = json.load(f)
+        for key in ('schema', 'source_sha256'):
+            raw.pop(key, None)
+        for seg in raw['segments']:
+            for key in ('block_start', 'block_end', 'fingerprints'):
+                seg.pop(key, None)
+        with open(pm.project_file, 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+        result = runner.invoke(cli, ['export', '-p', project_dir, '-f', 'chinese-only'])
+        assert result.exit_code == 0, result.output
+        book = os.path.splitext(os.path.basename(sample_epub))[0]
+        assert book != 'review-copy'
+        assert os.listdir(os.path.join(project_dir, 'output')) == [f'{book}-chinese-only.epub']
+
     @pytest.mark.parametrize('make', ['missing', 'file'])
     def test_migrate_needs_a_directory(self, runner, tmp_path, make):
         path = tmp_path / 'p'
