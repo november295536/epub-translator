@@ -77,7 +77,7 @@ from lxml import etree  # noqa: E402
 from src.core.migrate import migrate_project  # noqa: E402
 from src.core.project import ProjectManager  # noqa: E402
 from src.epub.blocks import localname, serialize  # noqa: E402
-from src.epub.exporter import FORMATS, NCX_MEDIA_TYPE, export_project  # noqa: E402
+from src.epub.exporter import EPUB_TYPE, FORMATS, NCX_MEDIA_TYPE, export_project  # noqa: E402
 from src.epub.extractor import (  # noqa: E402
     XHTML_MEDIA_TYPE, package_path, parse_xml, read_package,
 )
@@ -125,7 +125,8 @@ class Archive:
         root = self.tree(name)
         if root is None:
             return set()
-        return {v for e in root.iter(etree.Element) for v in (e.get('id'), e.get('name')) if v}
+        return {v for e in root.iter(etree.Element)
+                for v in (e.get('id'), e.get('name') if localname(e) == 'a' else None) if v}
 
 
 def _resolve(base: str, href: str):
@@ -160,9 +161,14 @@ def head_items(root) -> list:
     return [] if head is None else [c for c in head if localname(c) in ('link', 'style')]
 
 
-def duplicate_ids(root) -> set:
-    counts = Counter(e.get('id') for e in root.iter(etree.Element) if e.get('id'))
-    return {i for i, n in counts.items() if n > 1}
+def id_counts(root) -> Counter:
+    return Counter(e.get('id') for e in root.iter(etree.Element) if e.get('id'))
+
+
+def new_duplicates(root, src_root) -> set:
+    """Ids that occur more than once and more often than in the source."""
+    src = id_counts(src_root)
+    return {i for i, n in id_counts(root).items() if n > 1 and n > src[i]}
 
 
 def svg_attributes(root) -> set:
@@ -175,25 +181,55 @@ def uses_bilingual(root) -> bool:
                for e in root.iter(etree.Element) for c in BILINGUAL_CLASSES)
 
 
-def toc_labels(archive: Archive) -> list:
-    """(member, position, label, target member or None) of every NCX and
-    navigation entry."""
-    out = []
+def _entries(archive: Archive):
+    """(member, is the table of contents, label element, href) of every
+    labelled entry of the NCX and navigation documents: NCX navMap
+    navPoints and links of the nav whose epub:type holds `toc` are the
+    table of contents; page lists, nav lists, landmarks, docTitle,
+    docAuthor and other links are not."""
     for path, media_type, is_nav in archive.manifest.values():
         root = archive.tree(path) if (is_nav or media_type == NCX_MEDIA_TYPE) else None
         if root is None:
             continue
-        tag = 'a' if is_nav else 'text'
-        for i, e in enumerate(e for e in root.iter(etree.Element) if localname(e) == tag):
-            if is_nav:
-                href = e.get('href')
-            else:  # text -> navLabel -> navPoint, whose content holds the target
-                point = e.getparent().getparent()
-                content = next((c for c in point if localname(c) == 'content'), None)
-                href = None if content is None else content.get('src')
-            target = _resolve(path, href + '#x')[0] if href else None
-            out.append((path, i, ' '.join(''.join(e.itertext()).split()), target))
+        if is_nav:
+            toc_links = {a for nav in root.iter(etree.Element)
+                         if localname(nav) == 'nav' and 'toc' in (nav.get(EPUB_TYPE) or '').split()
+                         for a in nav.iter(etree.Element) if localname(a) == 'a'}
+            for e in root.iter(etree.Element):
+                if localname(e) == 'a':
+                    yield path, e in toc_links, e, e.get('href')
+            continue
+        for e in root.iter(etree.Element):
+            if localname(e) != 'text':
+                continue
+            point = e.getparent().getparent() if e.getparent() is not None else None
+            in_map = (point is not None and localname(point) == 'navPoint'
+                      and any(localname(a) == 'navMap' for a in point.iterancestors()))
+            content = None if point is None else next(
+                (c for c in point if localname(c) == 'content'), None)
+            yield path, in_map, e, None if content is None else content.get('src')
+
+
+def _label(e) -> str:
+    return ' '.join(''.join(e.itertext()).split())
+
+
+def toc_labels(archive: Archive) -> list:
+    """(member, position, label, target member or None) of every table of
+    contents entry, numbered within its file."""
+    out, positions = [], Counter()
+    for path, toc, e, href in _entries(archive):
+        if not toc:
+            continue
+        resolved = _resolve(path, href + '#x') if href else None
+        out.append((path, positions[path], _label(e), resolved[0] if resolved else None))
+        positions[path] += 1
     return out
+
+
+def other_labels(archive: Archive) -> list:
+    """(member, label) of every labelled entry outside the table of contents."""
+    return [(path, _label(e)) for path, toc, e, _ in _entries(archive) if not toc]
 
 
 def epubcheck_errors(path: str):
@@ -241,13 +277,21 @@ def check_export(source: Archive, output_path: str, report, fmt: str, source_err
     navs = [p for p, _, nav in source.manifest.values() if nav]
     translated = {by_id.get(c.chapter_id) for c in report.chapters if c.translated}
     css = {p for p, mt, _ in out.manifest.values() if mt == 'text/css'} - source.names
+    if len(css) > (0 if fmt == 'chinese-only' else 1):
+        problems.append(f'{len(css)} stylesheets added')
     allowed = translated | {source.opf_path} | set(ncx) | set(navs) | css
     if out.names - source.names - css:
         problems.append(f'{len(out.names - source.names - css)} members added')
-    changed = sum(1 for name in source.names - allowed
-                  if name not in out.names or out.zip.read(name) != source.zip.read(name))
+    missing = source.names - out.names
+    if missing:
+        problems.append(f'{len(missing)} source members missing')
+    changed = sum(1 for name in source.names - allowed - missing
+                  if out.zip.read(name) != source.zip.read(name))
     if changed:
         problems.append(f'{changed} members outside the allowed set differ')
+    problems += member_problems(source, out, allowed)
+    if other_labels(out) != other_labels(source):
+        problems.append('labels outside the table of contents changed')
 
     counts = Counter()
     for name in out.xhtml:
@@ -270,6 +314,32 @@ def check_export(source: Archive, output_path: str, report, fmt: str, source_err
     return problems
 
 
+def member_problems(source: Archive, out: Archive, allowed: set) -> list[str]:
+    """Order of the members, and the stored form of each untouched one:
+    raw name bytes, compression, date and attributes."""
+    problems = []
+    order = list(dict.fromkeys(['mimetype'] + source.zip.namelist()))
+    if [n for n in out.zip.namelist() if n in source.names] != [n for n in order
+                                                                 if n in out.names]:
+        problems.append('member order differs')
+    last = {i.filename: i for i in source.zip.infolist()}
+    fields = ('orig_filename', 'compress_type', 'date_time', 'external_attr', 'internal_attr',
+              'create_system', 'extra', 'comment')
+    differ = 0
+    for info in out.zip.infolist():
+        src = last.get(info.filename)
+        if src is None or info.filename in allowed:
+            continue
+        stored = [getattr(info, f) for f in fields] + [info.flag_bits & 0x800]
+        expect = [getattr(src, f) for f in fields] + [src.flag_bits & 0x800]
+        if info.filename == 'mimetype':  # stored, no extra field (OCF)
+            expect[1], expect[6] = zipfile.ZIP_STORED, b''
+        differ += stored != expect
+    if differ:
+        problems.append(f'{differ} untouched members stored differently')
+    return problems
+
+
 def chapter_problems(out: Archive, name: str, root, src_root, css: set) -> list[str]:
     """Problems of one output chapter compared with its source."""
     problems = []
@@ -281,7 +351,7 @@ def chapter_problems(out: Archive, name: str, root, src_root, css: set) -> list[
             items.pop()
     if items != src_items:
         problems.append('head links or styles differ')
-    if duplicate_ids(root) - duplicate_ids(src_root):
+    if new_duplicates(root, src_root):
         problems.append('duplicate id')
     if not svg_attributes(root) <= svg_attributes(src_root):
         problems.append('SVG attribute case changed')
@@ -324,8 +394,10 @@ def check_copy(copy_dir: str, out_dir: str) -> tuple[dict, list[str]]:
         counts = (report.translated, report.reasons())
         if fmt == FORMATS[0]:
             result['translated'], result['kept'] = counts
-            result['labels'] = sum(a[2] != b[2] for a, b in zip(src_labels,
-                                                                toc_labels(Archive(output))))
+            out_labels = toc_labels(Archive(output))
+            if [e[:2] for e in out_labels] != [e[:2] for e in src_labels]:
+                problems.append(f'{fmt}: table of contents entries differ')
+            result['labels'] = sum(a[2] != b[2] for a, b in zip(src_labels, out_labels))
             by_id = {i: p for i, (p, _, _) in source.manifest.items()}
             exported = {by_id.get(c.chapter_id) for c in report.chapters if c.translated}
             result['into'] = sum(entry[3] in exported for entry in src_labels)
@@ -392,22 +464,23 @@ def run(args, names: list[str], work: str) -> int:
     for index, name in enumerate(names, 1):
         label = f'project-{index}' if args.anonymize else name
         project_dir = os.path.join(args.projects_dir, name)
-        before = snapshot(project_dir)
-        copy_dir = os.path.join(work, name)
-        out_dir = os.path.join(work, f'{name}.exports')
-        os.makedirs(copy_dir)
-        os.makedirs(out_dir)
+        # numbered scratch directories: no project name reaches a path
+        copy_dir = os.path.join(work, f'{index}', 'project')
+        out_dir = os.path.join(work, f'{index}', 'exports')
+        before = None
         try:
+            before = snapshot(project_dir)
+            os.makedirs(copy_dir)
+            os.makedirs(out_dir)
             for file in COPIED:
                 if os.path.isfile(os.path.join(project_dir, file)):
                     shutil.copy2(os.path.join(project_dir, file), copy_dir)
             r, problems = check_copy(copy_dir, out_dir)
         except Exception as e:  # any failure is a FAIL, never a crash
-            failed += 1
-            print(f'FAIL {label}: export check raised {type(e).__name__}')
-            continue
-        if snapshot(project_dir) != before:
-            problems.append('files in the project directory changed')
+            r, problems = {}, [f'export check raised {type(e).__name__}']
+        finally:
+            if before is not None and snapshot(project_dir) != before:
+                problems.append('files in the project directory changed')
         if not r:
             failed += 1
             print(f'FAIL {label}: ' + '; '.join(problems))

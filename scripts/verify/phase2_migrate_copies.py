@@ -49,9 +49,8 @@ sys.path.insert(0, ROOT)
 
 from src.core.migrate import migrate_project  # noqa: E402
 from src.core.project import ProjectManager  # noqa: E402
-from src.epub.blocks import walk_blocks  # noqa: E402
-from src.epub.exporter import _matches  # noqa: E402
-from src.epub.extractor import find_body, open_archive, parse_xml, read_package  # noqa: E402
+from src.epub.exporter import _matches, chapter_items, load_chapter  # noqa: E402
+from src.epub.extractor import open_archive, read_package  # noqa: E402
 from src.web.server import create_app  # noqa: E402
 
 PROJECT_FILE = 'project.json'
@@ -78,20 +77,19 @@ def read_segments(project_file: str) -> tuple[int, int]:
 
 
 def placed_chapters(project_dir: str) -> tuple[int, int]:
-    """(chapters with segments, chapters whose blocks the exporter accepts)."""
+    """(chapters with segments, chapters the exporter accepts: a chapter
+    entry of the spine that loads and whose blocks match its segments)."""
     data = ProjectManager(project_dir).load()
     zf = open_archive(data.epub_path)
     _, _, spine = read_package(zf)
-    paths = {item.id: item.path for item in spine}
+    items = chapter_items(spine)
     by_chapter: dict = {}
     for seg in data.segments:
         by_chapter.setdefault(seg.chapter_id, []).append(seg)
     placed = 0
     for chapter_id, segments in by_chapter.items():
-        if chapter_id not in paths:
-            continue
-        body = find_body(parse_xml(zf.read(paths[chapter_id])))
-        placed += body is not None and _matches(walk_blocks(body), segments)
+        loaded = load_chapter(zf, items[chapter_id].path) if chapter_id in items else None
+        placed += loaded is not None and _matches(loaded[3], segments)
     return len(by_chapter), placed
 
 
