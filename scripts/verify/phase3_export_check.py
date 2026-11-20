@@ -159,8 +159,7 @@ def duplicate_ids(root) -> set:
 
 
 def svg_attributes(root) -> set:
-    return {etree.QName(a).localname if a.startswith('{') else a
-            for e in root.iter(etree.Element)
+    return {a for e in root.iter(etree.Element)
             if etree.QName(e).namespace == SVG_NS for a in e.attrib}
 
 
@@ -238,23 +237,8 @@ def check_export(source: Archive, output_path: str, report, fmt: str, source_err
         root, src_root = out.tree(name), source.tree(name)
         if root is None:
             counts['not well-formed'] += 1
-            continue
-        if src_root is None:
-            continue
-        items = [serialize(e) for e in head_items(root)]
-        src_items = [serialize(e) for e in head_items(src_root)]
-        if css and len(items) == len(src_items) + 1:
-            added = head_items(root)[-1]
-            if _resolve(name, (added.get('href') or '') + '#x') == (next(iter(css)), 'x'):
-                items.pop()
-        if items != src_items:
-            counts['head links or styles differ'] += 1
-        if duplicate_ids(root) - duplicate_ids(src_root):
-            counts['duplicate id'] += 1
-        if not svg_attributes(root) <= svg_attributes(src_root):
-            counts['SVG attribute case changed'] += 1
-        if uses_bilingual(root) and not _links_bilingual_css(out, name, root):
-            counts['bilingual chapter without its stylesheet'] += 1
+        elif src_root is not None:
+            counts.update(chapter_problems(out, name, root, src_root, css))
     problems += [f'{n} chapters: {what}' for what, n in sorted(counts.items())]
     broken = broken_links(out, ncx) - broken_links(source, ncx)
     if broken:
@@ -266,6 +250,26 @@ def check_export(source: Archive, output_path: str, report, fmt: str, source_err
         if new:
             problems.append('epubcheck new errors '
                             + ', '.join(f'{i} {n}' for i, n in sorted(new.items())))
+    return problems
+
+
+def chapter_problems(out: Archive, name: str, root, src_root, css: set) -> list[str]:
+    """Problems of one output chapter compared with its source."""
+    problems = []
+    items = [serialize(e) for e in head_items(root)]
+    src_items = [serialize(e) for e in head_items(src_root)]
+    if css and len(items) == len(src_items) + 1:
+        added = head_items(root)[-1]
+        if _resolve(name, (added.get('href') or '') + '#x') == (next(iter(css)), 'x'):
+            items.pop()
+    if items != src_items:
+        problems.append('head links or styles differ')
+    if duplicate_ids(root) - duplicate_ids(src_root):
+        problems.append('duplicate id')
+    if not svg_attributes(root) <= svg_attributes(src_root):
+        problems.append('SVG attribute case changed')
+    if uses_bilingual(root) and not _links_bilingual_css(out, name, root):
+        problems.append('bilingual chapter without its stylesheet')
     return problems
 
 
@@ -293,19 +297,18 @@ def check_copy(copy_dir: str, out_dir: str) -> tuple[dict, list[str]]:
     source = Archive(pm.data.epub_path)
     src_labels = toc_labels(source)
     source_errors = epubcheck_errors(pm.data.epub_path)
-    result = {'exports': 0, 'translated': 0, 'kept': Counter(), 'labels': 0,
-              'entries': len(src_labels), 'epubcheck': {}, 'source_errors': source_errors}
-    for fmt in FORMATS:
+    result = {'exports': len(FORMATS), 'entries': len(src_labels), 'epubcheck': {},
+              'source_errors': source_errors}
+    for fmt in FORMATS:  # chinese-only first: its counts are the project's
         output = os.path.join(out_dir, f'{fmt}.epub')
         report = export_project(copy_dir, output, fmt)
-        result['exports'] += 1
         problems += [f'{fmt}: {p}' for p in check_export(source, output, report, fmt,
                                                           source_errors, result['epubcheck'])]
-        if fmt == 'chinese-only':
-            result['translated'] = report.translated
-            result['kept'] = report.reasons()
+        counts = (report.translated, report.reasons())
+        if fmt == FORMATS[0]:
+            result['translated'], result['kept'] = counts
             result['labels'] = sum(a != b for a, b in zip(src_labels, toc_labels(Archive(output))))
-        elif (report.translated, report.reasons()) != (result['translated'], result['kept']):
+        elif counts != (result['translated'], result['kept']):
             problems.append(f'{fmt}: segment counts differ from chinese-only')
     result['epubcheck_failed'] = sum('epubcheck new errors' in p for p in problems)
     return result, problems
@@ -315,7 +318,7 @@ def epubcheck_text(r: dict) -> str:
     if r['source_errors'] is None:
         return ''
     ids = ' '.join(f'{i}:{n}' for i, n in sorted(r['source_errors'].items()))
-    exports = '/'.join(str(r['epubcheck'].get(fmt, '-')) for fmt in FORMATS)
+    exports = '/'.join(str(r['epubcheck'][fmt]) for fmt in FORMATS)
     return (f", epubcheck errors source {sum(r['source_errors'].values())}"
             + (f' ({ids})' if ids else '') + f', exports {exports}')
 

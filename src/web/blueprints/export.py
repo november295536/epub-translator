@@ -50,7 +50,6 @@ def start_export(project_name: str):
         'filename': filename,
         'output_path': output_path,
         'error': None,
-        'summary': None,
         'started_at': time.time(),
     }
 
