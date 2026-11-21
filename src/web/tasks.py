@@ -777,6 +777,7 @@ class TaskManager:
                 # run applies to the next one
                 with pm.mutex:
                     wanted = (pm.data.backend, pm.data.model)
+                    brief = pm.data.brief or ''  # an edit applies to the next segment
                 if wanted != current:
                     if current is not None:
                         logger.info("[%s] 模型切換: %s → %s", tag, current[1], wanted[1])
@@ -804,7 +805,8 @@ class TaskManager:
                     # an outcome: recorded as FAILED
                     outcome = translate_segment(engine, seg, all_segments, gm,
                                                 cancel=generation,
-                                                translations=translations, mutex=pm.mutex)
+                                                translations=translations, mutex=pm.mutex,
+                                                brief=brief)
                     task.result_queue.put(TranslationResult(
                         segment_id=seg.segment_id, outcome=outcome, revision=revision))
 

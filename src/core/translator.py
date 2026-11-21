@@ -114,6 +114,13 @@ HTML 標記規則：
 
 {{html}}"""
 
+# Placed above the text and HTML prompts when the project has a brief (the
+# prompt is otherwise unchanged); code segments get none
+BRIEF_SECTION = """本書簡介（請依此掌握文體、語氣與讀者；簡介本身不需翻譯）：
+{brief}
+
+"""
+
 # Follow-up message when a reply failed the checks (one retry per request)
 FEEDBACK_PROMPT = """你上一次的輸出沒有通過檢查：
 {problems}
@@ -468,15 +475,15 @@ class TranslationEngine:
     def translate(self, text: str, segment_type: SegmentType = SegmentType.TEXT,
                   glossary_text: str = '',
                   context_before: str = '', context_after: str = '',
-                  html: str = '') -> str:
+                  html: str = '', brief: str = '') -> str:
         """Translate a text segment; see translate_reply()."""
         return self.translate_reply(text, segment_type, glossary_text,
-                                    context_before, context_after, html).text
+                                    context_before, context_after, html, brief=brief).text
 
     def translate_reply(self, text: str, segment_type: SegmentType, glossary_text: str,
                         context_before: str, context_after: str, html: str,
                         cancel: threading.Event | None = None,
-                        fingerprints: list | None = None) -> Reply:
+                        fingerprints: list | None = None, brief: str = '') -> Reply:
         """Translate a segment through the backend, validated (plan 4.1).
 
         Args:
@@ -490,6 +497,7 @@ class TranslationEngine:
                   restored and validated against it.
             cancel: Set to abandon the call (raises CancelledError).
             fingerprints: The blocks' fingerprints (schema 2), for the check.
+            brief: The book's brief; '' for none.
 
         A reply that fails its check gets one follow-up with the errors.
         When that fails too and the HTML has two or more top-level blocks,
@@ -512,7 +520,8 @@ class TranslationEngine:
 
         def build(source_html: str = '') -> str:
             return self._build_prompt(text, segment_type, glossary_text,
-                                      context_before, context_after, html=source_html)
+                                      context_before, context_after, html=source_html,
+                                      brief=brief)
 
         try:
             if is_code:
@@ -573,8 +582,9 @@ class TranslationEngine:
     def _build_prompt(self, text: str, segment_type: SegmentType,
                       glossary_text: str = '',
                       context_before: str = '', context_after: str = '',
-                      html: str = '') -> str:
-        """Build the appropriate prompt based on segment type."""
+                      html: str = '', brief: str = '') -> str:
+        """Build the appropriate prompt based on segment type; a brief
+        (not for code) goes above it."""
         glossary_section = ''
         if glossary_text:
             glossary_section = f'''
@@ -601,18 +611,18 @@ class TranslationEngine:
 
         if segment_type == SegmentType.CODE:
             return CODE_PROMPT.format(text=text)
-        elif html:
-            return TEXT_HTML_PROMPT.format(
+        top = BRIEF_SECTION.format(brief=brief) if brief else ''
+        if html:
+            return top + TEXT_HTML_PROMPT.format(
                 html=html,
                 glossary_section=glossary_section,
                 context_section=context_section,
             )
-        else:
-            return TRANSLATION_PROMPT.format(
-                text=text,
-                glossary_section=glossary_section,
-                context_section=context_section,
-            )
+        return top + TRANSLATION_PROMPT.format(
+            text=text,
+            glossary_section=glossary_section,
+            context_section=context_section,
+        )
 
     @staticmethod
     def _clean_response(text: str, html_mode: bool = False,
@@ -672,7 +682,7 @@ def translate_segment(engine: TranslationEngine, seg, segments,
                       glossary=None,
                       cancel: threading.Event | None = None,
                       translations: bool = False,
-                      mutex=None) -> TranslationOutcome:
+                      mutex=None, brief: str = '') -> TranslationOutcome:
     """Translate one project segment: the single entry point for the web
     worker, both CLI modes and the re-translate endpoint.
 
@@ -687,6 +697,7 @@ def translate_segment(engine: TranslationEngine, seg, segments,
     translation when it has one (get_context; projects of segmentation 2).
     `mutex`: the project mutex, held while the context is read (other
     threads store results in `segments`), released before the model call.
+    `brief`: the book's brief, at the top of the prompt ('' for none).
     RateLimitError, AuthError, BackendUnavailableError and CancelledError
     are raised: they concern the run, not the segment. Writes no file.
     """
@@ -711,6 +722,7 @@ def translate_segment(engine: TranslationEngine, seg, segments,
             html=seg.html,  # ignored for code segments
             cancel=cancel,
             fingerprints=seg.fingerprints or None,
+            brief=brief,
         )
     except (RateLimitError, AuthError, BackendUnavailableError, CancelledError):
         raise
@@ -723,7 +735,7 @@ def translate_segment(engine: TranslationEngine, seg, segments,
             issues=list(e.issues), failure=e)
     except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on
         logger.exception("未預期的錯誤: %s", seg.segment_id)
-        prompt = _request_text(engine, seg, glossary_text, context) if context else ''
+        prompt = _request_text(engine, seg, glossary_text, context, brief) if context else ''
         return unexpected_error_outcome(model, e, prompt)
     issues = list(reply.issues) + _glossary_warnings(seg, reply.text, glossary)
     return TranslationOutcome(text=reply.text, status=SegmentStatus.TRANSLATED,
@@ -743,13 +755,15 @@ def _glossary_warnings(seg, text: str, glossary) -> list:
         return []
 
 
-def _request_text(engine: TranslationEngine, seg, glossary_text: str, context) -> str:
+def _request_text(engine: TranslationEngine, seg, glossary_text: str, context,
+                  brief: str = '') -> str:
     """The request of a call that raised, for its diagnostics ('' when it
     cannot be built)."""
     try:
         # the protected HTML (ignored for code)
         return engine._build_prompt(seg.text, seg.segment_type, glossary_text,
-                                    *context, html=validation.protect(seg.html).html)
+                                    *context, html=validation.protect(seg.html).html,
+                                    brief=brief)
     except Exception:  # noqa: BLE001 - diagnostics only
         return ''
 

@@ -68,6 +68,18 @@
                 </div>
             </div>
 
+            <!-- Book brief -->
+            <div style="margin-bottom: 1rem;">
+                <label for="brief-text" style="font-weight: 600; display: block; margin-bottom: 0.3rem;">書籍簡介（選填：類型、語氣、讀者；放在每段翻譯提示的最前面）</label>
+                <textarea id="brief-text" x-model="brief" rows="3"
+                          placeholder="例：通俗科普讀物，語氣輕鬆，讀者是一般大眾。"
+                          style="width: 100%; padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;"></textarea>
+                <div style="margin-top: 0.3rem; display: flex; gap: 0.75rem; align-items: center;">
+                    <button class="btn btn-secondary btn-small" @click="saveBrief()" :disabled="briefSaving || brief === savedBrief">儲存簡介</button>
+                    <span class="text-muted" x-show="brief === savedBrief && savedBrief" x-text="'已儲存'"></span>
+                </div>
+            </div>
+
             <!-- Status indicator -->
             <div class="translation-status-row">
                 <span class="translation-state-badge" :class="'state-' + state" x-text="stateLabel()"></span>
@@ -151,8 +163,12 @@ function translationController() {
         activeWorkers: 0,
         _pauseInFlight: false,
         autoResume: false,  // paused by a rate limit, resumes by itself
+        brief: '',
+        savedBrief: '',
+        briefSaving: false,
 
         init() {
+            this.fetchBrief();
             this.fetchModel();
             this.fetchStatus();
         },
@@ -191,6 +207,36 @@ function translationController() {
             } catch (e) {
                 console.error('Failed to fetch model:', e);
             }
+        },
+
+        async fetchBrief() {
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/brief');
+                const data = await res.json();
+                if (res.ok) this.brief = this.savedBrief = data.brief;
+            } catch (e) {
+                console.error('Failed to fetch brief:', e);
+            }
+        },
+
+        async saveBrief() {
+            this.briefSaving = true;
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/brief', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ brief: this.brief }),
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    this.brief = this.savedBrief = data.brief;
+                } else {
+                    this.error = data.error || '簡介儲存失敗';
+                }
+            } catch (e) {
+                this.error = '簡介儲存失敗: ' + e.message;
+            }
+            this.briefSaving = false;
         },
 
         modelKey() {

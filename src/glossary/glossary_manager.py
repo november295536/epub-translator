@@ -46,7 +46,11 @@ def term_pattern(term: str) -> str:
 logger = logging.getLogger(__name__)
 
 # The fields of a stored entry that must be strings where present
-TEXT_FIELDS = ('term', 'translation', 'category', 'notes', 'context')
+TEXT_FIELDS = ('term', 'translation', 'category', 'notes', 'context', 'gender', 'note')
+
+# Optional fields of an entry (for persons): stored only when not empty, so
+# a glossary without them keeps its file format
+OPTIONAL_FIELDS = ('gender', 'note')
 
 
 def load_glossary(path: str):
@@ -69,6 +73,17 @@ class GlossaryEntry:
     translation: str
     category: str = ''
     frequency: int = 0
+    gender: str = ''
+    note: str = ''
+
+
+def entry_dict(entry: GlossaryEntry) -> dict:
+    """The stored form of an entry: OPTIONAL_FIELDS only when not empty."""
+    raw = asdict(entry)
+    for key in OPTIONAL_FIELDS:
+        if not raw[key]:
+            del raw[key]
+    return raw
 
 
 class GlossaryManager:
@@ -110,7 +125,7 @@ class GlossaryManager:
         target = os.path.realpath(self.glossary_path)
         directory = os.path.dirname(target)
         os.makedirs(directory, exist_ok=True)
-        raw = [asdict(e) for e in self.entries.values()]
+        raw = [entry_dict(e) for e in self.entries.values()]
         raw.sort(key=lambda x: x['term'].lower())
         try:
             mode = os.stat(target).st_mode & 0o777
@@ -132,12 +147,13 @@ class GlossaryManager:
             raise
 
     def add_term(self, term: str, translation: str,
-                 category: str = '', frequency: int = 0) -> GlossaryEntry:
+                 category: str = '', frequency: int = 0,
+                 gender: str = '', note: str = '') -> GlossaryEntry:
         """Add or update a glossary entry."""
         key = term.lower()
         entry = GlossaryEntry(
             term=term, translation=translation,
-            category=category, frequency=frequency,
+            category=category, frequency=frequency, gender=gender, note=note,
         )
         self.entries[key] = entry
         self.save()
@@ -153,8 +169,10 @@ class GlossaryManager:
         return False
 
     def update_term(self, term: str, translation: str | None = None,
-                    category: str | None = None) -> GlossaryEntry | None:
-        """Update an existing glossary entry. Returns None if not found."""
+                    category: str | None = None, gender: str | None = None,
+                    note: str | None = None) -> GlossaryEntry | None:
+        """Update an existing glossary entry (None: that field stays).
+        Returns None if not found."""
         key = term.lower()
         entry = self.entries.get(key)
         if entry is None:
@@ -163,6 +181,10 @@ class GlossaryManager:
             entry.translation = translation
         if category is not None:
             entry.category = category
+        if gender is not None:
+            entry.gender = gender
+        if note is not None:
+            entry.note = note
         self.save()
         return entry
 
@@ -203,6 +225,10 @@ class GlossaryManager:
             if e.category:
                 label = CATEGORY_LABELS.get(e.category, e.category)
                 line += f' [{label}]'
+            details = [f'{name}：{value}' for name, value in
+                       (('性別', e.gender), ('備註', e.note)) if value]
+            if details:
+                line += '（' + '；'.join(details) + '）'
             lines.append(line)
         return '\n'.join(lines)
 
@@ -220,6 +246,8 @@ class GlossaryManager:
                     translation=translation,
                     category=item.get('category', ''),
                     frequency=item.get('frequency', 0),
+                    gender=item.get('gender', ''),
+                    note=item.get('note', ''),
                 )
                 count += 1
         return count
@@ -227,7 +255,7 @@ class GlossaryManager:
     def export_json(self, json_path: str) -> int:
         """Export entries to a JSON file. Returns number of entries exported."""
         entries = self.get_all_terms()
-        raw = [asdict(e) for e in entries]
+        raw = [entry_dict(e) for e in entries]
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(raw, f, ensure_ascii=False, indent=2)
         return len(raw)
