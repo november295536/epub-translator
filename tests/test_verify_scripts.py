@@ -3901,3 +3901,33 @@ class TestThroughputScriptRound1Survivors:
                                 '--segments', '2', '--anonymize']) == 2
         assert capsys.readouterr().out == \
             'ERROR the temporary directory would be inside a git work tree\n'
+
+
+class TestThroughputScriptRound2:
+
+    def test_failing_final_snapshot_still_removes_the_copy(self, tmp_path, capsys, monkeypatch):
+        """Item 7."""
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+        made, calls = [], []
+        real_mkdtemp = throughput.tempfile.mkdtemp
+        monkeypatch.setattr(throughput.tempfile, 'mkdtemp',
+                            lambda **kw: made.append(real_mkdtemp(**kw)) or made[-1])
+        real_snapshot = throughput.snapshot
+
+        def snapshot(path):
+            calls.append(path)
+            if len(calls) == 2:
+                raise FileNotFoundError('vanished')
+            return real_snapshot(path)
+
+        monkeypatch.setattr(throughput, 'snapshot', snapshot)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            code = throughput.main(['--projects-dir', str(projects), '--project-index', '2',
+                                    '--segments', '2', '--model', 'fake-model', '--anonymize'])
+        assert code == 1
+        assert capsys.readouterr().out.splitlines()[-1] == \
+            'ERROR the measurement stopped (FileNotFoundError)'
+        assert len(made) == 1 and not os.path.exists(made[0])

@@ -62,7 +62,7 @@ FILES = [
     'src/core/migrate.py', 'src/core/validation.py', 'src/epub/blocks.py', 'src/epub/extractor.py', 'src/epub/exporter.py',
     'src/glossary/glossary_manager.py', 'src/glossary/term_extractor.py',
     'src/llm/__init__.py', 'src/llm/base.py', 'src/llm/cli.py', 'src/llm/claude_cli.py',
-    'src/llm/copilot_cli.py', 'src/llm/fake.py', 'src/web/tasks.py', 'src/web/server.py', 'src/web/blueprints/export.py',
+    'src/llm/copilot_cli.py', 'src/llm/fake.py', 'src/web/tasks.py', 'src/web/server.py', 'src/web/blueprints/export.py', 'src/web/blueprints/home.py',
     'src/web/blueprints/glossary.py', 'src/web/blueprints/projects.py',
     'src/web/blueprints/review.py', 'src/web/blueprints/search.py',
     'src/web/blueprints/translation.py', 'translate.py',

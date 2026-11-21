@@ -3238,7 +3238,7 @@ class TestRound3InitialStatusError:
         first = next(iter(response.response)).decode('utf-8')
         response.close()
         assert first == ('event: status\ndata: {"state": "paused", "completed": 0, '
-                         '"total": 3, "error": "找不到程式"}\n\n')
+                         '"total": 3, "error": "找不到程式", "resume_in": null}\n\n')  # round 2
         TaskManager._instance = None
 
     def test_event_after_snapshot_delivered(self, client, project_with_translations):
@@ -3631,7 +3631,7 @@ class TestRound4StreamAfterEnd:
         body = b''.join(response.response).decode('utf-8')
         response.close()
         assert body == (f'event: status\ndata: {{"state": "{state}", "completed": 0, '
-                        '"total": 3, "error": null}\n\n')
+                        '"total": 3, "error": null, "resume_in": null}\n\n')  # round 2
         TaskManager._instance = None
 
     def test_page_closes_stream_on_ended_first_status(self, client):

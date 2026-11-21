@@ -246,13 +246,13 @@ def measure(args) -> int:
         code = run(args, label, project_dir, work, llm, translate, migrate_project,
                    ProjectManager, SegmentStatus)
     finally:
-        changed = snapshot(args.projects_dir) != before
-        if work is not None:
+        if work is not None:  # first: a failing snapshot below cannot skip it
             try:
                 shutil.rmtree(work)
             except OSError as e:
                 print(f'ERROR cannot remove the temporary directory ({type(e).__name__})')
                 code = 1
+    changed = snapshot(args.projects_dir) != before
     if changed:
         print(f'FAIL {label}: files in the projects directory changed')
         return 1

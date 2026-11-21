@@ -711,6 +711,9 @@ def translate_segment(engine: TranslationEngine, seg, segments,
     except (RateLimitError, AuthError, BackendUnavailableError, CancelledError):
         raise
     except TranslationError as e:
+        if cancel is not None and cancel.is_set():
+            # Cancelled, not failed: the segment stays pending
+            raise CancelledError('cancelled') from e
         return TranslationOutcome(
             text=None, status=SegmentStatus.FAILED, model=model, usage=e.usage,
             issues=list(e.issues), failure=e)
