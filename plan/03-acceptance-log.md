@@ -4485,3 +4485,267 @@ equivalent as recorded in the Phase 6 entry.
 ### Not verified
 
 - No real `claude` call.
+
+## Phase 7 — part A
+
+Date: 2026-11-21. Branch: `phase-7/runtime-control`, worktree `<repo>/.worktree/phase-7`, shared
+virtualenv. Part B (adaptive concurrency, backend failover) was split off after measurement and
+is not built (plan, Phase 7).
+
+### What was built
+
+| # | Item | What existed (Phase 1) | Built now | Where |
+|---|---|---|---|---|
+| 1 | Stop / pause end the call in flight | `run_process` already killed the process group on cancel (polls every 0.1 s), and a sequential CLI Ctrl-C already killed the child (the `KeyboardInterrupt` reaches `run_process`). But no caller passed a cancel event: web stop/pause and a parallel CLI Ctrl-C waited for the calls in flight (up to the 120 s timeout). | Web task: `cancel_event`, set by stop and pause, cleared on resume; a cancelled worker puts its segment back in the queue (pending, nothing stored). Parallel CLI: Ctrl-C sets a shared cancel event before joining the workers; a cancelled worker exits. | `src/web/tasks.py`, `translate.py` |
+| 2 | Run-level errors | Web: rate limit, auth, backend unavailable paused the task until the user resumed. CLI: all three stopped the run (exit 1). Transient errors: retried at once inside the segment's call budget (`MAX_CALLS` 4). | One rule, `runcontrol.resume_delay(error)`: a rate limit resumes after `retry_after` (when positive) or `RATE_LIMIT_WAIT_SECONDS` 300; auth and backend-unavailable return None (wait for the user: web pause, CLI stop, as before). Web: the worker sets `resume_at`, the coordinator's tick resumes the task and sends `resumed`. CLI sequential: message, flush, sleep, same segment again; CLI parallel: a gate that pauses every worker until the main loop's clock passes the deadline. Transient: the existing per-segment budget, now with a wait of 5, 15, 45 s before each retry (`TRANSIENT_BACKOFF_SECONDS`, the wait returns early on cancel); no second retry layer, because the budget already bounds the retries and a segment that runs out fails `transient` and is retried with `--retry-failed`. Time is injected everywhere: `TaskManager.clock`, `translate._clock`, `translate._sleep`, `TranslationEngine(wait=…)`. | `src/core/runcontrol.py`, `src/core/translator.py`, `src/web/tasks.py`, `translate.py` |
+| 3 | Debounced saves | Web: one save per result batch; CLI parallel: one per batch; CLI sequential: one per result. | `runcontrol.DebouncedSaver`: a save at most every `SAVE_INTERVAL_SECONDS` 10 or after `SAVE_EVERY_RESULTS` 20 results, and always on pause (web: the coordinator's tick sees a state other than running; CLI: before a rate-limit wait), stop, completion, error and before the lock is released (web: before the final state, in `_fail_task`; CLI: in `finally` / the interrupt handler, forced). Failure diagnostics are written after the save that stores the result, and (web) only when the segment's revision is still the one the result was applied to. Single writer kept (coordinator / CLI main thread); web edits still save through their transaction. A crash loses at most one window: 10 s or 19 results. | same |
+| 4 | Prompt order | — | Not changed (see below). | `src/core/translator.py` (comment) |
+| 5 | Claude CLI flags | `claude -p <prompt> --model <alias>` | measured; all five adopted (below) | `src/llm/claude_cli.py` (`LEAN_FLAGS`) |
+| 6 | Throughput script | — | `scripts/verify/phase7_throughput.py` (not run by me) | — |
+| 7 | `CopilotCLI` | — | backend `copilot-cli`; `project.json` `backend` (absent = Claude CLI, never written, so existing files round-trip; validated on load like `segmentation`); `llm.BACKENDS`, `llm.backend_for(name)`; every engine and extractor is made for the project's backend (web worker, both CLI paths, re-translate, term extraction); `start --backend/-b`, `--model` checked against the run's backend; web `GET /model` adds `backend` and `backends`, `PUT /model` takes `backend`; the model selector lists `backend：model` for every backend. A rate-limit message in the web says when it resumes. | `src/llm/copilot_cli.py`, `src/llm/__init__.py`, `src/core/project.py`, blueprints, template |
+
+Item 4. Both CLI backends send the whole prompt as one user message (`flatten_prompt`), and
+caching works on whole messages up to a cache breakpoint, so moving text inside the message is
+not expected to save anything (reasoning; not measured: the overhead run sends an identical
+prompt every time, which is cached whole). Moving the glossary and context below the rules
+would also put the HTML source directly after the context section, with no line saying where
+the source starts: that changes what the model reads. So the order stays as on `main`; the
+templates are byte-identical to `main`.
+
+### Claude CLI overhead (`scripts/verify/phase7_cli_overhead.py`)
+
+Claude Code 2.1.329, model haiku, 5 calls per configuration round-robin, prompt = the engine's
+text prompt around an invented paragraph (1986 characters). Every configuration adds its flags
+to `claude -p <prompt> --model haiku --output-format json`.
+
+```
+$ python3 scripts/verify/phase7_cli_overhead.py --raw
+base                     n=5 failed=0  wall   3.06 s  api   1.53 s  in    29831  cache_read    29829  out    80  cost $0.00034
+system-prompt            n=5 failed=0  wall   2.64 s  api   1.29 s  in    26677  cache_read    26675  out    78  cost $0.00031
+tools-none               n=5 failed=0  wall   2.48 s  api   1.17 s  in     5619  cache_read     5617  out    80  cost $0.00010
+strict-mcp               n=5 failed=0  wall   2.69 s  api   1.34 s  in    29562  cache_read    29560  out    81  cost $0.00034
+setting-sources-none     n=5 failed=0  wall   2.59 s  api   1.39 s  in    20870  cache_read    20868  out    78  cost $0.00025
+no-session-persistence   n=5 failed=0  wall   3.03 s  api   1.61 s  in    29831  cache_read    29829  out    89  cost $0.00034
+all                      n=5 failed=0  wall   2.43 s  api   1.12 s  in     2294  cache_read     2292  out    82  cost $0.00007
+```
+
+(The first round's `cache_read` was lower for some configurations: the cache was cold.) The
+transcript column was added after this run; it was taken from the file count of the CLI's
+projects folder for the working directory: the 25 calls without `--no-session-persistence`
+left 25 new transcripts, the 10 with it none. Re-run of that column, 1 call each:
+
+```
+$ python3 scripts/verify/phase7_cli_overhead.py --raw --repetitions 1 --only base no-session-persistence
+base                     n=1 failed=0  wall   3.57 s  api   2.01 s  in    29831  cache_read    29829  out    75  cost $0.00034  transcripts 1/1
+no-session-persistence   n=1 failed=0  wall   2.93 s  api   1.68 s  in    29831  cache_read    29829  out    79  cost $0.00034  transcripts 0/1
+```
+
+Adopted, each for its shown effect on input tokens per call (the wall-time differences of single
+flags are within the spread of the raw calls, 2.3–3.2 s; together 3.06 → 2.43 s median, and every
+`all` call was at most 2.82 s): `--tools ""` (−24212), `--setting-sources ""` (−8961; also keeps
+the user's own CLAUDE.md, memory and hooks out of translation calls), `--system-prompt
+'你是一位專業的英文翻譯。'` (−3154; replaces Claude Code's coding-agent system prompt; the request
+text is unchanged), `--strict-mcp-config` (−269), `--no-session-persistence` (no transcript per
+call; a book is thousands of calls). Together: 29831 → 2294 input tokens, cost per call
+$0.00034 → $0.00007 on haiku. The plain-text output is kept (usage still not reported by
+`ClaudeCLI`).
+
+### Copilot CLI characterization (1.0.114, invented prompts only)
+
+Flags checked in `copilot --help`. Calls made (all `claude-haiku-4.5`, each an invented sentence;
+plus two calls with an empty `COPILOT_HOME`, one of which answered "hello", and two with a
+non-existent model):
+
+- `-p <prompt> -s`: exit 0, stdout the reply and a newline, stderr empty.
+- `--output-format json`: one JSON object per line (`session.start`, …,
+  `assistant.reasoning_delta`, `assistant.message_delta`, `assistant.message` with `content`,
+  `session.usage_checkpoint` with `accountingSnapshot.modelMetrics.<model>.usage`
+  {`inputTokens`, `outputTokens`, `cacheReadTokens`, …}, `result` with `exitCode`). No account
+  data in it (checked: `session.start.context` has only `cwd`).
+- Tools: by default 22 tools (10762 tool tokens; 17299 input tokens for one sentence).
+  `--available-tools` with no name keeps all 22; `--available-tools view` leaves 1 (2975);
+  an unknown name leaves none (2160). `CopilotCLI` passes `--available-tools none`.
+- Error, model not available: exit 1; `-s`: stderr `\nExecution failed: Model "x" is not
+  available.`; json: a `session.error` event {`errorType`: `query`, `message`: …}, stderr empty.
+- Not characterized: a real rate limit (the patterns are the four messages `copilot help limits`
+  documents, all containing "rate limit"), expired credentials (an empty `COPILOT_HOME` and an
+  invalid `COPILOT_GITHUB_TOKEN` still answered without `--model` and gave "Model … is not
+  available" with it, so the error for missing credentials could not be produced; the auth
+  pattern is a guess), refusals / content filter (guess), `retry_after` (none observed; the
+  default wait applies).
+- Each call is saved as a Copilot session under the user's Copilot directory; there is no flag
+  to turn that off.
+
+Classification in `CopilotCLI.classify_error`: only error texts (`session.error` type and
+message, stderr) are searched, never the reply: `rate.?limit` → `RateLimitError`; `not logged
+in|not authenticated|copilot login|unauthorized` → `AuthError`; `Model "…" is not available` →
+`BackendUnavailableError` (pauses and waits for the user); `content filter|filtered` →
+`RefusalError`; any other error or non-zero exit → `TransientError`. Model list: four models of
+the account's catalog (`claude-sonnet-5.5` default, `gpt-6.2-sol`, `gemini-4-carbon`,
+`claude-haiku-4.5`), not queried at run time.
+
+Real single-segment call, as in Phase 1 (synthetic project in a temporary directory, the invented
+sentence of Phase 1, CLI sequential path → `translate_segment` → `CopilotCLI`):
+
+```
+$ python3 translate.py start --project <tmp>/p --backend copilot-cli --model claude-haiku-4.5
+使用模型：claude-haiku-4.5（copilot-cli）
+繼續翻譯：0/1 已完成 (0.0%)
+剩餘 1 個段落待翻譯
+
+[1/1] 翻譯段落 c1_seg0001...
+  ✓ 完成（11 字）
+
+全部翻譯完成！
+$ echo $?
+0
+```
+
+Stored segment (`html`/`text`/`fingerprints` omitted): `{'segment_id': 'c1_seg0001', 'status':
+'translated', 'translated_text': '<p>小機器人每天早上日出前都澆灌番茄植物。</p>', 'model':
+'claude-haiku-4.5', 'usage': {'input_tokens': 3421, 'output_tokens': 538}}`; project
+`backend: copilot-cli`, `model: claude-haiku-4.5`. 12.6 s wall for the whole command.
+
+### Throughput (`scripts/verify/phase7_throughput.py`)
+
+Not run by me (it sends book text). For the before/after numbers of the plan:
+
+```
+git worktree add <tmp>/main-checkout main
+python3 scripts/verify/phase7_throughput.py --projects-dir <repo>/projects --project-index N \
+    --segments 50 --model haiku --workers W --anonymize --code <tmp>/main-checkout   # before
+python3 scripts/verify/phase7_throughput.py --projects-dir <repo>/projects --project-index N \
+    --segments 50 --model haiku --workers W --anonymize                             # after
+```
+
+It copies the project to a temporary directory (refused inside a git work tree or the projects
+directory; removed in `finally`; the project directory is snapshotted and the run FAILs if it
+changed), migrates a schema 1 copy, makes the first 50 pending-or-translated text segments
+pending, marks every other pending segment failed (so a normal start queues exactly those 50),
+and runs `translate.py start` in-process with the code of `--code`; a counting wrapper around
+the backend attributes every call to its segment. It prints wall seconds, seconds per segment,
+segments per minute, calls with median and total call time, final statuses, failures by code,
+and how many segments needed a retry (more than one call) or a split (two different
+single-message requests). The run's own output and log lines (segment ids) are suppressed.
+
+### Checks
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase3_export_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  exports 24  translated segments 4162  as translation 3956  kept original 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 53)  toc labels changed 405/1885 (527 into translated chapters)  exports with new epubcheck errors 0  failed projects 0
+$ python3 scripts/verify/phase4_validate_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  round trip 9491/9491  translated 4162  failing the structural check 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 54; only tag rules 88)  warnings (length_ratio 36, untranslated 8)  length ratio over 2925 segments: p1 0.312 p5 0.333 p50 0.404 p95 0.547 p99 0.976; outside 0.25-0.8: 38 (1.3%)  sources that cannot be cut 0  with translatable attributes 22  translated code starting with a shebang 0  failed projects 0
+$ python3 scripts/verify/phase5_glossary_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  glossary entries 15, translated 4162, passing the structural check 3956, with term_not_applied 12, terms 4, by category (person: 9 warnings, 2 terms, term: 6 warnings, 2 terms)  failed projects 0
+$ python3 scripts/verify/phase6_segmentation_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  segments 9520 -> 7870, calls 9520 -> 6432 (ratio 0.676), passthrough 1438, headings merged 1655 of 1770  failed projects 0
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+All four exited 0; their TOTAL lines are identical to Phase 6 review round 3 (this phase changes
+no segmentation, validation or export code). No `phase7-throughput-` or other check directory
+left.
+
+### Tests
+
+2247 passed (main: 2149). New: `tests/test_runtime.py` (84: stop and pause kill a real child
+process in flight, a parallel CLI interrupt kills the other worker's child; web and CLI rate
+limits resume by themselves with and without `retry_after`, auth and backend-unavailable wait
+for the user; transient retried with 5/15/45 s waits inside the budget, permanent errors not
+retried, cancel during a wait; `DebouncedSaver` windows; 100 results → at most 6 writes of
+`project.json` (web, CLI sequential, CLI parallel) and all 100 on disk; a pause saves the
+window; the failure log waits for the save and is not written for a segment edited first; the
+backend contract run on `ClaudeCLI` and `CopilotCLI` with a fake process (registration and
+models, success with prompt, model, cancel, timeout, cwd and env passed, system prompt
+flattened, a reply quoting a limit is a reply, rate limit / auth / transient classified,
+timeout → transient, missing program → unavailable); Copilot command, parsing, usage and
+classification; backend selection in `project.json`, CLI and web API, worker following a
+backend switch mid-run), `TestThroughputScript`, `TestCliOverheadScript`,
+`TestCliOverheadScriptSurvivors` (`test_verify_scripts.py`). Assertions are on process state,
+stored state and events; time is injected (no wall-clock assertion; one test bounds a wait at
+5 s so that only the injected clock can satisfy it).
+
+Tests changed, none removed:
+
+| Test | Change | Reason |
+|---|---|---|
+| `test_llm` `TestClaudeCLICommand` (2), `test_glossary` `TestTermExtractorBackend` (2), `test_translator` `test_default_model_passed_to_subprocess` | the command ends with `LEAN_FLAGS` | item 5 |
+| `test_cli` `test_rate_limit_or_auth_stops_run` | only `AuthError` | a rate limit no longer stops the CLI run (item 2; tested in `TestCliRateLimitResumes`) |
+| `test_cli` `test_lock_released_after_rate_limit_exit`, `test_stop_message` | `AuthError` instead of `RateLimitError` | same |
+| `test_cli` `test_supervisor_failure_output`, `test_later_start_fails` | message `翻譯中斷，正在停止進行中的段落……` | the calls in flight are now killed, not awaited |
+| `test_web` `test_model_select_reverts_on_error`, `test_unlisted_stored_model_shown` | new template strings | options are `backend/model` keys |
+| `test_web` `test_stale_result_not_reported` | the task completes, no error event | with debounced saves a run whose only result is stale has nothing to save, so the failing save is never reached; still nothing reported |
+| `test_web` `test_skipped_result_in_queue_not_reported` | passes a `DebouncedSaver` | `_fail_task` takes the saver |
+| `test_web` `test_edited_in_flight_segment_not_unsaved` | a saver with a window of one result | the scenario needs the first result's save to fail while a call is in flight |
+| `conftest` | autouse: the engine's backoff wait returns at once (recorded), the CLI's rate-limit sleep raises unless a test replaces it | no test sleeps |
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, mutmut 3.8.1, parallel (about 10–12 minutes each: more
+files changed). Added to the mutated files: `src/core/runcontrol.py`, `src/llm/copilot_cli.py`,
+both Phase 7 scripts.
+
+| Run | Mutants | Killed | Survived | Timeout |
+|---|---|---|---|---|
+| 1 | 1463 | 1338 | 123 | 2 |
+| 2 | 1435 | 1403 | 30 | 2 |
+| 3 (final) | 1435 | 1418 | 15 | 2 |
+
+Run 1 → 2: the overhead script reads the CLI's JSON strictly (no defaults) and its calls,
+help, defaults and header are tested exactly; `_usage` reads the checkpoint inside its `try`;
+the web worker makes its engine for the project's `(backend, model)` and remakes it on a
+switch (before, the first segment's switch check made the initial values unobservable); tests
+for a short `retry_after`, `default_model(backend)`, non-object `data`, joined error texts, the
+web time window, the `resumed` event and log line, the failed-save log line, a backend switch
+mid-run. Run 2 → 3: an empty `modelMetrics`, the `resumed` event with a completed segment, the
+switch log line, the time-window test bounded so the real clock cannot pass it, the help
+description being the first doc line.
+
+Remaining, each equivalent for every input:
+
+| mutant(s) | why equivalent |
+|---|---|
+| `CopilotCLI.classify_error` 1 (`prompt='XXXX'` default) | `prompt` is not read by `CopilotCLI.classify_error` (only Claude's echo rule needs it); the base class signature keeps it |
+| overhead `main` 121, 123, 124 (`flush=None/False/omitted` in the `--raw` print) | flushing changes only when the line reaches the terminal, not what is printed |
+| overhead `main` 65 (`default=None` dropped for `--only`) | argparse's default for an optional argument is `None` |
+| overhead `median` 6 (`float('NAN')`) | `float()` parses `nan` case-insensitively: the same value |
+| overhead `prompt_text` 2–7 (engine model / backend) | `_build_prompt` reads neither the model nor the backend; `backend=None` makes a `ClaudeCLI` object, which starts nothing |
+| overhead `prompt_text` 8, 20 (`text` `None` / `'XXXX'`) | with `html` given and a text segment, `_build_prompt` formats the HTML prompt and never reads `text` |
+| overhead `prompt_text` 9 (`segment_type=None`) | `_build_prompt` only tests `segment_type == SegmentType.CODE`; `None` takes the same branch as `TEXT` |
+
+The two timeouts are detected (the suite does not pass): `wait_or_cancel` 1 (`cancel.wait(None)`)
+blocks for ever in `test_default_wait_uses_the_cancel_event`; `_start_parallel` 19 (gate test
+inverted) keeps every worker spinning, so the parallel CLI tests never end.
+
+### Known consequences and limitations
+
+- A crash (power loss, `kill -9`) loses up to 10 s or 19 results of a run; Ctrl-C, stop,
+  pause, errors and the end of a run save.
+- A rate limit that never clears makes the run retry every 300 s (one quick failing call per
+  worker each time) until the user stops it. Neither CLI reports `retry_after`; Claude's
+  message names a reset time ("resets 8pm") that is not parsed.
+- A run paused by a rate limit does not cancel the other workers' calls in flight; a user
+  pause does.
+- A segment whose call is cancelled goes to the end of the queue (order changes, nothing else).
+- The CLI `start` now keeps running through a rate limit instead of exiting 1.
+- `--system-prompt` replaces Claude Code's own system prompt for translation and term
+  extraction calls; the effect on translation quality is for the owner's throughput/quality runs
+  to show (retry and failure counts are printed).
+- A project with `backend` cannot be loaded by code from before this phase (`ProjectData(**raw)`
+  rejects the key); only projects where a backend was chosen get the key.
+- Copilot calls each leave a session on disk in the user's Copilot directory.
+
+### Not verified
+
+- No throughput numbers (the owner runs the script, before and after).
+- No real rate limit, auth failure or refusal of either CLI; Copilot's patterns for these are
+  from its documentation or guesses.
+- No real `claude` translation call through `ClaudeCLI` with the new flags; the flags were
+  exercised only by the overhead script (same flags, same prompt form).
+- The web model selector was checked by rendering the page through the Flask test client and
+  running its controller in node with stubbed `fetch` (options `claude-cli/…` and
+  `copilot-cli/…`, a PUT with `{model, backend}`), not in a browser.
+- Windows: unchanged (no `fcntl`).
