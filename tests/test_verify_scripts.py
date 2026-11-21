@@ -3748,5 +3748,6 @@ class TestCliOverheadScriptSurvivors:
                      '--model MODEL Model alias (default: haiku)',
                      '--repetitions REPETITIONS Calls per configuration',
                      '--timeout TIMEOUT Seconds per call', '--raw Also print every call',
-                     'Run only these configurations (names as printed)'):
+                     '--only [ONLY ...] Run only these configurations (names as printed)'):
             assert text in help_text
+        assert 'Makes REAL' not in help_text  # the description is the first line only
