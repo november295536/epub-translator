@@ -41,7 +41,6 @@ import re
 import statistics
 import sys
 import tempfile
-import threading
 import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -106,24 +105,22 @@ def _call(flags: list, prompt: str, model: str, timeout: float) -> dict:
     env = {k: v for k, v in os.environ.items() if k != 'CLAUDECODE'}
     start = time.monotonic()
     try:
-        result = run_process(cmd, timeout=timeout, cwd=tempfile.gettempdir(), env=env,
-                             cancel=threading.Event())
+        result = run_process(cmd, timeout=timeout, cwd=tempfile.gettempdir(), env=env)
     except Exception as e:  # noqa: BLE001 - a failed call is counted, never printed in full
         return {'ok': False, 'wall': time.monotonic() - start, 'error': type(e).__name__}
     wall = time.monotonic() - start
+    if result.returncode != 0:
+        return {'ok': False, 'wall': wall, 'error': f'exit {result.returncode}'}
     try:
         data = json.loads(result.stdout)
-    except ValueError:
-        return {'ok': False, 'wall': wall, 'error': f'exit {result.returncode}, not JSON'}
-    if result.returncode != 0 or data.get('is_error'):
-        return {'ok': False, 'wall': wall, 'error': f'exit {result.returncode}'}
-    usage = data.get('usage') or {}
-    cache_read = usage.get('cache_read_input_tokens', 0)
-    tokens_in = (usage.get('input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)
-                 + cache_read)
-    return {'ok': True, 'wall': wall, 'api': data.get('duration_api_ms', 0) / 1000,
-            'in': tokens_in, 'cache_read': cache_read,
-            'out': usage.get('output_tokens', 0), 'cost': data.get('total_cost_usd', 0.0)}
+        usage = data['usage']
+        cache_read = usage['cache_read_input_tokens']
+        return {'ok': not data['is_error'], 'wall': wall, 'api': data['duration_api_ms'] / 1000,
+                'in': usage['input_tokens'] + usage['cache_creation_input_tokens'] + cache_read,
+                'cache_read': cache_read, 'out': usage['output_tokens'],
+                'cost': data['total_cost_usd'], 'error': 'is_error'}
+    except (ValueError, KeyError, TypeError):
+        return {'ok': False, 'wall': wall, 'error': 'no usage in the output'}
 
 
 def median(values: list) -> float:

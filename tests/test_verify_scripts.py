@@ -3609,7 +3609,7 @@ class TestCliOverheadScript:
             return ProcessResult(returncode, json.dumps(payload), '')
         return run, seen
 
-    PAYLOAD = {'result': 'x', 'duration_api_ms': 1500, 'total_cost_usd': 0.0003,
+    PAYLOAD = {'result': 'x', 'is_error': False, 'duration_api_ms': 1500, 'total_cost_usd': 0.0003,
                'usage': {'input_tokens': 10, 'cache_creation_input_tokens': 20,
                          'cache_read_input_tokens': 300, 'output_tokens': 40}}
 
@@ -3643,7 +3643,7 @@ class TestCliOverheadScript:
         monkeypatch.setattr(overhead, 'run_process', run)
         assert overhead.main(['--repetitions', '1', '--only', 'base', '--raw']) == 1
         out = capsys.readouterr().out
-        assert 'FAILED exit 0' in out and 'n=1 failed=1' in out
+        assert 'FAILED no usage in the output' in out and 'n=1 failed=1' in out
 
         def broken(cmd, **kwargs):
             raise OSError('x')
@@ -3653,7 +3653,7 @@ class TestCliOverheadScript:
 
         from src.llm.cli import ProcessResult
         monkeypatch.setattr(overhead, 'run_process', lambda cmd, **kw: ProcessResult(1, 'no', ''))
-        assert overhead.one_call([], 'p', 'haiku', 5)['error'] == 'exit 1, not JSON'
+        assert overhead.one_call([], 'p', 'haiku', 5)['error'] == 'exit 1'
 
     def test_transcript_dir(self, monkeypatch, tmp_path):
         monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(tmp_path))
@@ -3662,3 +3662,91 @@ class TestCliOverheadScript:
         monkeypatch.delenv('CLAUDE_CONFIG_DIR')
         assert overhead.transcript_dir('/x').startswith(os.path.expanduser('~/.claude'))
         assert overhead.transcripts(str(tmp_path / 'missing')) == set()
+
+
+class TestCliOverheadScriptSurvivors:
+    """Mutation survivors of the overhead script (Phase 7 run 1)."""
+
+    PAYLOAD = TestCliOverheadScript.PAYLOAD
+
+    def _clock(self, monkeypatch, *times):
+        ticks = iter(times)
+        monkeypatch.setattr(overhead.time, 'monotonic', lambda: next(ticks))
+
+    def test_call_values(self, monkeypatch):
+        from src.llm.cli import ProcessResult
+        monkeypatch.setattr(overhead, 'run_process',
+                            lambda cmd, **kw: ProcessResult(0, json.dumps(self.PAYLOAD), ''))
+        self._clock(monkeypatch, 10.0, 12.5)
+        assert overhead._call([], 'p', 'haiku', 5) == {
+            'ok': True, 'wall': 2.5, 'api': 1.5, 'in': 330, 'cache_read': 300, 'out': 40,
+            'cost': 0.0003, 'error': 'is_error'}
+
+    def test_call_failures(self, monkeypatch):
+        from src.llm.cli import ProcessResult
+        results = iter([ProcessResult(3, '', ''), ProcessResult(0, 'not json', ''),
+                        ProcessResult(0, json.dumps({'usage': {}}), ''),
+                        ProcessResult(0, json.dumps(dict(self.PAYLOAD, is_error=True)), '')])
+        monkeypatch.setattr(overhead, 'run_process', lambda cmd, **kw: next(results))
+        self._clock(monkeypatch, 1.0, 3.0, 1.0, 4.0, 1.0, 5.0, 1.0, 6.0)
+        assert overhead._call([], 'p', 'm', 5) == {'ok': False, 'wall': 2.0, 'error': 'exit 3'}
+        assert overhead._call([], 'p', 'm', 5) == {'ok': False, 'wall': 3.0,
+                                                   'error': 'no usage in the output'}
+        assert overhead._call([], 'p', 'm', 5) == {'ok': False, 'wall': 4.0,
+                                                   'error': 'no usage in the output'}
+        assert overhead._call([], 'p', 'm', 5)['ok'] is False
+
+        def broken(cmd, **kwargs):
+            raise OSError('x')
+        monkeypatch.setattr(overhead, 'run_process', broken)
+        self._clock(monkeypatch, 1.0, 1.25)
+        assert overhead._call([], 'p', 'm', 5) == {'ok': False, 'wall': 0.25, 'error': 'OSError'}
+
+    def test_prompt_is_the_engines(self):
+        from src.core import validation
+        from src.core.segmenter import SegmentType
+        from src.core.translator import TranslationEngine
+        from src.llm.fake import FakeBackend
+        expected = TranslationEngine(backend=FakeBackend())._build_prompt(
+            'unused', SegmentType.TEXT, overhead.GLOSSARY, overhead.BEFORE, overhead.AFTER,
+            html=validation.protect(overhead.PARAGRAPH).html)
+        assert overhead.prompt_text() == expected
+
+    def test_summary_counts_failures(self):
+        calls = [{'ok': True, 'wall': 1.0, 'api': 0.5, 'in': 10, 'cache_read': 2, 'out': 3,
+                  'cost': 0.1, 'transcript': True},
+                 {'ok': False, 'wall': 9.0, 'error': 'exit 1', 'transcript': False}]
+        line = overhead.summary_line('base', calls)
+        assert line.startswith('base                     n=2 failed=1  wall   1.00 s')
+        assert line.endswith('transcripts 1/2')
+
+    def test_transcript_dir_keeps_capitals(self, monkeypatch, tmp_path):
+        monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(tmp_path))
+        assert overhead.transcript_dir('/Ab/C') == os.path.join(str(tmp_path), 'projects', '-Ab-C')
+
+    def test_defaults_help_and_header(self, monkeypatch, capsys):
+        seen = []
+
+        def one_call(flags, prompt, model, timeout):
+            seen.append((model, timeout))
+            return {'ok': False, 'wall': 0.0, 'error': 'x', 'transcript': False}
+
+        monkeypatch.setattr(overhead, 'one_call', one_call)
+        assert overhead.main([]) == 1
+        assert len(seen) == 5 * len(overhead.CONFIGS)
+        assert set(seen) == {('haiku', 120)}
+        out = capsys.readouterr().out
+        assert out.splitlines()[0] == (f'model haiku  repetitions 5  prompt '
+                                       f'{len(overhead.prompt_text())} characters (invented paragraph)')
+        seen.clear()
+        overhead.main(['--timeout', '7.5', '--repetitions', '1', '--only', 'base'])
+        assert seen == [('haiku', 7.5)]
+        with pytest.raises(SystemExit):
+            overhead.main(['--help'])
+        help_text = ' '.join(capsys.readouterr().out.split())
+        for text in ('Phase 7 measurement: per-call overhead of the Claude CLI with candidate flags.',
+                     '--model MODEL Model alias (default: haiku)',
+                     '--repetitions REPETITIONS Calls per configuration',
+                     '--timeout TIMEOUT Seconds per call', '--raw Also print every call',
+                     'Run only these configurations (names as printed)'):
+            assert text in help_text

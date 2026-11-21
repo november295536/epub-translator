@@ -643,8 +643,7 @@ class TaskManager:
         tag = f"W{worker_id}"
         pm = task.pm
         gm = task._gm
-        backend = pm.data.backend
-        engine = TranslationEngine(model=pm.data.model, backend=llm.backend_for(backend))
+        engine, current = None, None  # made for the project's (backend, model)
         all_segments = pm.data.segments
         translations = pm.data.segmentation == 2  # context from translations
         reduced_exit = False
@@ -676,13 +675,14 @@ class TaskManager:
                 except queue.Empty:
                     break  # No more segments
 
-                # Detect model switch (and a switch of backend with it)
-                if (pm.data.backend, pm.data.model) != (backend, engine.model):
-                    logger.info("[%s] 模型切換: %s → %s", tag, engine.model, pm.data.model)
-                    if pm.data.backend != backend:
-                        backend = pm.data.backend
-                        engine.backend = llm.backend_for(backend)
-                    engine.model = pm.data.model
+                # The project's backend and model, read again for every
+                # segment: a switch during the run applies to the next one
+                if (pm.data.backend, pm.data.model) != current:
+                    if current is not None:
+                        logger.info("[%s] 模型切換: %s → %s", tag, current[1], pm.data.model)
+                    current = (pm.data.backend, pm.data.model)
+                    engine = TranslationEngine(model=current[1],
+                                               backend=llm.backend_for(current[0]))
 
                 revision, queued_status = task.queued.get(
                     seg.segment_id, (seg.revision, seg.status))

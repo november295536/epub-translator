@@ -350,9 +350,11 @@ class TestCliRateLimitResumes:
             result = CliRunner().invoke(translate.cli, ['start', '--project', path,
                                                         '--workers', workers])
         assert result.exit_code == 0, result.output
-        assert f'使用量已達上限：{wait:.0f} 秒後自動繼續（Ctrl-C 停止）' in result.output \
-            or workers != '1'
-        assert '使用量已達上限' in result.output
+        if workers == '1':
+            assert ('  ✗ limit reached\n'
+                    f'  使用量已達上限：{wait:.0f} 秒後自動繼續（Ctrl-C 停止）\n') in result.output
+        else:  # announced by the main loop, which has moved its clock on
+            assert '  ✗ limit reached\n  使用量已達上限：' in result.output
         assert _statuses(path) == [SegmentStatus.TRANSLATED] * 3
         assert len(respond.calls) == 4  # the limited call is made again
         if workers == '1':
@@ -934,3 +936,96 @@ class TestClaudeLeanFlags:
         assert LEAN_FLAGS == ('--system-prompt', SYSTEM_PROMPT, '--tools', '',
                               '--strict-mcp-config', '--setting-sources', '',
                               '--no-session-persistence')
+
+
+# --- mutation survivors (run 1) ----------------------------------------------------
+
+class TestPhase7Survivors:
+
+    def test_short_positive_retry_after(self):
+        assert resume_delay(RateLimitError('x', retry_after=0.5)) == 0.5
+
+    def test_default_model_of_a_backend(self):
+        from src.core.translator import default_model
+        assert default_model('copilot-cli') == 'claude-sonnet-5.5'
+        assert default_model() == 'sonnet'
+
+    def test_copilot_data_that_is_not_an_object(self):
+        events = [{'type': 'assistant.message', 'data': ['not', 'an', 'object']},
+                  {'type': 'session.error', 'data': 'text'}]
+        text = '\n'.join(json.dumps(e) for e in events)
+        result = ProcessResult(1, text, '')
+        assert CopilotCLI().parse_output(result, _req()).text == ''
+        assert str(CopilotCLI().classify_error(result)) == 'copilot CLI exited with code 1: '
+
+    def test_copilot_errors_joined(self):
+        result = _copilot_error('first')
+        result = ProcessResult(1, result.stdout, 'second')
+        assert str(CopilotCLI().classify_error(result)) == \
+            'copilot CLI exited with code 1: query first | second'
+
+    def test_web_time_window_saves_while_running(self, tmp_path, fresh_tm, clock):
+        path = _make_project(tmp_path / 'projects', n=2)
+        gate = threading.Event()
+
+        def respond(request):
+            if '>Line 2.<' in request.messages[0].content:
+                assert gate.wait(20)
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            _wait(lambda: task.completed == 1)
+            time.sleep(0.1)
+            assert _statuses(path) == [SegmentStatus.PENDING] * 2  # window open
+            clock.now += SAVE_INTERVAL_SECONDS
+            _wait(lambda: _statuses(path)[0] == SegmentStatus.TRANSLATED)
+            assert task.state == 'running'
+            gate.set()
+            task._coordinator.join(timeout=20)
+
+    def test_resumed_event_and_log(self, tmp_path, fresh_tm, clock, caplog):
+        import logging
+        caplog.set_level(logging.INFO, logger='src.web.tasks')
+        _make_project(tmp_path / 'projects', n=2)
+        respond = _limited_once(RateLimitError('limit', retry_after=5))
+        with use_fake_backend(FakeBackend(responder=respond)):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            _wait(lambda: task.state == 'paused')
+            clock.now += 5
+            task._coordinator.join(timeout=20)
+        resumed = [e for e in task.progress.get_all() if e['event'] == 'resumed']
+        assert resumed == [{'event': 'resumed', 'data': {'completed': 0, 'remaining': 2}}]
+        assert '翻譯自動繼續（使用量限制的等待結束）' in caplog.messages
+
+    def test_failed_save_logged(self, tmp_path, fresh_tm, clock, monkeypatch, caplog):
+        _make_project(tmp_path / 'projects', n=1)
+        monkeypatch.setattr(ProjectManager, 'save',
+                            lambda self: (_ for _ in ()).throw(OSError('disk full')))
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            task._coordinator.join(timeout=20)
+        assert '無法儲存專案' in caplog.messages
+
+    def test_backend_switched_mid_run(self, tmp_path, fresh_tm, monkeypatch):
+        """The worker follows the project's backend from the next segment on."""
+        _make_project(tmp_path / 'projects', n=2)
+        other = FakeBackend(responder=lambda r: like(r, '乙'))
+        monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: other)
+        holder, ready = {}, threading.Event()
+
+        def first(request):
+            assert ready.wait(10)
+            holder['task'].pm.set_model('fake-model', backend='copilot-cli')
+            return like(request, '甲')
+
+        default = FakeBackend(responder=first)
+        with use_fake_backend(default):
+            fresh_tm.tasks.clear()
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            holder['task'] = task
+            ready.set()
+            task._coordinator.join(timeout=20)
+        assert task.state == 'completed'
+        # one worker: the second segment went to the new backend
+        assert (len(default.requests), len(other.requests)) == (1, 1)
