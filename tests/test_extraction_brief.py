@@ -1062,7 +1062,8 @@ class TestRound2:
     def test_add_form_sends_person_fields_only_when_shown(self, web):
         client, _ = web
         page = client.get('/project/book/glossary').get_data(as_text=True)
-        assert "const body = entry.category === 'person' ? { ...entry, gender, note } : entry;" in page
+        # round 3: sent only when shown and filled in (TestRound3)
+        assert "if (entry.category === 'person' && gender.trim()) body.gender = gender;" in page
         assert 'body: JSON.stringify(body)' in page
 
     @pytest.mark.parametrize('body', [5, ['a'], {'terms': 'a'}, {'terms': ['Tess', 5]}, None])
@@ -1095,3 +1096,36 @@ class TestRound2Survivors:
         gm = GlossaryManager(str(tmp_path / 'g.json'))
         gm.import_json(str(source))
         assert gm.get_term('A').frequency == 3
+
+
+# --- Review round 3 -----------------------------------------------------------------
+
+class TestRound3:
+
+    def test_loaded_and_imported_person_fields_one_line(self, tmp_path):
+        path = tmp_path / 'g.json'
+        path.write_text(json.dumps([{'term': 'Tess', 'translation': '泰絲', 'gender': ' female\n',
+                                     'note': 'the\n baker'}]), encoding='utf-8')
+        gm = GlossaryManager(str(path))
+        gm.load()
+        assert (gm.get_term('Tess').gender, gm.get_term('Tess').note) == ('female', 'the baker')
+        assert gm.format_for_prompt() == 'Tess → 泰絲（性別：female；備註：the baker）'
+        source = tmp_path / 'in.json'
+        source.write_text(json.dumps([{'term': 'Wren', 'translation': '雷恩', 'note': ' a\n\nbird '}]),
+                          encoding='utf-8')
+        gm.import_json(str(source))
+        assert gm.get_term('Wren').note == 'a bird'
+
+    def test_add_form_sends_only_filled_person_fields(self, web):
+        client, _ = web
+        page = client.get('/project/book/glossary').get_data(as_text=True)
+        assert "if (entry.category === 'person' && gender.trim()) body.gender = gender;" in page
+        assert "if (entry.category === 'person' && note.trim()) body.note = note;" in page
+
+    def test_brief_error_is_its_own_and_cleared_on_success(self, web):
+        client, _ = web
+        page = client.get('/project/book/translation').get_data(as_text=True)
+        assert 'x-show="briefError" x-text="briefError"' in page
+        assert "this.briefError = data.error || '簡介儲存失敗';" in page
+        assert "this.savedBrief = data.brief;\n                    this.briefError = '';" in page
+        assert "this.error = data.error || '簡介儲存失敗'" not in page
