@@ -4,176 +4,94 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-EPUB 智能翻譯系統 - Translates English EPUB books to Traditional Chinese using Claude Code CLI as the translation engine. Supports terminology management, bilingual output (3 formats), Web review interface, and CLI workflow.
+EPUB 智能翻譯系統 - Translates English EPUB books to Traditional Chinese through a command-line model backend (`claude-cli` or `copilot-cli`). Glossary with automatic extraction, per-book brief, structural validation with retry, three output formats, Web review interface and CLI. `plan/02-improvement-plan.md` is the design record, `plan/03-acceptance-log.md` the evidence per phase.
 
 ## Development Commands
 
 ```bash
-# Activate venv (required before all commands)
-source venv/bin/activate
+source venv/bin/activate                 # required before all commands
+pip install -r requirements.txt -r requirements-dev.txt   # dev: test fixtures (ebooklib), mutmut on 3.10+
 
-# Install dependencies
-pip install -r requirements.txt
+python3 -m flask --app src.web.server:create_app run --port 3000   # web UI
+python3 -m pytest tests/ -q -p no:cacheprovider -rfw               # tests
+scripts/verify/mutation.sh main          # mutation run over lines changed vs main (needs Python 3.10+, see below)
 
-# Run web server (recommended)
-python3 -m flask --app src.web.server:create_app run --port 3000
-
-# Run tests
-python3 -m pytest tests/ -v
-
-# CLI usage
-python3 translate.py init <epub_file>
-python3 translate.py start --model opus --workers 5
+# CLI (each command has --help); -p/--project picks the project, else the first one under projects/
+python3 translate.py init <epub_file>                    # -> projects/<sanitized file name>/
 python3 translate.py status
-python3 translate.py glossary show
-python3 translate.py glossary extract
-python3 translate.py glossary add "term" "translation" -c category
-python3 translate.py export --format bilingual-horizontal
-python3 translate.py review
+python3 translate.py start [-b claude-cli|copilot-cli] [-m MODEL] [-w 1..20] [--retry-failed]
+python3 translate.py validate <project_dir> [--mark-failed]
+python3 translate.py migrate <project_dir> [--dry-run]
+python3 translate.py brief show | brief set "TEXT"       # empty TEXT removes it
+python3 translate.py glossary show | extract | add TERM TRANSLATION [-c CAT] [-g GENDER] [-n NOTE] | import FILE | export FILE
+python3 translate.py export [-f chinese-only|bilingual-horizontal|bilingual-vertical]   # CLI default bilingual-horizontal
+python3 translate.py review [--port 5000]
 ```
 
 ## Architecture
 
-### Translation Workflow
-1. **EPUB Extraction** (`src/epub/extractor.py`) — Parse EPUB, extract chapters as HTML
-2. **Smart Segmentation** (`src/core/segmenter.py`) — Split into 300-500 word segments at sentence boundaries; merge small segments (<100 words), split large ones (>500 words)
-3. **Terminology Extraction** (`src/glossary/term_extractor.py`) — Auto-extract technical terms via Claude CLI
-4. **Translation** (`src/core/translator.py`) — Translate via `subprocess.run(['claude', '-p', prompt, '--model', model])` with segment-type-aware prompts and glossary context
-5. **Review** (`src/web/`) — Web interface for side-by-side review and editing
-6. **EPUB Reconstruction** (`src/epub/builder.py`) — Rebuild EPUB in chosen format
+### Pipeline
+1. **Extraction** (`src/epub/extractor.py`) — reads the package (OPF, spine) with lxml; chapters as parsed XHTML.
+2. **Blocks** (`src/epub/blocks.py`) — `walk_blocks`: a chapter body as blocks (block-level elements, or runs of inline content), each with an index and a whitespace-free text fingerprint.
+3. **Segmentation** (`src/core/segmenter.py`) — contiguous block ranges; a block is never split. Groups to `MIN_WORDS`=300 without passing `MAX_WORDS`=500 unless one block is larger; code and tables alone. Rules (`project.segmentation`): 1 = heading alone (old projects), 2 = heading joins the following blocks, and code without a comment line is `passthrough` (no model call, exported as is).
+4. **Translation** (`src/core/translator.py`) — `translate_segment` / `TranslationEngine`: prompt with glossary, context (with rules 2 the previous segment's translation), brief at the top; protected HTML in, reply checked, at most `MAX_CALLS`=4 calls per segment (request, one retry with the errors, one split in two halves). Returns a `TranslationOutcome`; failures are `FAILED` with typed `Issue`s and a diagnostics file `log/failed/<id>-<digest>.txt`.
+5. **Validation** (`src/core/validation.py`) — attributes replaced by keys (`<p k="1">`; `alt`/`title`/`aria-label` stay visible to be translated), `restore(protect(html)) == html`. `check_segment` is the one check used for model replies, review saves/approvals, `validate` and the export: structural rules block (`structure_mismatch`, `key_mismatch`, `tag_count`, `code_changed`, …), quality/glossary rules warn (`length_ratio`, `untranslated`, `term_not_applied`).
+6. **Review** (`src/web/`) — side-by-side editing; a save or approval that fails the structural check is refused (422).
+7. **Export** (`src/epub/exporter.py`) — ZIP written from the project's `source.epub` (hash checked): only translated chapters, OPF, NCX, nav (and one stylesheet for bilingual) differ; everything else is byte-identical. A chapter whose blocks no longer match the stored ranges/fingerprints, or a segment that fails the check, stays in the original language; the report says why.
 
-### Key Design Decisions
+### Backends (`src/llm/`)
+- `LLMBackend` protocol (`base.py`); `BACKENDS` / `backend_for(name)` in `__init__.py`; project field `backend` (absent = `claude-cli`). `CLIBackend` (`cli.py`) is the only place that starts model processes: own process group, cancel/deadline polling, killed on pause/stop and at interpreter exit, working directory = system temp dir, one `SYSTEM_PROMPT`.
+- `ClaudeCLI` (`claude_cli.py`): `claude -p` plus `LEAN_FLAGS` (`--system-prompt`, no tools, no MCP, no setting sources, no session file); `CLAUDECODE` removed from the environment. Models `sonnet` (default), `opus`, `haiku`. Error classes from output patterns (rate limit, expired login).
+- `CopilotCLI` (`copilot_cli.py`): `copilot -p … --output-format json --available-tools none … --experimental --plugin-dir src/llm/copilot_plugin`. The plugin's extension replaces Copilot's system prompt (read from `EPUB_TRANSLATOR_SYSTEM_PROMPT`). Every successful run must report exactly one `agent_replacement` system segment, else `BackendUnavailableError` and the run stops. Risks: experimental, undocumented interface and telemetry (tested with Copilot CLI 1.0.114); rate-limit/auth patterns are from docs, not observed.
+- `FakeBackend` (`fake.py`) for tests; `tests/conftest.py` refuses any real process call.
 
-- **Claude CLI Integration**: Translations go through `subprocess.run(['claude', '-p', prompt, '--model', model])`. Two segment types: `text` (prose, headings, tables) and `code` (pre/code blocks). Env var `CLAUDECODE` is stripped to avoid nested-session detection.
-- **JSON Persistence**: All state stored in `project.json` and `glossary.json` per project. No database required.
-- **Web Architecture**: Flask app factory with Blueprints. Alpine.js for frontend reactivity (no build step). SSE for real-time translation progress. Background threading for long-running tasks.
-- **Segmentation**: 300-500 words per segment, breaking at sentence boundaries. Code blocks, tables, and headings are isolated as standalone segments. Content divs (with text/inline tags) are preserved as atomic elements; container divs (only block children) are recursed into. Small consecutive text segments are merged; oversized segments are split.
-- **Parallel Translation**: Coordinator+worker+result pattern. Up to 20 parallel workers (`MAX_WORKERS`). Workers translate segments and put results into `result_queue`; coordinator drains results, updates state, and emits SSE events. Model can be switched mid-translation.
+### Runtime
+- **Web task** (`src/web/tasks.py`, `TaskManager`): coordinator + workers (`MAX_WORKERS`=20) + `result_queue`; only the coordinator applies results and saves. `EventBroadcaster` feeds SSE (every client sees every event). Backend/model/brief re-read per segment, so a switch applies to the next segment. Worker count can change on resume.
+- **Run-level errors** (`src/core/runcontrol.py`): rate limit → pause, auto-resume after `retry_after` (clamped 1–3600 s) or `RATE_LIMIT_WAIT_SECONDS`=300; expired login / backend unavailable → pause until the user resumes (CLI: exit 1). A pause cancels calls in flight; their segments are queued again. Transient errors back off 5/15/45 s inside the segment's call budget. `MAX_CONSECUTIVE_UNEXPECTED`=5 unexpected failures in a row stop the run.
+- **Saving**: `DebouncedSaver` saves every `SAVE_INTERVAL_SECONDS`=10 or `SAVE_EVERY_RESULTS`=20 results, and always on pause/stop/end/failure; results not saved are reported. Failure logs are written only after their result is on disk.
+- **Concurrency**: one in-process RLock per project (`project_mutex`) for every change and save, plus a file lock `project.lock` (`ProjectLock`, flock) held by a CLI run, a web task, and each web edit transaction; a locked project answers 409. Edits carry a `revision`; a result computed for an older revision is dropped.
+- `ProjectManager` mutations are in-memory; callers call `pm.save()` (atomic write, file mode kept).
 
-### Module Structure
+### Project data (`projects/<name>/`, not in git)
+- `project.json`: `schema` 2 for new projects (segments with `block_start`/`block_end`/`fingerprints`, `source_sha256`); fields `model`, `backend`, `segmentation`, `brief` are omitted when absent so older files round-trip unchanged. Status: `pending`, `translated`, `reviewed`, `failed`.
+- Schema 1 (pre-plan projects) translates but cannot be exported or validated: `translate.py migrate` (`src/core/migrate.py`) once; fail-closed (writes nothing unless every chapter matches), keeps `project.schema1.json`, copies `source.epub` when missing.
+- Also `glossary.json`, `source.epub`, `log/translation_*.log` (web runs), `log/failed/`, `output/*.epub`.
 
-```
-src/
-├── core/
-│   ├── project.py         # ProjectManager — JSON-based project state, segment CRUD
-│   ├── segmenter.py       # Segmenter — HTML to segments with type detection
-│   └── translator.py      # TranslationEngine — Claude CLI wrapper, prompt templates, response cleaning
-├── epub/
-│   ├── extractor.py       # EPUBExtractor — EPUB parsing, chapter extraction
-│   └── builder.py         # EPUBBuilder — EPUB reconstruction (3 output formats)
-├── glossary/
-│   ├── glossary_manager.py  # GlossaryManager — term CRUD, JSON storage, text search
-│   └── term_extractor.py    # TermExtractor — auto-extract terms via Claude CLI
-└── web/
-    ├── server.py          # Flask app factory with blueprint registration
-    ├── tasks.py           # TaskManager — background translation/extraction with threading
-    ├── blueprints/
-    │   ├── home.py        # Project listing, creation
-    │   ├── projects.py    # EPUB upload, project detail pages
-    │   ├── glossary.py    # Glossary CRUD API + auto-extraction
-    │   ├── translation.py # Translation start/pause/status + SSE streaming
-    │   ├── review.py      # Segment update/approve API
-    │   └── export.py      # EPUB export + download
-    ├── templates/         # Jinja2 + Alpine.js (base, index, project tabs)
-    └── static/            # CSS
-```
+### Glossary (`src/glossary/`)
+- Entries: term, translation, category (`person`, `place`, `work`, `organization`, `term`, `expression`, `other`), and for people `gender` and `note`, which go into the prompt. All entries are in the prompt up to 150, else those found in the segment.
+- `TermExtractor.extract_from_segments`: batches of ≤5000 chars propose terms; terms proposed with several translations are decided by a consolidation call; undecided ones keep the most frequent proposal. A rate limit/login error stops it with the terms found so far (kept). The web adds only terms not yet in the glossary; `glossary extract` (CLI) also replaces the translation and category of existing ones but keeps their gender/note.
 
-### Special Content Handling
+### Web (`src/web/`)
+Flask app factory (`server.py`, `create_app(projects_dir=None)`), one blueprint per area, Jinja2 + Alpine.js 3 (no build step). Alpine calls a component's `init()` itself: do not add `x-init="init()"`.
 
-- **Code blocks**: Preserve formatting, translate only comments (`#`, `//`)
-- **LaTeX formulas**: `$...$` and `$$...$$` kept unchanged
-- **Tables**: `<table>` elements isolated as standalone segments, HTML structure preserved
-- **Headings**: Standalone segments, simplified prompt
-- **Content divs**: `<div>` with text/inline content preserved as atomic elements (CSS classes retained); container divs (only block children) recursed into transparently. Determined by `_is_container()` heuristic using `BLOCK_TAGS` set.
+Pages: `/`, `/new`, `/project/<name>` (`/overview`, `/glossary`, `/translation`, `/review`, `/review/chapter/<chapter_id>`, `/search`, `/export`); `?issues=1` on review pages shows only segments with issues.
 
-### Output Formats
+API (`/api/...`):
+- projects: `GET /projects`, `POST /upload`, `POST /epub/metadata`, `POST /projects`, `GET|DELETE /projects/<name>`, `GET /projects/<name>/chapters`, `GET /projects/<name>/progress`
+- glossary: `GET|POST /projects/<name>/glossary`, `PUT|DELETE /projects/<name>/glossary/<term>`, `DELETE /projects/<name>/glossary/batch`, `POST /projects/<name>/glossary/extract`, `GET /projects/<name>/glossary/extract/status`
+- translation: `GET|PUT /projects/<name>/model` (`{model, backend}`), `GET|PUT /projects/<name>/brief`, `POST /projects/<name>/translate/start` (`workers`, `segment_ids`, `retry_failed`), `POST /projects/<name>/translate/pause` (`{action: pause|resume, workers}`), `GET /projects/<name>/translate/status`, `GET /projects/<name>/translate/stream` (SSE)
+- review: `POST /projects/<name>/segments/<id>` (edit), `…/approve`, `…/retranslate`; `POST /projects/<name>/search-segments`
+- export: `POST /projects/<name>/export` (`format`), `GET /projects/<name>/export/status`, `GET /projects/<name>/export/files`, `GET /projects/<name>/download/<filename>`
 
-| Format | Description |
-|--------|-------------|
-| `chinese-only` | Pure Traditional Chinese |
-| `bilingual-horizontal` | Side-by-side (CSS flex layout) |
-| `bilingual-vertical` | Top-bottom display |
+## Testing and verification
 
-### Web API Routes (key endpoints)
-
-- `GET /` — Project listing
-- `GET /new` — New project page
-- `POST /api/upload` — Upload EPUB file
-- `POST /api/epub/metadata` — Extract EPUB metadata
-- `POST /api/projects` — Create project
-- `DELETE /api/projects/<name>` — Delete project
-- `GET /project/<name>/overview` — Project detail with tabs (overview, glossary, translation, review, export)
-- `GET /api/projects/<name>` — Get project details JSON
-- `GET /api/projects/<name>/chapters` — Get chapter list
-- `GET /api/projects/<name>/glossary` — Get glossary entries
-- `POST /api/projects/<name>/glossary` — Add glossary term
-- `PUT /api/projects/<name>/glossary/<term>` — Update term
-- `DELETE /api/projects/<name>/glossary/<term>` — Delete term
-- `DELETE /api/projects/<name>/glossary/batch` — Batch delete terms
-- `POST /api/projects/<name>/glossary/extract` — Auto-extract terms
-- `GET /api/projects/<name>/model` — Get translation model
-- `PUT /api/projects/<name>/model` — Set translation model
-- `POST /api/projects/<name>/translate/start` — Start background translation (accepts `workers`, `segment_ids`)
-- `POST /api/projects/<name>/translate/pause` — Pause translation
-- `GET /api/projects/<name>/translate/status` — Translation task status
-- `GET /api/projects/<name>/translate/stream` — SSE progress stream
-- `POST /api/projects/<name>/segments/<id>` — Update segment translation
-- `POST /api/projects/<name>/segments/<id>/approve` — Mark segment reviewed
-- `POST /api/projects/<name>/segments/<id>/retranslate` — Re-translate segment
-- `GET /project/<name>/search` — Search page
-- `POST /api/projects/<name>/search-segments` — Search segments by keyword
-- `GET /api/projects/<name>/progress` — Get translation progress
-- `POST /api/projects/<name>/export` — Generate EPUB
-- `GET /api/projects/<name>/download/<filename>` — Download generated EPUB
+- `python3 -m pytest tests/ -q -p no:cacheprovider -rfw` — must pass with no warnings, also when several suites run at once. Tests wait on conditions (`_wait`, events), not on sleeps. No test makes a real model call.
+- `scripts/verify/mutation.sh [BASE]` — mutmut 3.8.1 over the lines changed vs `BASE` in the files listed in `mutation.py`, on a copy of the tree. Needs a Python 3.10+ environment with `requirements-dev.txt` (`MUTATION_VENV=<venv>` to point at one); the project venv may be 3.9.
+- `scripts/verify/` — one script per phase claim, each with a docstring:
+  - read-only checks of real projects (`--projects-dir`, copies to a temp dir, never writes there; `--anonymize` for publishable output): `phase0_code_segments`, `phase1_load_projects`, `phase2_roundtrip`, `phase2_migrate_copies`, `phase3_export_check`, `phase4_validate_check`, `phase5_glossary_check`, `phase6_segmentation_check`;
+  - guards of the test suite itself: `phase1_reverts` (old behaviours put back one by one; each must fail a test) and `phase1_survivor_kills` (recorded mutants must be killed); both work on `git archive HEAD`, so commit first;
+  - measurements that make REAL model calls (cost quota, run only on purpose): `phase7_cli_overhead`, `phase7_throughput`, `phase8_brief_sample`, `phase8_extraction_compare`, `phase9_copilot_overhead`.
 
 ## Troubleshooting
 
-### 查看與管理背景進程
-
-翻譯使用 `claude -p` subprocess，如果卡住需要手動處理：
-
 ```bash
-# 查看翻譯 subprocess
-ps aux | grep 'claude -p' | grep -v grep
-
-# 砍掉特定進程（用 PID）
-kill <PID>          # 正常終止
-kill -9 <PID>       # 強制終止
-
-# 一次砍掉所有翻譯 subprocess
-pkill -f 'claude -p'
+ps aux | grep -E 'claude -p|copilot -p' | grep -v grep   # model calls running
+pkill -f 'claude -p'                                     # or 'copilot -p'
+lsof -ti:3000 | xargs kill                               # web server on port 3000
 ```
 
-### 查看與管理 Web Server
-
-```bash
-# 查看佔用 port 3000 的進程
-lsof -ti:3000
-
-# 砍掉並重啟
-lsof -ti:3000 | xargs kill -9
-python3 -m flask --app src.web.server:create_app run --port 3000
-```
-
-### 翻譯卡住的常見原因
-
-- 多個 `claude` 互動式工作階段同時運行，導致 API 排隊（用 `ps aux | grep claude` 檢查）
-- subprocess 超時（預設 120 秒/次，共 3 次重試）
-- 翻譯日誌位於 `projects/<name>/log/translation_*.log`，可查看詳細錯誤
-
-## Testing
-
-246 tests covering all modules:
-```bash
-python3 -m pytest tests/ -v
-```
-
-Test files: `test_extractor.py`, `test_segmenter.py`, `test_translator.py`, `test_project.py`, `test_glossary.py`, `test_builder.py`, `test_web.py`, `test_cli.py`
-
-## Dependencies
-
-- `flask>=3.0` — Web server
-- `ebooklib>=0.18` — EPUB read/write
-- `beautifulsoup4>=4.12` + `lxml>=4.9` — HTML parsing
-- `click>=8.1` — CLI framework
-- `pytest>=7.4` — Testing
+- Model calls time out after 120 s; transient errors are retried within the segment's budget, then the segment is `failed` (see `log/failed/`, retry with `start --retry-failed` or the retry button).
+- "project locked" (409 / CLI message): another process (a CLI run, the web task) holds `project.lock`.
+- Export or validate refuses a schema 1 project: run `migrate` first.
+- Copilot run stopped with "無法確認 Copilot CLI 已套用翻譯用的系統提示": the plugin did not load or the CLI changed; check `copilot --help` for `--experimental`/`--plugin-dir`.
+- Web run log: `projects/<name>/log/translation_*.log`.
