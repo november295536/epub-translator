@@ -38,8 +38,9 @@ Usage:
         --project-index N --out DIR [--model haiku] [--chunks N] [--anonymize]
         [--code DIR] [--name before|after]
 
-Exit code: 0 when the extraction ran to the end and the projects directory
-is unchanged, 1 otherwise (also when a rate limit or a login stopped it),
+Exit code: 0 when the extraction ran to the end, some batch proposed a term
+and the projects directory is unchanged, 1 otherwise (also when a rate limit
+or a login stopped it, or when no batch proposed anything),
 2 when the setup is refused (no such project; --code without the term
 extractor, or code loaded from somewhere else than --code; a copy that
 migration leaves at schema 1; a place refused above).
@@ -89,6 +90,16 @@ def in_work_tree(path: str) -> bool:
 def inside(path: str, place: str) -> bool:
     path, place = os.path.realpath(path), os.path.realpath(place)
     return os.path.commonpath([path, place]) == place
+
+
+def loaded_from(module, code: str) -> bool:
+    """Whether `module` is the file of its name in the checkout `code`
+    (`<code>/src/llm/__init__.py` for src.llm): a module of a checkout
+    nested inside `code` (a worktree under it) is not."""
+    parts = module.__name__.split('.')
+    expected = os.path.join(code, *parts, '__init__.py') if hasattr(module, '__path__') \
+        else os.path.join(code, *parts) + '.py'
+    return os.path.realpath(module.__file__) == os.path.realpath(expected)
 
 
 class CountingBackend:
@@ -189,7 +200,7 @@ def compare(args) -> int:
     except ImportError as e:
         print(f'ERROR --code has no term extractor ({type(e).__name__})')
         return 2
-    if not all(inside(m.__file__, args.code) for m in (llm, migrate, project, extractor)):
+    if not all(loaded_from(m, args.code) for m in (llm, migrate, project, extractor)):
         print('ERROR the code that was loaded is not the one of --code')
         return 2
     migrate_project, ProjectManager = migrate.migrate_project, project.ProjectManager
@@ -264,6 +275,9 @@ def run(args, label, project_dir, work, llm, migrate_project, ProjectManager,
     print(f'wrote {file}')
     if stopped is not None:
         print(f'FAIL {label}: the extraction stopped ({type(stopped).__name__})')
+        return 1
+    if not any(proposals):  # every batch failed (or found nothing): no comparison
+        print(f'FAIL {label}: no batch proposed a term')
         return 1
     return 0
 
