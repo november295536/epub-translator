@@ -6010,3 +6010,219 @@ round 1, none in `src/llm/`.
 Tests: 2685 passed, alone and three suites at once, with `-rfw`: no failure and no warning in any
 of the four runs. No test removed; changed: `test_failed_calls` (D) and the compile test (A).
 The projects fingerprint is `a7197555c962562a530d6de80fa045af` after this round.
+
+## Cleanup after Phase 9
+
+Date: 2026-11-22. Branch: `cleanup/docs-and-checks` from `main`, worktree
+`<repo>/.worktree/cleanup`, shared virtualenv (Python 3.9). No real model calls. No new feature.
+
+### What was done
+
+| # | Item | Change | Evidence |
+|---|---|---|---|
+| 1 | `README.md` (Traditional Chinese), `CLAUDE.md` (English) described the state before the plan (`claude -p` through `subprocess.run`, the old builder, 246 tests, ebooklib as a runtime dependency, no backends, migration or validation) | rewritten from the code and the `--help` of every command and subcommand: backends and how to choose them (Copilot's needs and risks in three lines), CLI commands and options, schema 2 and `migrate`, validation and `--retry-failed`, glossary consolidation and person gender/note, the brief, pause/resume/rate limit, debounced saves, the project lock, export, the routes of `app.url_map`, tests, the mutation run, the verify scripts, troubleshooting. No test count | — |
+| 2 | `phase1_reverts.py` / `phase1_survivor_kills.py` no longer exited 0 | entries re-anchored at the code's new text; one mutant retired; three tests made to detect three reverts again (table below) | before/after below |
+| 3 | glossary and export pages ran `init()` twice (Alpine 3 calls it, and `x-init="init()"` called it again) | `x-init="init()"` removed from both; no other template has it (`grep -rn 'x-init' src/web/templates`: only the toast watcher in `base.html`) | `test_other_pages_initialized_once[glossary|export]` (each fails with its page's old template); server log in a real browser below |
+
+### Task 3: the double initialization, seen in a browser
+
+Flask on port 3917 over a scratch projects directory with one invented project, both pages opened
+in Chrome; the API requests the server logged per page load:
+
+```
+before (x-init="init()" present):
+GET /api/projects/book/glossary            x2
+GET /api/projects/book/glossary/extract/status  x2
+GET /api/projects/book/export/status       x2
+GET /api/projects/book/export/files        x2
+after:
+each of the four once
+```
+
+While an extraction was running, the glossary page polled it in two loops; otherwise the doubled
+loads were harmless (the export page's `startPolling` clears its previous timer).
+
+### Task 2: the phase 1 guards
+
+Before (both on `main`):
+
+```
+$ python3 scripts/verify/phase1_reverts.py | tail -1
+reverts not detected: 23        (82 OK; 22 BAD "has the old text 0 times", 1 MISS)
+$ python3 scripts/verify/phase1_survivor_kills.py | tail -1
+not killed 14                   (68 KILLED; 13 BAD "old text found 0 times", 1 SURVIVED)
+```
+
+After (the last line of each output; the exit codes were taken without a pipeline, see review
+round 1 below for the commands):
+
+```
+reverts not detected: 0         (105 OK)     exit 0
+not killed 0                    (81 KILLED)  exit 0
+```
+
+Reverts (`phase1_reverts.py`): every stale entry's guarded code still exists in a recognisable
+form, so all were re-anchored (the same old behaviour put back at the new place); none retired.
+
+| entry | what changed in the code | new anchor |
+|---|---|---|
+| 3 mark_reviewed outside the mutex | `_find` → `_changeable` | `with self.mutex:` before `seg = self._changeable(...)` in `mark_reviewed` |
+| 5 logging set up outside the try | set-up of `_run_translation` (saver, `log_dir`) | `handler = None` before `log_dir`; the call after `try:` |
+| 6 web coordinator failure does not wake paused workers | `_fail_task` also sets `cancel_event` | `task.pause_event.set()` after `task.cancel_event.set()` |
+| 6 CLI supervisor failure does not join workers | the join is in `try/finally`, the message changed | the join loop inside `try:` |
+| 7 late run error after stop pauses the task | a generation check follows the stop check | the stop check before `if task.cancel_event is generation:` |
+| 11 model select keeps a refused model | `setModel` restores the select element | `document.getElementById('model-select').value = previous;` |
+| 12 model list from the Claude module | `available_models` takes a backend | `llm.backend_for(backend).list_models()` |
+| 13 issue detail unbounded | the issue is built in `TranslationError` | `detail=message[:ERROR_MESSAGE_CHARS]` |
+| 14 timeout drops the output / R3-12 timeout raw not bounded | `raw` goes through `self.redact` | the redacted `raw=` |
+| 17 edit keeps FAILED and issues | `update_translation` stores the given issues | `seg.issues = list(issues or [])` |
+| 24 approve leaves the failure log | approve checks the text and answers with its warnings | `remove_failure_log` after `pm.save()` before the warnings answer |
+| R2-10 re-translate records the log before acceptance and save | the call has more arguments | after the call's last line |
+| R2-17 edit removes the log outside the transaction | the answer is built by `_answer` | the block including `answer = _answer(...)` |
+| R2-11 run-level error not kept on the task | the error is kept in `_pause_for` | `task.error = str(error)  # for a page opened later` |
+| R2-12 stored model not shown | models are keyed `backend/alias` | `m.key === this.modelKey()` |
+| R2-20 stale and skipped results reported as unsaved | unsaved results come from `DebouncedSaver.pending`, which only applied results enter | `if self._apply_result(...) or True:` + the drain filter (corrected in review round 1: only the drain filter) |
+| R3-2 stopped event leaves state and stream | the handler also clears `autoResume` | the `stopped` handler with `this.autoResume = false;` |
+| R3-6 initial status without the error | the status has `resume_in` after the error | `'total': task.total, 'error': task.error,` |
+| R3-9 sequential CLI goes on after five unexpected failures | the stop is raised as `_RunStopped` | `stop = streak.add(outcome)` … `raise _RunStopped(stop)` |
+| R4-2 worker added on resume listed and counted before its start | moved into `_top_up_workers` | its start block |
+| R4-3 streak stop discards in-flight results | a comment was added | the block with `# resume_translation refuses it now` |
+
+The 23rd, `6 web coordinator failure does not join workers`, matched but was a MISS (2 passed):
+since the debounced saves the run's first save comes after the workers have ended, so in
+`test_save_failure_joins_workers_and_reports_unsaved` nobody is in flight when `_fail_task` runs,
+and in `test_save_failure_wakes_paused_worker` the woken workers end before the test looks. With
+the re-anchored entries, `6 CLI supervisor failure does not join workers` (same cause in the CLI)
+and `7 late run error after stop pauses the task` (the single worker breaks at the loop's top on
+the stop event either way) were MISSes too. Three assertions make them detectable again:
+
+- `TestCoordinatorFailure::test_save_failure_wakes_paused_worker` records `Thread.join` calls:
+  every worker must have been joined (the save fails at the pause, `_fail_task` does the joins);
+- `TestCLISupervisorFailure::test_save_failure` the same for the supervisor;
+- `TestStopThenLateRunError::test_stop_then_error`: `task.pause_event` is still set at the end (the
+  revert clears it after the stop; this test's worker still exits at the next stop check, but a
+  cleared gate could strand another worker already past that check; corrected in review round 1).
+
+Survivor kills (`phase1_survivor_kills.py`):
+
+| entry | decision | reason |
+|---|---|---|
+| core58 | re-anchored | `mark_translated` uses `_changeable` and has a comment |
+| core62, core63 | re-anchored | a `seg.status` line now stands between the text and the time; anchored on status, time and the blank line after |
+| web171–176 | re-anchored | the edit and approve answers are built by `_answer(pm, gm, issues, status='ok', segment_id=...)` ; the same key/value mutants there |
+| cli8 | re-anchored | `value` → `model` |
+| cli75 | re-anchored | `tick()` before `continue` |
+| cli78 | re-anchored | message now `翻譯中斷，正在停止進行中的段落……` (the calls in flight are killed) |
+| cli82 | re-anchored | `_report_unsaved` joins `saver.pending` |
+| web142 | retired | `continue` → `break` after a skipped segment: `_workers_done` starts workers again while a segment is still queued, so the run translates the rest when those replacement workers start (fewer workers run meanwhile, and a replacement that cannot start fails the task; narrowed in review round 1); `test_worker_goes_on_after_a_skip` still checks the run goes on |
+
+The tests named by each entry were run on the re-anchored entry alone first (all OK / KILLED),
+then both scripts in full.
+
+### Checks
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase3_export_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  exports 24  translated segments 4162  as translation 3956  kept original 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 53)  toc labels changed 405/1885 (527 into translated chapters)  exports with new epubcheck errors 0  failed projects 0
+$ python3 scripts/verify/phase4_validate_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  round trip 9491/9491  translated 4162  failing the structural check 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 54; only tag rules 88)  warnings (length_ratio 36, untranslated 8)  length ratio over 2925 segments: p1 0.312 p5 0.333 p50 0.404 p95 0.547 p99 0.976; outside 0.25-0.8: 38 (1.3%)  sources that cannot be cut 0  with translatable attributes 22  translated code starting with a shebang 0  failed projects 0
+$ python3 scripts/verify/phase5_glossary_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  glossary entries 15, translated 4162, passing the structural check 3956, with term_not_applied 12, terms 4, by category (person: 9 warnings, 2 terms, term: 6 warnings, 2 terms)  failed projects 0
+$ python3 scripts/verify/phase6_segmentation_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  segments 9520 -> 7870, calls 9520 -> 6432 (ratio 0.676), passthrough 1438, headings merged 1655 of 1770  failed projects 0
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+All four exited 0 with the TOTAL lines recorded in Phase 9.
+
+Tests (`python3 -m pytest tests/ -q -p no:cacheprovider -rfw`): 2687 passed alone (230 s) and in
+each of three suites run at once (227, 229, 228 s); no failure and no warning in any of the four
+runs. 2687 = 2685 of Phase 9 + the two cases of `test_other_pages_initialized_once`. No test
+removed; three tests got an assertion (task 2).
+
+Mutation: not run. No Python file under `src/` changed (two templates, tests, two verify scripts
+and the docs); `scripts/verify/mutation.sh` mutates Python only.
+
+### Not verified
+
+- The docs' description of the Copilot backend's real behaviour rests on the Phase 9 record
+  (no real calls here); its model list is the one in `copilot_cli.MODELS`.
+- The glossary and export pages were checked in a browser only for the requests on load; the
+  extraction and export flows themselves were not run in the browser (their tests pass).
+- `known-issues.md` still describes a sentence split across segments; the segmenter now never
+  divides a block (`src/core/segmenter.py`). Left as it is (outside this pass).
+
+## Cleanup after Phase 9 — review round 1
+
+Date: 2026-11-22. Opus approved, GPT and Gemini requested changes. Every item was checked against
+the code first; all were real, none was rejected. Most were documentation accuracy.
+
+### Documentation (`README.md`, `CLAUDE.md`)
+
+| Topic | Correction | Code |
+|---|---|---|
+| Runnable commands (GPT 2) | `git clone "$REPO_URL"`; the CLI lines with `|` in CLAUDE.md are a `text` synopsis; README examples one command per line; `init`, `validate`, `migrate` take a path, the others `-p` | `translate.py` command definitions |
+| Troubleshooting (GPT 1) | lead with the web pause button / Ctrl-C; no `pkill -f` (hits other sessions) or `lsof … \| xargs kill`; one verified PID; process arguments contain book text; killing the web server loses unsaved results | `runcontrol.DebouncedSaver`, `claude_cli.LEAN_FLAGS` (prompt in argv) |
+| Failed translations (GPT 6, Opus 3, Gemini 2, 4) | a pending segment becomes `failed` (`--retry-failed`); a translated/reviewed one keeps text and status and only gets issues; stored translations that fail: `validate --mark-failed` then `start --retry-failed` | `ProjectManager.apply_outcome`, `get_pending_segments`, `translate.py validate` |
+| Locks (GPT 7, Opus 1, Gemini 3) | `project.lock` and the mutex cover `project.json` (and which operations take the lock); `glossary.json` takes neither: edits go through during a run, are not seen by it, can overwrite each other | `web/blueprints/glossary.py`, `GlossaryManager.save`, glossary loaded once in `_run_translation` / `_start` |
+| Pauses (GPT 8, Gemini 5, Opus 4) | a web pause cancels calls in flight; a CLI rate limit stops dispatch and backoff waits, running calls finish; neither backend reports `retry_after` (300 s); unavailable backend: web pauses, CLI exits 1 | `tasks.pause_translation`, worker `RUN_ERRORS` branch, `translate._start_parallel` |
+| Saving (GPT 9) | the 10 s / 20 results are a threshold checked after a result (web also per tick), not a durability bound; pause/stop/end/failure attempt a flush | `DebouncedSaver.maybe_save`, `_tick`, `_start_sequential` |
+| Migration (GPT 4, Opus 6) | needs the source EPUB; refuses when the backup exists or the project is locked; a merged group with a pending/failed/empty member keeps no translation: read the dry run; the lock file is created even when nothing else is written | `migrate.migrate_project`, `plan_migration` |
+| Web project creation (GPT 3) | replaces an idle project of the same name (`project.json`, `source.epub`, `log/failed/`; `glossary.json` kept); CLI `init` refuses | `projects.create_project`, `translate.init` |
+| Export source path (GPT 10) | export opens the absolute `epub_path` recorded at creation, not the directory's `source.epub`; a moved project directory cannot export (README note, CLAUDE.md, `known-issues.md`); unchanged members keep identical uncompressed bytes, the archive is rewritten; passing `validate` does not guarantee export | `exporter._export` |
+| Copilot-only order (GPT 5) | pick a Copilot model on the web translation page before extraction; `start -b` is the only CLI setter and it translates | `ProjectManager.create` (default backend), `glossary_extract` |
+| Platform (GPT 11) | POSIX only (`fcntl`, process groups) | `project.py` import, `cli.run_process` |
+| Mutation environment (Gemini 1, GPT 23) | both requirements files in the 3.10+ environment; exits 2 without mutmut or without eligible changed lines | `mutation.sh`, `mutation.main` |
+| Verify scripts (GPT 13, Opus 5, Gemini 8) | phase 0, 1, 2-roundtrip read in place, the others work on a copy; `--anonymize` covers stdout only; `--sample-out` / `--out` files hold book text | script docstrings |
+| Prompts and limits (GPT 20, 21, Opus 2, Gemini 6, 7) | brief, glossary and context only in text prompts; context is the nearest non-code segment (its translation with rules 2 when it has one); a heading's first text block may pass 500 words; 4 calls per `translate_segment`; 120 s translation, 180 s extraction; 150-entry rule; CLI extraction replaces translation and category; Copilot rate-limit messages documented, auth guessed | `translator._build_prompt`, `get_context`, `segmenter`, `TermExtractor`, `copilot_cli` docstring |
+| Minor wording (GPT 12, 19, 22) | validation entry points (`check_html`/`check_code` shared, `check_segment` for review and `validate`); `p = protect(html); restore(p.html, p)`; a missing `model` is written on the next save, `source_sha256` is project-level; SSE gives a snapshot then live events; the export flushes the running saver; `GET …/model` response fields | `validation`, `ProjectManager.load`, `translation` and `export` blueprints |
+
+### Checks and tests
+
+- R2-20 (GPT 14): the `or True` edit put a rejected result into the saver, so its test failed
+  because a save happened, not because of a wrong report. Since Phase 7 the saved part of the
+  report is `DebouncedSaver.pending`, which only accepted results enter; the old behaviour
+  survives only in the queue drain of `_fail_task`. The entry now puts back only that filter
+  (`if True:`), and `test_skipped_result_in_queue_not_reported` also queues a stale result, so the
+  revert fails on the reported IDs (`boom（1 個段落的結果未儲存：ch1_seg0003）` expected).
+- `test_save_failure_wakes_paused_worker` (GPT 16): the first save now fails only once a worker is
+  waiting in `pause_event.wait()` (a recording `Event.wait`), so the wake-up is what ends it; the
+  test also checks the error is the save's.
+- `TestCLISupervisorFailure::test_save_failure` (GPT 15, Opus 7): every result is saved at once,
+  so the failing save comes while the MARK4 call is still in flight (the others return only after
+  it started); the call ends only when the supervisor joins, and the test checks it ended before
+  `invoke` returned and that all four started workers were joined. The `sleep(1)` and its comment
+  are gone, also from `test_save_failure_joins_workers_and_reports_unsaved`.
+- Log wording (GPT 17, 18, 24): the late-error assertion, the web142 reason ("when those
+  replacement workers start") and the exit codes are corrected above.
+- `known-issues.md`: its only entry (a sentence split across segments, `block_count`) no longer
+  holds: the segmenter never divides a block (`src/core/segmenter.py`). It is replaced by the
+  export path limitation.
+
+```
+$ python3 scripts/verify/phase1_reverts.py > reverts.txt; echo "exit $?"
+exit 0                      (last line: reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py > kills.txt; echo "exit $?"
+exit 0                      (last line: not killed 0; 81 KILLED)
+```
+
+Tests: 2687 passed alone (218 s) and in each of three suites at once (218, 221, 229 s); no
+failure and no warning in any run. No test added or removed this round; three changed (above).
+Mutation: not run (no Python file under `src/` changed). Projects fingerprint unchanged
+(`a7197555c962562a530d6de80fa045af`). No real model calls.
+
+### Product behaviour documented that may be a defect
+
+- Export reads the absolute `epub_path`, so moving a project directory breaks export although
+  `source.epub` is inside it.
+- Glossary edits are not locked: two concurrent edits (web and CLI, or two tabs) can overwrite
+  each other, and a running translation does not see them.
+- Web project creation replaces an idle same-name project (the page warns; the API does not ask).
+- Migration can clear the translation of a merged group whose members were partly translated
+  (kept in `project.schema1.json`).
+- A failed re-translation of a translated or reviewed segment is not selected by
+  `--retry-failed`.
+- The CLI cannot set the backend without starting a translation.
