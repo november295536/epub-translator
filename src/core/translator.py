@@ -756,7 +756,7 @@ def _glossary_warnings(seg, text: str, glossary) -> list:
 
 
 def _request_text(engine: TranslationEngine, seg, glossary_text: str, context,
-                  brief: str = '') -> str:
+                  brief: str) -> str:
     """The request of a call that raised, for its diagnostics ('' when it
     cannot be built)."""
     try:

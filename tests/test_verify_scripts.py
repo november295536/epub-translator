@@ -4639,3 +4639,215 @@ class TestBriefSampleScript:
         request = LLMRequest(system='', messages=[Message('user', 'p')], model='m', timeout=1)
         assert counting.complete(request, threading.Event()).text == 'x'
         assert counting.calls == 1
+
+
+class TestPhase8ScriptSurvivors:
+    """Mutants of the first Phase 8 mutation run, for both scripts."""
+
+    def _brief_args(self, tmp_path, projects, *extra, index='2', model='other-model'):
+        brief = tmp_path / 'brief.txt'
+        brief.write_text('A brief.', encoding='utf-8')
+        return ['--projects-dir', str(projects), '--project-index', index, '--brief-file',
+                str(brief), '--out', str(tmp_path / 'out'), '--model', model, *extra]
+
+    def _extract_args(self, tmp_path, projects, *extra, index='2'):
+        return ['--projects-dir', str(projects), '--project-index', index,
+                '--out', str(tmp_path / 'out'), '--model', 'other-model', *extra]
+
+    @pytest.mark.parametrize('module', ['extraction', 'brief'])
+    def test_snapshot(self, tmp_path, module):
+        script = extraction if module == 'extraction' else brief_sample
+        (tmp_path / 'd' / 'sub').mkdir(parents=True)
+        (tmp_path / 'd' / 'sub' / 'f.txt').write_text('abc')
+        (tmp_path / 'd' / 'g').write_text('x')
+        st = os.stat(tmp_path / 'd' / 'sub' / 'f.txt')
+        st2 = os.stat(tmp_path / 'd' / 'g')
+        assert script.snapshot(str(tmp_path / 'd')) == [
+            ('g', 1, st2.st_mtime_ns), (os.path.join('sub', 'f.txt'), 3, st.st_mtime_ns)]
+
+    @pytest.mark.parametrize('module', ['extraction', 'brief'])
+    def test_counting_backend_passes_cancel(self, module):
+        import threading
+        script = extraction if module == 'extraction' else brief_sample
+        from src.llm.fake import FakeBackend
+        seen = []
+
+        class Inner(FakeBackend):
+            def complete(self, request, cancel):
+                seen.append(cancel)
+                return 'r'
+
+        cancel = threading.Event()
+        assert script.CountingBackend(Inner()).complete('req', cancel) == 'r'
+        assert seen == [cancel]
+
+    @pytest.mark.parametrize('module', ['extraction', 'brief'])
+    def test_temporary_directory_prefix_and_mkdtemp_failure(self, tmp_path, capsys, monkeypatch,
+                                                             module):
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        script = extraction if module == 'extraction' else brief_sample
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=10)
+        made = _mkdtemps(script, monkeypatch)
+        args = (self._extract_args(tmp_path, projects) if module == 'extraction'
+                else self._brief_args(tmp_path, projects))
+        fake = FakeBackend(responder=lambda r: '[]' if module == 'extraction' else like(r, '譯'))
+        with use_fake_backend(fake):
+            assert script.main(args) == 0
+        prefix = 'phase8-extraction-' if module == 'extraction' else 'phase8-brief-'
+        assert os.path.basename(made[0]).startswith(prefix)
+        capsys.readouterr()
+
+        def broken(**kw):
+            raise OSError('full')
+
+        monkeypatch.setattr(script.tempfile, 'mkdtemp', broken)
+        assert script.main(args) == 1
+        word = 'comparison' if module == 'extraction' else 'sample'
+        assert capsys.readouterr().out == f'ERROR the {word} stopped (OSError)\n'
+
+    @pytest.mark.parametrize('module', ['extraction', 'brief'])
+    def test_cleanup_failure_alone_fails(self, tmp_path, capsys, monkeypatch, module):
+        script = extraction if module == 'extraction' else brief_sample
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=10)
+        made = _mkdtemps(script, monkeypatch)
+        monkeypatch.setattr(script, 'run', lambda *a: 0)
+        monkeypatch.setattr(script.shutil, 'rmtree',
+                            lambda path: (_ for _ in ()).throw(OSError('busy')))
+        args = (self._extract_args(tmp_path, projects) if module == 'extraction'
+                else self._brief_args(tmp_path, projects))
+        assert script.main(args) == 1
+        assert capsys.readouterr().out == 'ERROR cannot remove the temporary directory (OSError)\n'
+        monkeypatch.undo()
+        shutil.rmtree(made[0])
+
+    @pytest.mark.parametrize('module', ['extraction', 'brief'])
+    def test_the_projects_backend_and_quiet_logging(self, tmp_path, capsys, monkeypatch, module):
+        import logging
+        import src.llm as llm
+        from src.core.project import ProjectManager
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like
+        script = extraction if module == 'extraction' else brief_sample
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=10)
+        pm = ProjectManager(str(projects / 'a'))
+        pm.load()
+        pm.set_model('gpt-6.2-sol', backend='copilot-cli')
+        pm.save()
+
+        def respond(request):
+            logging.getLogger('src.anything').warning('LOGGED-LINE')
+            return '[]' if module == 'extraction' else like(request, '譯')
+
+        fake = FakeBackend(responder=respond)
+        monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: fake)
+        handlers = list(logging.getLogger().handlers)
+        args = (self._extract_args(tmp_path, projects, index='1') if module == 'extraction'
+                else self._brief_args(tmp_path, projects, index='1'))
+        assert script.main(args) == 0
+        assert fake.requests and {r.model for r in fake.requests} == {'other-model'}
+        captured = capsys.readouterr()
+        assert 'LOGGED-LINE' not in captured.out + captured.err
+        assert logging.getLogger().handlers == handlers
+
+    @pytest.mark.parametrize('module', ['extraction', 'brief'])
+    def test_schema_1_copy_migrated_and_out_exists(self, tmp_path, capsys, monkeypatch, module):
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        script = extraction if module == 'extraction' else brief_sample
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=10)
+        migrated = []
+
+        def migrate(path):
+            migrated.append(os.path.basename(path))
+            from src.core.project import ProjectManager
+            pm = ProjectManager(path)
+            pm.load()
+            pm.data.schema = 2
+            pm.save()
+
+        monkeypatch.setattr('src.core.migrate.migrate_project', migrate)
+        file = projects / 'b' / 'project.json'
+        raw = json.loads(file.read_text())
+        raw['schema'] = 1
+        file.write_text(json.dumps(raw))
+        (tmp_path / 'out').mkdir()  # an existing --out is used
+        args = (self._extract_args(tmp_path, projects) if module == 'extraction'
+                else self._brief_args(tmp_path, projects))
+        fake = FakeBackend(responder=lambda r: '[]' if module == 'extraction' else like(r, '譯'))
+        with use_fake_backend(fake):
+            assert script.main(args) == 0, capsys.readouterr().out
+        assert migrated == ['2']
+
+    def test_brief_context_uses_translations_of_segmentation_2(self, tmp_path, capsys):
+        from src.core.project import ProjectManager
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=10)
+        pm = ProjectManager(str(projects / 'b'))
+        pm.load()
+        pm.data.segmentation = 2
+        pm.mark_translated('c1_segS', '<p>先前的譯文</p>')
+        pm.save()
+        fake = FakeBackend(responder=lambda r: like(r, '譯'))
+        with use_fake_backend(fake):
+            assert brief_sample.main(self._brief_args(tmp_path, projects)) == 0
+        # sample position 1 is Line2: its context before is the short segment's translation
+        # (the code segment between them is stepped over), both times
+        second = [p for p in fake.prompts if '<p k="1">Line2 ' in p]
+        assert len(second) == 2
+        assert all('前文參考（不需翻譯）：\n先前的譯文' in p for p in second)
+
+    def test_brief_index_1_and_required(self, tmp_path, capsys):
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=10)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            assert brief_sample.main(self._brief_args(tmp_path, projects, index='1')) == 0
+        assert capsys.readouterr().out.startswith('a: sampled 10  ')
+        full = self._brief_args(tmp_path, projects)
+        for option in ('--projects-dir', '--project-index', '--brief-file', '--out'):
+            i = full.index(option)
+            with pytest.raises(SystemExit) as info:
+                brief_sample.main(full[:i] + full[i + 2:])
+            assert info.value.code == 2
+
+    def test_brief_page_exact(self):
+        from types import SimpleNamespace as S
+        page = brief_sample.page('b', [('i', '<p>s</p>', S(text='<p>t</p>'), S(text='<p>u</p>')),
+                                       ('j', '<p>v</p>', S(text='<p>w</p>'), S(text='<p>x</p>'))])
+        assert page == (
+            '<!doctype html>\n<html><head><meta charset="utf-8"><title>Brief sample</title>'
+            '<style>table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;'
+            'padding:.5em;vertical-align:top;width:33%}th{background:#eee;text-align:left}'
+            '.failed{color:#a00}</style></head><body>\n'
+            '<h1>Brief</h1><pre>b</pre>\n'
+            '<table><tr><th>原文</th><th>無簡介</th><th>有簡介</th></tr>\n'
+            '<tr><th colspan="3">i</th></tr><tr><td><p>s</p></td><td><p>t</p></td>'
+            '<td><p>u</p></td></tr>\n'
+            '<tr><th colspan="3">j</th></tr><tr><td><p>v</p></td><td><p>w</p></td>'
+            '<td><p>x</p></td></tr>\n'
+            '</table></body></html>\n')
+
+    def test_extraction_file_text_and_name_after(self, tmp_path, capsys):
+        from src.llm.fake import FakeBackend
+        from tests.conftest import use_fake_backend
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=1)
+        fake = FakeBackend(responder=lambda r: '[{"term": "Orrin", "translation": "奧林"}]')
+        with use_fake_backend(fake):
+            assert extraction.main(self._extract_args(tmp_path, projects, '--name', 'after')) == 0
+        expected = {'terms': [{'term': 'Orrin', 'translation': '奧林', 'category': ''}],
+                    'conflicts': {}}
+        text = (tmp_path / 'out' / 'terms-after.json').read_text(encoding='utf-8')
+        assert text == json.dumps(expected, ensure_ascii=False, indent=2)
+
+    def test_conflicts_case_folding(self):
+        proposals = [[{'term': 'Straße', 'translation': '街'}], [{'term': 'STRASSE', 'translation': '路'}]]
+        assert extraction.conflicts(proposals) == {}  # lowercase keys: two different terms
