@@ -88,6 +88,22 @@ def _check_entries(raw) -> None:
             raise ValueError('a glossary entry is not an object with text fields')
 
 
+def _entries(raw) -> list:
+    """The entries of a stored or imported glossary; ValueError when one is
+    not an entry (_check_entries, or a missing or unknown field)."""
+    _check_entries(raw)
+    try:
+        return [GlossaryEntry(**item) for item in raw]
+    except TypeError:
+        raise ValueError('a glossary entry has a missing or unknown field') from None
+
+
+def _one_line(value: str) -> str:
+    """`value` with every run of whitespace (also a line break) one space,
+    none at the ends: an entry stays one prompt line."""
+    return ' '.join(value.split())
+
+
 def entry_dict(entry: GlossaryEntry) -> dict:
     """The stored form of an entry: OPTIONAL_FIELDS only when not empty."""
     raw = asdict(entry)
@@ -111,16 +127,13 @@ class GlossaryManager:
     def load(self) -> None:
         """Load glossary from JSON file. Raises ValueError (also for JSON
         that does not decode) when the file is not a list of entries whose
-        text fields (TEXT_FIELDS) are strings where present."""
+        text fields (TEXT_FIELDS) are strings where present and that have
+        exactly the fields of an entry (see _entries)."""
         if not os.path.isfile(self.glossary_path):
             return
         with open(self.glossary_path, 'r', encoding='utf-8') as f:
             raw = json.load(f)
-        _check_entries(raw)
-        entries = {}
-        for item in raw:
-            entries[item['term'].lower()] = GlossaryEntry(**item)
-        self.entries = entries
+        self.entries = {e.term.lower(): e for e in _entries(raw)}
 
     def save(self) -> None:
         """Save glossary to JSON file, atomically: written to a temporary
@@ -155,15 +168,17 @@ class GlossaryManager:
 
     def add_term(self, term: str, translation: str,
                  category: str = '', frequency: int = 0,
-                 gender: str = '', note: str = '') -> GlossaryEntry:
-        """Add or update a glossary entry."""
+                 gender: str = '', note: str = '', save: bool = True) -> GlossaryEntry:
+        """Add or update a glossary entry; save=False: in memory only (the
+        caller saves once after several)."""
         key = term.lower()
         entry = GlossaryEntry(
-            term=term, translation=translation,
-            category=category, frequency=frequency, gender=gender.strip(), note=note.strip(),
+            term=term, translation=translation, category=category, frequency=frequency,
+            gender=_one_line(gender), note=_one_line(note),
         )
         self.entries[key] = entry
-        self.save()
+        if save:
+            self.save()
         return entry
 
     def remove_term(self, term: str) -> bool:
@@ -189,9 +204,9 @@ class GlossaryManager:
         if category is not None:
             entry.category = category
         if gender is not None:
-            entry.gender = gender.strip()
+            entry.gender = _one_line(gender)
         if note is not None:
-            entry.note = note.strip()
+            entry.note = _one_line(note)
         self.save()
         return entry
 
@@ -245,21 +260,14 @@ class GlossaryManager:
         file is not a glossary that load() would accept."""
         with open(json_path, 'r', encoding='utf-8') as f:
             raw = json.load(f)
-        _check_entries(raw)
         count = 0
-        for item in raw:
-            term = item.get('term', '')
-            translation = item.get('translation', '')
-            if term and translation:
-                self.add_term(
-                    term=term,
-                    translation=translation,
-                    category=item.get('category', ''),
-                    frequency=item.get('frequency', 0),
-                    gender=item.get('gender', ''),
-                    note=item.get('note', ''),
-                )
+        for e in _entries(raw):
+            if e.term and e.translation:  # an empty one is skipped, as before
+                self.add_term(e.term, e.translation, category=e.category,
+                              frequency=e.frequency, gender=e.gender, note=e.note, save=False)
                 count += 1
+        if count:
+            self.save()
         return count
 
     def export_json(self, json_path: str) -> int:

@@ -755,7 +755,9 @@ def glossary_extract(project):
         for t in terms:
             old = gm.get_term(t['term'])  # a person's gender and note stay
             gm.add_term(t['term'], t['translation'], category=t.get('category', ''),
-                        gender=old.gender if old else '', note=old.note if old else '')
+                        gender=old.gender if old else '', note=old.note if old else '',
+                        save=False)
+        gm.save()  # once, right after the glossary was read
         click.echo(f"已儲存到 {_get_glossary_path(project_dir)}")
     if stopped is not None:
         sys.exit(1)
