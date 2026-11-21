@@ -2438,7 +2438,8 @@ class TestTemplatesHandleErrors:
 
     def test_model_select_reverts_on_error(self, client):
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
-        assert 'this.model = previous;' in html
+        # Phase 7: the select shows the stored backend/model again
+        assert "document.getElementById('model-select').value = previous;" in html
         assert "this.error = data.error || '模型設定失敗'" in html
 
     def test_retry_button_reactive(self, client):
@@ -2929,9 +2930,10 @@ class TestRound2UnsavedReport:
         with patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
             release.set()
             _finish(task, patcher)
-        assert task.state == 'failed'
-        error = [e for e in task.progress.get_all() if e['event'] == 'error'][0]
-        assert error['data'] == {'error': 'disk full', 'unsaved': []}
+        # Phase 7 (debounced saves): the stale result is dropped, nothing is
+        # waiting, so no save is made and none fails; nothing is reported
+        assert task.state == 'completed'
+        assert not [e for e in task.progress.get_all() if e['event'] == 'error']
 
     def test_skipped_result_in_queue_not_reported(self, project_with_translations):
         task = TranslationTask(task_id='t', project_name=PROJECT_NAME,
@@ -2941,7 +2943,8 @@ class TestRound2UnsavedReport:
         outcome = TranslationOutcome(text='x', status=SegmentStatus.TRANSLATED, issues=[],
                                      model='m', usage=None)
         task.result_queue.put(TranslationResult('ch1_seg0003', outcome, 0))
-        TaskManager()._fail_task(task, RuntimeError('boom'), [])
+        from src.core.runcontrol import DebouncedSaver
+        TaskManager()._fail_task(task, RuntimeError('boom'), DebouncedSaver(task.pm))
         assert task.error == 'boom（1 個段落的結果未儲存：ch1_seg0003）'
 
 
@@ -2986,9 +2989,11 @@ class TestRound2StoredModelOption:
 
     def test_unlisted_stored_model_shown(self, client):
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
-        assert ("if (!this.availableModels.some(m => m.alias === this.model))" in html)
-        assert "{ alias: this.model, label: this.model, description: '目前設定，後端未列出' }" \
-            in html
+        # Phase 7: options are backend/model keys
+        assert ("if (!this.availableModels.some(m => m.key === this.modelKey()))" in html)
+        assert ("{ alias: this.model, label: this.model, description: '目前設定，後端未列出',\n"
+                "                                              backend: this.backend, "
+                "key: this.modelKey() }") in html
 
     def test_model_unchanged_by_reading(self, client, project_with_translations):
         TaskManager._instance = None
@@ -3269,7 +3274,11 @@ class TestRound3StaleResultInFailureDrain:
             return like(request, '譯')
 
         TaskManager._instance = None
-        with patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
+        import functools
+        from src.core.runcontrol import DebouncedSaver
+        # Phase 7: a window of one result, so the first result's save fails
+        with patch.object(ProjectManager, 'save', side_effect=OSError('disk full')), \
+                patch('src.web.tasks.DebouncedSaver', functools.partial(DebouncedSaver, every=1)):
             task, patcher = _start(project_with_translations, respond,
                                    segment_ids=['ch1_seg0003', 'ch2_seg0001'],
                                    num_workers=2)

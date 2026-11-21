@@ -5,9 +5,12 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import time
 from collections import Counter
 
 import click
+
+import src.llm as llm
 
 from src import __version__
 from src.epub.extractor import EPUBError, EPUBExtractor
@@ -15,9 +18,10 @@ from src.core.segmenter import Segmenter, SegmentType
 from src.core.project import (
     ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus, sha256_file,
 )
+from src.core.runcontrol import DebouncedSaver, resume_delay
 from src.core.translator import (
-    AuthError, BackendUnavailableError, RateLimitError, TranslationEngine, available_models,
-    UnexpectedStreak, record_failure_log, translate_segment,
+    AuthError, BackendUnavailableError, CancelledError, RateLimitError, TranslationEngine,
+    available_models, UnexpectedStreak, record_failure_log, translate_segment,
 )
 from src.glossary.glossary_manager import GlossaryManager, load_glossary
 from src.core.migrate import MigrationError, migrate_project
@@ -116,30 +120,35 @@ def init(epub_file):
     click.echo("使用 'python translate.py start' 開始翻譯")
 
 
-def _check_model(ctx, param, value):
-    """--model must be one of the backend's models (asked when used)."""
-    if value is None:
-        return value
-    aliases = [m['alias'] for m in available_models()]
-    if value not in aliases:
-        raise click.BadParameter(f"'{value}' is not one of {', '.join(aliases)}")
-    return value
+def _check_model(model, backend):
+    """--model must be one of the models of the backend the run will use."""
+    aliases = [m['alias'] for m in available_models(backend)]
+    if model not in aliases:
+        raise click.BadParameter(f"'{model}' is not one of {', '.join(aliases)}",
+                                 param_hint="'--model' / '-m'")
 
 
 @cli.command()
 @click.option('--project', '-p', default=None, help='Project directory path')
-@click.option('--model', '-m', default=None, callback=_check_model,
+@click.option('--backend', '-b', default=None, type=click.Choice(sorted(llm.BACKENDS)),
+              help="Backend for this and later runs (default: the project's, else claude-cli)")
+@click.option('--model', '-m', default=None,
               help="Translation model: one of the backend's models")
 @click.option('--workers', '-w', type=click.IntRange(1, 20), default=1,
               help='Number of parallel workers (1-20)')
 @click.option('--retry-failed', is_flag=True, default=False,
               help='Also translate segments whose earlier translation failed')
-def start(project, model, workers, retry_failed):
+def start(project, backend, model, workers, retry_failed):
     """Start or resume translation of pending segments."""
     project_dir = _find_project(project)
     if not project_dir:
         click.echo("找不到專案。請先執行 init 指令，或用 --project 指定專案目錄。")
         sys.exit(1)
+    if backend is not None and model is None:
+        model = llm.backend_for(backend).default_model
+    if model is not None:
+        stored = ProjectManager(project_dir)
+        _check_model(model, backend if backend is not None else stored.load().backend)
 
     # One writer per project: held for the whole run, released on any exit
     lock = ProjectLock(project_dir)
@@ -149,17 +158,17 @@ def start(project, model, workers, retry_failed):
         click.echo(str(e))
         sys.exit(1)
     try:
-        _start(project_dir, model, workers, retry_failed)
+        _start(project_dir, backend, model, workers, retry_failed)
     finally:
         lock.release()
 
 
-def _start(project_dir, model, workers, retry_failed):
+def _start(project_dir, backend, model, workers, retry_failed):
     pm = ProjectManager(project_dir)
     pm.load()
 
     if model:
-        pm.set_model(model)
+        pm.set_model(model, backend=backend)
         pm.save()
 
     pending = pm.get_pending_segments(include_failed=retry_failed)
@@ -171,7 +180,8 @@ def _start(project_dir, model, workers, retry_failed):
         return
 
     progress = pm.get_progress()
-    click.echo(f"使用模型：{pm.data.model}")
+    click.echo(f"使用模型：{pm.data.model}"
+               + (f"（{pm.data.backend}）" if pm.data.backend else ''))
     click.echo(f"繼續翻譯：{progress['translated']}/{progress['total']} 已完成 ({progress['percent']}%)")
     click.echo(f"剩餘 {len(pending)} 個段落待翻譯")
     if workers > 1:
@@ -198,42 +208,72 @@ def _start(project_dir, model, workers, retry_failed):
     click.echo("全部翻譯完成！")
 
 
-# Errors that stop a whole run, leaving the segment pending
+# Errors that stop or pause a whole run, leaving the segment pending
 RUN_ERRORS = (RateLimitError, AuthError, BackendUnavailableError)
+
+# Injectable (tests): sleeping through a rate-limit pause, and the clock
+_sleep = time.sleep
+_clock = time.monotonic
 
 
 def _stop_run(e):
-    """A rate limit, an expired login or a backend that cannot be started
-    stops the whole run."""
+    """An expired login or a backend that cannot be started stops the whole
+    run (so do too many unexpected failures in a row)."""
     click.echo(f"  ✗ {e}")
     click.echo("翻譯中斷。已完成的進度已儲存，可用 start 繼續。")
     sys.exit(1)
 
 
+def _rate_limit_message(e, delay: float) -> str:
+    return f"  ✗ {e}\n  使用量已達上限：{delay:.0f} 秒後自動繼續（Ctrl-C 停止）"
+
+
+def _saver(pm, log_dir):
+    """Debounced saves of a CLI run; each result's diagnostics are written
+    once it is on disk (the CLI holds the lock: nobody edits meanwhile)."""
+    def after_save(items):
+        for segment_id, outcome in items:
+            record_failure_log(log_dir, segment_id, outcome)
+    return DebouncedSaver(pm, after_save, clock=_clock)
+
+
 def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
     """Single-worker sequential translation. Returns the number of failed segments."""
-    engine = TranslationEngine(model=pm.data.model)
+    engine = TranslationEngine(model=pm.data.model, backend=llm.backend_for(pm.data.backend))
     failed = 0
     streak = UnexpectedStreak()
+    saver = _saver(pm, log_dir)
 
-    for i, seg in enumerate(pending, 1):
-        click.echo(f"[{progress['translated'] + i}/{progress['total']}] 翻譯段落 {seg.segment_id}...")
-        try:
-            outcome = translate_segment(engine, seg, all_segments, gm,
-                                        translations=pm.data.segmentation == 2)
-        except RUN_ERRORS as e:
-            _stop_run(e)
-        pm.apply_outcome(seg.segment_id, outcome)
-        pm.save()
-        record_failure_log(log_dir, seg.segment_id, outcome)
-        if outcome.status == SegmentStatus.FAILED:
-            failed += 1
-            click.echo(f"  ✗ 翻譯失敗：{outcome.issues[0].detail}")
-        else:
-            click.echo(f"  ✓ 完成（{seg.word_count} 字）")
-        stop = streak.add(outcome)
-        if stop:
-            _stop_run(stop)
+    try:
+        for i, seg in enumerate(pending, 1):
+            click.echo(f"[{progress['translated'] + i}/{progress['total']}] 翻譯段落 {seg.segment_id}...")
+            while True:
+                try:
+                    outcome = translate_segment(engine, seg, all_segments, gm,
+                                                translations=pm.data.segmentation == 2)
+                    break
+                except RUN_ERRORS as e:
+                    delay = resume_delay(e)
+                    if delay is None:
+                        _stop_run(e)
+                    saver.flush()  # a pause saves what is waiting
+                    click.echo(_rate_limit_message(e, delay))
+                    _sleep(delay)
+            pm.apply_outcome(seg.segment_id, outcome)
+            saver.add((seg.segment_id, outcome))
+            saver.maybe_save()
+            if outcome.status == SegmentStatus.FAILED:
+                failed += 1
+                click.echo(f"  ✗ 翻譯失敗：{outcome.issues[0].detail}")
+            else:
+                click.echo(f"  ✓ 完成（{seg.word_count} 字）")
+            stop = streak.add(outcome)
+            if stop:
+                _stop_run(stop)
+    finally:
+        # Also on Ctrl-C (the call in flight was killed, its segment stays
+        # pending) and on a stopped run
+        saver.flush()
     return failed
 
 
@@ -247,16 +287,23 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
         seg_queue.put(seg)
 
     result_queue = queue_mod.Queue()
-    error_event = threading.Event()  # rate limit or auth error: stop the run
+    error_event = threading.Event()  # an error that stops the run
+    cancel = threading.Event()       # Ctrl-C: the calls in flight are killed
+    gate = threading.Event()         # cleared while a rate limit pauses the run
+    gate.set()
+    pause = {'until': None, 'error': None, 'shown': False}
+    pause_lock = threading.Lock()
     stop_errors = []
     total = progress['total']
     base_translated = progress['translated']
 
     def worker(worker_id):
         tag = f"W{worker_id}"
-        engine = TranslationEngine(model=pm.data.model)
+        engine = TranslationEngine(model=pm.data.model, backend=llm.backend_for(pm.data.backend))
 
         while not error_event.is_set():
+            if not gate.wait(timeout=0.5):
+                continue  # paused by a rate limit
             try:
                 seg = seg_queue.get(timeout=1)
             except queue_mod.Empty:
@@ -264,12 +311,23 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
 
             try:
                 outcome = translate_segment(engine, seg, all_segments, gm,
+                                            cancel=cancel,
                                             translations=pm.data.segmentation == 2,
                                             mutex=pm.mutex)
+            except CancelledError:
+                break  # interrupted: the segment stays pending
             except RUN_ERRORS as e:
-                stop_errors.append(e)
-                error_event.set()
-                break
+                seg_queue.put(seg)  # pending again, for after the pause
+                delay = resume_delay(e)
+                if delay is None:
+                    stop_errors.append(e)
+                    error_event.set()
+                    break
+                with pause_lock:
+                    if gate.is_set():  # the first worker to hit it
+                        gate.clear()
+                        pause.update(until=_clock() + delay, error=e, shown=False)
+                continue
             result_queue.put((seg.segment_id, outcome, seg.word_count, tag))
 
     actual_workers = min(num_workers, len(pending))
@@ -278,8 +336,7 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
     # Process results in main thread
     completed = 0
     failed = 0
-    unsaved = []  # applied in memory since the last successful save
-    applied = []  # (segment id, outcome) of the same, for their diagnostics
+    saver = _saver(pm, log_dir)
     streak = UnexpectedStreak()
 
     def apply(seg_id, outcome, word_count, tag):
@@ -290,14 +347,28 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
             stop_errors.append(stop)
             error_event.set()
         pm.apply_outcome(seg_id, outcome)
-        unsaved.append(seg_id)
-        applied.append((seg_id, outcome))
+        saver.add((seg_id, outcome))
         if outcome.status == SegmentStatus.FAILED:
             failed += 1
             click.echo(f"  [{tag}] ✗ {seg_id} 翻譯失敗：{outcome.issues[0].detail}")
         else:
             completed += 1
             click.echo(f"  [{tag}] [{base_translated + completed}/{total}] ✓ {seg_id}（{word_count} 字）")
+
+    def tick():
+        """Save the window; announce a rate-limit pause, end it when due."""
+        if not gate.is_set():
+            saver.flush()  # a pause saves what is waiting
+            with pause_lock:
+                if not pause['shown']:
+                    pause['shown'] = True
+                    click.echo(_rate_limit_message(pause['error'],
+                                                   pause['until'] - _clock()))
+                if _clock() >= pause['until']:
+                    click.echo("  繼續翻譯")
+                    gate.set()
+        else:
+            saver.maybe_save()
 
     try:
         # Started inside the try: if a later start fails or is interrupted,
@@ -312,6 +383,7 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
             try:
                 apply(*result_queue.get(timeout=0.5))
             except queue_mod.Empty:
+                tick()
                 continue
 
             # Batch: drain any immediately available results
@@ -320,27 +392,31 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
                     apply(*result_queue.get_nowait())
                 except queue_mod.Empty:
                     break
-            pm.save()
-            unsaved.clear()
-            for seg_id, outcome in applied:
-                record_failure_log(log_dir, seg_id, outcome)
-            applied.clear()
+            tick()
+        saver.flush()
     except BaseException:
         # The supervisor failed (a save raised, Ctrl-C): stop dispatching,
-        # wait for the calls in flight, then report what was not saved
-        # before the caller releases the lock
+        # kill the calls in flight (their segments stay pending), save what
+        # was received, else report it, before the caller releases the lock
         error_event.set()
-        click.echo("翻譯中斷，等待進行中的段落結束……")
+        cancel.set()
+        click.echo("翻譯中斷，正在停止進行中的段落……")
         for t in threads:
             t.join()
         while True:
             try:
-                unsaved.append(result_queue.get_nowait()[0])
+                seg_id, outcome, _, _ = result_queue.get_nowait()
             except queue_mod.Empty:
                 break
-        if unsaved:
-            click.echo(f"未儲存的結果（{len(unsaved)} 個段落，下次 start 會重新翻譯）："
-                       + ', '.join(unsaved))
+            pm.apply_outcome(seg_id, outcome)
+            saver.add((seg_id, outcome))
+        try:
+            saver.flush(force=True)
+        except BaseException:  # noqa: BLE001 - reported below (the save itself may be what failed)
+            pass
+        if saver.pending:
+            click.echo(f"未儲存的結果（{len(saver.pending)} 個段落，下次 start 會重新翻譯）："
+                       + ', '.join(item[0] for item in saver.pending))
         raise
 
     for t in threads:
@@ -605,7 +681,7 @@ def glossary_extract(project):
     pm.load()
 
     from src.glossary.term_extractor import ExtractionError, TermExtractor
-    extractor = TermExtractor(model=pm.data.model)
+    extractor = TermExtractor(model=pm.data.model, backend=llm.backend_for(pm.data.backend))
 
     segments = [{'text': s.text} for s in pm.data.segments if s.segment_type == SegmentType.TEXT]
     click.echo(f"正在從 {len(segments)} 個文字段落中提取術語...")

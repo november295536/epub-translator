@@ -10,9 +10,11 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
+import src.llm as llm
 from src.core.project import ProjectLock, ProjectManager, SegmentStatus, project_mutex
+from src.core.runcontrol import DebouncedSaver, resume_delay
 from src.core.translator import (
-    AuthError, BackendUnavailableError, RateLimitError, TranslationEngine,
+    AuthError, BackendUnavailableError, CancelledError, RateLimitError, TranslationEngine,
     TranslationOutcome, UnexpectedStreak, record_failure_log, translate_segment,
 )
 from src.glossary.glossary_manager import GlossaryManager
@@ -23,6 +25,10 @@ MAX_WORKERS = 20
 
 # How long a new start waits for the threads of a stopped task to end
 STOP_WAIT_SECONDS = 5
+
+# How often the coordinator looks at the task when no result arrives (saves
+# a waiting window, resumes after a rate limit)
+COORDINATOR_TICK_SECONDS = 1
 
 # Errors that stop (pause) a whole run, leaving the segment pending, and the
 # event each one sends
@@ -130,6 +136,12 @@ class TranslationTask:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     pause_event: threading.Event = field(default_factory=threading.Event, repr=False)
     stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    # Set by stop and pause: the calls in flight are killed and their
+    # segments go back to the queue; cleared on resume
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    # Clock time (TaskManager.clock) at which a run paused by a rate limit
+    # resumes by itself; None: no automatic resume
+    resume_at: float | None = None
 
     # Queues
     segment_queue: queue.Queue = field(default_factory=queue.Queue, repr=False)
@@ -160,6 +172,8 @@ class TaskManager:
 
     _instance = None
     _lock = threading.Lock()
+    # Monotonic seconds; tests replace it
+    clock = staticmethod(time.monotonic)
 
     def __new__(cls):
         if cls._instance is None:
@@ -228,6 +242,7 @@ class TaskManager:
             if task.state in ('running', 'paused'):
                 task.state = 'stopped'
             task.stop_event.set()
+            task.cancel_event.set()  # the calls in flight end now
             task.pause_event.set()  # unblock any paused workers
 
     def start_translation(self, project_name: str, projects_dir: str,
@@ -342,7 +357,9 @@ class TaskManager:
             if task.state != 'running':
                 return False
             task.state = 'paused'
+            task.resume_at = None
             task.pause_event.clear()
+            task.cancel_event.set()  # the calls in flight end; their segments wait
         task.progress.put({'event': 'paused', 'data': {
             'completed': task.completed,
             'remaining': task.total - task.completed
@@ -397,6 +414,8 @@ class TaskManager:
 
             task.state = 'running'
             task.error = None  # the run-level error that paused it
+            task.resume_at = None
+            task.cancel_event.clear()  # before the workers go on
             task.pause_event.set()
         return True
 
@@ -404,11 +423,19 @@ class TaskManager:
         """Coordinator: set up resources, launch workers, process results."""
         project_dir = os.path.join(task.projects_dir, task.project_name)
         handler = None
-        unsaved = []  # results accepted in memory since the last save
         log_dir = os.path.join(project_dir, 'log')
+        pm = task.pm
+
+        def after_save(items):
+            # Under the mutex, right after the save: the diagnostics of each
+            # result saved, unless its segment was edited since
+            for segment_id, outcome, revision in items:
+                if pm._find(segment_id).revision == revision:
+                    record_failure_log(log_dir, segment_id, outcome)
+
+        saver = DebouncedSaver(pm, after_save, clock=self.clock)
         try:
             handler = setup_project_logging(project_dir)
-            pm = task.pm
 
             # Load glossary
             glossary_path = os.path.join(project_dir, 'glossary.json')
@@ -444,8 +471,9 @@ class TaskManager:
             while True:
                 # Get first result (blocking with timeout)
                 try:
-                    result = task.result_queue.get(timeout=1)
+                    result = task.result_queue.get(timeout=COORDINATOR_TICK_SECONDS)
                 except queue.Empty:
+                    self._tick(task, saver)
                     # Done when all workers have exited and nothing is left
                     # (a worker puts its last result before it exits)
                     with task._lock:
@@ -462,16 +490,12 @@ class TaskManager:
                     except queue.Empty:
                         break
 
-                # Process batch, save once, then the diagnostics of what was
-                # accepted: one step under the mutex, so an edit cannot
-                # come between
+                # Apply the batch in memory under the mutex, so an edit
+                # cannot come between; saved by the window (_tick)
                 with pm.mutex:
-                    accepted = [res for res in batch if self._apply_result(task, pm, res)]
-                    unsaved.extend(res.segment_id for res in accepted)
-                    pm.save()
-                    unsaved.clear()
-                    for res in accepted:
-                        record_failure_log(log_dir, res.segment_id, res.outcome)
+                    for res in batch:
+                        if self._apply_result(task, pm, res):
+                            saver.add((res.segment_id, res.outcome, res.revision))
 
                 # Too many unexpected failures in a row: a run-level error
                 stop = None
@@ -484,6 +508,7 @@ class TaskManager:
                     with task._lock:
                         task.stop_event.set()
                         task.pause_event.set()
+                self._tick(task, saver)
 
                 # Results that arrived meanwhile are taken by the next round
                 with task._lock:
@@ -491,6 +516,7 @@ class TaskManager:
                 if workers_done and task.result_queue.empty():
                     break
 
+            saver.flush()  # before the final state: readers then load the file
             if streak_stop:
                 raise RuntimeError(streak_stop)
 
@@ -510,22 +536,43 @@ class TaskManager:
                 }})
 
         except Exception as e:
-            self._fail_task(task, e, unsaved)
+            self._fail_task(task, e, saver)
         finally:
             if task.project_lock is not None:
                 task.project_lock.release()
             teardown_project_logging(handler)
 
-    def _fail_task(self, task: TranslationTask, error: Exception, unsaved: list) -> None:
-        """The coordinator failed: stop dispatching, wake paused workers,
-        wait for the calls in flight and report every result not saved,
+    def _tick(self, task: TranslationTask, saver: DebouncedSaver) -> None:
+        """Save a full or expired window, everything when the task is not
+        running (paused, stopping); resume a run paused by a rate limit once
+        its time has come."""
+        if task.state == 'running' and not task.stop_event.is_set():
+            saver.maybe_save()
+        else:
+            saver.flush()
+        with task._lock:
+            due = (task.state == 'paused' and task.resume_at is not None
+                   and self.clock() >= task.resume_at)
+        if due and self.resume_translation(task.project_name):
+            logger.info("翻譯自動繼續（使用量限制的等待結束）")
+            task.progress.put({'event': 'resumed', 'data': {
+                'completed': task.completed,
+                'remaining': task.total - task.completed,
+            }})
+
+    def _fail_task(self, task: TranslationTask, error: Exception,
+                   saver: DebouncedSaver) -> None:
+        """The coordinator failed: stop dispatching, end the calls in
+        flight, save what can be saved and report every result not saved,
         before the caller releases the lock."""
         with task._lock:
             task.state = 'failed'
             task.stop_event.set()
+            task.cancel_event.set()
             task.pause_event.set()
         for t in list(task._threads):
             t.join()
+        unsaved = []
         with task.pm.mutex:
             while True:
                 try:
@@ -537,6 +584,11 @@ class TaskManager:
                 if (res.outcome is not None
                         and task.pm._find(res.segment_id).revision == res.revision):
                     unsaved.append(res.segment_id)
+            try:
+                saver.flush()
+            except Exception:  # noqa: BLE001 - reported below as not saved
+                logger.exception("無法儲存專案")
+            unsaved = [item[0] for item in saver.pending] + unsaved
         message = str(error)
         if unsaved:
             message += f'（{len(unsaved)} 個段落的結果未儲存：{", ".join(unsaved)}）'
@@ -591,7 +643,8 @@ class TaskManager:
         tag = f"W{worker_id}"
         pm = task.pm
         gm = task._gm
-        engine = TranslationEngine(model=pm.data.model)
+        backend = pm.data.backend
+        engine = TranslationEngine(model=pm.data.model, backend=llm.backend_for(backend))
         all_segments = pm.data.segments
         translations = pm.data.segmentation == 2  # context from translations
         reduced_exit = False
@@ -623,9 +676,12 @@ class TaskManager:
                 except queue.Empty:
                     break  # No more segments
 
-                # Detect model switch
-                if pm.data.model != engine.model:
+                # Detect model switch (and a switch of backend with it)
+                if (pm.data.backend, pm.data.model) != (backend, engine.model):
                     logger.info("[%s] 模型切換: %s → %s", tag, engine.model, pm.data.model)
+                    if pm.data.backend != backend:
+                        backend = pm.data.backend
+                        engine.backend = llm.backend_for(backend)
                     engine.model = pm.data.model
 
                 revision, queued_status = task.queued.get(
@@ -645,9 +701,16 @@ class TaskManager:
                     # A failed segment, also one with an unexpected error, is
                     # an outcome: recorded as FAILED
                     outcome = translate_segment(engine, seg, all_segments, gm,
+                                                cancel=task.cancel_event,
                                                 translations=translations, mutex=pm.mutex)
                     task.result_queue.put(TranslationResult(
                         segment_id=seg.segment_id, outcome=outcome, revision=revision))
+
+                except CancelledError:
+                    # Stopped or paused while in flight: the process is
+                    # gone, nothing was stored; the segment waits again
+                    task.segment_queue.put(seg)
+                    continue
 
                 except RUN_ERRORS as e:
                     event_name = next(name for cls, name in RUN_ERROR_EVENTS
@@ -663,12 +726,17 @@ class TaskManager:
                             break
                         # Only first worker to hit this sends the event
                         if task.state == 'running':
+                            # A rate limit resumes by itself (the
+                            # coordinator's tick); the others wait for the user
+                            delay = resume_delay(e)
                             task.state = 'paused'
                             task.error = str(e)  # for a page opened later
+                            task.resume_at = None if delay is None else self.clock() + delay
                             task.progress.put({'event': event_name, 'data': {
                                 'error': str(e),
                                 'completed': task.completed,
                                 'remaining': task.total - task.completed,
+                                'resume_in': delay,
                             }})
                         task.pause_event.clear()
 

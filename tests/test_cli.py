@@ -428,8 +428,9 @@ class TestCLIFailedSegments:
         assert os.listdir(os.path.join(path, 'log', 'failed')) == []
 
     @pytest.mark.parametrize('workers', ['1', '3'])
-    @pytest.mark.parametrize('error', [RateLimitError("You've hit your limit"),
-                                       AuthError('expired')])
+    # Phase 7: a rate limit no longer stops the run, it resumes by itself
+    # (tests/test_runtime.py TestCliRateLimitResumes)
+    @pytest.mark.parametrize('error', [AuthError('expired')])
     def test_rate_limit_or_auth_stops_run(self, runner, tmp_path, workers, error):
         path = _make_project(str(tmp_path / 'p'), n=1)
         with use_fake_backend(FakeBackend([error])):
@@ -487,8 +488,9 @@ class TestCLILock:
         assert _statuses(path) == {'c1_seg0001': SegmentStatus.FAILED}
 
     def test_lock_released_after_rate_limit_exit(self, runner, tmp_path):
+        # Phase 7: a rate limit pauses and resumes; an auth error still exits
         path = _make_project(str(tmp_path / 'p'), n=1)
-        with use_fake_backend(FakeBackend([RateLimitError('limit')])):
+        with use_fake_backend(FakeBackend([AuthError('expired')])):
             result = runner.invoke(cli, ['start', '--project', path])
         assert result.exit_code == 1
         assert lock_free_for_other_process(path)
@@ -592,7 +594,8 @@ class TestCLIMessages:
     @pytest.mark.parametrize('workers', ['1', '2'])
     def test_stop_message(self, runner, tmp_path, workers):
         path = _make_project(str(tmp_path / 'p'), n=1)
-        with use_fake_backend(FakeBackend([RateLimitError('limit reached')])):
+        # Phase 7: an auth error (a rate limit now resumes by itself)
+        with use_fake_backend(FakeBackend([AuthError('limit reached')])):
             result = runner.invoke(cli, ['start', '--project', path, '--workers', workers])
         assert result.output.splitlines()[-2:] == [
             '  ✗ limit reached',
@@ -767,7 +770,7 @@ class TestCLIRound1Exact:
                 patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
             result = runner.invoke(cli, ['start', '--project', path, '--workers', '2'])
         lines = result.output.splitlines()
-        assert '翻譯中斷，等待進行中的段落結束……' in lines
+        assert '翻譯中斷，正在停止進行中的段落……' in lines  # Phase 7: the calls are killed
         assert lines[-1] in (
             '未儲存的結果（2 個段落，下次 start 會重新翻譯）：c1_seg0001, c1_seg0002',
             '未儲存的結果（2 個段落，下次 start 會重新翻譯）：c1_seg0002, c1_seg0001')
@@ -816,7 +819,7 @@ class TestRound2WorkerStartup:
         assert result.exit_code != 0
         assert workers and not any(t.is_alive() for t in workers)
         assert lock_free
-        assert '翻譯中斷，等待進行中的段落結束' in result.output
+        assert '翻譯中斷，正在停止進行中的段落' in result.output  # Phase 7 wording
 
 
 # --- Review round 3 ---------------------------------------------------------------
