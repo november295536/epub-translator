@@ -15,8 +15,10 @@ from src.llm import BackendUnavailableError, LLMRequest, Message, RateLimitError
 from src.llm import claude_cli, copilot_cli
 from src.llm.cli import SYSTEM_PROMPT, ProcessResult
 from src.llm.copilot_cli import (
-    NOT_REPLACED_MESSAGE, PLUGIN_DIR, REPLACED_SEGMENT, SYSTEM_PROMPT_ENV, CopilotCLI,
+    NOT_REPLACED_MESSAGE, PLUGIN_DIR, PLUGIN_LOCATION, REPLACED_SEGMENT, SYSTEM_PROMPT_ENV,
+    CopilotCLI,
 )
+from src.llm import AuthError, TransientError
 from tests.conftest import echo_reply
 from tests.test_runtime import _make_project
 
@@ -139,25 +141,40 @@ class TestReplacementChecked:
             {'models': {'m': {'system_segments': [{'name': REPLACED_SEGMENT}]}}}]}}],
         [{'type': 'session.usage_checkpoint', 'data': {'promptCacheBreakState': 5}}],
         [],                                                   # no checkpoint at all
+        # review round 1, A: every checkpoint must report (real runs: one call each)
+        [_checkpoint({'m': REPLACED}),
+         {'type': 'session.usage_checkpoint', 'data': {'promptCacheBreakState': []}}],
+        [{'type': 'session.usage_checkpoint', 'data': {'promptCacheBreakState': []}},
+         _checkpoint({'m': REPLACED})],
+        [_checkpoint({'m': REPLACED}), _checkpoint({})],
+        [_checkpoint({}), _checkpoint({'m': REPLACED})],
+        [{'type': 'session.usage_checkpoint', 'data': {'promptCacheBreakState': [
+            {'models': {'m': {'system_segments': REPLACED}}}, {'models': {}}]}}],
+        [{'type': 'session.usage_checkpoint', 'data': {'promptCacheBreakState': {}}}],
     ])
     def test_not_replaced_stops(self, process, checkpoints):
         process(lambda cmd: _output('答', *checkpoints))
         with pytest.raises(BackendUnavailableError) as info:
             CopilotCLI().complete(_req(), threading.Event())
         assert str(info.value) == NOT_REPLACED_MESSAGE
-        assert '"assistant.message"' in info.value.raw  # the output, for the diagnostics
+        assert '"assistant.message"' in info.value.raw  # set by CLIBackend.complete
 
     def test_message(self):
         assert NOT_REPLACED_MESSAGE == (
-            'Copilot CLI 沒有套用翻譯用的系統提示（擴充功能未載入），為免每次呼叫都送出完整的內建提示，'
-            f'已停止。請確認 copilot 版本支援 --experimental 與 --plugin-dir，且外掛資料夾存在：{PLUGIN_DIR}')
+            '無法確認 Copilot CLI 已套用翻譯用的系統提示，為免每次呼叫都送出完整的內建提示，已停止。'
+            '可能原因：外掛沒有載入（請確認 copilot 支援 --experimental 與 --plugin-dir，且 '
+            'src/llm/copilot_plugin 資料夾存在），或 Copilot 更新後改變了擴充功能的介面或 '
+            'system_segments 的回報。')
+        assert PLUGIN_LOCATION == 'src/llm/copilot_plugin'
+        assert PLUGIN_DIR.endswith(os.path.join('src', 'llm', 'copilot_plugin'))
+        assert os.path.isfile(os.path.join(PLUGIN_DIR, 'plugin.json'))
 
     def test_answer_beside_an_ignored_error_is_checked_too(self):
         error = {'type': 'session.error', 'data': {'errorType': 'x', 'message': 'minor'}}
         replaced = _output('答', _checkpoint({'m': REPLACED}), extra=[error])
         assert CopilotCLI().classify_error(replaced) is None
         built_in = _output('答', _checkpoint({'m': BUILT_IN}), extra=[error])
-        assert str(CopilotCLI().classify_error(built_in)) == NOT_REPLACED_MESSAGE
+        assert str(CopilotCLI().classify_error(built_in)) == NOT_REPLACED_MESSAGE + 'CLI 訊息：x minor'
 
     def test_a_failed_run_keeps_its_class(self):
         limit = {'type': 'session.error', 'data': {'errorType': 'query',
@@ -167,6 +184,79 @@ class TestReplacementChecked:
         # a reply with a rate limit beside it is a rate limit, replaced or not
         found = CopilotCLI().classify_error(_output('答', extra=[limit]))
         assert type(found) is RateLimitError
+
+
+# Review round 1, B: what Copilot CLI 1.0.114 printed when it rejected the
+# extension's system message (the extension without its environment variable)
+REJECTED = ProcessResult(1, json.dumps({'type': 'result', 'exitCode': 1}) + '\n',
+                         'Error executing prompt: Error: GenericFailure, data did not match any '
+                         'variant of untagged enum ProtocolSystemMessageConfig\n')
+PLUGIN_WARNING = ('Warning: [plugin-dir] no plugin.json or SKILL.md found in '
+                  '/somewhere/copilot_plugin-missing')
+
+
+class TestRound1:
+
+    def test_rejected_system_message_stops(self):
+        found = CopilotCLI().classify_error(REJECTED)
+        assert type(found) is BackendUnavailableError
+        assert str(found) == (NOT_REPLACED_MESSAGE + 'CLI 訊息：Error executing prompt: Error: '
+                              'GenericFailure, data did not match any variant of untagged enum '
+                              'ProtocolSystemMessageConfig')
+
+    def test_rejected_beside_a_reply_is_the_check(self):
+        # a reply is judged by the segments, not by the text beside it
+        error = {'type': 'session.error', 'data': {'message': 'ProtocolSystemMessageConfig'}}
+        assert CopilotCLI().classify_error(
+            _output('答', _checkpoint({'m': REPLACED}), extra=[error])) is None
+
+    @pytest.mark.parametrize('stderr, error', [
+        ('Execution failed: Rate limited.', RateLimitError),
+        ('Error: not logged in', AuthError),
+    ])
+    def test_clean_exit_without_reply_keeps_a_recognized_class(self, stderr, error):
+        result = ProcessResult(0, json.dumps({'type': 'result', 'exitCode': 0}), stderr)
+        assert type(CopilotCLI().classify_error(result)) is error
+
+    def test_clean_exit_without_reply_or_report_names_what_was_printed(self):
+        result = _output('', _checkpoint({'m': BUILT_IN}))
+        result = ProcessResult(0, result.stdout, PLUGIN_WARNING + '\n')
+        found = CopilotCLI().classify_error(result)
+        assert type(found) is BackendUnavailableError
+        assert str(found) == NOT_REPLACED_MESSAGE + 'CLI 訊息：' + PLUGIN_WARNING
+
+    def test_clean_exit_without_reply_but_replaced_is_an_empty_reply(self):
+        assert CopilotCLI().classify_error(_output('', _checkpoint({'m': REPLACED}))) is None
+
+    def test_answered_with_warning_on_stderr_quotes_it(self):
+        result = _output('答', _checkpoint({'m': BUILT_IN}))
+        found = CopilotCLI().classify_error(ProcessResult(0, result.stdout, PLUGIN_WARNING))
+        assert str(found) == NOT_REPLACED_MESSAGE + 'CLI 訊息：' + PLUGIN_WARNING
+        replaced = _output('答', _checkpoint({'m': REPLACED}))
+        assert CopilotCLI().classify_error(ProcessResult(0, replaced.stdout, PLUGIN_WARNING)) is None
+
+    def test_message_redacts_and_is_bounded(self):
+        result = ProcessResult(0, _output('答').stdout, 'user someone@example.com ' + 'y' * 2000)
+        found = str(CopilotCLI().classify_error(result))
+        assert 'someone@example.com' not in found and '<redacted>' in found
+        assert len(found) <= len(NOT_REPLACED_MESSAGE) + len('CLI 訊息：') + 500
+
+    def test_unrecognized_failure_is_still_transient(self):
+        result = ProcessResult(1, '', 'socket hang up')
+        assert type(CopilotCLI().classify_error(result)) is TransientError
+
+    @pytest.mark.parametrize('workers', ['1', '2'])
+    def test_cli_run_stops_without_retries(self, tmp_path, process, workers):
+        path = _copilot_project(tmp_path, n=3)
+        calls = process(lambda cmd: REJECTED)
+        result = CliRunner().invoke(translate.cli, ['start', '--project', path,
+                                                    '--workers', workers])
+        assert result.exit_code == 1, result.output
+        assert 'ProtocolSystemMessageConfig' in result.output
+        assert 1 <= len(calls) <= int(workers)  # not four calls per segment
+        pm = ProjectManager(path)
+        pm.load()
+        assert [s.status for s in pm.data.segments] == [SegmentStatus.PENDING] * 3
 
 
 def _copilot_project(tmp_path, n):
