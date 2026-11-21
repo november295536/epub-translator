@@ -121,6 +121,12 @@ class CountingBackend:
         return self.inner.complete(request, cancel)
 
 
+def usable(proposal) -> bool:
+    """A proposal with a term and a translation that are non-blank text."""
+    return all(isinstance(proposal.get(k), str) and proposal[k].strip()
+               for k in ('term', 'translation'))
+
+
 def conflicts(proposals: list) -> dict:
     """{term: {translation: batches}} for every term (case-insensitive, the
     first spelling) that the batches proposed with more than one translation.
@@ -276,7 +282,7 @@ def run(args, label, project_dir, work, llm, migrate_project, ProjectManager,
     if stopped is not None:
         print(f'FAIL {label}: the extraction stopped ({type(stopped).__name__})')
         return 1
-    if not any(proposals):  # every batch failed (or found nothing): no comparison
+    if not any(usable(t) for terms in proposals for t in terms):  # every batch failed or empty
         print(f'FAIL {label}: no batch proposed a term')
         return 1
     return 0

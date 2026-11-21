@@ -45,6 +45,7 @@ import argparse
 import html
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -125,12 +126,17 @@ def pick(segments: list) -> list:
     return [eligible[i * len(eligible) // SAMPLE] for i in range(SAMPLE)]
 
 
+# A line break or the end of a table cell: a space follows in the text
+_SPACED = re.compile(r'(<br\b[^>]*>|</t[dh]\s*>)', re.IGNORECASE)
+
+
 def readable(markup: str) -> str:
     """The text of book markup, escaped: one line per top-level block
     (validation.top_level_units), its text as a reader sees it
     (validation.plain_text: parsed, tags, script and style removed, entities
-    decoded). The page shows text only, so nothing of the book is run or
+    decoded; a space at a line break and between table cells). The page shows text only, so nothing of the book is run or
     loaded by the browser. Markup that does not parse is shown as it is."""
+    markup = _SPACED.sub(r'\1 ', markup)  # one two, not onetwo
     units = [unit[:2] for unit in validation.top_level_units(markup)] or [(0, len(markup))]
     lines = (' '.join(validation.plain_text(markup[start:end]).split()) for start, end in units)
     return html.escape('\n'.join(line for line in lines if line))

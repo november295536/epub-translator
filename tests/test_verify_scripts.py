@@ -5060,7 +5060,7 @@ class TestPhase8Round1Scripts:
                   '<img src="https://example.invalid/i.png" onerror="alert(1)"/></p>'
                   '<script>alert("x")</script><p>  </p>')
         # one line per top-level block; script removed; attributes never shown
-        assert brief_sample.readable(markup) == 'Title &amp; more\nOne twothree'
+        assert brief_sample.readable(markup) == 'Title &amp; more\nOne two three'  # round 3: a space at <br/>
         assert brief_sample.readable('<p>a</p><li>b</li><blockquote>c</blockquote>d') == 'a\nb\nc\nd'
         assert brief_sample.readable('<p title="a > b">word</p>') == 'word'
         assert brief_sample.readable('<p>one\n  two</p>') == 'one two'
@@ -5206,3 +5206,31 @@ class TestPhase8Round2Scripts:
         from tests.conftest import like
         with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
             assert brief_sample.main(args) == 0
+
+
+class TestPhase8Round3Scripts:
+
+    def test_readable_spaces_at_breaks_and_cells(self):
+        assert brief_sample.readable('<p>one<br/>two</p>') == 'one two'
+        assert brief_sample.readable('<p>a<BR />b</p>') == 'a b'
+        assert brief_sample.readable(
+            '<table><tr><th>h</th><td>a</td><td>b</td></tr><tr><TD>c</TD></tr></table><p>n</p>') \
+            == 'h a b c\nn'
+
+    def test_no_usable_proposal_fails(self, tmp_path, capsys):
+        from src.llm.fake import FakeBackend
+        from tests.conftest import use_fake_backend
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=1)
+        reply = '[{"term": "marker", "translation": null}, {"term": " ", "translation": "空"}]'
+        with use_fake_backend(FakeBackend(responder=lambda r: reply)):
+            code = extraction.main(['--projects-dir', str(projects), '--project-index', '2',
+                                    '--out', str(tmp_path / 'out'), '--anonymize'])
+        assert code == 1
+        assert capsys.readouterr().out.splitlines()[-1] == 'FAIL project-2: no batch proposed a term'
+
+    def test_usable(self):
+        assert extraction.usable({'term': 'A', 'translation': '甲'})
+        for bad in ({'term': 'A', 'translation': ' '}, {'term': '', 'translation': '甲'},
+                    {'term': 'A', 'translation': None}, {'translation': '甲'}, {'term': 5, 'translation': '甲'}):
+            assert not extraction.usable(bad)
