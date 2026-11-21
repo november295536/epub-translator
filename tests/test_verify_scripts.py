@@ -3941,3 +3941,209 @@ def _record_mkdtemp(monkeypatch):
     monkeypatch.setattr(throughput.tempfile, 'mkdtemp',
                         lambda **kw: made.append(real(**kw)) or made[-1])
     return made
+
+
+class TestThroughputScriptRound4:
+    """Review round 4: the mutants that earlier runs counted as killed only
+    because the measurement test failed when another mutmut worker had a
+    phase7-throughput-* directory in the shared temporary directory."""
+
+    def _args(self, projects, *extra):
+        return ['--projects-dir', str(projects), '--project-index', '2', '--segments', '2',
+                '--model', 'fake-model', '--anonymize', *extra]
+
+    def test_help(self, capsys, monkeypatch):
+        monkeypatch.setenv('COLUMNS', '300')
+        with pytest.raises(SystemExit):
+            throughput.main(['--help'])
+        out = capsys.readouterr().out
+        assert out.split('\n\n')[1] == throughput.__doc__.split('\n')[0]
+        for text in ('Directory of the project folders',
+                     '1-based position among the directories holding a project.json',
+                     'Segments to translate (default 50)', 'Model (default: haiku)',
+                     'Parallel workers (default 1)',
+                     "Backend name (default: the project's); not with a --code of main",
+                     'Checkout whose code runs (default: this one); a checkout of main '
+                     'measures the behaviour before Phase 7',
+                     'Print project-N, no names or paths'):
+            assert text in out
+
+    @pytest.mark.parametrize('argv', [['--project-index', '1'], ['--projects-dir', 'p']])
+    def test_required(self, argv, capsys):
+        with pytest.raises(SystemExit) as info:
+            throughput.main(argv)
+        assert info.value.code == 2
+
+    def test_defaults_and_types(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(throughput, 'measure', lambda args: seen.append(vars(args)) or 0)
+        throughput.main(['--projects-dir', 'p', '--project-index', '1'])
+        throughput.main(['--projects-dir', 'p', '--project-index', '3', '--segments', '7',
+                         '--workers', '2'])
+        assert seen[0] == {'projects_dir': 'p', 'project_index': 1, 'segments': 50,
+                           'model': 'haiku', 'workers': 1, 'backend': None,
+                           'code': throughput.HERE, 'anonymize': False}
+        assert (seen[1]['project_index'], seen[1]['segments'], seen[1]['workers']) == (3, 7, 2)
+
+    def test_report_lines(self):
+        from collections import Counter
+        calls = {'a': [(1, 'd1', 1.0), (3, 'd1', 2.0)], 'b': [(1, 'd2', 0.5), (1, 'd3', 0.5)]}
+        lines = throughput.report_lines('project-2', 30.0, ['a', 'b'],
+                                        {'a': 'translated', 'b': 'failed'}, calls,
+                                        Counter({'tag_count': 1, 'error': 2}))
+        assert lines == [
+            'project-2: segments 2  wall 30.0 s  seconds per segment 15.00  segments per minute 2.00',
+            'calls 4  per call median 0.75 s  total 4.0 s',
+            'status failed 1, translated 1',
+            'failures by code error 2, tag_count 1',
+            'needed a retry 2  needed a split 1',
+        ]
+        assert throughput.report_lines('p', 0.0, ['a'], {'a': 'failed'}, {}, Counter()) == [
+            'p: segments 1  wall 0.0 s  seconds per segment 0.00  segments per minute 0.00',
+            'calls 0  per call median 0.00 s  total 0.0 s',
+            'status failed 1',
+            'failures by code none',
+            'needed a retry 0  needed a split 0',
+        ]
+        assert throughput.report_lines('p', 0.5, ['a'], {'a': 'translated'}, {}, Counter())[0] \
+            == 'p: segments 1  wall 0.5 s  seconds per segment 0.50  segments per minute 120.00'
+
+    def test_prepare(self):
+        from types import SimpleNamespace
+        from src.core.project import SegmentStatus
+
+        def seg(sid, status, kind='text', **kw):
+            return SimpleNamespace(segment_id=sid, status=status, segment_type=kind,
+                                   translated_text='t', translated_at='x', issues=['i'],
+                                   model='m', usage='u', **kw)
+
+        segments = [seg('pt', SegmentStatus.TRANSLATED, passthrough=True),
+                    seg('code', SegmentStatus.PENDING, kind='code'),
+                    seg('old', SegmentStatus.TRANSLATED),  # no passthrough attribute
+                    seg('new', SegmentStatus.PENDING, passthrough=False),
+                    seg('rest', SegmentStatus.PENDING, passthrough=False)]
+        pm = SimpleNamespace(data=SimpleNamespace(segments=segments))
+        assert throughput.prepare(pm, 2, SegmentStatus) == ['old', 'new']
+        for s in segments[2:4]:
+            assert (s.status, s.translated_text, s.translated_at, s.issues, s.model, s.usage) \
+                == (SegmentStatus.PENDING, '', '', [], '', None)
+        assert segments[0].status == SegmentStatus.TRANSLATED
+        assert segments[1].status == SegmentStatus.FAILED  # pending, not chosen
+        assert segments[4].status == SegmentStatus.FAILED
+
+    def test_snapshot_and_work_tree(self, tmp_path):
+        (tmp_path / 'd').mkdir()
+        (tmp_path / 'd' / 'f.txt').write_text('abc')
+        st = os.stat(tmp_path / 'd' / 'f.txt')
+        assert throughput.snapshot(str(tmp_path)) == [
+            (os.path.join('d', 'f.txt'), 3, st.st_mtime_ns)]
+        (tmp_path / 'repo' / '.git').mkdir(parents=True)
+        (tmp_path / 'repo' / 'a' / 'b').mkdir(parents=True)
+        assert throughput.in_work_tree(str(tmp_path / 'repo' / 'a' / 'b'))
+        assert not throughput.in_work_tree(str(tmp_path / 'd'))
+
+    def test_recorder_and_counting_backend(self):
+        from src.llm import LLMRequest, Message
+        from src.llm.fake import FakeBackend
+        import threading
+        recorder = throughput.Recorder()
+        fake = FakeBackend(['x', 'y'])
+        seen = []
+        real_complete = fake.complete
+        fake.complete = lambda request, cancel: seen.append(cancel) or real_complete(request, cancel)
+        counting = throughput.CountingBackend(fake, recorder)
+        assert (counting.name, counting.capabilities, counting.default_model,
+                counting.auth_hint) == (fake.name, fake.capabilities, fake.default_model,
+                                        fake.auth_hint)
+        cancel = threading.Event()
+        for text in ('one', 'two'):
+            counting.complete(LLMRequest(system='', messages=[Message('user', text)],
+                                         model='m', timeout=1), cancel)
+        assert seen == [cancel, cancel]
+        (n1, d1, s1), (n2, d2, s2) = recorder.calls[None]
+        assert n1 == n2 == 1 and d1 != d2 and 0 <= s1 < 60 and 0 <= s2 < 60
+
+    def test_errors_without_a_path(self, tmp_path, capsys, monkeypatch):
+        not_a_dir = tmp_path / 'file'
+        not_a_dir.write_text('')
+        assert throughput.main(['--projects-dir', str(not_a_dir), '--project-index', '1']) == 2
+        assert capsys.readouterr().out == \
+            'ERROR cannot list the projects directory (NotADirectoryError)\n'
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+        monkeypatch.setattr(throughput.tempfile, 'gettempdir', lambda: str(projects / 'a'))
+        assert throughput.main(self._args(projects)) == 2
+        assert capsys.readouterr().out == \
+            'ERROR the temporary directory would be inside the projects directory\n'
+
+    def test_measurement_details(self, tmp_path, capsys, monkeypatch):
+        """The temporary directory's place and name, the timing (a fake
+        clock), the logging handler removed, the counted calls through the
+        copy's backend, warnings not counted as failures, the keyword arguments
+        passed through to translate_segment."""
+        import logging
+        import src.llm as llm
+        from src.core.project import ProjectManager
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+        pm = ProjectManager(os.path.join(str(projects), 'b'))
+        pm.load()
+        pm.set_model('fake-model', backend='copilot-cli')
+        pm.save()
+        kwargs = []
+        real_mkdtemp = throughput.tempfile.mkdtemp
+        monkeypatch.setattr(throughput.tempfile, 'mkdtemp',
+                            lambda **kw: kwargs.append(kw) or real_mkdtemp(**kw))
+
+        class Clock:
+            now = 100.0
+
+            def monotonic(self):
+                self.now += 1
+                return self.now
+
+        monkeypatch.setattr(throughput, 'time', Clock())
+        prompts = []
+
+        def respond(request):
+            prompts.append(request.messages[0].content)
+            if '>Line 2.<' in request.messages[0].content:
+                return like(request, 'Line 2.')  # untranslated: a warning, not a failure
+            return like(request, '譯')
+
+        fake = FakeBackend(responder=respond)
+        monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: fake)
+        handlers = list(logging.getLogger().handlers)
+        import translate
+        seen_kwargs = []
+        real_translate_segment = translate.translate_segment
+        monkeypatch.setattr(translate, 'translate_segment', lambda engine, seg, *a, **kw: (
+            seen_kwargs.append(kw), real_translate_segment(engine, seg, *a, **kw))[1])
+        assert throughput.main(self._args(projects)) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert kwargs == [{'prefix': 'phase7-throughput-',
+                           'dir': os.path.realpath(throughput.tempfile.gettempdir())}]
+        assert out[0].startswith('project-2: segments 2  wall 5.0 s  ')  # 2 calls, 2 ticks each
+        assert out[1] == 'calls 2  per call median 1.00 s  total 2.0 s'
+        assert out[2:4] == ['status translated 2', 'failures by code none']
+        assert logging.getLogger().handlers == handlers
+        assert seen_kwargs and all('translations' in kw for kw in seen_kwargs)  # passed through
+
+    def test_backend_option_and_unfinished_segments(self, tmp_path, capsys, monkeypatch):
+        """--backend reaches the run; segments left pending: exit 1."""
+        import src.llm as llm
+        from src.llm import AuthError
+        from src.llm.fake import FakeBackend
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+
+        def respond(request):
+            raise AuthError('expired')  # the run stops, the segments stay pending
+
+        fake = FakeBackend(responder=respond)
+        monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: fake)
+        assert throughput.main(self._args(projects, '--backend', 'copilot-cli')) == 1
+        assert len(fake.requests) == 1
+        assert capsys.readouterr().out.splitlines()[2] == 'status pending 2'
