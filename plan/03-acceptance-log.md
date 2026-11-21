@@ -4957,3 +4957,56 @@ equivalent mutants of round 1, with the reasons given there.
 ### Not verified
 
 - No real model call in this round.
+
+## Phase 7 — part A, review round 3
+
+Date: 2026-11-21. Same branch and worktree. Minor fixes; each has a test that fails without
+it (checked by reverting each fix alone).
+
+### Changes
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| 1 | round 2's `seg.status == outcome.status` skipped the diagnostics of a failed call on a TRANSLATED or REVIEWED segment (`apply_outcome` keeps that status) | the coordinator records the segment's status right after `apply_outcome` with the saver item; `after_save` compares with that | `test_failed_retranslation_of_a_translated_segment_keeps_diagnostics`; round 2's `test_no_failure_log_for_a_segment_translated_again` still passes |
+| 2 | a failed run reported `auto_resume: true` | `_fail_task` clears `resume_at` | `test_failed_task_does_not_wait` |
+| 3 | the automatic `resumed` event was published after the workers woke, so a user pause in between was followed by a stale `resumed` | `resume_translation(due=…)` publishes it under the lock, before `pause_event.set()` | `test_resumed_event_before_the_workers_wake` |
+| 4 | a pause followed by a resume before the next tick skipped the pause's flush | a pause (user or run-level) sets `flush_due`; the next tick flushes even when the task is running again | `test_pause_flush_survives_a_quick_resume` |
+| 5 | an older CLI that rejects a flag was a transient error (four calls and backoff per segment) | `UNKNOWN_OPTION_PATTERN` (`unknown option`, `unrecognised/unrecognized option/argument`) on a failed run is `BackendUnavailableError` for both CLIs: the web run pauses, the CLI stops | `test_unknown_option_is_unavailable` |
+| 6 | a save failing partway through a batch left the rest of the batch out of the unsaved report | the rest goes back to the result queue, which `_fail_task` reports | `test_save_failing_in_a_batch_reports_the_rest` |
+| 7 | CLI: a second Ctrl-C during the join skipped the forced flush; a failing final flush in the sequential path reported nothing | parallel: the drain and the forced flush run in a `finally` around the join; sequential: a failing final flush prints the unsaved segments (shared `_report_unsaved`) | `test_cli_second_interrupt_during_the_join_still_saves`, `test_cli_sequential_failed_final_save_is_reported` |
+
+### Known limitations (recorded, not fixed)
+
+- Item 1's check cannot tell one case apart. The run translates a segment, the review page
+  then translates it again and that call fails, all inside one save window. `apply_outcome`
+  keeps TRANSLATED for the failure, so the status and revision are the same as when the run's
+  success was applied, and the deferred `after_save` of that success removes the
+  diagnostics the review page just wrote. The translation itself is right; only the
+  failure note is lost. A fix would need a per-segment change counter beyond `revision`.
+
+### Checks
+
+Before and after: `stat -f '%m %z' <repo>/projects/*/project.json | md5` =
+`a7197555c962562a530d6de80fa045af`, unchanged. The four older read-only checks: TOTAL lines
+identical to round 1 (md5 of the four lines the same).
+
+### Tests
+
+2330 passed (round 2: 2322). No existing test changed.
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, one full run:
+
+| Mutants | Killed | Survived | Timeout |
+|---|---|---|---|
+| 1790 | 1767 | 14 | 9 |
+
+Timeouts are the same inverted gates and waits as before (detected). Survivors, all
+equivalent:
+
+| Mutant | Why it is equivalent |
+|---|---|
+| `_tick` 8 (`flush_due = None` for `False`) | the flag is only read as `not task.flush_due`; `None` is false like `False` |
+| `_tick` 21 (`due = ""` for `None`) | round 1's `_tick` 17 under its new number: `resume_translation(due="")` refuses it |
+| `classify_error` 1, overhead `main` 65, `median` 6, `prompt_text` 2–9, 20 | as in rounds 1 and 2 |
