@@ -1082,6 +1082,15 @@ class TestRound2:
         assert '<div x-data="translationController()">' in page
         assert 'x-init="init()"' not in page
 
+    @pytest.mark.parametrize('tab, component', [('glossary', 'glossaryManager'),
+                                                ('export', 'exportController')])
+    def test_other_pages_initialized_once(self, web, tab, component):
+        client, _ = web
+        page = client.get(f'/project/book/{tab}').get_data(as_text=True)
+        # The same double init() as on the translation page (cleanup after Phase 9)
+        assert f'<div x-data="{component}()">' in page
+        assert 'x-init="init()"' not in page
+
 
 class TestRound2Survivors:
 
