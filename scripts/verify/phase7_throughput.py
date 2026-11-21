@@ -30,8 +30,9 @@ segments per minute (translated segments per minute of wall time), the
 median and total seconds per call, the number of calls, the segments by
 final status, the failures by issue code, and the retry and split counts.
 The run's own output (segment ids) and log messages are not shown, and no
-book text is printed. The copy is removed at the end. The projects
-directory is only read: the run FAILs if any file in it changed.
+book text is printed. The copy is removed at the end (a failure to remove
+it is reported, without its path). The projects directory is only read:
+the run FAILs if any file under it changed (name, size, modification time).
 
 With --anonymize the project is shown as project-N; otherwise by its
 directory name.
@@ -202,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return measure(args)
-    except Exception as e:  # noqa: BLE001 - no path or text may reach the output
+    except BaseException as e:  # noqa: BLE001 - also Ctrl-C: no path, text or traceback
         print(f'ERROR the measurement stopped ({type(e).__name__})')
         return 1
 
@@ -238,80 +239,97 @@ def measure(args) -> int:
         print('ERROR --backend needs the code of Phase 7 or later')
         return 2
 
-    work = tempfile.mkdtemp(prefix='phase7-throughput-', dir=parent)
-    before = snapshot(project_dir)
+    before = snapshot(args.projects_dir)
+    work = None
     try:
-        copy = os.path.join(work, str(args.project_index))  # no project name in a path
-        os.makedirs(copy)
-        for file in COPIED:
-            if os.path.isfile(os.path.join(project_dir, file)):
-                shutil.copy2(os.path.join(project_dir, file), copy)
+        work = tempfile.mkdtemp(prefix='phase7-throughput-', dir=parent)
+        code = run(args, label, project_dir, work, llm, translate, migrate_project,
+                   ProjectManager, SegmentStatus)
+    finally:
+        changed = snapshot(args.projects_dir) != before
+        if work is not None:
+            try:
+                shutil.rmtree(work)
+            except OSError as e:
+                print(f'ERROR cannot remove the temporary directory ({type(e).__name__})')
+                code = 1
+    if changed:
+        print(f'FAIL {label}: files in the projects directory changed')
+        return 1
+    return code
+
+
+def run(args, label, project_dir, work, llm, translate, migrate_project,
+        ProjectManager, SegmentStatus) -> int:
+    """The measurement on a copy in `work`."""
+    copy = os.path.join(work, str(args.project_index))  # no project name in a path
+    os.makedirs(copy)
+    for file in COPIED:
+        if os.path.isfile(os.path.join(project_dir, file)):
+            shutil.copy2(os.path.join(project_dir, file), copy)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         pm = ProjectManager(copy)
         if pm.load().schema != 2:
             migrate_project(copy)
             pm.load()
         chosen = prepare(pm, args.segments, SegmentStatus)
-        if len(chosen) < args.segments:
-            print(f'ERROR {label} has only {len(chosen)} such segments')
-            return 2
-        pm.save()
+        if len(chosen) >= args.segments:
+            pm.save()
+    if len(chosen) < args.segments:
+        print(f'ERROR {label} has only {len(chosen)} such segments')
+        return 2
 
-        recorder = Recorder()
-        inner = (llm.backend_for(args.backend) if args.backend is not None
-                 else llm.default_backend())
-        counting = CountingBackend(inner, recorder)
-        real_translate_segment = translate.translate_segment
+    recorder = Recorder()
+    if hasattr(llm, 'backend_for'):  # the copy's backend, unless --backend names one
+        inner = llm.backend_for(args.backend if args.backend is not None
+                                else getattr(pm.data, 'backend', None))
+    else:
+        inner = llm.default_backend()
+    counting = CountingBackend(inner, recorder)
+    real_translate_segment = translate.translate_segment
 
-        def translate_segment(engine, seg, *a, **kw):
-            recorder.local.segment = seg.segment_id
-            try:
-                return real_translate_segment(engine, seg, *a, **kw)
-            finally:
-                recorder.local.segment = None
-
-        cmd = ['start', '--project', copy, '--model', args.model, '--workers', str(args.workers)]
-        if args.backend is not None:
-            cmd += ['--backend', args.backend]
-        replaced = [(translate, 'translate_segment', translate_segment),
-                    # a project without a backend name uses default_backend
-                    (llm, 'default_backend', lambda: counting)]
-        if hasattr(llm, 'backend_for'):
-            replaced.append((llm, 'backend_for', lambda name: counting))
-        originals = [(module, attr, getattr(module, attr)) for module, attr, _ in replaced]
-        quiet = logging.NullHandler()  # no log line (segment ids) on stderr
-        logging.getLogger().addHandler(quiet)
+    def translate_segment(engine, seg, *a, **kw):
+        recorder.local.segment = seg.segment_id
         try:
-            for module, attr, value in replaced:
-                setattr(module, attr, value)
-            start = time.monotonic()
-            with contextlib.redirect_stdout(io.StringIO()), \
-                    contextlib.redirect_stderr(io.StringIO()):
-                try:
-                    translate.cli.main(cmd, standalone_mode=False)
-                except SystemExit:
-                    pass  # exit 1: some segments failed; counted below
-            wall = time.monotonic() - start
+            return real_translate_segment(engine, seg, *a, **kw)
         finally:
-            for module, attr, value in originals:
-                setattr(module, attr, value)
-            logging.getLogger().removeHandler(quiet)
+            recorder.local.segment = None
 
-        with open(os.path.join(copy, PROJECT_FILE), encoding='utf-8') as f:
-            stored = {s['segment_id']: s for s in json.load(f)['segments']}
-        final = {s: stored[s].get('status', 'pending') for s in chosen}
-        failures = Counter(stored[s]['issues'][0]['code'] for s in chosen
-                           if final[s] == 'failed' and stored[s].get('issues'))
-        for line in report_lines(label, wall, chosen, final, recorder.calls, failures):
-            print(line)
-        done = all(final[s] in ('translated', 'failed') for s in chosen)
-        code = 0 if done else 1
+    cmd = ['start', '--project', copy, '--model', args.model, '--workers', str(args.workers)]
+    if args.backend is not None:
+        cmd += ['--backend', args.backend]
+    replaced = [(translate, 'translate_segment', translate_segment),
+                # a project without a backend name uses default_backend
+                (llm, 'default_backend', lambda: counting)]
+    if hasattr(llm, 'backend_for'):
+        replaced.append((llm, 'backend_for', lambda name: counting))
+    originals = [(module, attr, getattr(module, attr)) for module, attr, _ in replaced]
+    quiet = logging.NullHandler()  # no log line (segment ids) on stderr
+    logging.getLogger().addHandler(quiet)
+    try:
+        for module, attr, value in replaced:
+            setattr(module, attr, value)
+        start = time.monotonic()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                translate.cli.main(cmd, standalone_mode=False)
+            except SystemExit:
+                pass  # exit 1: some segments failed; counted below
+        wall = time.monotonic() - start
     finally:
-        changed = snapshot(project_dir) != before
-        shutil.rmtree(work, ignore_errors=True)
-    if changed:
-        print(f'FAIL {label}: files in the project directory changed')
-        return 1
-    return code
+        for module, attr, value in originals:
+            setattr(module, attr, value)
+        logging.getLogger().removeHandler(quiet)
+
+    with open(os.path.join(copy, PROJECT_FILE), encoding='utf-8') as f:
+        stored = {s['segment_id']: s for s in json.load(f)['segments']}
+    final = {s: stored[s].get('status', 'pending') for s in chosen}
+    failures = Counter(stored[s]['issues'][0]['code'] for s in chosen
+                       if final[s] == 'failed' and stored[s].get('issues'))
+    for line in report_lines(label, wall, chosen, final, recorder.calls, failures):
+        print(line)
+    return 0 if all(final[s] in ('translated', 'failed') for s in chosen) else 1
 
 
 if __name__ == '__main__':

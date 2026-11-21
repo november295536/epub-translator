@@ -966,7 +966,7 @@ class TestDynamicWorkers:
             with patch.object(tm, 'resume_translation', return_value=True) as mock_resume:
                 response = client.post(
                     f'/api/projects/{PROJECT_NAME}/translate/pause',
-                    data=json.dumps({'workers': 4}),
+                    data=json.dumps({'action': 'resume', 'workers': 4}),  # Phase 7 round 1
                     content_type='application/json',
                 )
                 assert response.status_code == 200

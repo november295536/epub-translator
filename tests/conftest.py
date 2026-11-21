@@ -379,9 +379,9 @@ def backoff_waits(monkeypatch):
     here, in seconds."""
     waited = []
 
-    def no_wait(seconds, cancel):
+    def no_wait(seconds, cancel, interrupted=None):
         waited.append(seconds)
-        return cancel.is_set()
+        return cancel.is_set() or (interrupted is not None and interrupted())
 
     monkeypatch.setattr('src.core.translator.wait_or_cancel', no_wait)
     return waited

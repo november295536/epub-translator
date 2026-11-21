@@ -54,7 +54,15 @@ _RATE_LIMIT_PATTERN = re.compile(r'rate.?limit', re.IGNORECASE)
 _AUTH_PATTERN = re.compile(r'not (?:logged in|authenticated)|copilot login|unauthori[sz]ed',
                            re.IGNORECASE)
 _UNAVAILABLE_PATTERN = re.compile(r'Model "[^"]*" is not available', re.IGNORECASE)
-_REFUSAL_PATTERN = re.compile(r'content.?filter|filtered', re.IGNORECASE)
+_REFUSAL_PATTERN = re.compile(r'content.?filter', re.IGNORECASE)
+
+# What looks like an e-mail address (an account name) in kept error text
+_EMAIL_PATTERN = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+')
+
+
+def redact(text: str) -> str:
+    """`text` with every e-mail-like string replaced by <redacted>."""
+    return _EMAIL_PATTERN.sub('<redacted>', text)
 
 
 def _events(stdout) -> list:
@@ -68,6 +76,14 @@ def _events(stdout) -> list:
         if isinstance(event, dict):
             events.append(event)
     return events
+
+
+def _is_json(line: str) -> bool:
+    try:
+        json.loads(line)
+    except ValueError:
+        return False
+    return True
 
 
 def _data(event: dict) -> dict:
@@ -87,6 +103,12 @@ def _usage(events: list) -> Optional[Usage]:
                      sum(int(u['outputTokens']) for u in usages)) if usages else None
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
+
+
+def _reply(events: list) -> str:
+    """The content of the last `assistant.message` event ('' when none)."""
+    messages = [e for e in events if e.get('type') == 'assistant.message']
+    return _text(_data(messages[-1]).get('content')) if messages else ''
 
 
 class CopilotCLI(CLIBackend):
@@ -111,24 +133,39 @@ class CopilotCLI(CLIBackend):
 
     def parse_output(self, result: ProcessResult, request: LLMRequest) -> LLMResponse:
         events = _events(result.stdout)
-        messages = [e for e in events if e.get('type') == 'assistant.message']
-        text = _text(_data(messages[-1]).get('content')) if messages else ''
-        return LLMResponse(text=text, stop_reason='complete', usage=_usage(events),
+        return LLMResponse(text=_reply(events), stop_reason='complete', usage=_usage(events),
                            model=request.model)
 
+    def redact(self, text: str) -> str:
+        return redact(text)
+
     def classify_error(self, result: ProcessResult, prompt: str = '') -> Optional[LLMError]:
-        errors = [_data(e) for e in _events(result.stdout) if e.get('type') == 'session.error']
+        events = _events(result.stdout)
+        errors = [_data(e) for e in events if e.get('type') == 'session.error']
         stderr = _text(result.stderr).strip()
-        texts = [f"{_text(d.get('errorType'))} {_text(d.get('message'))}".strip()
-                 for d in errors] + ([stderr] if stderr else [])
+        texts = [redact(f"{_text(d.get('errorType'))} {_text(d.get('message'))}".strip())
+                 for d in errors] + ([redact(stderr)] if stderr else [])
+        if not errors and result.returncode != 0:
+            # No error event: a plain-text message on stdout is the error
+            plain = ' '.join(line.strip() for line in _text(result.stdout).splitlines()
+                             if line.strip() and not _is_json(line))
+            if plain:
+                texts.insert(0, redact(plain))
         joined = ' | '.join(texts)[:ERROR_CHARS]
         if result.returncode == 0 and not errors:
             return None
+        # A successful run with a reply fails only for a rate limit or
+        # expired credentials; any other error event beside the reply is ignored
+        answered = result.returncode == 0 and bool(_reply(events))
         for pattern, cls in ((_RATE_LIMIT_PATTERN, RateLimitError), (_AUTH_PATTERN, AuthError),
                              (_UNAVAILABLE_PATTERN, BackendUnavailableError),
                              (_REFUSAL_PATTERN, RefusalError)):
+            if answered and cls not in (RateLimitError, AuthError):
+                continue
             if any(pattern.search(t) for t in texts):
                 if cls is AuthError:
                     return AuthError(f'Copilot CLI 認證失敗，{AUTH_HINT}：{joined}')
                 return cls(f'copilot CLI: {joined}')
+        if answered:
+            return None
         return TransientError(f'copilot CLI exited with code {result.returncode}: {joined}')

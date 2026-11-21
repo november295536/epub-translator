@@ -59,16 +59,21 @@ def start_translation(project_name: str):
 
 @translation_bp.route('/api/projects/<project_name>/translate/pause', methods=['POST'])
 def pause_translation(project_name: str):
-    """Pause a running translation."""
+    """Pause or resume a translation: body {"action": "pause" | "resume",
+    "workers": N (resume only, optional)}. Both are idempotent; a pause of a
+    task waiting after a rate limit makes it a lasting user pause."""
     tm = _get_task_manager()
     task = tm.get_task(project_name)
 
     if not task:
         return jsonify({'error': '沒有執行中的翻譯任務'}), 404
 
-    if task.state == 'paused':
+    data = request.get_json(silent=True) or {}
+    action = data.get('action')
+    if action not in ('pause', 'resume'):
+        return jsonify({'error': 'action 必須是 pause 或 resume'}), 400
+    if action == 'resume':
         # Resume — optionally adjust workers
-        data = request.get_json(silent=True) or {}
         num_workers = None
         if 'workers' in data:
             try:
@@ -114,6 +119,7 @@ def translation_status(project_name: str):
         'percent': round(task.completed / task.total * 100, 1) if task.total > 0 else 0,
         'workers': task.num_workers,
         'active_workers': task.active_workers,
+        'auto_resume': task.resume_at is not None,  # paused, resumes by itself
     })
 
 
@@ -200,12 +206,14 @@ def set_model(project_name: str):
 
     model = data['model']
     backend = data.get('backend')  # None: the project's backend stays
-    if backend is not None and backend not in llm.BACKENDS:
+    if backend is not None and (not isinstance(backend, str) or backend not in llm.BACKENDS):
         return jsonify({'error': f'無效的後端：{backend}'}), 400
 
     tm = _get_task_manager()
     try:
         with tm.transaction(project_name, projects_dir) as pm:
+            if backend == (pm.data.backend or llm.default_backend().name):
+                backend = None  # the project's backend already: nothing new to store
             chosen = backend if backend is not None else pm.data.backend
             valid_aliases = [m['alias'] for m in available_models(chosen)]
             if model not in valid_aliases:

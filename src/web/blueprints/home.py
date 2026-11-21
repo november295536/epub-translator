@@ -6,6 +6,7 @@ import os
 from flask import Blueprint, render_template, jsonify, current_app
 
 from src.core.project import ProjectManager
+from src.web.tasks import TaskManager
 
 
 home_bp = Blueprint('home', __name__)
@@ -28,7 +29,10 @@ def get_all_projects() -> list[dict]:
         if not pm.exists():
             continue
 
-        pm.load()
+        # A running task's project in memory (the file lags by the save window)
+        pm = TaskManager().get_project_manager(name) or pm
+        if pm.data is None:
+            pm.load()
         progress = pm.get_progress()
 
         projects.append({

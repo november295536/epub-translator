@@ -137,11 +137,17 @@ class TranslationTask:
     pause_event: threading.Event = field(default_factory=threading.Event, repr=False)
     stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
     # Set by stop and pause: the calls in flight are killed and their
-    # segments go back to the queue; cleared on resume
+    # segments go back to the queue. Never cleared: resume installs a new
+    # one, so a call still holding the old event is cancelled for good
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     # Clock time (TaskManager.clock) at which a run paused by a rate limit
-    # resumes by itself; None: no automatic resume
+    # resumes by itself; None: no automatic resume (a user pause, an auth or
+    # backend error)
     resume_at: float | None = None
+    # Coordinator ticks so far (tests wait for ticks instead of sleeping)
+    ticks: int = 0
+    # The coordinator's saver while it runs (the export flushes it)
+    saver: DebouncedSaver | None = field(default=None, repr=False)
 
     # Queues
     segment_queue: queue.Queue = field(default_factory=queue.Queue, repr=False)
@@ -349,12 +355,14 @@ class TaskManager:
         return task
 
     def pause_translation(self, project_name: str) -> bool:
-        """Pause a running translation task."""
+        """Pause a running task, or turn the automatic wait of a task paused
+        by a rate limit into a lasting user pause. True also when it is
+        paused already (idempotent)."""
         task = self.tasks.get(project_name)
         if not task:
             return False
         with task._lock:
-            if task.state != 'running':
+            if task.state not in ('running', 'paused'):
                 return False
             task.state = 'paused'
             task.resume_at = None
@@ -366,12 +374,20 @@ class TaskManager:
         }})
         return True
 
-    def resume_translation(self, project_name: str, num_workers: int | None = None) -> bool:
-        """Resume a paused translation task, optionally adjusting worker count."""
+    def resume_translation(self, project_name: str, num_workers: int | None = None,
+                           due: float | None = None) -> bool:
+        """Resume a paused translation task, optionally adjusting worker
+        count. True also when it is running (idempotent). `due`: an
+        automatic resume for that deadline; refused when the task's deadline
+        has changed since (a user pause, an error, a later rate limit)."""
         task = self.tasks.get(project_name)
         if not task:
             return False
         with task._lock:
+            if due is not None and task.resume_at != due:
+                return False
+            if task.state == 'running' and due is None:
+                return True
             if task.state != 'paused':
                 return False
             # Check coordinator or any worker thread is alive
@@ -382,41 +398,40 @@ class TaskManager:
                 task.error = '翻譯執行緒已終止，請重新開始翻譯'
                 return False
 
-            # Dynamic worker adjustment
+            # Dynamic worker adjustment; also brings back workers that
+            # ended while the queue was empty and a segment was in flight
             if num_workers is not None:
-                num_workers = max(1, min(num_workers, MAX_WORKERS))
-                current_alive = sum(1 for t in task._threads if t.is_alive())
-                task.num_workers = num_workers
-
-                if num_workers > current_alive:
-                    # Spawn additional workers
-                    additional = num_workers - current_alive
-                    if task.pm and task._gm:
-                        project_dir = os.path.join(task.projects_dir, task.project_name)
-                        for i in range(additional):
-                            wid = len(task._threads)
-                            t = threading.Thread(
-                                target=self._worker_loop,
-                                args=(task, wid),
-                                daemon=True,
-                            )
-                            task.active_workers += 1
-                            try:
-                                t.start()
-                            except Exception as e:
-                                # Not started: neither listed nor counted; the
-                                # task stays paused with the workers it has
-                                task.active_workers -= 1
-                                task.error = f'無法增加 worker：{e}'
-                                return False
-                            task._threads.append(t)
-                        logger.info("動態增加 %d workers (共 %d)", additional, num_workers)
+                task.num_workers = max(1, min(num_workers, MAX_WORKERS))
+            if not self._top_up_workers(task):
+                return False  # the task stays paused with the workers it has
 
             task.state = 'running'
             task.error = None  # the run-level error that paused it
             task.resume_at = None
-            task.cancel_event.clear()  # before the workers go on
+            task.cancel_event = threading.Event()  # before the workers go on
             task.pause_event.set()
+        return True
+
+    def _top_up_workers(self, task: TranslationTask) -> bool:
+        """Start workers until task.num_workers run (under task._lock).
+        False, with task.error set, when one cannot be started."""
+        current_alive = sum(1 for t in task._threads if t.is_alive())
+        additional = task.num_workers - current_alive
+        if additional <= 0 or not (task.pm and task._gm):
+            return True
+        for _ in range(additional):
+            t = threading.Thread(target=self._worker_loop, args=(task, len(task._threads)),
+                                 daemon=True)
+            task.active_workers += 1
+            try:
+                t.start()
+            except Exception as e:
+                # Not started: neither listed nor counted
+                task.active_workers -= 1
+                task.error = f'無法增加 worker：{e}'
+                return False
+            task._threads.append(t)
+        logger.info("動態增加 %d workers (共 %d)", additional, task.num_workers)
         return True
 
     def _run_translation(self, task: TranslationTask):
@@ -434,6 +449,7 @@ class TaskManager:
                     record_failure_log(log_dir, segment_id, outcome)
 
         saver = DebouncedSaver(pm, after_save, clock=self.clock)
+        task.saver = saver
         try:
             handler = setup_project_logging(project_dir)
 
@@ -476,9 +492,7 @@ class TaskManager:
                     self._tick(task, saver)
                     # Done when all workers have exited and nothing is left
                     # (a worker puts its last result before it exits)
-                    with task._lock:
-                        workers_done = task.active_workers == 0
-                    if workers_done and task.result_queue.empty():
+                    if self._workers_done(task):
                         break
                     continue
 
@@ -511,9 +525,7 @@ class TaskManager:
                 self._tick(task, saver)
 
                 # Results that arrived meanwhile are taken by the next round
-                with task._lock:
-                    workers_done = task.active_workers == 0
-                if workers_done and task.result_queue.empty():
+                if self._workers_done(task):
                     break
 
             saver.flush()  # before the final state: readers then load the file
@@ -542,6 +554,19 @@ class TaskManager:
                 task.project_lock.release()
             teardown_project_logging(handler)
 
+    def _workers_done(self, task: TranslationTask) -> bool:
+        """Every worker has ended and every result was taken. A segment
+        still queued (put back by a worker after the others had ended on an
+        empty queue) gets workers again instead, unless the run is stopping."""
+        with task._lock:
+            if task.active_workers != 0 or not task.result_queue.empty():
+                return False
+            if task.segment_queue.empty() or task.stop_event.is_set():
+                return True
+            if not self._top_up_workers(task):
+                raise RuntimeError(task.error)
+            return False
+
     def _tick(self, task: TranslationTask, saver: DebouncedSaver) -> None:
         """Save a full or expired window, everything when the task is not
         running (paused, stopping); resume a run paused by a rate limit once
@@ -551,9 +576,12 @@ class TaskManager:
         else:
             saver.flush()
         with task._lock:
-            due = (task.state == 'paused' and task.resume_at is not None
-                   and self.clock() >= task.resume_at)
-        if due and self.resume_translation(task.project_name):
+            task.ticks += 1
+            due = task.resume_at
+            if task.state != 'paused' or due is None or self.clock() < due:
+                due = None
+        # resume_translation checks the deadline again, under the lock
+        if due is not None and self.resume_translation(task.project_name, due=due):
             logger.info("翻譯自動繼續（使用量限制的等待結束）")
             task.progress.put({'event': 'resumed', 'data': {
                 'completed': task.completed,
@@ -638,12 +666,42 @@ class TaskManager:
         }})
         return True
 
+    def _pause_for(self, task: TranslationTask, error: Exception, event_name: str) -> None:
+        """A run-level error pauses the task (under task._lock). A rate limit
+        resumes by itself after resume_delay; any other error waits for the
+        user and wins over an automatic wait in progress. A later rate limit
+        during an automatic wait extends it. A user pause stays as it is."""
+        delay = resume_delay(error)
+        if task.state == 'running':
+            pass
+        elif task.state == 'paused' and task.resume_at is not None:
+            if delay is not None:  # another rate limit during the wait
+                task.resume_at = max(task.resume_at, self.clock() + delay)
+                return
+        else:
+            return  # paused by the user, or by an error that waits for the user
+        task.state = 'paused'
+        task.error = str(error)  # for a page opened later
+        task.resume_at = None if delay is None else self.clock() + delay
+        task.progress.put({'event': event_name, 'data': {
+            'error': str(error),
+            'completed': task.completed,
+            'remaining': task.total - task.completed,
+            'resume_in': delay,
+        }})
+
     def _worker_loop(self, task: TranslationTask, worker_id: int):
         """Single worker loop: fetch segments from queue and translate."""
         tag = f"W{worker_id}"
         pm = task.pm
         gm = task._gm
         engine, current = None, None  # made for the project's (backend, model)
+
+        def interrupted() -> bool:
+            # A retry's backoff wait ends, and no call is made, once the
+            # run stops or pauses (also for a rate limit another worker hit)
+            return task.stop_event.is_set() or not task.pause_event.is_set()
+
         all_segments = pm.data.segments
         translations = pm.data.segmentation == 2  # context from translations
         reduced_exit = False
@@ -674,15 +732,23 @@ class TaskManager:
                     seg = task.segment_queue.get(timeout=1)
                 except queue.Empty:
                     break  # No more segments
+                if not task.pause_event.is_set() or task.stop_event.is_set():
+                    # Paused (or stopped) while this worker waited for it
+                    task.segment_queue.put(seg)
+                    continue
 
                 # The project's backend and model, read again for every
-                # segment: a switch during the run applies to the next one
-                if (pm.data.backend, pm.data.model) != current:
+                # segment (as one, under the mutex): a switch during the
+                # run applies to the next one
+                with pm.mutex:
+                    wanted = (pm.data.backend, pm.data.model)
+                if wanted != current:
                     if current is not None:
-                        logger.info("[%s] 模型切換: %s → %s", tag, current[1], pm.data.model)
-                    current = (pm.data.backend, pm.data.model)
+                        logger.info("[%s] 模型切換: %s → %s", tag, current[1], wanted[1])
+                    current = wanted
                     engine = TranslationEngine(model=current[1],
-                                               backend=llm.backend_for(current[0]))
+                                               backend=llm.backend_for(current[0]),
+                                               interrupted=interrupted)
 
                 revision, queued_status = task.queued.get(
                     seg.segment_id, (seg.revision, seg.status))
@@ -697,11 +763,12 @@ class TaskManager:
                         segment_id=seg.segment_id, outcome=None, revision=revision))
                     continue
 
+                generation = task.cancel_event  # replaced by every resume
                 try:
                     # A failed segment, also one with an unexpected error, is
                     # an outcome: recorded as FAILED
                     outcome = translate_segment(engine, seg, all_segments, gm,
-                                                cancel=task.cancel_event,
+                                                cancel=generation,
                                                 translations=translations, mutex=pm.mutex)
                     task.result_queue.put(TranslationResult(
                         segment_id=seg.segment_id, outcome=outcome, revision=revision))
@@ -717,28 +784,19 @@ class TaskManager:
                                       if isinstance(e, cls))
                     logger.warning("[%s] %s, pausing: %s", tag, event_name, e)
 
-                    # Return segment to queue for retry
-                    task.segment_queue.put(seg)
-
                     with task._lock:
                         # Stopped meanwhile: do not pause a task that is ending
                         if task.stop_event.is_set():
                             break
-                        # Only first worker to hit this sends the event
-                        if task.state == 'running':
-                            # A rate limit resumes by itself (the
-                            # coordinator's tick); the others wait for the user
-                            delay = resume_delay(e)
-                            task.state = 'paused'
-                            task.error = str(e)  # for a page opened later
-                            task.resume_at = None if delay is None else self.clock() + delay
-                            task.progress.put({'event': event_name, 'data': {
-                                'error': str(e),
-                                'completed': task.completed,
-                                'remaining': task.total - task.completed,
-                                'resume_in': delay,
-                            }})
-                        task.pause_event.clear()
+                        if task.cancel_event is generation:
+                            self._pause_for(task, e, event_name)
+                            task.pause_event.clear()
+                        # else: a call from before a pause and resume; that
+                        # pause already decided, so its error pauses nothing
+                        # again (the segment is just sent again)
+                    # Back in the queue once the pause is in place, so no
+                    # other worker starts it meanwhile
+                    task.segment_queue.put(seg)
 
                     # Block until resumed
                     task.pause_event.wait()
