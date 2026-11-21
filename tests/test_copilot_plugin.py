@@ -260,6 +260,27 @@ class TestRound1:
         assert [s.status for s in pm.data.segments] == [SegmentStatus.PENDING] * 3
 
 
+class TestRound2:
+    """Review round 2, C: plain text on stdout of a clean exit without a reply."""
+
+    @pytest.mark.parametrize('stdout, error', [
+        ('Execution failed: Rate limited.\n', RateLimitError),
+        ('Error: not logged in\n', AuthError),
+    ])
+    def test_plain_stdout_classified(self, stdout, error):
+        found = CopilotCLI().classify_error(ProcessResult(0, stdout, ''))
+        assert type(found) is error and stdout.strip() in str(found)
+
+    def test_plain_stdout_quoted_when_not_recognized(self):
+        found = CopilotCLI().classify_error(ProcessResult(0, 'something odd\n', ''))
+        assert str(found) == NOT_REPLACED_MESSAGE + 'CLI 訊息：something odd'
+
+    def test_plain_stdout_beside_a_reply_is_not_an_error_text(self):
+        replied = _output('答', _checkpoint({'m': REPLACED}))
+        result = ProcessResult(0, 'Rate limited.\n' + replied.stdout, '')
+        assert CopilotCLI().classify_error(result) is None
+
+
 def _copilot_project(tmp_path, n):
     path = _make_project(tmp_path, n=n)
     pm = ProjectManager(path)
