@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -3672,7 +3673,8 @@ class TestCliOverheadScriptSurvivors:
 
     def _clock(self, monkeypatch, *times):
         ticks = iter(times)
-        monkeypatch.setattr(overhead.time, 'monotonic', lambda: next(ticks))
+        # the script's own `time`: the process-wide clock stays real for other threads
+        monkeypatch.setattr(overhead, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
 
     def test_call_values(self, monkeypatch):
         from src.llm.cli import ProcessResult
@@ -5234,3 +5236,262 @@ class TestPhase8Round3Scripts:
         for bad in ({'term': 'A', 'translation': ' '}, {'term': '', 'translation': '甲'},
                     {'term': 'A', 'translation': None}, {'translation': '甲'}, {'term': 5, 'translation': '甲'}):
             assert not extraction.usable(bad)
+
+
+# --- Phase 9: Copilot overhead script --------------------------------------------
+
+copilot_overhead = _load('phase9_copilot_overhead')
+
+
+def _copilot_run(segments_for, seen, tokens=(90, 20), code=0):
+    """run_process stand-in: Copilot's JSON output whose system segments
+    are `segments_for(cmd)`."""
+    from src.llm.cli import ProcessResult
+
+    def run(cmd, **kwargs):
+        seen.append((cmd, kwargs))
+        events = [{'type': 'assistant.message', 'data': {'content': '答'}},
+                  {'type': 'session.usage_checkpoint', 'data': {
+                      'accountingSnapshot': {'modelMetrics': {'m': {'usage': {
+                          'inputTokens': tokens[0], 'outputTokens': tokens[1]}}}},
+                      'promptCacheBreakState': [{'models': {'m': {
+                          'system_segments': segments_for(cmd)}}}]}}]
+        return ProcessResult(code, '\n'.join(json.dumps(e) for e in events), '')
+    return run
+
+
+def _segments_as_copilot(cmd):
+    """What the real CLI reports: replaced only with --experimental and the plugin."""
+    from src.llm.copilot_cli import PLUGIN_DIR
+    loaded = '--experimental' in cmd and cmd[cmd.index('--plugin-dir') + 1] == PLUGIN_DIR \
+        if '--plugin-dir' in cmd else False
+    if loaded:
+        return [{'segment': 'agent_replacement', 'hash': 'h', 'tokens': 14}]
+    return [{'segment': f's{i}', 'hash': 'h', 'tokens': 110} for i in range(18)]
+
+
+class TestPhase9CopilotOverheadScript:
+
+    def test_run_passes(self, monkeypatch, capsys):
+        from src.llm.copilot_cli import PLUGIN_DIR, SYSTEM_PROMPT_ENV
+        seen = []
+        monkeypatch.setattr(copilot_overhead, 'run_process', _copilot_run(_segments_as_copilot, seen))
+        assert copilot_overhead.main(['--repetitions', '2', '--raw']) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert len(seen) == 10
+        names = [name for name, _, _ in copilot_overhead.CONFIGS]
+        assert names == ['built-in', 'replaced', 'replaced-long', 'no-experimental',
+                         'wrong-plugin-dir']
+        built_in, replaced, long, no_exp, wrong = (c for c, _ in seen[:5])
+        assert replaced[:2] == ['copilot', '-p'] and replaced[3:] == [
+            '--model', 'claude-haiku-4.5', '--output-format', 'json', '--available-tools',
+            'none', '--no-custom-instructions', '--disable-builtin-mcps', '--no-ask-user',
+            '--no-auto-update', '--experimental', '--plugin-dir', PLUGIN_DIR]
+        assert built_in == replaced[:-3]
+        assert long[3:] == replaced[3:] and len(long[2]) > 4 * len(replaced[2])
+        assert no_exp == replaced[:-3] + ['--no-experimental', '--plugin-dir', PLUGIN_DIR]
+        assert wrong == replaced[:-1] + [PLUGIN_DIR + '-missing']
+        assert 'robot' in replaced[2] and '術語表' in replaced[2] and 'lantern-59' in long[2]
+        assert all(kw['env'][SYSTEM_PROMPT_ENV] for _, kw in seen)
+        assert all(kw['timeout'] == 120 for _, kw in seen)
+        from src.llm.copilot_cli import CopilotCLI
+        assert all(kw['cwd'] == CopilotCLI().working_directory() for _, kw in seen)
+        assert out[0] == (f'model claude-haiku-4.5  repetitions 2  prompts {len(replaced[2])} '
+                          f'and {len(long[2])} characters (invented paragraphs)')
+        assert out[1] == ('  1 built-in           pass not replaced wall '
+                          + out[1].split('wall ')[1].split(' ')[0]
+                          + ' in 90 out 20 system segments 18 (1980 tokens)')
+        assert '  1 replaced           pass replaced ' in out[2]
+        assert out[2].endswith('system segments 1 (14 tokens)')
+        assert out[-5].startswith('built-in           n=2 passed=2  wall ') and 'nan' not in out[-5]
+        assert out[-5].endswith('in      90  out    20  system segments   18 ( 1980 tokens)')
+        assert out[-4].endswith('system segments    1 (   14 tokens)')
+
+    def test_replacement_missing_fails(self, monkeypatch, capsys):
+        seen = []
+        never = lambda cmd: _segments_as_copilot([])  # noqa: E731 - never replaced
+        monkeypatch.setattr(copilot_overhead, 'run_process', _copilot_run(never, seen))
+        assert copilot_overhead.main(['--repetitions', '1', '--raw', '--only', 'replaced']) == 1
+        out = capsys.readouterr().out
+        assert '  1 replaced           FAIL not replaced ' in out
+        assert 'replaced           n=1 passed=0' in out
+
+    def test_broken_setup_not_detected_fails(self, monkeypatch, capsys):
+        always = lambda cmd: _segments_as_copilot(['--experimental', '--plugin-dir',  # noqa: E731
+                                                   copilot_overhead.copilot_cli.PLUGIN_DIR])
+        monkeypatch.setattr(copilot_overhead, 'run_process', _copilot_run(always, []))
+        assert copilot_overhead.main(['--repetitions', '1', '--raw', '--only',
+                                      'no-experimental']) == 1
+        assert '  1 no-experimental    FAIL replaced ' in capsys.readouterr().out
+
+    def test_failed_calls(self, monkeypatch, capsys):
+        from src.llm.cli import ProcessResult
+
+        def broken(cmd, **kwargs):
+            raise OSError('x')
+
+        monkeypatch.setattr(copilot_overhead, 'run_process', broken)
+        assert copilot_overhead.main(['--repetitions', '1', '--raw', '--only', 'replaced']) == 1
+        out = capsys.readouterr().out
+        assert '  1 replaced           FAIL OSError\n' in out
+        assert 'replaced           n=1 passed=0  wall    nan s  in     nan' in out
+        monkeypatch.setattr(copilot_overhead, 'run_process',
+                            lambda cmd, **kw: ProcessResult(3, 'no', ''))
+        call = copilot_overhead.one_call('replaced', True, 'p', 'm', 5)
+        assert call['ok'] is False and call['error'] == 'no usage in the output (exit 3, TransientError)'
+        # review round 2, D: the class of the result is named (not its text)
+        replaced_only = json.dumps({'type': 'session.usage_checkpoint', 'data': {
+            'promptCacheBreakState': [{'models': {'m': {'system_segments': [
+                {'segment': 'agent_replacement'}]}}}]}})
+        for result, found in ((ProcessResult(0, '', ''), 'BackendUnavailableError'),
+                              (ProcessResult(0, replaced_only, ''), 'no error')):
+            monkeypatch.setattr(copilot_overhead, 'run_process', lambda cmd, r=result, **kw: r)
+            call = copilot_overhead.one_call('replaced', True, 'p', 'm', 5)
+            assert call == {'ok': False, 'error': f'no usage in the output (exit 0, {found})'}
+        # a rate limit beside the usage: neither replaced nor detected
+        limit = json.dumps({'type': 'session.error', 'data': {'message': 'rate limit'}})
+        run = _copilot_run(_segments_as_copilot, [])
+        monkeypatch.setattr(copilot_overhead, 'run_process',
+                            lambda cmd, **kw: ProcessResult(0, run(cmd).stdout + '\n' + limit, ''))
+        for name, replaced in (('replaced', True), ('built-in', False)):
+            call = copilot_overhead.one_call(name, replaced, 'p', 'm', 5)
+            assert (call['ok'], call['error']) == (False, 'RateLimitError')
+        # another unavailable error (not the replacement's) is no detection
+        other = json.dumps({'type': 'session.error', 'data': {
+            'message': 'Execution failed: Model "x" is not available.'}})
+        monkeypatch.setattr(copilot_overhead, 'run_process',
+                            lambda cmd, **kw: ProcessResult(1, run(cmd).stdout + '\n' + other, ''))
+        call = copilot_overhead.one_call('built-in', False, 'p', 'm', 5)
+        assert (call['ok'], call['error']) == (False, 'BackendUnavailableError')
+
+    def test_call_values(self, monkeypatch):
+        ticks = iter([10.0, 12.5])
+        monkeypatch.setattr(copilot_overhead, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
+        monkeypatch.setattr(copilot_overhead, 'run_process',
+                            _copilot_run(_segments_as_copilot, [], tokens=(4079, 2447)))
+        assert copilot_overhead.one_call('replaced', True, 'p', 'm', 5) == {
+            'ok': True, 'wall': 2.5, 'in': 4079, 'out': 2447, 'segments': 1,
+            'system_tokens': 14, 'error': 'replaced'}
+
+    def test_system_segments(self):
+        def checkpoint(*segment_lists):
+            return {'type': 'session.usage_checkpoint', 'data': {'promptCacheBreakState': [
+                {'models': {f'm{i}': {'system_segments': [{'tokens': t} for t in segments]}
+                            for i, segments in enumerate(segment_lists)}}]}}
+        assert copilot_overhead.system_segments([]) == (0, 0)
+        assert copilot_overhead.system_segments(
+            [checkpoint([5, 6]), {'type': 'other'}, checkpoint([1], [7, 8, 9])]) == (3, 24)
+        with pytest.raises(KeyError):
+            copilot_overhead.system_segments([{'type': 'session.usage_checkpoint', 'data': {}}])
+
+    def test_unreadable_segments_counted_as_none(self, monkeypatch):
+        from src.llm.cli import ProcessResult
+        text = json.dumps({'type': 'session.usage_checkpoint', 'data': {'accountingSnapshot': {
+            'modelMetrics': {'m': {'usage': {'inputTokens': 1, 'outputTokens': 2}}}}}})
+        monkeypatch.setattr(copilot_overhead, 'run_process',
+                            lambda cmd, **kw: ProcessResult(0, text, ''))
+        call = copilot_overhead.one_call('built-in', False, 'p', 'm', 5)
+        assert (call['ok'], call['segments'], call['system_tokens']) == (True, 0, 0)
+
+    def test_prompts_are_the_engines(self):
+        from src.core import validation
+        from src.core.segmenter import SegmentType
+        from src.core.translator import TranslationEngine
+        from src.llm.fake import FakeBackend
+        engine = TranslationEngine(backend=FakeBackend())
+        for long, html, glossary in ((False, copilot_overhead.SHORT, copilot_overhead.GLOSSARY_SHORT),
+                                     (True, copilot_overhead.LONG, copilot_overhead.GLOSSARY_LONG)):
+            assert copilot_overhead.prompt_text(long) == engine._build_prompt(
+                'x', SegmentType.TEXT, glossary, copilot_overhead.BEFORE, copilot_overhead.AFTER,
+                html=validation.protect(html).html)
+        assert copilot_overhead.LONG.count('<p>') == 8
+        assert copilot_overhead.GLOSSARY_LONG.splitlines()[-1] == '- lantern-59 → 燈籠59號 [術語]'
+
+    def test_defaults_and_help(self, monkeypatch, capsys):
+        seen = []
+
+        def one_call(name, replaced, prompt, model, timeout):
+            seen.append((name, replaced, model, timeout))
+            return {'ok': True, 'wall': 0.0, 'error': 'x'}
+
+        monkeypatch.setattr(copilot_overhead, 'one_call', one_call)
+        assert copilot_overhead.main([]) == 0
+        assert len(seen) == 3 * 5
+        assert {(m, t) for _, _, m, t in seen} == {('claude-haiku-4.5', 120)}
+        assert [(n, r) for n, r, _, _ in seen[:5]] == [
+            ('built-in', False), ('replaced', True), ('replaced-long', True),
+            ('no-experimental', False), ('wrong-plugin-dir', False)]
+        assert capsys.readouterr().out.splitlines()[0].startswith(
+            'model claude-haiku-4.5  repetitions 3  prompts ')
+        seen.clear()
+        copilot_overhead.main(['--timeout', '7.5', '--repetitions', '1', '--only', 'replaced',
+                               'built-in', '--model', 'gpt-x'])
+        assert seen == [('built-in', False, 'gpt-x', 7.5), ('replaced', True, 'gpt-x', 7.5)]
+        capsys.readouterr()
+        with pytest.raises(SystemExit):
+            copilot_overhead.main(['--help'])
+        help_text = ' '.join(capsys.readouterr().out.split())
+        assert copilot_overhead.__doc__.split('\n')[0] in help_text
+        assert 'Makes REAL' not in help_text
+        for line in ('--model MODEL Model (default: claude-haiku-4.5)',
+                     '--repetitions REPETITIONS Calls per configuration',
+                     '--timeout TIMEOUT Seconds per call', '--raw Also print every call',
+                     '--only NAME [NAME ...] Run only these configurations (names as printed)'):
+            assert line in help_text
+
+
+class TestPhase9ScriptRound1:
+    """Review round 1, items E and F."""
+
+    def _never(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(copilot_overhead, 'one_call', lambda *a: seen.append(a) or {
+            'ok': True, 'wall': 0.0, 'error': 'x'})
+        return seen
+
+    @pytest.mark.parametrize('args', [['--only'], ['--only', 'replace'],
+                                      ['--only', 'built-in', 'replace'], ['--repetitions', '0'],
+                                      ['--repetitions', '-1'], ['--repetitions', 'x']])
+    def test_invalid_options_refused(self, monkeypatch, capsys, args):
+        seen = self._never(monkeypatch)
+        with pytest.raises(SystemExit) as info:
+            copilot_overhead.main(args)
+        assert info.value.code == 2 and seen == []
+        assert 'error: argument' in capsys.readouterr().err
+
+    def test_positive(self):
+        assert copilot_overhead.positive('1') == 1 and copilot_overhead.positive('7') == 7
+        with pytest.raises(Exception) as info:
+            copilot_overhead.positive('0')
+        assert str(info.value) == 'must be at least 1: 0'
+
+    def test_no_call_is_no_pass(self, monkeypatch):
+        seen = self._never(monkeypatch)
+        monkeypatch.setattr(copilot_overhead, 'CONFIGS', [])
+        assert copilot_overhead.main(['--repetitions', '1']) == 1 and seen == []
+
+    def test_raw_lines_flushed(self, monkeypatch):
+        import io
+
+        class Observed(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.flushed_at = []
+
+            def flush(self):
+                self.flushed_at.append(self.getvalue().count('\n'))
+                super().flush()
+
+        stream = Observed()
+        monkeypatch.setattr(sys, 'stdout', stream)
+        self._never(monkeypatch)
+        copilot_overhead.main(['--repetitions', '2', '--only', 'replaced', '--raw'])
+        lines = stream.getvalue().splitlines()
+        raw = [i + 1 for i, line in enumerate(lines) if line.startswith('  ')]
+        assert raw == [2, 3]
+        assert all(n in stream.flushed_at for n in raw)  # flushed right after each
+
+    def test_header_names_the_side_effects(self):
+        doc = ' '.join(copilot_overhead.__doc__.split())
+        assert 'each call is saved as a session in the user\'s Copilot directory' in doc
+        assert '`plugin-data/_direct/`' in doc

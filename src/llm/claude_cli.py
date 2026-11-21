@@ -9,7 +9,9 @@ from src.llm.base import (
     AuthError, BackendUnavailableError, Capabilities, LLMError, LLMRequest, LLMResponse, ModelInfo,
     RateLimitError, TransientError,
 )
-from src.llm.cli import ERROR_CHARS, UNKNOWN_OPTION_PATTERN, CLIBackend, ProcessResult, _text
+from src.llm.cli import (
+    ERROR_CHARS, SYSTEM_PROMPT, UNKNOWN_OPTION_PATTERN, CLIBackend, ProcessResult, _text,
+)
 
 MODELS = [
     ModelInfo('sonnet', 'Sonnet', '快速且高品質，適合大多數翻譯'),
@@ -36,11 +38,9 @@ AUTH_MESSAGE = f'Claude CLI 認證已過期，{AUTH_HINT}'
 # the phrases on its own is still taken for an error.
 SHORT_REPLY_CHARS = 300
 
-# Replaces Claude Code's own (coding agent) system prompt; the request text
-# is sent unchanged as the prompt
-SYSTEM_PROMPT = '你是一位專業的英文翻譯。'
-
-# Flags that strip what a translation call does not need, each adopted for
+# Flags that strip what a translation call does not need (SYSTEM_PROMPT
+# replaces Claude Code's own system prompt; the request text is sent unchanged
+# as the prompt), each adopted for
 # its measured effect (plan/03-acceptance-log.md, Phase 7 part A;
 # scripts/verify/phase7_cli_overhead.py, haiku, median of 5 calls, input
 # tokens per call 29831 without any): the default system prompt (-3154

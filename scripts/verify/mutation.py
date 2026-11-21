@@ -72,6 +72,7 @@ FILES = [
     'scripts/verify/phase5_glossary_check.py', 'scripts/verify/phase6_segmentation_check.py',
     'scripts/verify/phase7_cli_overhead.py', 'scripts/verify/phase7_throughput.py',
     'scripts/verify/phase8_extraction_compare.py', 'scripts/verify/phase8_brief_sample.py',
+    'scripts/verify/phase9_copilot_overhead.py',
 ]
 MODULE_REF = re.compile(r'\bsrc\.(core|epub|web|glossary|llm)\b')
 OK = ('killed',)  # any other status, known or not, fails the run
