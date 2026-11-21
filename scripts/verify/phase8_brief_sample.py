@@ -195,7 +195,7 @@ def sample(args) -> int:
     before = snapshot(args.projects_dir)
     work = None
     try:
-        work = tempfile.mkdtemp(prefix='phase8-brief-', dir=parent)
+        work = tempfile.mkdtemp(prefix='phase8-brief-')  # in `parent`
         code = run(args, brief, label, project_dir, work, llm, migrate_project, ProjectManager,
                    TranslationEngine, translate_segment, load_glossary)
     finally:

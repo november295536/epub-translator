@@ -181,7 +181,7 @@ def compare(args) -> int:
     before = snapshot(args.projects_dir)
     work = None
     try:
-        work = tempfile.mkdtemp(prefix='phase8-extraction-', dir=parent)
+        work = tempfile.mkdtemp(prefix='phase8-extraction-')  # in `parent`
         code = run(args, label, project_dir, work, llm, migrate_project, ProjectManager,
                    ExtractionError, TermExtractor)
     finally:
@@ -212,7 +212,7 @@ def run(args, label, project_dir, work, llm, migrate_project, ProjectManager,
             pm.load()
     segments = [{'text': s.text} for s in pm.data.segments if s.segment_type != 'code']
 
-    backend = CountingBackend(llm.backend_for(getattr(pm.data, 'backend', None)))
+    backend = CountingBackend(llm.backend_for(pm.data.backend))
     extractor = TermExtractor(model=args.model, backend=backend)
     real = extractor.extract_from_text
     proposals = []
