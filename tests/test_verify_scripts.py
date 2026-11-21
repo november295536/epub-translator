@@ -5292,6 +5292,8 @@ class TestPhase9CopilotOverheadScript:
         assert 'robot' in replaced[2] and '術語表' in replaced[2] and 'lantern-59' in long[2]
         assert all(kw['env'][SYSTEM_PROMPT_ENV] for _, kw in seen)
         assert all(kw['timeout'] == 120 for _, kw in seen)
+        from src.llm.copilot_cli import CopilotCLI
+        assert all(kw['cwd'] == CopilotCLI().working_directory() for _, kw in seen)
         assert out[0] == (f'model claude-haiku-4.5  repetitions 2  prompts {len(replaced[2])} '
                           f'and {len(long[2])} characters (invented paragraphs)')
         assert out[1] == ('  1 built-in           pass not replaced wall '
@@ -5299,7 +5301,7 @@ class TestPhase9CopilotOverheadScript:
                           + ' in 90 out 20 system segments 18 (1980 tokens)')
         assert '  1 replaced           pass replaced ' in out[2]
         assert out[2].endswith('system segments 1 (14 tokens)')
-        assert out[-5].startswith('built-in           n=2 passed=2  wall ')
+        assert out[-5].startswith('built-in           n=2 passed=2  wall ') and 'nan' not in out[-5]
         assert out[-5].endswith('in      90  out    20  system segments   18 ( 1980 tokens)')
         assert out[-4].endswith('system segments    1 (   14 tokens)')
 
@@ -5343,6 +5345,13 @@ class TestPhase9CopilotOverheadScript:
         for name, replaced in (('replaced', True), ('built-in', False)):
             call = copilot_overhead.one_call(name, replaced, 'p', 'm', 5)
             assert (call['ok'], call['error']) == (False, 'RateLimitError')
+        # another unavailable error (not the replacement's) is no detection
+        other = json.dumps({'type': 'session.error', 'data': {
+            'message': 'Execution failed: Model "x" is not available.'}})
+        monkeypatch.setattr(copilot_overhead, 'run_process',
+                            lambda cmd, **kw: ProcessResult(1, run(cmd).stdout + '\n' + other, ''))
+        call = copilot_overhead.one_call('built-in', False, 'p', 'm', 5)
+        assert (call['ok'], call['error']) == (False, 'BackendUnavailableError')
 
     def test_call_values(self, monkeypatch):
         ticks = iter([10.0, 12.5])
@@ -5405,8 +5414,16 @@ class TestPhase9CopilotOverheadScript:
             'model claude-haiku-4.5  repetitions 3  prompts ')
         seen.clear()
         copilot_overhead.main(['--timeout', '7.5', '--repetitions', '1', '--only', 'replaced',
-                               '--model', 'gpt-x'])
-        assert seen == [('replaced', True, 'gpt-x', 7.5)]
+                               'built-in', '--model', 'gpt-x'])
+        assert seen == [('built-in', False, 'gpt-x', 7.5), ('replaced', True, 'gpt-x', 7.5)]
+        capsys.readouterr()
         with pytest.raises(SystemExit):
             copilot_overhead.main(['--help'])
-        assert copilot_overhead.__doc__.split('\n')[0] in ' '.join(capsys.readouterr().out.split())
+        help_text = ' '.join(capsys.readouterr().out.split())
+        assert copilot_overhead.__doc__.split('\n')[0] in help_text
+        assert 'Makes REAL' not in help_text
+        for line in ('--model MODEL Model (default: claude-haiku-4.5)',
+                     '--repetitions REPETITIONS Calls per configuration',
+                     '--timeout TIMEOUT Seconds per call', '--raw Also print every call',
+                     '...] Run only these configurations (names as printed)'):
+            assert line in help_text

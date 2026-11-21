@@ -91,7 +91,7 @@ def command(name: str, prompt: str, model: str) -> list:
         prompt, LLMRequest(system='', messages=[Message('user', prompt)], model=model, timeout=0))
     plugin = cmd.index('--plugin-dir')
     if name == 'built-in':
-        del cmd[plugin - 1:plugin + 2]  # --experimental --plugin-dir <dir>
+        del cmd[plugin - 1:]  # --experimental --plugin-dir <dir>, the last three
     elif name == 'no-experimental':
         cmd[plugin - 1] = '--no-experimental'
     elif name == 'wrong-plugin-dir':
@@ -118,12 +118,12 @@ def one_call(name: str, replaced: bool, prompt: str, model: str, timeout: float)
         result = run_process(command(name, prompt, model), timeout=timeout,
                              cwd=backend.working_directory(), env=backend.environment())
     except Exception as e:  # noqa: BLE001 - a failed call is counted, never printed in full
-        return {'ok': False, 'wall': time.monotonic() - start, 'error': type(e).__name__}
+        return {'ok': False, 'error': type(e).__name__}
     wall = time.monotonic() - start
     events = copilot_cli._events(result.stdout)
     usage = copilot_cli._usage(events)
     if usage is None:
-        return {'ok': False, 'wall': wall, 'error': f'no usage in the output (exit {result.returncode})'}
+        return {'ok': False, 'error': f'no usage in the output (exit {result.returncode})'}
     try:
         segments, tokens = system_segments(events)
     except (KeyError, TypeError, AttributeError):
@@ -161,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
                         help='Run only these configurations (names as printed)')
     args = parser.parse_args(argv)
     configs = [c for c in CONFIGS if args.only is None or c[0] in args.only]
-    prompts = {False: prompt_text(False), True: prompt_text(True)}
+    prompts = {long: prompt_text(long) for long in (False, True)}
     print(f'model {args.model}  repetitions {args.repetitions}  prompts {len(prompts[False])} '
           f'and {len(prompts[True])} characters (invented paragraphs)')
     calls = {name: [] for name, _, _ in configs}
