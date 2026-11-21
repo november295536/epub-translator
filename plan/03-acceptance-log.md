@@ -4498,7 +4498,7 @@ is not built (plan, Phase 7).
 |---|---|---|---|---|
 | 1 | Stop / pause end the call in flight | `run_process` already killed the process group on cancel (polls every 0.1 s), and a sequential CLI Ctrl-C already killed the child (the `KeyboardInterrupt` reaches `run_process`). But no caller passed a cancel event: web stop/pause and a parallel CLI Ctrl-C waited for the calls in flight (up to the 120 s timeout). | Web task: `cancel_event`, set by stop and pause, cleared on resume; a cancelled worker puts its segment back in the queue (pending, nothing stored). Parallel CLI: Ctrl-C sets a shared cancel event before joining the workers; a cancelled worker exits. | `src/web/tasks.py`, `translate.py` |
 | 2 | Run-level errors | Web: rate limit, auth, backend unavailable paused the task until the user resumed. CLI: all three stopped the run (exit 1). Transient errors: retried at once inside the segment's call budget (`MAX_CALLS` 4). | One rule, `runcontrol.resume_delay(error)`: a rate limit resumes after `retry_after` (when positive) or `RATE_LIMIT_WAIT_SECONDS` 300; auth and backend-unavailable return None (wait for the user: web pause, CLI stop, as before). Web: the worker sets `resume_at`, the coordinator's tick resumes the task and sends `resumed`. CLI sequential: message, flush, sleep, same segment again; CLI parallel: a gate that pauses every worker until the main loop's clock passes the deadline. Transient: the existing per-segment budget, now with a wait of 5, 15, 45 s before each retry (`TRANSIENT_BACKOFF_SECONDS`, the wait returns early on cancel); no second retry layer, because the budget already bounds the retries and a segment that runs out fails `transient` and is retried with `--retry-failed`. Time is injected everywhere: `TaskManager.clock`, `translate._clock`, `translate._sleep`, `TranslationEngine(wait=…)`. | `src/core/runcontrol.py`, `src/core/translator.py`, `src/web/tasks.py`, `translate.py` |
-| 3 | Debounced saves | Web: one save per result batch; CLI parallel: one per batch; CLI sequential: one per result. | `runcontrol.DebouncedSaver`: a save at most every `SAVE_INTERVAL_SECONDS` 10 or after `SAVE_EVERY_RESULTS` 20 results, and always on pause (web: the coordinator's tick sees a state other than running; CLI: before a rate-limit wait), stop, completion, error and before the lock is released (web: before the final state, in `_fail_task`; CLI: in `finally` / the interrupt handler, forced). Failure diagnostics are written after the save that stores the result, and (web) only when the segment's revision is still the one the result was applied to. Single writer kept (coordinator / CLI main thread); web edits still save through their transaction. A crash loses at most one window: 10 s or 19 results. | same |
+| 3 | Debounced saves | Web: one save per result batch; CLI parallel: one per batch; CLI sequential: one per result. | `runcontrol.DebouncedSaver`: a save at most every `SAVE_INTERVAL_SECONDS` 10 or after `SAVE_EVERY_RESULTS` 20 results, and always on pause (web: the coordinator's tick sees a state other than running; CLI: before a rate-limit wait), stop, completion, error and before the lock is released (web: before the final state, in `_fail_task`; CLI: in `finally` / the interrupt handler, forced). Failure diagnostics are written after the save that stores the result, and (web) only when the segment's revision is still the one the result was applied to. Single writer kept (coordinator / CLI main thread); web edits still save through their transaction. A crash loses at most one window: 10 s or 19 results. (Corrected in review round 1: the window is checked when a result arrives and on the web coordinator's tick; the CLI sequential path checks it only after each result, so it can hold one result unsaved for as long as the next segment takes.) | same |
 | 4 | Prompt order | — | Not changed (see below). | `src/core/translator.py` (comment) |
 | 5 | Claude CLI flags | `claude -p <prompt> --model <alias>` | measured; all five adopted (below) | `src/llm/claude_cli.py` (`LEAN_FLAGS`) |
 | 6 | Throughput script | — | `scripts/verify/phase7_throughput.py` (not run by me) | — |
@@ -4722,8 +4722,12 @@ inverted) keeps every worker spinning, so the parallel CLI tests never end.
 
 ### Known consequences and limitations
 
-- A crash (power loss, `kill -9`) loses up to 10 s or 19 results of a run; Ctrl-C, stop,
+- A crash (power loss, `kill -9`) loses up to 10 s or 19 results of a run (CLI sequential:
+  also the last result for as long as the next segment takes; see item 3); Ctrl-C, stop,
   pause, errors and the end of a run save.
+- `--setting-sources ""` also stops the Claude CLI from loading `env` and `apiKeyHelper` from
+  the user's settings file: credentials or an endpoint configured only there are not used, and
+  such a setup fails (added in review round 1).
 - A rate limit that never clears makes the run retry every 300 s (one quick failing call per
   worker each time) until the user stops it. Neither CLI reports `retry_after`; Claude's
   message names a reset time ("resets 8pm") that is not parsed.
@@ -4749,3 +4753,147 @@ inverted) keeps every worker spinning, so the parallel CLI tests never end.
   running its controller in node with stubbed `fetch` (options `claude-cli/…` and
   `copilot-cli/…`, a PUT with `{model, backend}`), not in a browser.
 - Windows: unchanged (no `fcntl`).
+
+## Phase 7 — part A, review round 1
+
+Date: 2026-11-21. Same branch and worktree. Findings of three reviewers; each fix has a test
+that fails without it (checked by reverting each fix alone and running its test; the
+exceptions are named below).
+
+### Changes
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| 1 | resume cleared the cancel event that calls in flight still held: pause, then a quick resume, let the old child live and its result be stored | resume installs a new `cancel_event`; an event handed to a call is never cleared | `TestRound1CancelGenerations` (real sleeping child: pause and resume at once, the old child is gone, a new one starts) |
+| 2 | the pause route toggled on server state, which now changes by itself | body `{"action": "pause" \| "resume"}` (400 otherwise), both idempotent; a pause during a rate-limit wait clears `resume_at` and lasts; the page offers 暫停 during the wait (`auto_resume` in the status, `autoResume` on the page); the tick passes the deadline that was due and `resume_translation(due=…)` re-checks it under the lock | `TestRound1PauseResumeActions` (through the real route: rate limit, user pause twice, clock far on, still paused, resume twice, completed; stale deadlines refused; page strings) |
+| 3 | an auth / backend error during a rate-limit wait could be overridden by the automatic resume; a second, longer limit shortened nothing but did not extend | `TaskManager._pause_for`: an error that waits for the user wins (deadline cleared, event sent); a later rate limit extends (`max`), never shortens; a user pause stays. CLI: auth/unavailable stops the run even during the wait (as before) and now also cancels the calls in flight; a later limit extends the gate's deadline | `TestRound1ErrorPrecedence` (web rules; CLI auth during the wait exits 1 without reopening the gate; CLI extension: closed at the first deadline, open at the second) |
+| 4, C | the segment was put back before the pause/gate closed; a worker that got a segment from the queue did not look at the pause again | the pause is set (web) / the gate closed (CLI) first, then the segment goes back; after `get()` both paths check pause/stop/gate again and put the segment back | `TestRound1RecheckAfterGet` (web: a pause during `get()`; CLI: a worker waiting in `get()` gets the segment back during the pause and does not send it). The order change alone is not observable in a test: with the re-check after `get()` in place, a wrong order only changes which worker puts the segment back |
+| 5 | a retry's backoff ended only on cancel | `TranslationEngine(interrupted=…)`: the default wait polls it every 0.1 s and ends; no call follows (CancelledError, the segment goes back). Web: stop or pause; CLI parallel: run stopped (auth/unavailable, failure streak) or gate closed; a CLI worker whose backoff a pause ended puts its segment back instead of exiting | `TestRound1BackoffInterrupted` (engine; default wait; the web check; CLI: a transient error whose backoff falls in a rate-limit pause makes no call until the gate opens) |
+| 6 | `resume_delay` trusted `retry_after` | finite positive int/float (not bool), clamped to [1, 3600]; anything else 300; never raises | `TestRound1ResumeDelay` (0.2, 1, 90, 1e9, inf, nan, True, '12', -1, None, an object) |
+| 7 | backend and model read separately | read as one under `pm.mutex` | `TestRound1ModelReadUnderMutex` |
+| 8 | sequential CLI: Ctrl-C between `apply_outcome` and the saver lost the result | `flush(force=True)` in `finally` | `TestRound1SequentialForcedFlush` |
+| 9 | export read the file while the guard read memory | the export route flushes the running task's saver first (500 if that save fails) | `TestRound1ExportFlushes` |
+| 10 | changing only the Claude model wrote `"backend": "claude-cli"`; `start -b` without `--model` replaced the stored model | the requested backend equal to the project's current one (explicit or implicit) stores nothing; `start -b X` keeps the stored model when X is the project's backend | `TestRound1BackendKey` |
+| 11 | Copilot: an error event beside a reply failed the call; `filtered` too wide; account names in kept text | exit 0 with a reply fails only for rate-limit or auth patterns; refusal pattern `content.?filter`; e-mail-like strings become `<redacted>` in the message and in the raw output kept by `CLIBackend` (new hook `CLIBackend.redact`, identity for Claude) | `TestRound1Copilot` |
+| 12 | throughput script cleanup and output | temp dir made inside the `try`; removal in an unconditional `finally`, a failure reported as `ERROR cannot remove the temporary directory (<type>)`; `BaseException` caught at the top (Ctrl-C prints only the type); setup output suppressed; the whole projects directory snapshotted (as the docstring says); the backend taken from the copy unless `--backend` | `TestThroughputScriptRound1` |
+| 13 | tests slept and compared real with injected time; the parallel CLI rate-limit test used a clock jumping 1000 s per read | `task.ticks` (coordinator ticks) replaces every `time.sleep` coordination; the time-window test asserts after ticks, no wall bound; new parallel test with a stationary clock: closed before the deadline (no new call over several main-loop ticks), open after, the printed seconds checked | `TestRound1ParallelCliGate`, the rewritten tests |
+| 14 | `flush=` survivors | killed with an observing stream | `TestCliOverheadScriptRound1` |
+| 15 | log | `--setting-sources ""` consequence added; the saving description corrected (both in the part A entry) | — |
+| B | workers ending on an empty queue while a segment was in flight; completion with a segment still queued | `_workers_done`: no completion while a segment is queued (unless stopping): workers are started again; every resume tops the workers up to `num_workers` (also without a count) | `TestRound1WorkersComeBack` |
+| D | a call from before a pause and resume that ends in a run-level error paused the resumed run | web: the worker compares the cancel event it called with to the current one; an older call's error pauses nothing (its segment is sent again) | `TestRound1StaleRunError` |
+| E | the error banner stayed after a resume | cleared when the pause/resume answer says `running` (the automatic `resumed` event already cleared it) | page string in `TestRound1PauseResumeActions` |
+| F | `PUT /model` with a non-string `backend` → 500 | 400 | `test_web_non_string_backend` |
+| G | Copilot: plain-text error on stdout lost; exit 0 with an error event and no reply | non-JSON stdout lines are the message when there is no error event; exit 0 with an error and no reply is classified (it already was: the reply check only spares runs with a reply) | `test_plain_stdout_only_without_error_events`, `test_error_without_a_reply_is_classified` |
+| H | home listing read the file during a run | the running task's project from memory (`get_project_manager`) | `TestRound1HomeListing` |
+
+Checked and not changed:
+
+- A (parallel CLI drops results after a run-level stop): false. The main loop runs while any
+  worker is alive or the result queue is not empty, so every result queued before a worker
+  ends is applied and flushed before the join; the join only waits for threads that have
+  already ended. Part of A was taken: the stop now also cancels the calls in flight (item 3).
+- D in the parallel CLI: not changed. The gate has no generations; a call started before the
+  gate closed that ends in a rate limit after it reopened closes it again. That is a real
+  limit reported by the service, so the pause is right; recorded as a limitation.
+- The two claims the orchestrator had already disproved (`run_process` pipes, `--code`) were
+  not looked at again.
+
+Settled decisions (not done, as decided):
+
+- Re-translate from the review page stays outside project pause/stop (one user-requested call).
+- A cancelled `segment_ids` or retry-failed run does not keep its unfinished intent across a
+  stop; the segments keep their previous state.
+- No timer thread for saves during a call; no stop button.
+- Part B.
+
+### Throughput (run by the orchestrator on the owner's machine)
+
+`scripts/verify/phase7_throughput.py`, haiku, the same project copy, anonymized; before =
+`--code` a checkout of `main`, after = this branch:
+
+```
+50 segments, 4 workers, before: wall 78.0 s, calls 60, failed 3 (key_mismatch 3), retry 6, split 2, per call median 3.15 s
+50 segments, 4 workers, after:  wall 79.0 s, calls 51, failed 0, retry 1, split 0, per call median 2.47 s
+repeat, before:                 wall 79.7 s, calls 65, failed 4 (key_mismatch 3, tag_count 1), retry 9, split 3, median 2.88 s
+repeat, after:                  wall 85.2 s, calls 52, failed 0, retry 2, split 0, median 2.76 s
+20 segments, 1 worker, before:  wall 104.9 s, calls 25, failed 1 (tag_count 1), retry 3, split 1, median 2.67 s
+20 segments, 1 worker, after:   wall 100.2 s, calls 20, failed 0, retry 0, split 0, median 2.79 s
+```
+
+Wall time is unchanged within the run-to-run spread. After the change there were fewer
+failures and retries: 0 of 120 segments failed, against 8 of 120 before. Which flag causes that
+was not isolated. The orchestrator also checked in the browser: a web pause kills the Claude
+process within 1 s with the segments left pending, resume completes the run, and one invented
+segment was re-translated through `copilot-cli` chosen in the model selector.
+
+### Checks
+
+Before and after: `stat -f '%m %z' <repo>/projects/*/project.json | md5` =
+`a7197555c962562a530d6de80fa045af`, unchanged. The four older read-only checks
+(`--projects-dir <repo>/projects --anonymize`), TOTAL lines identical to part A:
+
+```
+TOTAL projects 8  exports 24  translated segments 4162  as translation 3956  kept original 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 53)  toc labels changed 405/1885 (527 into translated chapters)  exports with new epubcheck errors 0  failed projects 0
+TOTAL projects 8  round trip 9491/9491  translated 4162  failing the structural check 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 54; only tag rules 88)  warnings (length_ratio 36, untranslated 8)  length ratio over 2925 segments: p1 0.312 p5 0.333 p50 0.404 p95 0.547 p99 0.976; outside 0.25-0.8: 38 (1.3%)  sources that cannot be cut 0  with translatable attributes 22  translated code starting with a shebang 0  failed projects 0
+TOTAL projects 8  glossary entries 15, translated 4162, passing the structural check 3956, with term_not_applied 12, terms 4, by category (person: 9 warnings, 2 terms, term: 6 warnings, 2 terms)  failed projects 0
+TOTAL projects 8  segments 9520 -> 7870, calls 9520 -> 6432 (ratio 0.676), passthrough 1438, headings merged 1655 of 1770  failed projects 0
+```
+
+### Tests
+
+2307 passed (part A: 2247). Changed existing tests, with the reason:
+
+- `test_injected_wait_and_cancel_during_backoff`: the injected wait takes the new third
+  argument `interrupted`.
+- `TestPhase7Survivors::test_short_positive_retry_after`: 0.5 s is now raised to 1 s
+  (item 6); 1.5 s added to keep a fractional value.
+- `TestDynamicWorkers::test_resume_api_passes_workers`: the body names `"action": "resume"`
+  (item 2).
+- Copilot classification case `(2, 'garbage', '')`: the plain stdout is now the message (G).
+- `TestCliRateLimitResumes::test_resumes_without_user`: sequential only; the parallel case,
+  which used a clock that jumped 1000 s per read, is replaced by `TestRound1ParallelCliGate`
+  (item 13).
+- Five tests that slept 0.1 s for coordinator ticks wait for `task.ticks` instead; the
+  time-window test no longer compares with real time (item 13).
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, two full runs (no separate targeted run: the round's
+mutants are all on changed lines, which is what the script mutates).
+
+| Run | Mutants | Killed | Survived | Timeout |
+|---|---|---|---|---|
+| 1 (after the fixes) | 1722 | 1671 | 47 | 4 |
+| 2 (final, after the survivor tests) | 1716 | 1693 | 13 | 10 |
+
+Run 1's survivors were killed by `TestRound1Survivors`, `TestThroughputScriptRound1Survivors`
+(event data, the tick's due argument and count, worker top-up: count with a live worker,
+daemon threads, log line, nothing without a project, the worker going on after a put-back
+and after a cancelled call, the start-failure message, the backoff slices with a fake clock,
+plain text before stderr, the default model, the work-tree message), or removed by
+simplifying the code (`error.retry_after` instead of `getattr`; Copilot's pattern list built
+instead of skipped with `continue`).
+
+Timeouts count as detected: each one makes a worker loop spin or a wait never end
+(`wait_or_cancel` 5, 8, 9; `_start_parallel` 23, 24, 25, 28, 47, 67, 74: the gate or the
+put-back inverted).
+
+The 13 survivors of run 2, all equivalent:
+
+| Mutant | Why it is equivalent |
+|---|---|
+| `classify_error` 1 (`prompt` default `'XXXX'`) | Copilot's `classify_error` never reads `prompt` (the parameter is the base class's signature) |
+| `_tick` 17 (`due = ""` for `None`) | `""` reaches `resume_translation(due="")`, which refuses it: `resume_at` is never `""`; nothing resumes, as with `None` |
+| overhead `main` 65 (`--only` without `default=None`) | argparse's default for `nargs='*'` is `None` |
+| overhead `median` 6, `prompt_text` 2–9, 20 | the same mutants as part A, justified there |
+
+### Known limitations (recorded, not fixed)
+
+- Parallel CLI: a stale call's rate limit after the gate reopened closes it again (D above).
+- The backoff wait looks at `interrupted` every 0.1 s (`WAIT_SLICE_SECONDS`), like
+  `run_process` looks at cancel.
+
+### Not verified
+
+- No real model call in this round (the orchestrator's browser and throughput runs above are
+  the real checks).
