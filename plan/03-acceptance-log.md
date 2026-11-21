@@ -5669,3 +5669,235 @@ expectations are named above); the four older check scripts give the same TOTAL 
 projects fingerprint is `a7197555c962562a530d6de80fa045af`. No real model call.
 
 Not verified: items 1 and 3 in a browser (rendered pages only).
+
+## Phase 9 — Copilot CLI completion
+
+Date: 2026-11-22. Branch: `phase-9/copilot-cli-completion`, worktree `<repo>/.worktree/phase-9`,
+shared virtualenv. Copilot CLI 1.0.114, model `claude-haiku-4.5`, invented text only.
+
+### What was built
+
+| # | Item | Built | Where |
+|---|---|---|---|
+| 1 | Plugin | `src/llm/copilot_plugin/plugin.json` and `extensions/system-prompt/extension.mjs`: `joinSession({systemMessage: {mode: "replace", content: process.env.EPUB_TRANSLATOR_SYSTEM_PROMPT}})`. Kept next to the backend module; `PLUGIN_DIR` is its absolute path, computed from the module's file, so the working directory does not matter, and it is passed as one argument (no shell), so spaces do not matter. | `src/llm/copilot_plugin/` |
+| 2 | One system prompt | `SYSTEM_PROMPT` moved to `src/llm/cli.py`; `ClaudeCLI` passes it with `--system-prompt`, `CopilotCLI.environment()` adds it as `EPUB_TRANSLATOR_SYSTEM_PROMPT` (the environment variable is how the prompt reaches the extension; the file has no copy of the text). | `src/llm/cli.py`, `claude_cli.py`, `copilot_cli.py` |
+| 3 | Command | `CopilotCLI` adds `--experimental --plugin-dir <PLUGIN_DIR>` (the owner's settings have `experimental: true`, but the backend does not depend on it). | `src/llm/copilot_cli.py` |
+| 4 | Check | Every run that `classify_error` would accept is also checked by `_replaced`: every `session.usage_checkpoint` must have `promptCacheBreakState[].models.<model>.system_segments`, and every model call's segment list must be exactly `[agent_replacement]`. Otherwise `BackendUnavailableError(NOT_REPLACED_MESSAGE)` (raw output kept for the diagnostics): the web task pauses waiting for the user, the CLI run stops (exit 1), nothing is stored. A failed run keeps its own class (rate limit, auth, …). | `src/llm/copilot_cli.py` |
+| 5 | Check script | `scripts/verify/phase9_copilot_overhead.py` | — |
+
+### The detection signal
+
+Candidates, compared on the research outputs and reproduced here:
+
+- `session.extensions_loaded` lists the plugin's extension as `running` whenever it starts, also
+  when its `joinSession` call then fails (extension without the environment variable: status
+  `running`, then the run fails with `data did not match any variant of untagged enum
+  ProtocolSystemMessageConfig`, exit 1). With `--no-experimental` the event is missing, with a
+  wrong plugin folder it is an empty list. It says that an extension started, not that the
+  prompt was replaced. Not used.
+- Input tokens: replaced 94, built-in 2127 for one sentence; but a long prompt with the
+  replacement (4079, below) is above the built-in short call (3704). A fixed threshold false-alarms
+  on long segments, and a threshold relative to the prompt needs a token estimate of mixed
+  English and Chinese text. Not used.
+- `system_segments` in the usage checkpoint: the system prompt parts actually sent with each
+  model call. Built-in: 18 named segments (`customized_identity_preamble`, …,
+  `final_instructions`, 1972–1979 tokens). Replaced: one segment `agent_replacement` of 14
+  tokens, whose `hash` is the first 12 hex digits of the SHA-256 of our prompt (`66b1b00b4dea`,
+  checked; the research's two different prompts gave their own SHA-256 prefixes too). It does not
+  depend on the prompt's length (14 tokens for the 1927- and the 8966-character prompt). Used,
+  by name only (the hash is not checked: one more undocumented detail that could change).
+
+Threshold: none; the check is structural (exactly one `agent_replacement` segment per model
+call). A missing report counts as not replaced, so a CLI update that drops the field stops the
+run with the message instead of translating on unverified.
+
+### Real calls
+
+Before/after per call (`scripts/verify/phase9_copilot_overhead.py`, 3 calls per configuration,
+round-robin; the short prompt is the engine's text prompt around an invented paragraph, the long
+one has 8 invented paragraphs and a 60-entry invented glossary):
+
+```
+$ python3 scripts/verify/phase9_copilot_overhead.py --raw
+model claude-haiku-4.5  repetitions 3  prompts 1927 and 8966 characters (invented paragraphs)
+  1 built-in           pass not replaced wall 12.19 in 3704 out 810 system segments 18 (1977 tokens)
+  1 replaced           pass replaced wall 11.79 in 1670 out 673 system segments 1 (14 tokens)
+  1 replaced-long      pass replaced wall 23.60 in 4079 out 2447 system segments 1 (14 tokens)
+  1 no-experimental    pass not replaced wall 11.09 in 3706 out 680 system segments 18 (1979 tokens)
+  1 wrong-plugin-dir   pass not replaced wall 11.40 in 3704 out 629 system segments 18 (1977 tokens)
+  2 built-in           pass not replaced wall 12.85 in 3706 out 859 system segments 18 (1979 tokens)
+  2 replaced           pass replaced wall 11.84 in 1670 out 697 system segments 1 (14 tokens)
+  2 replaced-long      pass replaced wall 23.94 in 4079 out 2567 system segments 1 (14 tokens)
+  2 no-experimental    pass not replaced wall 9.41 in 3702 out 538 system segments 18 (1975 tokens)
+  2 wrong-plugin-dir   pass not replaced wall 14.94 in 3705 out 1015 system segments 18 (1978 tokens)
+  3 built-in           pass not replaced wall 12.00 in 3703 out 720 system segments 18 (1976 tokens)
+  3 replaced           pass replaced wall 9.69 in 1670 out 548 system segments 1 (14 tokens)
+  3 replaced-long      pass replaced wall 27.20 in 4079 out 2928 system segments 1 (14 tokens)
+  3 no-experimental    pass not replaced wall 13.24 in 3699 out 875 system segments 18 (1972 tokens)
+  3 wrong-plugin-dir   pass not replaced wall 12.11 in 3706 out 747 system segments 18 (1979 tokens)
+built-in           n=3 passed=3  wall  12.19 s  in    3704  out   810  system segments   18 ( 1977 tokens)
+replaced           n=3 passed=3  wall  11.79 s  in    1670  out   673  system segments    1 (   14 tokens)
+replaced-long      n=3 passed=3  wall  23.94 s  in    4079  out  2567  system segments    1 (   14 tokens)
+no-experimental    n=3 passed=3  wall  11.09 s  in    3702  out   680  system segments   18 ( 1975 tokens)
+wrong-plugin-dir   n=3 passed=3  wall  12.11 s  in    3705  out   747  system segments   18 ( 1978 tokens)
+$ echo $?
+0
+```
+
+- Input per call: 3704 → 1670 tokens on the engine's prompt (−2034, the built-in system prompt
+  and its framing); on a bare sentence 2127 → 94 (two single calls before the script, same flags).
+- Wall time per call: median 12.19 → 11.79 s (single calls 7.77 → 7.44 s): within the spread of
+  the raw calls (9.4–14.9 s); the extra Node process costs no measurable time here.
+- Broken setups: `--no-experimental` (exit 0, no `extensions_loaded` event, 18 segments) and a
+  wrong plugin folder (exit 0, stderr `Warning: [plugin-dir] no plugin.json or SKILL.md found in
+  …`, 18 segments) were each detected on all 3 calls (`not replaced` = the backend's
+  `BackendUnavailableError` with `NOT_REPLACED_MESSAGE`).
+- Output tokens include the model's reasoning; they are what the CLI reports.
+
+Short invented book through the real CLI path (6 text segments, one heading, invented sentences,
+project in a scratch directory; the repository copied with `git archive` into a folder whose
+path contains spaces, run from `/tmp`, so the plugin path has spaces and is not under the
+working directory):
+
+```
+$ cd /tmp && python3 "<scratch>/repo with spaces/translate.py" start --project <scratch>/book \
+    --backend copilot-cli --model claude-haiku-4.5 --workers 2
+使用模型：claude-haiku-4.5（copilot-cli）
+繼續翻譯：0/6 已完成 (0.0%)
+剩餘 6 個段落待翻譯
+並行 Workers：2
+
+  [W1] [1/6] ✓ c1_seg0002（23 字）
+  [W0] [2/6] ✓ c1_seg0001（5 字）
+  [W1] [3/6] ✓ c1_seg0003（26 字）
+  [W0] [4/6] ✓ c1_seg0004（26 字）
+  [W1] [5/6] ✓ c1_seg0005（19 字）
+  [W0] [6/6] ✓ c1_seg0006（20 字）
+
+全部翻譯完成！
+$ echo $?
+0
+```
+
+6 calls, all passed the check (a call that failed it would have stopped the run); stored input
+tokens per segment 1433, 1473, 1499, 1490, 1483, 1434; replies plain (one translated element
+each, no alternatives).
+
+Processes. While the book ran, `ps` showed per call `copilot -p …` (its own process group, as
+`run_process` starts it) and a child `copilot extension_bootstrap.mjs` — in a process group of
+its own (pgid = its pid), so the group kill does not reach it directly. Cancel in flight, real
+call through `CopilotCLI.complete` (scratch script: cancel set once the extension process exists,
+and once 4 s later during the model call): `CancelledError`, the call returned within 0.05 s,
+and the `copilot` process, the extension process and every other child of `copilot` were gone
+within 1.1 s and 0.9 s (polled with `ps`). The extension ends by itself when its parent dies;
+no process was left.
+
+Calls made in this phase: 28 (5 single probes, 15 by the script, 6 for the book, 2 cancelled).
+
+### Checks
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase3_export_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  exports 24  translated segments 4162  as translation 3956  kept original 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 53)  toc labels changed 405/1885 (527 into translated chapters)  exports with new epubcheck errors 0  failed projects 0
+$ python3 scripts/verify/phase4_validate_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  round trip 9491/9491  translated 4162  failing the structural check 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 54; only tag rules 88)  warnings (length_ratio 36, untranslated 8)  length ratio over 2925 segments: p1 0.312 p5 0.333 p50 0.404 p95 0.547 p99 0.976; outside 0.25-0.8: 38 (1.3%)  sources that cannot be cut 0  with translatable attributes 22  translated code starting with a shebang 0  failed projects 0
+$ python3 scripts/verify/phase5_glossary_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  glossary entries 15, translated 4162, passing the structural check 3956, with term_not_applied 12, terms 4, by category (person: 9 warnings, 2 terms, term: 6 warnings, 2 terms)  failed projects 0
+$ python3 scripts/verify/phase6_segmentation_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  segments 9520 -> 7870, calls 9520 -> 6432 (ratio 0.676), passthrough 1438, headings merged 1655 of 1770  failed projects 0
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+All four exited 0 with the TOTAL lines of Phase 8 (this phase changes no segmentation,
+validation, glossary or export code). The fingerprint was the same before the first real call and
+after all work. No real call sent text from the projects directory.
+
+### Tests
+
+2581 passed (main: 2545), and three suites at once: 2581 passed each, no failure. New:
+`tests/test_copilot_plugin.py` (27): the exact command with `--experimental --plugin-dir
+<PLUGIN_DIR>` and the environment variable holding `SYSTEM_PROMPT` (the rest of the environment
+kept); one prompt object for both backends; the plugin's files in the repository and the
+extension reading that variable; a replaced reply returned with its usage; a 112 000-character
+prompt with 30 000 input tokens and the replacement passes; 14 forms of a reply without the
+replacement (built-in segments, replacement plus another segment, one of two model calls or of
+two checkpoints not replaced, empty or missing lists, malformed state, no checkpoint) raise the
+unavailable error with the raw output kept; an answer beside an ignored error event is checked
+too; a failed run keeps its class; a CLI run (1 and 2 workers, real `CopilotCLI`, fake process)
+stops with exit 1 and the message after at most one call per worker, every segment still pending
+with no translation, and the same run with the replacement completes.
+`TestPhase9CopilotOverheadScript` (`test_verify_scripts.py`, 9): the five commands, prompts,
+environment, working directory and timeout, the lines printed, the exit code when a replaced call
+fails or a broken setup is not detected, failed calls, another unavailable error not counted as a
+detection, defaults and help. No fixed sleep; waits are on results.
+
+Tests changed, none removed:
+
+| Test | Change | Reason |
+|---|---|---|
+| `test_runtime` `_copilot_ok` (fixture of the backend contract and of `TestCopilotCLI`) | its usage checkpoint reports the replaced system prompt | a successful Copilot run must now report it, as the real one does |
+| `test_runtime` `TestCopilotCLI::test_command` | the command ends with `--experimental --plugin-dir <PLUGIN_DIR>` | item 3 |
+| `test_runtime` `TestRound1Copilot::test_error_beside_a_reply` | the two accepted runs include the replaced checkpoint | same as the fixture |
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, mutmut 3.8.1, parallel (about 8 minutes per run). Added to the
+mutated files: `scripts/verify/phase9_copilot_overhead.py`.
+
+| Run | Mutants | Killed | Survived | Timeout |
+|---|---|---|---|---|
+| 1 | 386 | 329 | 57 | 0 |
+| 2 (final) | 376 | 358 | 18 | 0 |
+
+Run 1: every survivor was in the check script; none in `src/llm/` (the check, the command, the
+environment, the shared prompt). Run 1 → 2: tests for the exact help text, two names after
+`--only`, the working directory passed, a wall time printed, another unavailable error not
+counted as a detection; the script's failure records no longer carry a wall time nobody reads,
+the built-in command is cut with `del cmd[plugin - 1:]`, and the two prompts are built in one
+expression (removing equivalent mutants).
+
+Remaining, each equivalent:
+
+| mutant(s) | why equivalent |
+|---|---|
+| `command` 6, 7, 9, 14, 15, 16, 19, 20, 21 (the `LLMRequest` handed to `build_command`: `system`, `messages`, the message's role or content, `timeout` changed) | `CopilotCLI.build_command` reads only `request.model` from the request; the prompt is its own argument |
+| `main` 132, 134, 138 (`flush=None/False/omitted` in the `--raw` print) | flushing changes when the line reaches the terminal, not what is printed |
+| `main` 65 (`default=None` dropped for `--only`) | argparse's default for an optional argument is `None` |
+| `median` 6 (`float('NAN')`) | `float()` parses `nan` case-insensitively: the same value |
+| `prompt_text` 2 (`backend=None`) | `_build_prompt` does not use the backend; `None` makes a `ClaudeCLI` object, which starts nothing |
+| `prompt_text` 6, 18 (`text` `None` / `'XXXX'`) | with `html` given and a text segment, `_build_prompt` formats the HTML prompt and never reads `text` |
+| `prompt_text` 7 (`segment_type=None`) | `_build_prompt` only tests `segment_type == SegmentType.CODE`; `None` takes the same branch as `TEXT` |
+
+### Known limitations and risks
+
+- Undocumented: replacing the system prompt from an extension loaded through `--plugin-dir` in
+  `-p` mode, and the `system_segments` report the check reads. A Copilot CLI update can break
+  either; then every call fails the check and the run stops with `NOT_REPLACED_MESSAGE` (web:
+  paused, CLI: exit 1) until the backend is updated. Extensions are an experimental feature.
+- `mode: "replace"` drops Copilot's built-in guardrails with the rest of its prompt (the SDK
+  documentation says so). The calls have no tools.
+- One more process per call (`copilot extension_bootstrap.mjs`). It runs in its own process group,
+  so a cancel kills it only indirectly: it exits by itself once `copilot` is killed (measured
+  within about 1 s, twice). If a Copilot version kept it alive after its parent died, it would be
+  left running; the cancel check above would show it.
+- The extension needs `EPUB_TRANSLATOR_SYSTEM_PROMPT`; without it the CLI fails the run (exit 1,
+  `ProtocolSystemMessageConfig`), which is classified as transient. `CopilotCLI` always sets it,
+  so only a hand-made call can hit this.
+- The check accepts any `agent_replacement` content; that it is our prompt is shown by the hash
+  (the SHA-256 prefix of `SYSTEM_PROMPT`), which is not checked.
+- Copilot calls still each leave a session in the user's Copilot directory (as in Phase 7). The
+  CLI also creates one empty folder per plugin location under `plugin-data/_direct/` there (two
+  appeared during this phase: the worktree's and the copy's). Its `config.json` and
+  `settings.json` do not mention the plugin (checked with `grep`).
+
+### Not verified
+
+- The web path with the real CLI (the CLI path ran for real; the web worker uses the same backend
+  and the same error handling, tested with fake processes in Phase 7).
+- Term extraction through Copilot with the replacement (same backend call).
+- Models other than `claude-haiku-4.5`; Copilot versions other than 1.0.114.
+- Translation quality with the short system prompt compared to Copilot's own; the replies were
+  plain translations in every real call.
