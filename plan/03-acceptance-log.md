@@ -5961,6 +5961,9 @@ src/glossary/glossary_manager.py:30
 
 Python emits it only when it compiles that file (a docstring with `\w` that is not raw), so it
 appears on a run that finds no cached bytecode and not on the next: a likelier source of the
-intermittent warning on `main` than a thread. Not changed here (outside this phase).
+intermittent warning on `main` than a thread.
+
+Cause of the intermittent warning (seen during Phase 7 and after the Phase 8 merge): that docstring, the only one of the repository's Python files that warns when compiled (`py_compile` under `-W error`); it is now a raw string (`__doc__` only; no behaviour change).
+Pinned by `tests/test_sources_compile.py`: every `.py` file under `src`, `scripts`, `tests` and `translate.py` is compiled in memory with warnings as errors (no bytecode written); it fails on the old docstring.
 
 The projects fingerprint is `a7197555c962562a530d6de80fa045af` after this round.
