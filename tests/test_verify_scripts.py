@@ -3881,3 +3881,23 @@ class TestThroughputScriptRound1:
         args[args.index('--segments') + 1] = '9'  # too few: stops after the setup
         assert throughput.main(args) == 2
         assert 'SEGMENT TEXT' not in capsys.readouterr().out
+
+
+class TestThroughputScriptRound1Survivors:
+
+    def test_default_model_is_haiku(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(throughput, 'measure', lambda args: seen.append(args.model) or 0)
+        assert throughput.main(['--projects-dir', 'p', '--project-index', '1']) == 0
+        assert seen == ['haiku']
+
+    def test_temporary_directory_in_a_work_tree(self, tmp_path, capsys, monkeypatch):
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+        tree = tmp_path / 'tree'
+        (tree / '.git').mkdir(parents=True)
+        monkeypatch.setattr(throughput.tempfile, 'gettempdir', lambda: str(tree))
+        assert throughput.main(['--projects-dir', str(projects), '--project-index', '2',
+                                '--segments', '2', '--anonymize']) == 2
+        assert capsys.readouterr().out == \
+            'ERROR the temporary directory would be inside a git work tree\n'

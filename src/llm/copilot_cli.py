@@ -157,11 +157,11 @@ class CopilotCLI(CLIBackend):
         # A successful run with a reply fails only for a rate limit or
         # expired credentials; any other error event beside the reply is ignored
         answered = result.returncode == 0 and bool(_reply(events))
-        for pattern, cls in ((_RATE_LIMIT_PATTERN, RateLimitError), (_AUTH_PATTERN, AuthError),
-                             (_UNAVAILABLE_PATTERN, BackendUnavailableError),
-                             (_REFUSAL_PATTERN, RefusalError)):
-            if answered and cls not in (RateLimitError, AuthError):
-                continue
+        patterns = ((_RATE_LIMIT_PATTERN, RateLimitError), (_AUTH_PATTERN, AuthError))
+        if not answered:
+            patterns += ((_UNAVAILABLE_PATTERN, BackendUnavailableError),
+                         (_REFUSAL_PATTERN, RefusalError))
+        for pattern, cls in patterns:
             if any(pattern.search(t) for t in texts):
                 if cls is AuthError:
                     return AuthError(f'Copilot CLI 認證失敗，{AUTH_HINT}：{joined}')

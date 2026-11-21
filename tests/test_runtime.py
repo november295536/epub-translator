@@ -1799,3 +1799,161 @@ class TestRound1HomeListing:
             task._coordinator.join(timeout=20)
         entry = listed[0] if isinstance(listed, list) else listed['projects'][0]
         assert entry['translated'] == 1
+
+
+class TestRound1Survivors:
+    """Mutants left by the round 1 mutation run."""
+
+    def test_wait_slices(self, monkeypatch):
+        import src.core.translator as translator_module
+
+        class Time:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+        fake_time = Time()
+
+        class Cancel:
+            waits = []
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+                fake_time.now += seconds
+                return False
+
+        monkeypatch.setattr(translator_module, 'time', fake_time)
+        monkeypatch.setattr(translator_module, 'WAIT_SLICE_SECONDS', 1)
+        cancel = Cancel()
+        assert wait_or_cancel(3, cancel) is False
+        assert cancel.waits == [1, 1, 1]
+        cancel.waits.clear()
+        assert wait_or_cancel(2.5, cancel) is False
+        assert cancel.waits == [1, 1, 0.5]
+
+    def test_plain_text_before_stderr(self):
+        result = ProcessResult(1, 'plain', 'err')
+        assert str(CopilotCLI().classify_error(result)) == \
+            'copilot CLI exited with code 1: plain | err'
+
+    def test_pause_event_data(self, tmp_path, fresh_tm, clock):
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path), state='running',
+                                            total=5)
+        task.completed = 2
+        fresh_tm._pause_for(task, RateLimitError('limit', retry_after=30), 'rate_limit')
+        assert task.progress.get_all()[-1] == {'event': 'rate_limit', 'data': {
+            'error': 'limit', 'completed': 2, 'remaining': 3, 'resume_in': 30.0}}
+
+    def test_tick_passes_the_due_deadline(self, tmp_path, fresh_tm, clock, monkeypatch):
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path), state='paused')
+        task.resume_at = clock.now - 1
+        seen = []
+        monkeypatch.setattr(fresh_tm, 'resume_translation',
+                            lambda name, due=None, **kw: seen.append(due) or False)
+
+        class Saver:
+            def flush(self):
+                pass
+
+        fresh_tm._tick(task, Saver())
+        assert seen == [clock.now - 1] and task.ticks == 1
+
+    def _paused_task(self, tmp_path, fresh_tm, workers):
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path), state='paused',
+                                            num_workers=workers)
+        task.pm, task._gm = object(), object()
+        return task
+
+    def test_top_up(self, tmp_path, fresh_tm, caplog, monkeypatch):
+        import logging
+        caplog.set_level(logging.INFO, logger='src.web.tasks')
+        release = threading.Event()
+        monkeypatch.setattr(tasks_module.TaskManager, '_worker_loop',
+                            lambda self, t, wid: release.wait(20))
+        task = self._paused_task(tmp_path, fresh_tm, 3)
+        busy = threading.Thread(target=release.wait, args=(20,), daemon=True)
+        busy.start()
+        task._threads.append(busy)  # one alive already
+        assert fresh_tm._top_up_workers(task)
+        assert len(task._threads) == 3 and task.active_workers == 2
+        assert all(t.daemon for t in task._threads[1:])
+        assert '動態增加 2 workers (共 3)' in caplog.messages
+        caplog.clear()
+        assert fresh_tm._top_up_workers(task)  # enough: nothing started, nothing logged
+        assert len(task._threads) == 3 and caplog.messages == []
+        release.set()
+        for t in task._threads:
+            t.join()
+        for pm, gm in ((None, object()), (object(), None)):
+            empty = self._paused_task(tmp_path, fresh_tm, 2)
+            empty.pm, empty._gm = pm, gm
+            assert fresh_tm._top_up_workers(empty) and empty._threads == []
+
+    def test_workers_done_when_a_worker_cannot_start(self, tmp_path, fresh_tm, monkeypatch):
+        task = self._paused_task(tmp_path, fresh_tm, 1)
+        task.segment_queue.put('seg')
+
+        def refuse(self):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(threading.Thread, 'start', refuse)
+        with pytest.raises(RuntimeError) as info:
+            fresh_tm._workers_done(task)
+        assert str(info.value) == "無法增加 worker：can't start new thread"
+
+    def _worker_task(self, tmp_path, fresh_tm):
+        from src.glossary.glossary_manager import GlossaryManager
+        path = _make_project(tmp_path / 'projects', n=1)
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path / 'projects'),
+                                            state='running', total=1)
+        task.pm = ProjectManager(path)
+        task.pm.load()
+        task._gm = GlossaryManager(os.path.join(path, 'glossary.json'))
+        task.active_workers = 1
+        task.segment_queue.put(task.pm.data.segments[0])
+        return task
+
+    def test_worker_goes_on_after_putting_back_a_segment(self, tmp_path, fresh_tm):
+        """Paused after get(): the worker puts it back and waits; resumed, it
+        sends it."""
+        task = self._worker_task(tmp_path, fresh_tm)
+        task.segment_queue = _HookQueue(task.segment_queue, task.pause_event.clear)
+        fake = FakeBackend(responder=lambda r: like(r, '譯'))
+        with use_fake_backend(fake):
+            worker = threading.Thread(target=fresh_tm._worker_loop, args=(task, 0), daemon=True)
+            worker.start()
+            try:
+                _wait(lambda: task.segment_queue.done and task.segment_queue.qsize() == 1)
+                assert fake.requests == []
+                task.pause_event.set()
+                _wait(lambda: task.result_queue.qsize() == 1)
+            finally:
+                task.stop_event.set()
+                task.pause_event.set()
+                worker.join(timeout=20)
+        assert len(fake.requests) == 1
+
+    def test_worker_goes_on_after_a_cancelled_call(self, tmp_path, fresh_tm):
+        task = self._worker_task(tmp_path, fresh_tm)
+        calls = []
+
+        def respond(request):
+            calls.append(1)
+            if len(calls) == 1:
+                task.pause_event.clear()
+                raise CancelledError('paused')
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            worker = threading.Thread(target=fresh_tm._worker_loop, args=(task, 0), daemon=True)
+            worker.start()
+            try:
+                _wait(lambda: calls and task.segment_queue.qsize() == 1)
+                task.pause_event.set()
+                _wait(lambda: task.result_queue.qsize() == 1)
+            finally:
+                task.stop_event.set()
+                task.pause_event.set()
+                worker.join(timeout=20)
+        assert len(calls) == 2

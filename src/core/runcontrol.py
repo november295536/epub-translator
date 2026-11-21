@@ -29,7 +29,7 @@ def resume_delay(error: Exception) -> float | None:
     the user."""
     if not isinstance(error, RateLimitError):
         return None
-    value = getattr(error, 'retry_after', None)
+    value = error.retry_after
     if (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(value) and value > 0):
         low, high = RETRY_AFTER_BOUNDS
