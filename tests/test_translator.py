@@ -431,7 +431,8 @@ class TestModelSelection:
             engine.translate('test')
 
         cmd = mock_run.call_args[0][0]
-        assert cmd == ['claude', '-p', mock_run.call_args[0][0][2], '--model', 'sonnet']
+        from src.llm.claude_cli import LEAN_FLAGS
+        assert cmd == ['claude', '-p', mock_run.call_args[0][0][2], '--model', 'sonnet'] + list(LEAN_FLAGS)
 
     def test_model_changeable_between_calls(self):
         engine = TranslationEngine(model='sonnet')

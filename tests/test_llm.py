@@ -12,7 +12,7 @@ from src.llm import (
     AuthError, CancelledError, LLMError, LLMRequest, LLMResponse, Message,
     RateLimitError, TransientError, Usage, default_backend,
 )
-from src.llm.claude_cli import ClaudeCLI
+from src.llm.claude_cli import LEAN_FLAGS, ClaudeCLI
 from src.llm.cli import CLIBackend, ProcessResult, flatten_prompt, run_process
 from src.llm.fake import FakeBackend
 
@@ -73,11 +73,15 @@ class TestClaudeCLICommand:
 
     def test_command(self):
         cmd = ClaudeCLI().build_command('PROMPT', _request(model='opus'))
-        assert cmd == ['claude', '-p', 'PROMPT', '--model', 'opus']
+        # Phase 7: the measured lean flags follow (phase7_cli_overhead.py)
+        assert cmd == ['claude', '-p', 'PROMPT', '--model', 'opus',
+                       '--system-prompt', '你是一位專業的英文翻譯。', '--tools', '',
+                       '--strict-mcp-config', '--setting-sources', '',
+                       '--no-session-persistence']
 
     def test_command_without_model(self):
         assert ClaudeCLI().build_command('PROMPT', _request(model='')) == \
-            ['claude', '-p', 'PROMPT']
+            ['claude', '-p', 'PROMPT'] + list(LEAN_FLAGS)
 
     def test_parse_output(self):
         response = ClaudeCLI().parse_output(_result(0, '  譯文\n'), _request(model='haiku'))

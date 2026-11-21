@@ -362,7 +362,8 @@ class TestTermExtractorBackend:
         with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             TermExtractor(model='opus').extract_from_text('Some text')
         cmd = mock_run.call_args[0][0]
-        assert cmd[:2] == ['claude', '-p'] and cmd[3:] == ['--model', 'opus']
+        from src.llm.claude_cli import LEAN_FLAGS
+        assert cmd[:2] == ['claude', '-p'] and cmd[3:] == ['--model', 'opus'] + list(LEAN_FLAGS)
         assert 'CLAUDECODE' not in mock_run.call_args[1]['env']
         assert mock_run.call_args[1]['cwd'] == tempfile.gettempdir()
 
@@ -370,7 +371,8 @@ class TestTermExtractorBackend:
         mock_result = MagicMock(returncode=0, stdout='[]', stderr='')
         with patch('src.llm.cli.run_process', return_value=mock_result) as mock_run:
             TermExtractor().extract_from_text('Some text')
-        assert mock_run.call_args[0][0][3:] == []
+        from src.llm.claude_cli import LEAN_FLAGS
+        assert mock_run.call_args[0][0][3:] == list(LEAN_FLAGS)
 
     def test_rate_limit_stops_extraction(self):
         from src.llm import RateLimitError

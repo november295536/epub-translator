@@ -1,4 +1,4 @@
-"""Claude Code CLI backend: `claude -p <prompt> --model <alias>`."""
+"""Claude Code CLI backend: `claude -p <prompt> --model <alias>` plus LEAN_FLAGS."""
 
 from __future__ import annotations
 
@@ -36,6 +36,20 @@ AUTH_MESSAGE = f'Claude CLI 認證已過期，{AUTH_HINT}'
 # the phrases on its own is still taken for an error.
 SHORT_REPLY_CHARS = 300
 
+# Replaces Claude Code's own (coding agent) system prompt; the request text
+# is sent unchanged as the prompt
+SYSTEM_PROMPT = '你是一位專業的英文翻譯。'
+
+# Flags that strip what a translation call does not need, each adopted for
+# its measured effect (plan/03-acceptance-log.md, Phase 7 part A;
+# scripts/verify/phase7_cli_overhead.py, haiku, median of 5 calls, input
+# tokens per call 29831 without any): the default system prompt (-3154
+# tokens), the built-in tools (-24212), MCP servers not named on the command
+# line (-269), the user's, project's and local settings with their CLAUDE.md
+# and memory (-8961), and a session transcript written per call (none written).
+LEAN_FLAGS = ('--system-prompt', SYSTEM_PROMPT, '--tools', '', '--strict-mcp-config',
+              '--setting-sources', '', '--no-session-persistence')
+
 
 class ClaudeCLI(CLIBackend):
     name = 'claude-cli'
@@ -56,7 +70,7 @@ class ClaudeCLI(CLIBackend):
         cmd = ['claude', '-p', prompt]
         if request.model:
             cmd += ['--model', request.model]
-        return cmd
+        return cmd + list(LEAN_FLAGS)
 
     def parse_output(self, result: ProcessResult, request: LLMRequest) -> LLMResponse:
         return LLMResponse(text=result.stdout, stop_reason='complete',
