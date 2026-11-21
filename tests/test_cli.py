@@ -614,22 +614,49 @@ class TestCLISupervisorFailure:
     """Item 6: the parallel supervisor joins its workers before the lock goes."""
 
     @pytest.mark.parametrize('error', [OSError('disk full'), KeyboardInterrupt()])
-    def test_save_failure(self, runner, tmp_path, error):
+    def test_save_failure(self, runner, tmp_path, error, monkeypatch):
+        """The first save fails while one call is still in flight: the
+        supervisor waits for that worker before it returns (and the lock goes)."""
+        import src.core.runcontrol as runcontrol
         path = _make_project(str(tmp_path / 'p'), n=4)
-        threads = []
+        started, joined = [], []
+        in_flight, release, done = threading.Event(), threading.Event(), threading.Event()
+        real_start, real_join = threading.Thread.start, threading.Thread.join
+
+        def start(thread):
+            started.append(thread)
+            return real_start(thread)
+
+        def join(thread, *args, **kwargs):
+            joined.append(thread)
+            release.set()  # the supervisor joins: the call in flight may end
+            return real_join(thread, *args, **kwargs)
+
+        monkeypatch.setattr(threading.Thread, 'start', start)
+        monkeypatch.setattr(threading.Thread, 'join', join)
+        # Every result is saved at once, so the first save comes mid-run
+        monkeypatch.setattr(runcontrol.DebouncedSaver, 'maybe_save', lambda self: self.flush())
 
         def respond(request):
-            threads.append(threading.current_thread())
             if 'Sentence MARK4.</p>' in request.messages[-1].content:
-                _time.sleep(1)  # still in flight when the save fails
+                in_flight.set()
+                assert release.wait(10)
+                done.set()
+            else:
+                assert in_flight.wait(10)  # applied (and saved) only once MARK4 runs
             return '<p k="1">譯文</p>'
 
-        # Without --model the run's first save is the supervisor's
-        with use_fake_backend(FakeBackend(responder=respond)), \
-                patch.object(ProjectManager, 'save', side_effect=error):
-            result = runner.invoke(cli, ['start', '--project', path, '--workers', '3'])
+        try:
+            with use_fake_backend(FakeBackend(responder=respond)), \
+                    patch.object(ProjectManager, 'save', side_effect=error):
+                result = runner.invoke(cli, ['start', '--project', path, '--workers', '4'])
+            finished_before_return = done.is_set()
+        finally:
+            release.set()
         assert result.exit_code != 0
-        assert threads and not any(t.is_alive() for t in threads)
+        assert finished_before_return  # the supervisor waited for the call in flight
+        assert len(started) == 4 and all(t in joined for t in started)
+        assert not any(t.is_alive() for t in started)
         assert '未儲存的結果' in result.output
         assert lock_free_for_other_process(path)
         # Nothing was saved: every segment is still pending
