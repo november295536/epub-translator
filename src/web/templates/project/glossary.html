@@ -301,10 +301,12 @@ function glossaryManager() {
         },
 
         async addTerm() {
-            // the person fields only when they are shown: hidden ones are not sent,
-            // so an existing entry keeps its own
+            // the person fields only when shown and filled in: an existing entry
+            // keeps its own (clearing them is done in the edit row)
             const { gender, note, ...entry } = this.newTerm;
-            const body = entry.category === 'person' ? { ...entry, gender, note } : entry;
+            const body = { ...entry };
+            if (entry.category === 'person' && gender.trim()) body.gender = gender;
+            if (entry.category === 'person' && note.trim()) body.note = note;
             const res = await fetch(`/api/projects/${projectName}/glossary`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
