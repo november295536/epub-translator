@@ -37,6 +37,10 @@ KEPT_OUTPUT_CHARS = 20000
 UNKNOWN_OPTION_PATTERN = re.compile(r'unknown option|unrecogni[sz]ed (?:option|argument)',
                                     re.IGNORECASE)
 
+# Replaces the CLI's own (coding agent) system prompt in every CLI backend:
+# Claude through --system-prompt, Copilot through its plugin (copilot_cli.py)
+SYSTEM_PROMPT = '你是一位專業的英文翻譯。'
+
 # Start errors caused by a temporary shortage of system resources
 RESOURCE_ERRNOS = (errno.EAGAIN, errno.ENOMEM, errno.EMFILE, errno.ENFILE)
 
