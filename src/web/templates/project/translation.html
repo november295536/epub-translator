@@ -77,6 +77,7 @@
                 <div style="margin-top: 0.3rem; display: flex; gap: 0.75rem; align-items: center;">
                     <button class="btn btn-secondary btn-small" @click="saveBrief()" :disabled="briefSaving || brief === savedBrief">儲存簡介</button>
                     <span class="text-muted" x-show="brief === savedBrief && savedBrief" x-text="'已儲存'"></span>
+                    <span class="text-error" x-show="briefError" x-text="briefError"></span>
                 </div>
             </div>
 
@@ -167,6 +168,7 @@ function translationController() {
         savedBrief: '',
         briefLoaded: false,  // not editable before the stored brief is shown
         briefSaving: false,
+        briefError: '',  // the brief's own: a later save clears it, the task error stays
 
         init() {
             this.fetchBrief();
@@ -237,11 +239,12 @@ function translationController() {
                     // a draft typed meanwhile is kept (and shows as not saved)
                     if (this.brief === sent) this.brief = data.brief;
                     this.savedBrief = data.brief;
+                    this.briefError = '';
                 } else {
-                    this.error = data.error || '簡介儲存失敗';
+                    this.briefError = data.error || '簡介儲存失敗';
                 }
             } catch (e) {
-                this.error = '簡介儲存失敗: ' + e.message;
+                this.briefError = '簡介儲存失敗: ' + e.message;
             }
             this.briefSaving = false;
         },

@@ -89,13 +89,17 @@ def _check_entries(raw) -> None:
 
 
 def _entries(raw) -> list:
-    """The entries of a stored or imported glossary; ValueError when one is
-    not an entry (_check_entries, or a missing or unknown field)."""
+    """The entries of a stored or imported glossary, gender and note on one
+    line (_one_line); ValueError when one is not an entry (_check_entries,
+    or a missing or unknown field)."""
     _check_entries(raw)
     try:
-        return [GlossaryEntry(**item) for item in raw]
+        entries = [GlossaryEntry(**item) for item in raw]
     except TypeError:
         raise ValueError('a glossary entry has a missing or unknown field') from None
+    for e in entries:  # a hand-edited file too: one prompt line per entry
+        e.gender, e.note = _one_line(e.gender), _one_line(e.note)
+    return entries
 
 
 def _one_line(value: str) -> str:
