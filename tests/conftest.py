@@ -363,6 +363,30 @@ def no_real_model_calls(monkeypatch):
     monkeypatch.setattr('src.llm.cli.run_process', refuse)
 
 
+@pytest.fixture(autouse=True)
+def no_cli_sleep(monkeypatch):
+    """The CLI never sleeps through a rate-limit pause in a test: a test
+    that expects one replaces translate._sleep itself."""
+    def refuse(seconds):
+        raise AssertionError(f'the CLI would sleep {seconds} s')
+    monkeypatch.setattr('translate._sleep', refuse)
+
+
+@pytest.fixture(autouse=True)
+def backoff_waits(monkeypatch):
+    """No test sleeps through a retry backoff: the engine's default wait
+    returns at once (cancelled when the event is set) and is recorded
+    here, in seconds."""
+    waited = []
+
+    def no_wait(seconds, cancel, interrupted=None):
+        waited.append(seconds)
+        return cancel.is_set() or (interrupted is not None and interrupted())
+
+    monkeypatch.setattr('src.core.translator.wait_or_cancel', no_wait)
+    return waited
+
+
 # --- Parsed chapter bodies -----------------------------------------------------
 
 def body_of(html: str):

@@ -12,7 +12,7 @@ from src.llm import (
     AuthError, CancelledError, LLMError, LLMRequest, LLMResponse, Message,
     RateLimitError, TransientError, Usage, default_backend,
 )
-from src.llm.claude_cli import ClaudeCLI
+from src.llm.claude_cli import LEAN_FLAGS, ClaudeCLI
 from src.llm.cli import CLIBackend, ProcessResult, flatten_prompt, run_process
 from src.llm.fake import FakeBackend
 
@@ -73,11 +73,15 @@ class TestClaudeCLICommand:
 
     def test_command(self):
         cmd = ClaudeCLI().build_command('PROMPT', _request(model='opus'))
-        assert cmd == ['claude', '-p', 'PROMPT', '--model', 'opus']
+        # Phase 7: the measured lean flags follow (phase7_cli_overhead.py)
+        assert cmd == ['claude', '-p', 'PROMPT', '--model', 'opus',
+                       '--system-prompt', '你是一位專業的英文翻譯。', '--tools', '',
+                       '--strict-mcp-config', '--setting-sources', '',
+                       '--no-session-persistence']
 
     def test_command_without_model(self):
         assert ClaudeCLI().build_command('PROMPT', _request(model='')) == \
-            ['claude', '-p', 'PROMPT']
+            ['claude', '-p', 'PROMPT'] + list(LEAN_FLAGS)
 
     def test_parse_output(self):
         response = ClaudeCLI().parse_output(_result(0, '  譯文\n'), _request(model='haiku'))
@@ -507,10 +511,12 @@ class TestRunProcessCancelAndDeadline:
 class TestTimeoutKeepsOutput:
     """Item 14: output written before a timeout reaches the diagnostics."""
 
-    def test_timeout_expired_carries_output(self, tmp_path):
+    def test_timeout_expired_carries_output(self, tmp_path, monkeypatch):
         cmd = [sys.executable, '-c',
                'import sys,time; print("partial reply", flush=True); '
-               'print("an error line", file=sys.stderr, flush=True); time.sleep(60)']
+               'print("an error line", file=sys.stderr, flush=True); '
+               f'open({str(tmp_path / "ready")!r}, "w").close(); time.sleep(60)']
+        _deadline_once_written(monkeypatch, tmp_path / 'ready')
         with pytest.raises(_subprocess.TimeoutExpired) as info:
             run_process(cmd, timeout=1, cwd=str(tmp_path), env=dict(os.environ))
         assert 'partial reply' in info.value.output
@@ -524,14 +530,29 @@ class TestTimeoutKeepsOutput:
                 ClaudeCLI().complete(_request(), threading.Event())
         assert info.value.raw == 'partial replyan error line'
 
-    def test_output_kept_is_bounded(self, tmp_path):
+    def test_output_kept_is_bounded(self, tmp_path, monkeypatch):
         cmd = [sys.executable, '-c',
                'import sys,time; print("x" * 30000, flush=True); '
-               'print("y" * 30000, file=sys.stderr, flush=True); time.sleep(60)']
+               'print("y" * 30000, file=sys.stderr, flush=True); '
+               f'open({str(tmp_path / "ready")!r}, "w").close(); time.sleep(60)']
+        _deadline_once_written(monkeypatch, tmp_path / 'ready')
         with pytest.raises(_subprocess.TimeoutExpired) as info:
             run_process(cmd, timeout=1, cwd=str(tmp_path), env=dict(os.environ))
         assert info.value.output == 'x' * 20000
         assert info.value.stderr == 'y' * 20000
+
+
+def _deadline_once_written(monkeypatch, ready):
+    """run_process's clock stands still until the child has written its
+    output (it then creates `ready`), and is past any deadline after: the
+    timeout fires after the output, also on a loaded machine (pre-merge)."""
+    import src.llm.cli as cli_module
+
+    class Clock:
+        def monotonic(self):
+            return 1e9 if os.path.exists(ready) else 0.0
+
+    monkeypatch.setattr(cli_module, 'time', Clock())
 
 
 class TestBackendUnavailable:

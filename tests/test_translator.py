@@ -431,7 +431,8 @@ class TestModelSelection:
             engine.translate('test')
 
         cmd = mock_run.call_args[0][0]
-        assert cmd == ['claude', '-p', mock_run.call_args[0][0][2], '--model', 'sonnet']
+        from src.llm.claude_cli import LEAN_FLAGS
+        assert cmd == ['claude', '-p', mock_run.call_args[0][0][2], '--model', 'sonnet'] + list(LEAN_FLAGS)
 
     def test_model_changeable_between_calls(self):
         engine = TranslationEngine(model='sonnet')
@@ -2039,3 +2040,36 @@ class TestTranslateSegmentGlossaryRound1:
         record = caplog.records[-1]
         assert record.getMessage() == '術語檢查失敗，略過術語警告: c1_seg0042'
         assert record.exc_info is not None and record.exc_info[0] is RuntimeError
+
+
+class TestPhase7Round4Interrupted:
+    """A feedback call and a split call are not made once the run is
+    paused or stopped (`interrupted`): the segment goes back."""
+
+    def test_feedback_call(self):
+        from src.llm import CancelledError
+        fake = FakeBackend([DROPPED_B, GOOD])
+        engine = TranslationEngine(model='haiku', backend=fake,
+                                   interrupted=lambda: len(fake.requests) >= 1)
+        seg = _html_seg()
+        with pytest.raises(CancelledError):
+            translate_segment(engine, seg, [seg])
+        assert len(fake.requests) == 1
+
+    def test_split_call(self):
+        from src.llm import CancelledError
+        halves = ['<p k="1">見 <a k="2"><sup>3</sup></a> 的<em k="3">核心概念</em>。</p>',
+                  '<p k="1">第二個<b>粗體</b>。</p>']
+        fake = FakeBackend([DROPPED_B, DROPPED_B] + halves)
+        engine = TranslationEngine(model='haiku', backend=fake,
+                                   interrupted=lambda: len(fake.requests) >= 2)
+        seg = _html_seg()
+        with pytest.raises(CancelledError):
+            translate_segment(engine, seg, [seg])
+        assert len(fake.requests) == 2
+
+    def test_not_interrupted(self):
+        fake = FakeBackend([DROPPED_B, GOOD])
+        engine = TranslationEngine(model='haiku', backend=fake, interrupted=lambda: False)
+        seg = _html_seg()
+        assert translate_segment(engine, seg, [seg]).text == RESTORED

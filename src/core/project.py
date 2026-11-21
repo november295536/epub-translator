@@ -49,6 +49,14 @@ def check_rules(value) -> int:
     return value
 
 
+def check_backend(value) -> str:
+    """`value` when it names a backend (src.llm.BACKENDS); raises ValueError
+    otherwise."""
+    if type(value) is not str or value not in llm.BACKENDS:
+        raise ValueError(f'unknown backend: {value!r}')
+    return value
+
+
 def sha256_file(path: str) -> str:
     """SHA-256 of a file, hex."""
     digest = hashlib.sha256()
@@ -132,6 +140,10 @@ class ProjectData:
     # unchanged. Projects created since have 2. With 2 the prompt's context is
     # the previous segment's translation when it has one (translator.get_context)
     segmentation: int | None = None
+    # The backend `model` belongs to (a name of src.llm.BACKENDS); None: the
+    # file has no such key, which means the Claude CLI and is never written,
+    # so existing files round-trip unchanged
+    backend: str | None = None
     segments: list[SegmentState] = field(default_factory=list)
 
 
@@ -242,8 +254,10 @@ class ProjectManager:
                 if key not in valid_fields:
                     del s[key]
         segments = [SegmentState(**s) for s in raw_segments]
+        if 'backend' in raw:  # absent: the default backend (None)
+            check_backend(raw['backend'])
         if 'model' not in raw:
-            raw['model'] = llm.default_backend().default_model
+            raw['model'] = llm.backend_for(raw.get('backend')).default_model
         if 'segmentation' in raw:  # absent: rules 1 (None)
             check_rules(raw['segmentation'])
         self.data = ProjectData(**raw, segments=segments)
@@ -265,6 +279,8 @@ class ProjectManager:
             del raw['segmenter_version']  # superseded by the schema
         if raw['segmentation'] is None:
             del raw['segmentation']  # the file had none: saved as before
+        if raw['backend'] is None:
+            del raw['backend']  # the default backend: saved as before
         for seg in raw['segments']:
             for key, default in _SEGMENT_DEFAULTS.items():
                 if seg[key] == default:
@@ -299,11 +315,17 @@ class ProjectManager:
                     pass
                 raise
 
-    def set_model(self, model: str) -> None:
-        """Set the translation model (in-memory only; call save() to persist)."""
+    def set_model(self, model: str, backend: str | None = None) -> None:
+        """Set the translation model and, when given, the backend it belongs
+        to (in-memory only; call save() to persist). An unknown backend
+        raises ValueError."""
         if not self.data:
             raise RuntimeError("No project loaded.")
+        if backend is not None:
+            check_backend(backend)
         with self.mutex:
+            if backend is not None:
+                self.data.backend = backend
             self.data.model = model
 
     def mark_translated(self, segment_id: str, translated_text: str) -> None:

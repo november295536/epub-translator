@@ -9,6 +9,7 @@ from __future__ import annotations
 import atexit
 import errno
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -32,6 +33,9 @@ KILL_WAIT_SECONDS = 2
 
 # Characters of output kept from a call that timed out or was killed
 KEPT_OUTPUT_CHARS = 20000
+# An option the installed CLI does not know (an older version): no retry helps
+UNKNOWN_OPTION_PATTERN = re.compile(r'unknown option|unrecogni[sz]ed (?:option|argument)',
+                                    re.IGNORECASE)
 
 # Start errors caused by a temporary shortage of system resources
 RESOURCE_ERRNOS = (errno.EAGAIN, errno.ENOMEM, errno.EMFILE, errno.ENFILE)
@@ -171,6 +175,11 @@ class CLIBackend:
     # Environment variables removed before starting the program
     env_remove = ()
 
+    def redact(self, text: str) -> str:
+        """Output kept for the diagnostics, with what must not be kept
+        removed (subclasses; the base class keeps everything)."""
+        return text
+
     def environment(self) -> dict:
         return {k: v for k, v in os.environ.items() if k not in self.env_remove}
 
@@ -190,7 +199,7 @@ class CLIBackend:
         except subprocess.TimeoutExpired as e:
             # What the program wrote before it hung, for the diagnostics
             raise TransientError(f'{self.name} timed out after {request.timeout:g} s',
-                                 raw=(_text(e.output) + _text(e.stderr))[:KEPT_OUTPUT_CHARS])
+                                 raw=self.redact(_text(e.output) + _text(e.stderr))[:KEPT_OUTPUT_CHARS])
         except OSError as e:
             message = f'{self.name} could not be started: {str(e)[:ERROR_CHARS]}'
             if isinstance(e, (FileNotFoundError, PermissionError)) or e.errno == errno.ENOEXEC:
@@ -204,7 +213,7 @@ class CLIBackend:
             raise LLMError(message)
         error = self.classify_error(result, prompt)
         if error is not None:
-            error.raw = (_text(result.stdout) + _text(result.stderr))[:KEPT_OUTPUT_CHARS]
+            error.raw = self.redact(_text(result.stdout) + _text(result.stderr))[:KEPT_OUTPUT_CHARS]
             raise error
         return self.parse_output(result, request)
 

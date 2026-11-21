@@ -7,7 +7,8 @@ import os
 from flask import Blueprint, Response, jsonify, request, current_app
 
 from src.core.project import ProjectLockedError, ProjectManager
-from src.core.translator import available_models
+import src.llm as llm
+from src.core.translator import available_backends, available_models
 from src.web.tasks import TaskManager
 
 
@@ -58,16 +59,21 @@ def start_translation(project_name: str):
 
 @translation_bp.route('/api/projects/<project_name>/translate/pause', methods=['POST'])
 def pause_translation(project_name: str):
-    """Pause a running translation."""
+    """Pause or resume a translation: body {"action": "pause" | "resume",
+    "workers": N (resume only, optional)}. Both are idempotent; a pause of a
+    task waiting after a rate limit makes it a lasting user pause."""
     tm = _get_task_manager()
     task = tm.get_task(project_name)
 
     if not task:
         return jsonify({'error': '沒有執行中的翻譯任務'}), 404
 
-    if task.state == 'paused':
+    data = request.get_json(silent=True) or {}
+    action = data.get('action')
+    if action not in ('pause', 'resume'):
+        return jsonify({'error': 'action 必須是 pause 或 resume'}), 400
+    if action == 'resume':
         # Resume — optionally adjust workers
-        data = request.get_json(silent=True) or {}
         num_workers = None
         if 'workers' in data:
             try:
@@ -113,6 +119,7 @@ def translation_status(project_name: str):
         'percent': round(task.completed / task.total * 100, 1) if task.total > 0 else 0,
         'workers': task.num_workers,
         'active_workers': task.active_workers,
+        'auto_resume': task.resume_at is not None,  # paused, resumes by itself
     })
 
 
@@ -132,8 +139,12 @@ def translation_stream(project_name: str):
         cursor = task.progress.cursor_end
         # Initial status, with a run-level error that paused the task before
         # this page connected
+        # and an automatic wait in progress (seconds left), so the page offers
+        # the pause button and shows when the run goes on
+        resume_at = task.resume_at
         status = {'state': task.state, 'completed': task.completed,
-                  'total': task.total, 'error': task.error}
+                  'total': task.total, 'error': task.error,
+                  'resume_in': None if resume_at is None else max(0.0, resume_at - tm.clock())}
         yield f"event: status\ndata: {json.dumps(status, ensure_ascii=False)}\n\n"
         if status['state'] in ('completed', 'failed', 'stopped'):
             return  # ended before this stream opened: its last event is gone
@@ -179,9 +190,12 @@ def get_model(project_name: str):
     except Exception as e:
         return jsonify({'error': str(e)}), 404
 
+    backend = pm.data.backend or llm.default_backend().name
     return jsonify({
         'current': pm.data.model,
-        'available': available_models(),
+        'available': available_models(pm.data.backend),  # of the project's backend
+        'backend': backend,
+        'backends': available_backends(),
     })
 
 
@@ -195,16 +209,24 @@ def set_model(project_name: str):
         return jsonify({'error': '未提供模型名稱'}), 400
 
     model = data['model']
-    valid_aliases = [m['alias'] for m in available_models()]
-    if model not in valid_aliases:
-        return jsonify({'error': f'無效的模型：{model}，可用模型：{", ".join(valid_aliases)}'}), 400
+    backend = data.get('backend')  # None: the project's backend stays
+    if backend is not None and (not isinstance(backend, str) or backend not in llm.BACKENDS):
+        return jsonify({'error': f'無效的後端：{backend}'}), 400
 
     tm = _get_task_manager()
     try:
         with tm.transaction(project_name, projects_dir) as pm:
-            pm.set_model(model)
+            if backend == (pm.data.backend or llm.default_backend().name):
+                backend = None  # the project's backend already: nothing new to store
+            chosen = backend if backend is not None else pm.data.backend
+            valid_aliases = [m['alias'] for m in available_models(chosen)]
+            if model not in valid_aliases:
+                return jsonify({'error': f'無效的模型：{model}，'
+                                         f'可用模型：{", ".join(valid_aliases)}'}), 400
+            pm.set_model(model, backend=backend)
             pm.save()
+            chosen = pm.data.backend or llm.default_backend().name
     except (FileNotFoundError, ValueError) as e:
         return jsonify({'error': str(e)}), 404
 
-    return jsonify({'status': 'ok', 'model': model})
+    return jsonify({'status': 'ok', 'model': model, 'backend': chosen})

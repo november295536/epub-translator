@@ -18,13 +18,13 @@
                 <button class="btn btn-secondary" @click="startTranslation(true)" :disabled="starting"
                         x-show="failedCount > 0 && (state === 'idle' || state === 'completed' || state === 'failed' || state === 'stopped')"
                         x-text="'重試失敗段落（' + failedCount + '）'">重試失敗段落（{{ progress.failed }}）</button>
-                <template x-if="state === 'running'">
-                    <button class="btn btn-secondary" @click="pauseTranslation()">
+                <template x-if="state === 'running' || (state === 'paused' && autoResume)">
+                    <button class="btn btn-secondary" @click="pauseTranslation('pause')">
                         ⏸ 暫停
                     </button>
                 </template>
                 <template x-if="state === 'paused'">
-                    <button class="btn btn-success" @click="pauseTranslation()">
+                    <button class="btn btn-success" @click="pauseTranslation('resume')">
                         ▶ 繼續翻譯
                     </button>
                 </template>
@@ -39,9 +39,9 @@
                             :disabled="modelLoading"
                             @change="setModel($event.target.value)"
                             style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
-                        <template x-for="m in availableModels" :key="m.alias">
-                            <option :value="m.alias" :selected="m.alias === model"
-                                    x-text="m.label + ' — ' + m.description"></option>
+                        <template x-for="m in availableModels" :key="m.key">
+                            <option :value="m.key" :selected="m.key === modelKey()"
+                                    x-text="m.backend + '：' + m.label + ' — ' + m.description"></option>
                         </template>
                     </select>
                     <span x-show="modelLoading" class="spinner" style="margin-left: 0.5rem;"></span>
@@ -143,12 +143,14 @@ function translationController() {
         eventSource: null,
         logCounter: 0,
         model: '',
+        backend: '',
         failedCount: {{ progress.failed }},
         availableModels: [],
         modelLoading: false,
         workers: 1,
         activeWorkers: 0,
         _pauseInFlight: false,
+        autoResume: false,  // paused by a rate limit, resumes by itself
 
         init() {
             this.fetchModel();
@@ -172,12 +174,18 @@ function translationController() {
             try {
                 const res = await fetch('/api/projects/{{ project_name }}/model');
                 const data = await res.json();
-                this.availableModels = data.available;
                 this.model = data.current;
+                this.backend = data.backend;
+                // Every backend's models; the project's backend first
+                const lists = (data.backends || []).filter(b => b.name !== data.backend);
+                lists.unshift({ name: data.backend, models: data.available });
+                this.availableModels = lists.flatMap(b => b.models.map(m => ({
+                    ...m, backend: b.name, key: b.name + '/' + m.alias })));
                 // A stored model the backend does not list: shown as it is,
                 // changed only when another one is picked
-                if (!this.availableModels.some(m => m.alias === this.model)) {
-                    this.availableModels = [{ alias: this.model, label: this.model, description: '目前設定，後端未列出' },
+                if (!this.availableModels.some(m => m.key === this.modelKey())) {
+                    this.availableModels = [{ alias: this.model, label: this.model, description: '目前設定，後端未列出',
+                                              backend: this.backend, key: this.modelKey() },
                                             ...this.availableModels];
                 }
             } catch (e) {
@@ -185,9 +193,15 @@ function translationController() {
             }
         },
 
-        async setModel(alias) {
-            const previous = this.model;
-            this.model = alias;
+        modelKey() {
+            return this.backend + '/' + this.model;
+        },
+
+        async setModel(key) {
+            const previous = this.modelKey();
+            const chosen = this.availableModels.find(m => m.key === key);
+            if (!chosen) return;
+            const alias = chosen.alias;
             this.modelLoading = true;
             let data = {};
             let ok = false;
@@ -195,7 +209,7 @@ function translationController() {
                 const res = await fetch('/api/projects/{{ project_name }}/model', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model: alias }),
+                    body: JSON.stringify({ model: alias, backend: chosen.backend }),
                 });
                 data = await res.json();
                 ok = res.ok && data.status === 'ok';
@@ -204,9 +218,9 @@ function translationController() {
             }
             if (ok) {
                 this.model = data.model;
+                this.backend = data.backend;
             } else {
                 // Not saved: show the stored model again
-                this.model = previous;
                 document.getElementById('model-select').value = previous;
                 this.error = data.error || '模型設定失敗';
             }
@@ -232,7 +246,7 @@ function translationController() {
             }
         },
 
-        async fetchStatus() {
+        async fetchStatus(connect = true) {
             try {
                 const res = await fetch('/api/projects/{{ project_name }}/translate/status');
                 const data = await res.json();
@@ -244,9 +258,10 @@ function translationController() {
                 this.error = data.error;
                 if (data.workers) this.workers = data.workers;
                 if (data.active_workers !== undefined) this.activeWorkers = data.active_workers;
+                this.autoResume = !!data.auto_resume;
 
                 if (this.state === 'running' || this.state === 'paused') {
-                    this.connectSSE();
+                    if (connect) this.connectSSE();
                 } else if (['completed', 'failed', 'stopped'].includes(this.state)) {
                     this.refreshFailedCount();  // a run that ended since the page was rendered
                 }
@@ -258,6 +273,7 @@ function translationController() {
         async startTranslation(retryFailed = false) {
             this.starting = true;
             this.error = null;
+            this.autoResume = false;  // a new run: no wait
             this.logs = [];
             try {
                 const res = await fetch('/api/projects/{{ project_name }}/translate/start', {
@@ -290,19 +306,22 @@ function translationController() {
             }
         },
 
-        async pauseTranslation() {
+        async pauseTranslation(action) {
             if (this._pauseInFlight) return;
             this._pauseInFlight = true;
             try {
-                const opts = { method: 'POST' };
-                if (this.state === 'paused') {
-                    opts.headers = { 'Content-Type': 'application/json' };
-                    opts.body = JSON.stringify({ workers: parseInt(this.workers) });
-                }
-                const res = await fetch('/api/projects/{{ project_name }}/translate/pause', opts);
+                const body = { action: action };
+                if (action === 'resume') body.workers = parseInt(this.workers);
+                const res = await fetch('/api/projects/{{ project_name }}/translate/pause', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
                 const data = await res.json();
                 if (data.state) {
                     this.state = data.state;
+                    this.autoResume = false;  // a user pause lasts; a resume ends any wait
+                    if (data.state === 'running') this.error = null;  // the pause's reason is over
                 }
                 if (data.error) {
                     this.error = data.error;
@@ -329,6 +348,11 @@ function translationController() {
                 if (this._isFirstStatus) {
                     this.state = data.state;
                     if (data.error) this.error = data.error;
+                    if (data.resume_in != null) {  // a rate limit before this stream opened
+                        this.autoResume = true;
+                        this.error = (data.error || 'API 使用量已達上限') +
+                            `（${Math.round(data.resume_in)} 秒後自動繼續）`;
+                    }
                     this._isFirstStatus = false;
                 }
                 this.completed = data.completed;
@@ -380,34 +404,44 @@ function translationController() {
             });
 
             this.eventSource.addEventListener('paused', (e) => {
-                // User-initiated pause state is set by the API response.
-                // This handler is kept for potential multi-tab scenarios but
-                // does NOT overwrite state to avoid oscillation with resume.
+                // From this tab or another: the server's state, not the event's
+                this.fetchStatus(false);
             });
 
             this.eventSource.addEventListener('rate_limit', (e) => {
                 const data = JSON.parse(e.data);
                 this.state = 'paused';
-                this.error = data.error || 'API 使用量已達上限，請稍後再繼續';
+                this.error = (data.error || 'API 使用量已達上限') +
+                    (data.resume_in ? `（${Math.round(data.resume_in)} 秒後自動繼續）` : '');
+                this.autoResume = !!data.resume_in;
                 this.refreshFailedCount();
+            });
+
+            this.eventSource.addEventListener('resumed', (e) => {
+                // Resumed by itself after a rate limit; a pause may have
+                // followed already: the server's state, not the event's
+                this.fetchStatus(false);
             });
 
             this.eventSource.addEventListener('auth_error', (e) => {
                 const data = JSON.parse(e.data);
                 this.state = 'paused';
                 this.error = data.error || {{ auth_hint|tojson }};
+                this.autoResume = false;  // waits for the user
                 this.refreshFailedCount();
             });
 
             this.eventSource.addEventListener('backend_error', (e) => {
                 const data = JSON.parse(e.data);
                 this.state = 'paused';
+                this.autoResume = false;
                 this.error = data.error;
                 this.refreshFailedCount();
             });
 
             this.eventSource.addEventListener('stopped', (e) => {
                 this.state = 'stopped';
+                this.autoResume = false;
                 this.currentSegment = null;
                 this.refreshFailedCount();
                 this.eventSource.close();
@@ -417,6 +451,7 @@ function translationController() {
             this.eventSource.addEventListener('complete', (e) => {
                 const data = JSON.parse(e.data);
                 this.state = 'completed';
+                this.autoResume = false;
                 this.currentSegment = null;
                 this.completed = data.total_translated;
                 if (this.total > 0) {
@@ -428,7 +463,8 @@ function translationController() {
             });
 
             this.eventSource.addEventListener('error', (e) => {
-                if (e.data) {
+                if (e.data) {  // the run failed (not a dropped connection)
+                    this.autoResume = false;
                     const data = JSON.parse(e.data);
                     this.error = data.error;
                     this.state = 'failed';
