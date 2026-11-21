@@ -273,6 +273,7 @@ function translationController() {
         async startTranslation(retryFailed = false) {
             this.starting = true;
             this.error = null;
+            this.autoResume = false;  // a new run: no wait
             this.logs = [];
             try {
                 const res = await fetch('/api/projects/{{ project_name }}/translate/start', {
@@ -347,6 +348,11 @@ function translationController() {
                 if (this._isFirstStatus) {
                     this.state = data.state;
                     if (data.error) this.error = data.error;
+                    if (data.resume_in != null) {  // a rate limit before this stream opened
+                        this.autoResume = true;
+                        this.error = (data.error || 'API 使用量已達上限') +
+                            `（${Math.round(data.resume_in)} 秒後自動繼續）`;
+                    }
                     this._isFirstStatus = false;
                 }
                 this.completed = data.completed;
@@ -437,6 +443,7 @@ function translationController() {
 
             this.eventSource.addEventListener('stopped', (e) => {
                 this.state = 'stopped';
+                this.autoResume = false;
                 this.currentSegment = null;
                 this.refreshFailedCount();
                 this.eventSource.close();
@@ -446,6 +453,7 @@ function translationController() {
             this.eventSource.addEventListener('complete', (e) => {
                 const data = JSON.parse(e.data);
                 this.state = 'completed';
+                this.autoResume = false;
                 this.currentSegment = null;
                 this.completed = data.total_translated;
                 if (this.total > 0) {
@@ -457,7 +465,8 @@ function translationController() {
             });
 
             this.eventSource.addEventListener('error', (e) => {
-                if (e.data) {
+                if (e.data) {  // the run failed (not a dropped connection)
+                    this.autoResume = false;
                     const data = JSON.parse(e.data);
                     this.error = data.error;
                     this.state = 'failed';

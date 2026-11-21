@@ -31,9 +31,9 @@ def resume_delay(error: Exception) -> float | None:
         return None
     value = error.retry_after
     if (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value) and value > 0):
+            and (isinstance(value, int) or math.isfinite(value)) and value > 0):
         low, high = RETRY_AFTER_BOUNDS
-        return float(min(max(value, low), high))
+        return float(min(max(value, low), high))  # clamped first: a huge int fits
     return float(RATE_LIMIT_WAIT_SECONDS)
 
 
@@ -75,9 +75,11 @@ class DebouncedSaver:
         """Save what is waiting (with `force`, also when nothing is: after
         an interruption, a change may have been applied without being
         added). True when it saved."""
-        if not self.pending and not force:
-            return False
+        # Decided under the mutex: the applier adds a result under it, so a
+        # result applied in memory is also in `pending` here
         with self.pm.mutex:
+            if not self.pending and not force:
+                return False
             self.pm.save()
             items, self.pending = self.pending, []
             self.saves += 1

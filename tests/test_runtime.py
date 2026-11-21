@@ -510,7 +510,7 @@ class TestHundredResults:
             task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'), num_workers=4)
             task._coordinator.join(timeout=60)
         assert task.state == 'completed'
-        assert len(writes) <= 100 // SAVE_EVERY_RESULTS + 1
+        assert 100 // SAVE_EVERY_RESULTS <= len(writes) <= 100 // SAVE_EVERY_RESULTS + 1  # in windows, not only at the end
         assert _statuses(path) == [SegmentStatus.TRANSLATED] * 100
 
     @pytest.mark.parametrize('workers', ['1', '4'])
@@ -521,7 +521,7 @@ class TestHundredResults:
             result = CliRunner().invoke(translate.cli, ['start', '--project', path,
                                                         '--workers', workers])
         assert result.exit_code == 0, result.output
-        assert len(writes) <= 100 // SAVE_EVERY_RESULTS + 1
+        assert 100 // SAVE_EVERY_RESULTS <= len(writes) <= 100 // SAVE_EVERY_RESULTS + 1  # in windows, not only at the end
         assert _statuses(path) == [SegmentStatus.TRANSLATED] * 100
 
     def test_web_pause_saves_the_window(self, tmp_path, fresh_tm, clock):
@@ -1874,14 +1874,18 @@ class TestRound1Survivors:
         task = self._paused_task(tmp_path, fresh_tm, 3)
         busy = threading.Thread(target=release.wait, args=(20,), daemon=True)
         busy.start()
-        task._threads.append(busy)  # one alive already
+        task._threads.append(busy)  # one counted already
+        task.active_workers = 1
+        ending = threading.Thread(target=release.wait, args=(20,), daemon=True)
+        ending.start()
+        task._threads.append(ending)  # alive, but it has ended its loop (round 2, E)
         assert fresh_tm._top_up_workers(task)
-        assert len(task._threads) == 3 and task.active_workers == 2
-        assert all(t.daemon for t in task._threads[1:])
+        assert len(task._threads) == 4 and task.active_workers == 3
+        assert all(t.daemon for t in task._threads[2:])
         assert '動態增加 2 workers (共 3)' in caplog.messages
         caplog.clear()
         assert fresh_tm._top_up_workers(task)  # enough: nothing started, nothing logged
-        assert len(task._threads) == 3 and caplog.messages == []
+        assert len(task._threads) == 4 and caplog.messages == []
         release.set()
         for t in task._threads:
             t.join()
@@ -1957,3 +1961,380 @@ class TestRound1Survivors:
                 task.pause_event.set()
                 worker.join(timeout=20)
         assert len(calls) == 2
+
+
+# --- review round 2 ----------------------------------------------------------------
+
+class _LimitedSleeper(SleeperBackend):
+    """Line 1's first call hits a rate limit once another call's child runs;
+    every other call is a real sleeping child."""
+
+    def __init__(self, pid_dir):
+        super().__init__(pid_dir)
+        self.limited = False
+
+    def complete(self, request, cancel):
+        if '>Line 1.<' in request.messages[0].content and not self.limited:
+            self.limited = True
+            _wait(lambda: self.pids())
+            raise RateLimitError('limit', retry_after=30)
+        return super().complete(request, cancel)
+
+
+class TestRound2RunLevelPauseCancels:
+    """Item 1: a pause for a run-level error ends the other calls in
+    flight; after resume, pause and stop reach every call."""
+
+    def test_real_children(self, tmp_path, fresh_tm, clock, monkeypatch):
+        monkeypatch.setattr('src.llm.cli.run_process', real_run_process)
+        pid_dir = tmp_path / 'pids'
+        pid_dir.mkdir()
+        backend = _LimitedSleeper(str(pid_dir))
+        path = _make_project(tmp_path / 'projects', n=2)
+        with use_fake_backend(backend):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'),
+                                              num_workers=2)
+            _wait(lambda: task.state == 'paused' and task.resume_at is not None)
+            assert _gone(backend.pids()[0])  # the other worker's child
+            _wait(lambda: task.segment_queue.qsize() == 2)
+            assert fresh_tm.resume_translation(PROJECT)
+            _wait(lambda: len(backend.pids()) == 3)
+            assert fresh_tm.pause_translation(PROJECT)
+            assert all(_gone(p) for p in backend.pids())
+            assert fresh_tm.resume_translation(PROJECT)
+            _wait(lambda: len(backend.pids()) == 5)
+            fresh_tm.stop_translation(PROJECT)
+            task._coordinator.join(timeout=20)
+            assert not task._coordinator.is_alive()  # stop did not hang
+        assert all(_gone(p) for p in backend.pids())
+        assert _statuses(path) == [SegmentStatus.PENDING] * 2
+
+
+class TestRound2Values:
+
+    def test_huge_retry_after(self):
+        error = RateLimitError('x', retry_after=10 ** 400)
+        assert resume_delay(error) == 3600.0
+
+    def test_flush_decides_under_the_mutex(self):
+        """Item 3: a result added while the mutex is held is saved by a
+        flush that waited for the mutex."""
+        flusher_waiting = threading.Event()
+        main = threading.current_thread()
+
+        class Mutex:
+            def __init__(self):
+                self.lock = threading.RLock()
+
+            def __enter__(self):
+                if threading.current_thread() is not main:
+                    flusher_waiting.set()
+                self.lock.acquire()
+
+            def __exit__(self, *exc):
+                self.lock.release()
+
+        class PM:
+            mutex = Mutex()
+            saved = 0
+
+            def save(self):
+                self.saved += 1
+
+        pm = PM()
+        saver = DebouncedSaver(pm)
+        result = {}
+        flusher = threading.Thread(target=lambda: result.update(saved=saver.flush()))
+        with pm.mutex:
+            flusher.start()
+            _wait(lambda: flusher_waiting.is_set() or not flusher.is_alive())
+            saver.add('applied')
+        flusher.join(timeout=20)
+        assert result == {'saved': True} and pm.saved == 1 and saver.pending == []
+
+
+class TestRound2Events:
+
+    def test_extension_sends_the_new_wait(self, tmp_path, fresh_tm, clock):
+        """Item 5."""
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path), state='paused',
+                                            total=4)
+        task.resume_at = clock.now + 10
+        task.error = 'first'
+        fresh_tm._pause_for(task, RateLimitError('later', retry_after=60), 'rate_limit')
+        assert task.progress.get_all()[-1] == {'event': 'rate_limit', 'data': {
+            'error': 'first', 'completed': 0, 'remaining': 4, 'resume_in': 60.0}}
+
+    def test_stream_snapshot_has_the_wait(self, tmp_path, fresh_tm, clock):
+        """Item 4: a rate limit before the stream opened."""
+        from src.web.server import create_app
+        _make_project(tmp_path / 'projects', n=1)
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path / 'projects'),
+                                            state='paused', total=1, error='limit')
+        task.resume_at = clock.now + 42
+        fresh_tm.tasks[PROJECT] = task
+        client = create_app(projects_dir=str(tmp_path / 'projects')).test_client()
+        response = client.get(f'/api/projects/{PROJECT}/translate/stream', buffered=False)
+        first = next(iter(response.response)).decode('utf-8')
+        response.close()
+        assert json.loads(first.split('data: ', 1)[1]) == {
+            'state': 'paused', 'completed': 0, 'total': 1, 'error': 'limit', 'resume_in': 42.0}
+        task.resume_at = clock.now - 5  # due: not negative
+        response = client.get(f'/api/projects/{PROJECT}/translate/stream', buffered=False)
+        first = next(iter(response.response)).decode('utf-8')
+        response.close()
+        assert json.loads(first.split('data: ', 1)[1])['resume_in'] == 0.0
+        task.state = 'completed'
+        html = client.get(f'/project/{PROJECT}/translation').get_data(as_text=True)
+        assert 'if (data.resume_in != null) {  // a rate limit before this stream opened' in html
+        assert 'this.autoResume = true;' in html
+
+
+def _record_saves(monkeypatch):
+    """The number of translated segments in memory at each save."""
+    counts = []
+    real = ProjectManager.save
+
+    def save(self):
+        counts.append(sum(s.status == SegmentStatus.TRANSLATED for s in self.data.segments))
+        real(self)
+
+    monkeypatch.setattr(ProjectManager, 'save', save)
+    return counts
+
+
+def _most_unsaved(counts):
+    return max(b - a for a, b in zip([0] + counts, counts))
+
+
+class TestRound2WindowInBatches:
+    """Item 6: a batch of more than 20 results is saved every 20."""
+
+    def test_web(self, tmp_path, fresh_tm, clock, monkeypatch):
+        path = _make_project(tmp_path / 'projects', n=60)
+        counts = _record_saves(monkeypatch)
+        real_done = tasks_module.TaskManager._workers_done
+        held = []
+
+        def done(self, task):
+            if not held:  # the coordinator waits once until a big batch is queued
+                held.append(1)
+                _wait(lambda: task.result_queue.qsize() >= 45)
+            return real_done(self, task)
+
+        monkeypatch.setattr(tasks_module.TaskManager, '_workers_done', done)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'), num_workers=4)
+            task._coordinator.join(timeout=60)
+        assert task.state == 'completed'
+        assert _most_unsaved(counts) <= SAVE_EVERY_RESULTS
+        assert _statuses(path) == [SegmentStatus.TRANSLATED] * 60
+
+    def test_cli(self, tmp_path, clock, monkeypatch):
+        import queue
+        path = _make_project(tmp_path, n=60)
+        counts = _record_saves(monkeypatch)
+        made = []
+
+        class Held(queue.Queue):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                made.append(self)
+                self.held = False
+
+            def get(self, *a, **kw):
+                if self is made[1] and not self.held:  # the result queue
+                    self.held = True
+                    _wait(lambda: self.qsize() >= 45)
+                return super().get(*a, **kw)
+
+        monkeypatch.setattr(queue, 'Queue', Held)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            result = CliRunner().invoke(translate.cli, ['start', '--project', path,
+                                                        '--workers', '4'])
+        assert result.exit_code == 0, result.output
+        assert _most_unsaved(counts) <= SAVE_EVERY_RESULTS
+        assert _statuses(path) == [SegmentStatus.TRANSLATED] * 60
+
+
+class TestRound2CliBackendUnderTheLock:
+    """Item 9: the backend and model are checked against the project read
+    under the lock."""
+
+    def test_switch_before_the_lock(self, tmp_path, monkeypatch):
+        path = _make_project(tmp_path, n=1)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.mark_translated('c1_seg0001', '<p>譯</p>')
+        pm.save()
+        real_acquire = translate.ProjectLock.acquire
+
+        switched = []
+
+        def acquire(self):
+            if not switched:  # the web switched meanwhile (its save takes the lock too)
+                switched.append(1)
+                other = ProjectManager(path)
+                other.load()
+                other.set_model('gpt-6.2-sol', backend='copilot-cli')
+                other.save()
+            return real_acquire(self)
+
+        monkeypatch.setattr(translate.ProjectLock, 'acquire', acquire)
+        result = CliRunner().invoke(translate.cli, ['start', '--project', path,
+                                                    '-b', 'copilot-cli'])
+        assert result.exit_code == 0, result.output
+        pm.load()
+        assert (pm.data.backend, pm.data.model) == ('copilot-cli', 'gpt-6.2-sol')
+
+
+class TestRound2Minor:
+    """The third reviewer's items A-F."""
+
+    def test_cancelled_rejected_reply_is_not_a_failure(self, tmp_path):
+        """A: a check that rejects the reply after cancel: CancelledError."""
+        path = _make_project(tmp_path, n=1)
+        pm = ProjectManager(path)
+        pm.load()
+        seg = pm.data.segments[0]
+        fake = FakeBackend(responder=lambda r: 'no markup at all')
+        engine = TranslationEngine(model='m', backend=fake)
+        outcome = translate_segment(engine, seg, pm.data.segments, None)
+        assert outcome.status == SegmentStatus.FAILED
+        cancel = threading.Event()
+        cancel.set()
+        with pytest.raises(CancelledError):
+            translate_segment(engine, seg, pm.data.segments, None, cancel=cancel)
+        FakeBackend.overcalls.clear()
+
+    def test_stopping_task_does_not_resume(self, tmp_path, fresh_tm, clock):
+        """B (web)."""
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path), state='paused')
+        alive = threading.Event()
+        keeper = threading.Thread(target=alive.wait, daemon=True)
+        keeper.start()
+        task._coordinator = keeper
+        fresh_tm.tasks[PROJECT] = task
+        task.resume_at = clock.now
+        task.stop_event.set()  # as the failure streak does
+        assert not fresh_tm.resume_translation(PROJECT, due=clock.now)
+        assert not fresh_tm.resume_translation(PROJECT)
+        assert task.state == 'paused'
+        task.stop_event.clear()
+        fresh_tm.stop_translation(PROJECT)
+        assert task.resume_at is None and task.state == 'stopped'
+        alive.set()
+        keeper.join()
+
+    def test_cli_stopping_run_does_not_reopen_the_gate(self, tmp_path, monkeypatch):
+        """B (CLI): once the run stops, the tick neither announces nor
+        reopens, also when the deadline has passed."""
+        import src.core.runcontrol as runcontrol
+        clock = _CountingClock()
+        monkeypatch.setattr(translate, '_clock', clock)
+        path = _make_project(tmp_path, n=2)
+        flushes = []
+        real_flush = runcontrol.DebouncedSaver.flush
+        monkeypatch.setattr(runcontrol.DebouncedSaver, 'flush',
+                            lambda self, force=False: flushes.append(1) or real_flush(self, force))
+        announced = threading.Event()
+        real_message = translate._rate_limit_message
+        monkeypatch.setattr(translate, '_rate_limit_message',
+                            lambda e, d: (announced.set(), real_message(e, d))[1])
+        real_event = threading.Event
+        stop_events = []
+
+        class Event(real_event):
+            def __init__(self):
+                super().__init__()
+                if sys._getframe(1).f_code.co_name == '_start_parallel' and not stop_events:
+                    stop_events.append(self)  # the first one made there: error_event
+
+            def set(self):
+                super().set()
+                if stop_events and self is stop_events[0]:
+                    clock.now += 100  # the deadline has passed
+                    start = len(flushes)
+                    _wait(lambda: len(flushes) >= start + 2)  # two ticks after the stop
+
+        monkeypatch.setattr(threading, 'Event', Event)
+        both = threading.Barrier(2)
+
+        def respond(request):
+            both.wait(20)
+            if '>Line 1.<' in request.messages[0].content:
+                raise RateLimitError('limit', retry_after=7)
+            assert announced.wait(20)
+            raise AuthError('expired')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            result = CliRunner().invoke(translate.cli, ['start', '--project', path,
+                                                        '--workers', '2'])
+        assert result.exit_code == 1, result.output
+        assert '  繼續翻譯\n' not in result.output
+
+    def test_worker_goes_on_after_a_resume_and_a_new_pause(self, tmp_path, fresh_tm):
+        """D: woken after a run-level error and finding the task paused
+        again, the worker does not exit."""
+        survivors = TestRound1Survivors()
+        task = survivors._worker_task(tmp_path, fresh_tm)
+        calls = []
+
+        def respond(request):
+            calls.append(1)
+            if len(calls) == 1:
+                raise AuthError('expired')
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            worker = threading.Thread(target=fresh_tm._worker_loop, args=(task, 0), daemon=True)
+            worker.start()
+            try:
+                _wait(lambda: task.state == 'paused' and task.segment_queue.qsize() == 1)
+                task.state = 'paused'  # resumed and paused again before it woke
+                task.pause_event.set()
+                _wait(lambda: task.result_queue.qsize() == 1)
+            finally:
+                task.stop_event.set()
+                task.pause_event.set()
+                worker.join(timeout=20)
+        assert len(calls) == 2
+
+    def test_no_failure_log_for_a_segment_translated_again(self, tmp_path, fresh_tm, clock):
+        """F: failed in the run, translated again (as from the review page)
+        before the save: no diagnostics are written for it."""
+        from src.core.translator import TranslationOutcome
+        path = _make_project(tmp_path / 'projects', n=2)
+        gate = threading.Event()
+
+        def respond(request):
+            if '>Line 2.<' in request.messages[0].content:
+                assert gate.wait(20)
+                return like(request, '譯')
+            raise LLMError('bad request')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            _wait(lambda: task.pm.data.segments[0].status == SegmentStatus.FAILED)
+            pm = task.pm
+            with pm.mutex:
+                seg = pm.data.segments[0]
+                assert pm.apply_outcome(seg.segment_id, TranslationOutcome(
+                    '<p>譯</p>', SegmentStatus.TRANSLATED, [], 'm', None),
+                    revision=seg.revision)
+            gate.set()
+            task._coordinator.join(timeout=20)
+        failed = os.path.join(path, 'log', 'failed')
+        assert not os.path.isdir(failed) or os.listdir(failed) == []
+
+    def test_page_resets_the_wait(self, tmp_path):
+        """C: a new run, stopped, complete and a failed run end any wait."""
+        from src.web.server import create_app
+        _make_project(tmp_path / 'projects', n=1)
+        client = create_app(projects_dir=str(tmp_path / 'projects')).test_client()
+        html = client.get(f'/project/{PROJECT}/translation').get_data(as_text=True)
+        assert 'this.autoResume = false;  // a new run: no wait' in html
+        assert "this.state = 'stopped';\n                this.autoResume = false;" in html
+        assert "this.state = 'completed';\n                this.autoResume = false;" in html
+        assert ('if (e.data) {  // the run failed (not a dropped connection)\n'
+                '                    this.autoResume = false;') in html

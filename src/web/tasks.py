@@ -248,6 +248,7 @@ class TaskManager:
             if task.state in ('running', 'paused'):
                 task.state = 'stopped'
             task.stop_event.set()
+            task.resume_at = None  # a stopping run does not resume by itself
             task.cancel_event.set()  # the calls in flight end now
             task.pause_event.set()  # unblock any paused workers
 
@@ -384,6 +385,8 @@ class TaskManager:
         if not task:
             return False
         with task._lock:
+            if task.stop_event.is_set():
+                return False  # stopping
             if due is not None and task.resume_at != due:
                 return False
             if task.state == 'running' and due is None:
@@ -408,6 +411,9 @@ class TaskManager:
             task.state = 'running'
             task.error = None  # the run-level error that paused it
             task.resume_at = None
+            # A new generation: the retiring event is set first, so no call
+            # can go on holding an event that nothing will set any more
+            task.cancel_event.set()
             task.cancel_event = threading.Event()  # before the workers go on
             task.pause_event.set()
         return True
@@ -415,8 +421,8 @@ class TaskManager:
     def _top_up_workers(self, task: TranslationTask) -> bool:
         """Start workers until task.num_workers run (under task._lock).
         False, with task.error set, when one cannot be started."""
-        current_alive = sum(1 for t in task._threads if t.is_alive())
-        additional = task.num_workers - current_alive
+        # Counted, not alive: a worker that has ended its loop is not one
+        additional = task.num_workers - task.active_workers
         if additional <= 0 or not (task.pm and task._gm):
             return True
         for _ in range(additional):
@@ -445,7 +451,9 @@ class TaskManager:
             # Under the mutex, right after the save: the diagnostics of each
             # result saved, unless its segment was edited since
             for segment_id, outcome, revision in items:
-                if pm._find(segment_id).revision == revision:
+                seg = pm._find(segment_id)
+                # (also not for a segment translated again meanwhile, as from the review page)
+                if seg.revision == revision and seg.status == outcome.status:
                     record_failure_log(log_dir, segment_id, outcome)
 
         saver = DebouncedSaver(pm, after_save, clock=self.clock)
@@ -510,6 +518,7 @@ class TaskManager:
                     for res in batch:
                         if self._apply_result(task, pm, res):
                             saver.add((res.segment_id, res.outcome, res.revision))
+                            saver.maybe_save()  # the window, after every result
 
                 # Too many unexpected failures in a row: a run-level error
                 stop = None
@@ -521,6 +530,7 @@ class TaskManager:
                     streak_stop = stop
                     with task._lock:
                         task.stop_event.set()
+                        task.resume_at = None  # a stopping run does not resume
                         task.pause_event.set()
                 self._tick(task, saver)
 
@@ -677,6 +687,12 @@ class TaskManager:
         elif task.state == 'paused' and task.resume_at is not None:
             if delay is not None:  # another rate limit during the wait
                 task.resume_at = max(task.resume_at, self.clock() + delay)
+                task.progress.put({'event': 'rate_limit', 'data': {
+                    'error': task.error,
+                    'completed': task.completed,
+                    'remaining': task.total - task.completed,
+                    'resume_in': task.resume_at - self.clock(),
+                }})
                 return
         else:
             return  # paused by the user, or by an error that waits for the user
@@ -791,31 +807,17 @@ class TaskManager:
                         if task.cancel_event is generation:
                             self._pause_for(task, e, event_name)
                             task.pause_event.clear()
+                            # Like a user pause: the other calls in flight
+                            # end; their segments go back to the queue
+                            task.cancel_event.set()
                         # else: a call from before a pause and resume; that
                         # pause already decided, so its error pauses nothing
                         # again (the segment is just sent again)
                     # Back in the queue once the pause is in place, so no
                     # other worker starts it meanwhile
                     task.segment_queue.put(seg)
-
-                    # Block until resumed
-                    task.pause_event.wait()
-
-                    # Check if we should stop after resuming
-                    if task.stop_event.is_set():
-                        break
-                    if task.state not in ('running',):
-                        break
-
-                    # Check dynamic reduction after resume
-                    with task._lock:
-                        if task.active_workers > task.num_workers:
-                            task.active_workers -= 1
-                            reduced_exit = True
-                            logger.info("[%s] Worker 退出 (動態減少)", tag)
-                            return
-
-                    logger.info("[%s] 翻譯繼續", tag)
+                    # The top waits for the resume, checks stop and the
+                    # worker count (a new pause meanwhile: it waits again)
                     continue
 
         finally:

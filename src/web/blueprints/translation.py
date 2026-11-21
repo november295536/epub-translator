@@ -139,8 +139,12 @@ def translation_stream(project_name: str):
         cursor = task.progress.cursor_end
         # Initial status, with a run-level error that paused the task before
         # this page connected
+        # and an automatic wait in progress (seconds left), so the page offers
+        # the pause button and shows when the run goes on
+        resume_at = task.resume_at
         status = {'state': task.state, 'completed': task.completed,
-                  'total': task.total, 'error': task.error}
+                  'total': task.total, 'error': task.error,
+                  'resume_in': None if resume_at is None else max(0.0, resume_at - tm.clock())}
         yield f"event: status\ndata: {json.dumps(status, ensure_ascii=False)}\n\n"
         if status['state'] in ('completed', 'failed', 'stopped'):
             return  # ended before this stream opened: its last event is gone

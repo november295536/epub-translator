@@ -144,15 +144,6 @@ def start(project, backend, model, workers, retry_failed):
     if not project_dir:
         click.echo("找不到專案。請先執行 init 指令，或用 --project 指定專案目錄。")
         sys.exit(1)
-    if backend is not None or model is not None:
-        stored = ProjectManager(project_dir).load()
-        current = stored.backend or llm.default_backend().name
-        if backend == current:
-            backend = None  # the project's backend already: nothing to store
-        if backend is not None and model is None:
-            model = llm.backend_for(backend).default_model  # a model of the new backend
-        if model is not None:
-            _check_model(model, backend if backend is not None else stored.backend)
 
     # One writer per project: held for the whole run, released on any exit
     lock = ProjectLock(project_dir)
@@ -169,7 +160,15 @@ def start(project, backend, model, workers, retry_failed):
 
 def _start(project_dir, backend, model, workers, retry_failed):
     pm = ProjectManager(project_dir)
-    pm.load()
+    pm.load()  # under the lock: the backend and model are checked against this
+    if backend is not None or model is not None:
+        current = pm.data.backend or llm.default_backend().name
+        if backend == current:
+            backend = None  # the project's backend already: nothing to store
+        if backend is not None and model is None:
+            model = llm.backend_for(backend).default_model  # a model of the new backend
+        if model is not None:
+            _check_model(model, backend if backend is not None else pm.data.backend)
 
     if model:
         pm.set_model(model, backend=backend)
@@ -366,6 +365,7 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
             error_event.set()
         pm.apply_outcome(seg_id, outcome)
         saver.add((seg_id, outcome))
+        saver.maybe_save()  # the window, after every result
         if outcome.status == SegmentStatus.FAILED:
             failed += 1
             click.echo(f"  [{tag}] ✗ {seg_id} 翻譯失敗：{outcome.issues[0].detail}")
@@ -377,6 +377,8 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
         """Save the window; announce a rate-limit pause, end it when due."""
         if not gate.is_set():
             saver.flush()  # a pause saves what is waiting
+            if error_event.is_set():
+                return  # stopping: no announcement, the gate stays closed
             with pause_lock:
                 if not pause['shown']:
                     pause['shown'] = True
