@@ -113,10 +113,10 @@ r('9 failure log write error propagates',
   ['tests/test_translator.py::TestDiagnosticWriteFailure', 'tests/test_web.py::TestWorkerUnexpectedErrors',
    'tests/test_cli.py::TestCLIUnexpectedErrors'])
 r('9 web worker dies on an unexpected exception',
-  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        prompt = _request_text(engine, seg, glossary_text, context) if context else \'\'\n        return unexpected_error_outcome(model, e, prompt)\n', '')],
+  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        prompt = _request_text(engine, seg, glossary_text, context, brief) if context else \'\'\n        return unexpected_error_outcome(model, e, prompt)\n', '')],
   ['tests/test_web.py::TestWorkerUnexpectedErrors::test_unexpected_exception'])
 r('9 CLI worker dies on an unexpected exception',
-  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        prompt = _request_text(engine, seg, glossary_text, context) if context else \'\'\n        return unexpected_error_outcome(model, e, prompt)\n', '')],
+  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        prompt = _request_text(engine, seg, glossary_text, context, brief) if context else \'\'\n        return unexpected_error_outcome(model, e, prompt)\n', '')],
   ['tests/test_cli.py::TestCLIUnexpectedErrors::test_unexpected_worker_exception',
    'tests/test_cli.py::TestCLILock::test_lock_released_on_error'])
 r('10 no cancel check before the start',
@@ -191,7 +191,7 @@ r('18 delete ignores the lock of another process',
    ('src/web/blueprints/projects.py', '        finally:\n            lock.release()', '        finally:\n            pass')],
   ['tests/test_web.py::TestDeleteGuard::test_delete_refused_while_other_process_holds_lock'])
 r('19 extraction stop drops earlier terms',
-  [('src/glossary/term_extractor.py', 'raise ExtractionError(str(e), terms=found()) from e', 'raise')],
+  [('src/glossary/term_extractor.py', 'raise ExtractionError(str(e), terms=_final(groups, {})) from e', 'raise')],
   ['tests/test_glossary.py::TestExtractionStopKeepsTerms', 'tests/test_cli.py::TestCLIGlossaryExtractStop',
    'tests/test_web.py::TestTermExtractionStop'])
 r('19 CLI extraction stop not caught',
@@ -246,7 +246,7 @@ r('R2-4 every start error stops the run',
     '            if True:')],
   ['tests/test_llm.py::TestRound2StartErrors', 'tests/test_translator.py::TestRound2StartErrorFailsSegment'])
 r('R2-5 unexpected exception escapes the entry point',
-  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        prompt = _request_text(engine, seg, glossary_text, context) if context else \'\'\n        return unexpected_error_outcome(model, e, prompt)\n', '')],
+  [(TR, '    except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on\n        logger.exception("未預期的錯誤: %s", seg.segment_id)\n        prompt = _request_text(engine, seg, glossary_text, context, brief) if context else \'\'\n        return unexpected_error_outcome(model, e, prompt)\n', '')],
   ['tests/test_translator.py::TestRound2UnexpectedErrorInEntryPoint',
    'tests/test_cli.py::TestCLIUnexpectedErrors::test_unexpected_worker_exception'])
 r('R2-6 group left alone when the parent has exited',
@@ -363,7 +363,7 @@ r('R3-7 unexpected failure without diagnostics',
   ['tests/test_translator.py::TestRound3UnexpectedFailureLog',
    'tests/test_translator.py::TestRound2EntryPointWritesNoFile'])
 r('R3-7 request not in the unexpected-failure log',
-  [(TR, "        prompt = _request_text(engine, seg, glossary_text, context) if context else ''",
+  [(TR, "        prompt = _request_text(engine, seg, glossary_text, context, brief) if context else ''",
     "        prompt = ''")],
   ['tests/test_translator.py::TestRound3UnexpectedFailureLog'])
 r('R3-8 stale result in the failure drain reported as unsaved',

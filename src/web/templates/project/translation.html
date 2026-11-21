@@ -1,7 +1,7 @@
 {% extends "project/layout.html" %}
 
 {% block tab_content %}
-<div x-data="translationController()" x-init="init()">
+<div x-data="translationController()">
     <!-- Control Panel -->
     <div class="card" style="margin-bottom: 1.5rem;">
         <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
@@ -65,6 +65,19 @@
                     <span x-show="state === 'running' && activeWorkers > 0" class="text-muted"
                           style="margin-left: 0.5rem;"
                           x-text="activeWorkers + ' 個活躍中'"></span>
+                </div>
+            </div>
+
+            <!-- Book brief -->
+            <div style="margin-bottom: 1rem;">
+                <label for="brief-text" style="font-weight: 600; display: block; margin-bottom: 0.3rem;">書籍簡介（選填：類型、語氣、讀者；放在每段翻譯提示的最前面）</label>
+                <textarea id="brief-text" x-model="brief" rows="3" :disabled="!briefLoaded"
+                          placeholder="例：通俗科普讀物，語氣輕鬆，讀者是一般大眾。"
+                          style="width: 100%; padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;"></textarea>
+                <div style="margin-top: 0.3rem; display: flex; gap: 0.75rem; align-items: center;">
+                    <button class="btn btn-secondary btn-small" @click="saveBrief()" :disabled="briefSaving || brief === savedBrief">儲存簡介</button>
+                    <span class="text-muted" x-show="brief === savedBrief && savedBrief" x-text="'已儲存'"></span>
+                    <span class="text-error" x-show="briefError" x-text="briefError"></span>
                 </div>
             </div>
 
@@ -151,8 +164,14 @@ function translationController() {
         activeWorkers: 0,
         _pauseInFlight: false,
         autoResume: false,  // paused by a rate limit, resumes by itself
+        brief: '',
+        savedBrief: '',
+        briefLoaded: false,  // not editable before the stored brief is shown
+        briefSaving: false,
+        briefError: '',  // the brief's own: a later save clears it, the task error stays
 
         init() {
+            this.fetchBrief();
             this.fetchModel();
             this.fetchStatus();
         },
@@ -191,6 +210,43 @@ function translationController() {
             } catch (e) {
                 console.error('Failed to fetch model:', e);
             }
+        },
+
+        async fetchBrief() {
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/brief');
+                const data = await res.json();
+                if (res.ok) {
+                    this.brief = this.savedBrief = data.brief;
+                    this.briefLoaded = true;
+                }
+            } catch (e) {
+                console.error('Failed to fetch brief:', e);
+            }
+        },
+
+        async saveBrief() {
+            this.briefSaving = true;
+            const sent = this.brief;
+            try {
+                const res = await fetch('/api/projects/{{ project_name }}/brief', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ brief: sent }),
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    // a draft typed meanwhile is kept (and shows as not saved)
+                    if (this.brief === sent) this.brief = data.brief;
+                    this.savedBrief = data.brief;
+                    this.briefError = '';
+                } else {
+                    this.briefError = data.error || '簡介儲存失敗';
+                }
+            } catch (e) {
+                this.briefError = '簡介儲存失敗: ' + e.message;
+            }
+            this.briefSaving = false;
         },
 
         modelKey() {

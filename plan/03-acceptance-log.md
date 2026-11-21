@@ -5275,3 +5275,397 @@ loops at once:
 Confirmation series, after the mechanisms were forced and fixed: the full suite 12 times,
 four series of three at once (`-rf`, every run's tail kept): **12 of 12 passed, 2357 tests
 each, no failure**.
+
+## Phase 8 — Extraction quality and book-level context
+
+Date: 2026-11-21. Branch: `phase-8/extraction-and-brief`, worktree `<repo>/.worktree/phase-8`,
+shared virtualenv.
+
+### What was built
+
+| # | Item | Built | Where |
+|---|---|---|---|
+| 1 | Term extraction second pass | Every batch's proposals are collected (`collect_candidates`): grouped by lowercased term, the first spelling kept, each proposed translation and category counted once per batch that proposed it. Terms proposed with more than one translation go to one consolidating call (`CONSOLIDATE_PROMPT`): one JSON line per term with its translations and counts; the reply is a JSON array of `term`, `translation`, `category`. A term the reply decides (a known term, a non-empty text translation) takes that translation (it may be one the batches did not propose) and its category (the proposals' most frequent one when the reply's is not text). Every other term, and every term when the call or its reply is unusable (an error other than a stop, no JSON, not a list, missing or empty fields), keeps its most frequent proposal, the first proposed on a tie, so no candidate is lost; a partial reply is logged (`Term consolidation decided n of m terms`). Terms without a conflict need no call. A rate limit, expired login or unusable backend in the consolidation raises `ExtractionError` with every term (the decisions made so far, the rest by frequency); a stop during the batches makes no consolidating call. | `src/glossary/term_extractor.py` |
+| 2 | Per-book brief | `project.json` `brief` (absent: none, never written, so existing files round-trip byte for byte; a non-text value is refused on load). `ProjectManager.set_brief` (stripped; empty removes it). Placed at the very top of the text and HTML prompts as `BRIEF_SECTION` (`本書簡介（請依此掌握文體、語氣與讀者；簡介本身不需翻譯）：` + the brief + a blank line); code segments get none (their prompt only translates comments). Absent: the prompt is exactly as on `main`. Every caller passes it: CLI sequential and parallel, the web worker (read under the project mutex for every segment, so an edit during a run applies from the next segment), re-translate, and the failure diagnostics. CLI `brief show`, `brief set TEXT` (empty TEXT removes it; under the project lock). Web `GET/PUT /api/projects/<name>/brief` (through the task manager's transaction) and a text area on the translation tab. | `src/core/project.py`, `src/core/translator.py`, `src/web/tasks.py`, `src/web/blueprints/{translation,review}.py`, `src/web/templates/project/translation.html`, `translate.py` |
+| 3 | Person notes | Glossary entries have optional `gender` and `note` (text; stored only when not empty, so a glossary without them keeps its file format, also in `glossary export`). In the prompt they follow the entry: `Tess → 泰絲 [人名]（性別：female；備註：the baker）`; absent: the line as before. CLI `glossary add --gender/-g --note/-n`, shown by `glossary show`; `glossary extract` keeps an existing entry's gender and note when it replaces the entry. Web: add and edit (the fields show for the person category; any text accepted, `male`/`female` suggested), shown under the translation; non-text values refused (400). | `src/glossary/glossary_manager.py`, `src/web/blueprints/glossary.py`, `src/web/templates/project/glossary.html`, `translate.py` |
+| 4 | Comparison script | `scripts/verify/phase8_extraction_compare.py` (below) | — |
+| 5 | Brief sample script | `scripts/verify/phase8_brief_sample.py` (below) | — |
+
+Design choices:
+
+- Size of the consolidating call: only conflicting terms are sent (a term with one proposal has
+  nothing to decide), and their lines are cut into parts of at most
+  `MAX_CHARS_PER_CONSOLIDATION` 8000 characters, one call each. On the real run below 9 terms
+  conflicted (one call); a whole book stays at one or a few calls.
+- The consolidation does not drop or add terms: it only decides. Pruning the list was not
+  asked for, and a model that drops terms would lose candidates.
+- Brief placement: at the top of the prompt, as the plan says ("at the top"); Phase 7 kept the
+  rest of the order unchanged. Not in the code prompt.
+- `gender` and `note` are not restricted to the person category in the data (the web form shows
+  them for persons only); a note on another entry is shown in the prompt the same way.
+- The prompt shows the gender value as given (no mapping to pronouns): the model reads
+  `性別：female` well enough, and a mapping would be one more rule.
+
+### Comparison script (`scripts/verify/phase8_extraction_compare.py`)
+
+Copies one project (as the Phase 7 throughput script: `project.json`, `source.epub`,
+`glossary.json` into a new temporary directory, refused inside a git work tree or the projects
+directory, removed in `finally`, the projects directory snapshotted and the run FAILs if it
+changed), migrates a schema 1 copy, and runs the term extraction of `--code` on the copy's
+text segments. `--code <checkout of main>` gives the extraction before this phase. `--chunks N`
+sends only the first N batches (the batching is the same before and after). It records every
+batch's proposals and counts calls, writes `terms-before.json` / `terms-after.json` (`terms`,
+and `conflicts`: every term proposed with more than one translation, with the counts) to
+`--out` (refused inside the projects directory or a git work tree), and prints counts only.
+
+The before checkout was made with `git archive main | tar -x -C <scratch>/main-code` (no
+worktree metadata). Claude CLI backend, model haiku, project index 3 (2956 text segments,
+about 760 000 characters, 170 batches in all (counted in review round 1); 20 sent):
+
+```
+$ python3 scripts/verify/phase8_extraction_compare.py --projects-dir <repo>/projects \
+    --project-index 3 --anonymize --model haiku --chunks 20 --out <scratch>/phase8-out \
+    --code <scratch>/main-code
+project-3 before: batches sent 20  calls 20  proposals 331  terms 225  terms with conflicting translations 10
+wrote terms-before.json
+$ python3 scripts/verify/phase8_extraction_compare.py --projects-dir <repo>/projects \
+    --project-index 3 --anonymize --model haiku --chunks 20 --out <scratch>/phase8-out
+project-3 after: batches sent 20  calls 21  proposals 355  terms 233  terms with conflicting translations 9
+wrote terms-after.json
+```
+
+Both exited 0. The two runs are separate model runs, so their proposals differ (331 / 355).
+Counted from the two files (numbers only): every conflicting term is one entry in both lists.
+Before, the kept translation was the first proposal (9 of 10 also the most frequent one);
+after, the consolidating call chose the most frequent proposal for 5 of 9, another proposal
+for 3, and a translation no batch proposed for 1. Which list is better is for the owner to
+judge from the two files (kept outside the repository).
+
+### Brief sample script (`scripts/verify/phase8_brief_sample.py`)
+
+Same copy rules. The sample: of the text segments (not code, not passthrough) with at least
+`MIN_WORDS` 50 words, in book order, positions `i * count // 10` for i = 0..9 (fixed, no random
+seed). Each is translated with `translate_segment` (the copy's glossary and context) once without
+and once with the brief of `--brief-file`; nothing is stored. Writes `brief-sample.html` (the
+brief, then per segment the source and both translations side by side) to `--out`. The brief
+used was invented and generic (genre: general non-fiction for a broad readership; tone: clear,
+friendly, conversational; audience: curious adult readers without specialist background).
+
+```
+$ python3 scripts/verify/phase8_brief_sample.py --projects-dir <repo>/projects --project-index 3 \
+    --anonymize --model haiku --brief-file <scratch>/brief.txt --out <scratch>/phase8-out
+project-3: sampled 10  calls 21  without brief: translated 10 failed 0  with brief: translated 10 failed 0
+wrote brief-sample.html
+```
+
+Exit 0; 21 calls for 20 translations (one retry). The quality comparison is the owner's.
+
+### Checks
+
+```
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+$ python3 scripts/verify/phase3_export_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  exports 24  translated segments 4162  as translation 3956  kept original 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 53)  toc labels changed 405/1885 (527 into translated chapters)  exports with new epubcheck errors 0  failed projects 0
+$ python3 scripts/verify/phase4_validate_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  round trip 9491/9491  translated 4162  failing the structural check 206 (code_changed 19, empty_block 14, key_mismatch 35, not_well_formed 20, structure_mismatch 65, tag_count 54; only tag rules 88)  warnings (length_ratio 36, untranslated 8)  length ratio over 2925 segments: p1 0.312 p5 0.333 p50 0.404 p95 0.547 p99 0.976; outside 0.25-0.8: 38 (1.3%)  sources that cannot be cut 0  with translatable attributes 22  translated code starting with a shebang 0  failed projects 0
+$ python3 scripts/verify/phase5_glossary_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  glossary entries 15, translated 4162, passing the structural check 3956, with term_not_applied 12, terms 4, by category (person: 9 warnings, 2 terms, term: 6 warnings, 2 terms)  failed projects 0
+$ python3 scripts/verify/phase6_segmentation_check.py --projects-dir <repo>/projects --anonymize
+TOTAL projects 8  segments 9520 -> 7870, calls 9520 -> 6432 (ratio 0.676), passthrough 1438, headings merged 1655 of 1770  failed projects 0
+$ stat -f '%m %z' <repo>/projects/*/project.json | md5
+a7197555c962562a530d6de80fa045af
+```
+
+All four exited 0 with the TOTAL lines of Phase 7 (no glossary entry of the real projects has
+`gender` or `note`, and no project has a brief, so the glossary check is unchanged). The
+fingerprint of the projects directory was the same before and after all work of this phase,
+including the three real runs; no `phase8-*` temporary directory was left.
+
+### Tests
+
+2475 passed (main: 2357), and three suites at once: 2475 passed each, no failure. New:
+`tests/test_extraction_brief.py` (75): conflicting proposals consolidated into one entry and the
+consolidation request's content; no call without a conflict; nine kinds of unusable reply and
+a transient error keep the most frequent proposal; a partial reply; a stop in the consolidation
+or in a batch keeps every term; bounded consolidation calls; the brief at the top of the text
+and HTML prompts, not in code, kept on a retry and in the diagnostics; an absent brief gives
+the prompt and the `project.json` text of `main`; `set_brief`, a non-text brief refused; person
+notes in the glossary lines and in the translation prompt, the glossary file unchanged without
+them, update, import and export; CLI `brief show/set`, refused while another process holds the
+lock, `start` (one and two workers) with and without a brief, `glossary add -g -n`, `show`,
+`extract` keeping a person's notes and consolidating; web brief GET/PUT, refused bodies, an edit
+during a run used from the next segment (the first prompt is today's), re-translate with the
+brief, glossary POST/PUT with notes, non-text refused, both pages' fields. `TestExtractionCompareScript`,
+`TestBriefSampleScript`, `TestPhase8ScriptSurvivors` (`test_verify_scripts.py`, 43). Waits are on
+events and conditions (`_wait` polls a predicate); no fixed sleep. No existing test was removed
+or changed.
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, mutmut 3.8.1, parallel (about 8 minutes per run). Added to
+the mutated files: both Phase 8 scripts.
+
+| Run | Mutants | Killed | Survived | Timeout |
+|---|---|---|---|---|
+| 1 | 1180 | 1046 | 134 | 0 |
+| 2 | 1177 | 1147 | 30 | 0 |
+| 3 (final) | 1164 | 1139 | 25 | 0 |
+
+Run 1 → 2: tests for exact error texts, the diagnostics prompt with a glossary,
+`translate_reply` without a brief, the default arguments of `add_term` and `import_json`, a
+second extraction batch filled exactly to the limit, the consolidation part boundary, the sort
+by lowercase, ties, the cancel event of an extraction call, a reply item read after an
+unusable one, today's prompt in the web worker and both CLI paths without a brief; for the
+scripts: snapshots, the cancel passed through the counting backend, the temporary directory's
+prefix, a `mkdtemp` failure, a cleanup failure alone, the project's backend and model, no log
+line on stderr and the root handlers restored, a schema 1 copy, an existing `--out`, context
+from translations (segmentation 2), project index 1, required options, the exact page and the
+exact term file. Three equivalent forms were removed from the code (an unused default of
+`_request_text`, the dead initial `size` of `_consolidation_batches`, `most_common(1)` → `max`).
+Run 2 → 3: `mkdtemp(dir=parent)` → `mkdtemp()` (the default directory is the checked one) and
+`getattr(pm.data, 'backend', None)` → `pm.data.backend` (every project of this code and of
+`main` has the field), removing their equivalent mutants.
+
+Remaining, each equivalent:
+
+| mutant(s) | why equivalent |
+|---|---|
+| `translate_segment` 4 (`if context` → `if context or True` in the diagnostics after an unexpected error) | with `context` None, `_request_text` unpacks `*None`, raises `TypeError` inside its own `try` and returns `''`, the same as the `else` branch (the logic is from Phase 4; the line changed only by the new argument) |
+| `_candidate_line` 2, extraction `run` 82 (`ensure_ascii=None`) | `json` tests the flag for truth: `None` acts as `False` |
+| both scripts `in_work_tree` 10 (`'.git'` → `'.GIT'`), brief `run` 35 (`'glossary.json'` → `'GLOSSARY.JSON'`) | the file system here (APFS) is case-insensitive: the same path |
+| both scripts `run` 21, 22 (`redirect_stdout(None)` / `redirect_stderr(None)` around load and migration) | with `sys.stdout` / `sys.stderr` set to `None`, `print` writes nothing, as into the discarded buffer; nothing in that block writes to the streams other than through `print` |
+| brief `run` 88, 91, 99, `sample` 2, 4, 6; extraction `run` 68, 71, 79 (`encoding='utf-8'` → `None`, omitted, `'UTF-8'`) | `'UTF-8'` is the same codec; `None` / omitted take the locale's encoding, UTF-8 on this machine (Python 3.12, macOS) |
+| brief `sample` 63, extraction `compare` 47 (`sys.path.insert(0, None)`) | the tests run in a process that has imported `src` already, so the import does not search the path; a fresh run needs the entry, and the real runs above made it (killed there, not in the suite) |
+| brief `sample` 66, extraction `compare` 50 (`insert(1, …)`) | position 1 is directly after the script's own directory, which holds no `src` package: the same module is found |
+| extraction `main` 61, 87 (`default=None` dropped for `--chunks` / `--name`) | argparse's default for an optional argument is `None` |
+
+### Known limitations
+
+- A project with `brief`, or a glossary with `gender` / `note`, cannot be loaded by code from
+  before this phase (`ProjectData(**raw)` / `GlossaryEntry(**item)` reject the key); only
+  projects and entries where one was set get the key.
+- The consolidation sees only the proposals' translations and counts, not the text they came
+  from; a term proposed once with one translation is not reviewed.
+- `glossary extract` in the CLI still replaces existing entries with the extracted translation
+  (as on `main`); it now keeps their gender and note. The web extraction adds only new terms
+  (as on `main`).
+- The brief is not in the code prompt.
+
+### Not verified
+
+- Translation quality with and without the brief, and which term list is better: the owner
+  judges `brief-sample.html`, `terms-before.json` and `terms-after.json` (outside the repository).
+- The extraction comparison covered 20 of the 170 batches of one book (`--chunks 20`), so the
+  consolidation of a whole book (more conflicts, possibly several calls) was not run for real.
+- The web pages were checked through the Flask test client (fields, requests), not in a browser.
+- The Copilot backend was not used for any real run.
+
+## Phase 8 — review round 1
+
+Date: 2026-11-21. Three reviews (GPT, Opus, Gemini through Copilot); the orchestrator's triage
+accepted items A to N below and rejected the rest. Each accepted claim was checked against the
+code first; all of them were real.
+
+### Accepted
+
+| Item | Fix | Test |
+|---|---|---|
+| A. Counting once per batch | `collect_candidates` counts each (term, translation) and (term, category) at most once per batch reply; the comparison script's `conflicts()` uses the same rule, strips texts and skips a blank term or translation | `TestRound1Consolidation::test_a_reply_counts_once_per_batch`, `test_candidates_stripped`; `TestPhase8Round1Scripts::test_conflicts_count_once_per_batch_and_skip_blanks`, `TestPhase8Round1Survivors::test_conflicts_read_on_after_an_unusable_proposal` |
+| B. Consolidation reply | `_parse_response`: JSON that decodes to something other than a list is no answer (no search for an array inside an object; this also applies to the extraction replies, logged as before). Any exception while parsing a consolidation reply makes it unusable (logged with its type). Two rows that decide one term differently leave that term to the frequency rule; the same decision twice is kept. Term, translation and category are stripped; an empty category takes the batches' most common one | `test_decoded_reply_that_is_not_a_list_is_unusable`, `test_extraction_reply_that_is_not_a_list`, `test_reply_that_cannot_be_parsed_is_unusable` (a reply nested 100000 deep: `RecursionError`), `test_contradicting_rows_leave_the_term_undecided`, `test_stripped_reply_and_empty_category`, `test_stripped_category` |
+| C. `--code` verified | the four modules are imported inside a `try` (an `ImportError`: `ERROR --code has no term extractor (…)`, exit 2) and each must lie inside `--code` (otherwise `ERROR the code that was loaded is not the one of --code`, exit 2) | `test_code_of_two_checkouts_in_fresh_interpreters` (two stub checkouts with different answers, and an empty directory, each in a fresh interpreter); `test_code_loaded_from_the_checkout_in_process` and `test_checkout_without_the_extractor_in_process` (the package unloaded, this checkout first on `sys.path`: the stub must still win); the earlier test with an empty `--code` now expects the refusal |
+| D. Survivors | `sys.path`: killed through C; the brief sample's path entry and imports moved to module level, as in the earlier check scripts. Filename case and encodings: tests in the Phase 5 style (`test_looks_for_dot_git`, `test_brief_glossary_file_name`, `test_files_read_and_written_as_utf8`). The `redirect_stdout` / `redirect_stderr` wrappers were not needed (load, migration and glossary loading print nothing) and are removed | mutation runs below |
+| E. Glossary import and API | `import_json` checks the whole file with the rules of `load()` (one shared `_check_entries`) before it writes anything; CLI `glossary import` reports `無法匯入：…` and exits 1. The glossary endpoints read the body with `get_json(silent=True)` and refuse a non-object with 400. `gender` and `note` are stripped in `add_term` and `update_term` | `TestRound1Glossary::test_import_checked_before_anything_is_written` (4 cases), `test_cli_import_refused`, `test_person_fields_stripped`, `test_web_non_object_body` (3 cases) |
+| F. Brief length | `MAX_BRIEF_CHARS` 2000 in `ProjectManager.set_brief` (after stripping); longer raises `ValueError('書籍簡介最多 2000 字（目前 N 字）')` and changes nothing; web 400 with that message, CLI the message and exit 1, the file unchanged | `TestRound1Brief::test_limit_in_the_setter`, `test_limit_in_the_cli_and_web` |
+| G. Brief PUT during a run | the PUT sets and saves under the project mutex and puts the previous brief back when the save raises (the workers read it under the same mutex, so they never see an unsaved one); GET reads it under the mutex | `test_failed_save_restores_the_previous_brief`, `test_get_reads_under_the_mutex` |
+| H. Brief text area | disabled until the stored brief is loaded; a save sends a snapshot and replaces the text only if it is still that snapshot (a newer draft stays and shows as not saved) | `test_text_area_waits_for_the_load_and_keeps_a_newer_draft` (rendered page; not run in a browser) |
+| I. CLI `glossary add` | `-g` / `-n` default to "not given": an existing entry keeps its value, an explicit `''` clears it; a new entry gets `''` | `test_cli_add_keeps_omitted_person_fields` |
+| J. `brief-sample.html` | every cell is plain text: tags removed, one line per block (`</p>`, `</h1>`…, `<br>`, `</li>` …), entities decoded, then escaped; shown with `white-space: pre-wrap`. Chosen over escaped markup because a translation is judged by its words, and the tags would make the Chinese hard to read; no book markup is rendered, so nothing runs or loads | `test_readable`, `test_brief_page_exact`, `test_page` |
+| K. Migration result | both scripts reload the copy after `migrate_project` and stop with `ERROR project-N: the copy could not be migrated` (exit 2, no model call) if it is not schema 2 | `test_copy_left_at_schema_1_refused` (both scripts) |
+| L. Brief sample with failures | the file and the counts are still written; exit 1 with `FAIL project-N: not every sampled segment has both translations` unless all ten segments have both | `test_samples_with_and_without` (one failure with the brief), `test_brief_sample_fails_when_a_translation_without_the_brief_failed` |
+| M. Phase 1 check scripts | seven entries re-anchored: reverts 9 (web, CLI), R2-5 and R3-7 (the diagnostics line passes the brief), 19 (the extraction stop is in `collect_candidates`), survivor kills core263 / core264 (the batching moved into `_batches`) | the runs below |
+| N. Whole-book comparison | project 1, the real project with the fewest text segments (220; 105 batches), run in full before and after | below |
+
+Phase 1 scripts (`phase1_reverts.py`, `phase1_survivor_kills.py`, each on its own commit's code):
+
+| Code | reverts not detected | not killed |
+|---|---|---|
+| `main` (a `git clone --shared` of `main` in the scratch directory) | 23 | 14 |
+| this branch before the re-anchoring | 28 | 16 |
+| this branch after | 23 | 14 |
+
+The 23 and 14 left are the same entries, line for line, on `main` and on the branch (compared
+after removing durations): anchors made stale by Phases 2 to 7 (for example `BAD 3
+mark_reviewed outside the mutex`, `BAD core58`). They are not this phase's and were left as
+they are. The seven re-anchored entries were run alone too: `reverts not detected: 0`,
+`not killed 0`.
+
+Whole-book comparison (Claude CLI, haiku; the before code is that `main` clone):
+
+```
+$ python3 scripts/verify/phase8_extraction_compare.py --projects-dir <repo>/projects \
+    --project-index 1 --anonymize --model haiku --out <scratch>/phase8-out/whole --code <scratch>/main-clone
+project-1 before: batches sent 105  calls 105  proposals 1861  terms 906  terms with conflicting translations 111
+wrote terms-before.json
+$ python3 scripts/verify/phase8_extraction_compare.py --projects-dir <repo>/projects \
+    --project-index 1 --anonymize --model haiku --out <scratch>/phase8-out/whole
+project-1 after: batches sent 105  calls 107  proposals 1873  terms 923  terms with conflicting translations 98
+wrote terms-after.json
+```
+
+Both exited 0. The files were renamed to `terms-before-whole-book.json` and
+`terms-after-whole-book.json` in `<scratch>/phase8-out` (the 20-batch files of the first run
+keep their names). After: two consolidating calls (98 conflicting terms, more than 8000
+characters of candidate lines). Counted from the files (numbers only): every conflicting term
+is one entry in both lists; before, the first proposal was kept (also the most frequent one
+for 94 of 111); after, the consolidation chose the most frequent proposal for 67 of 98, another
+proposal for 28 and a translation no batch proposed for 3. Which list is better is the owner's
+judgement.
+
+### Rejected (considered, not done)
+
+- GPT 1 (an existing report file being a link to a project file), GPT 9 (a differently
+  capitalized projects directory, `TMPDIR` inside the projects directory), GPT 10 (cleanup on
+  SIGHUP / SIGTERM): not realistic for a script the owner runs by hand; the same standard as
+  the earlier check scripts.
+- GPT 5 (one term whose candidate line exceeds 8000 characters): not realistic.
+- GPT 6 (case folding beyond `lower()`): English source books; consistent with the glossary's
+  own lookup.
+- GPT 8 (logging handlers already installed under `--anonymize`): the scripts run standalone;
+  no such handler exists.
+- GPT 14 (e-mail addresses in the commit metadata): settled by the owner; the existing git
+  identity and the single trailer stay.
+- Opus 7 (README / CLAUDE.md): not in this branch; those files have the owner's uncommitted
+  edits.
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, parallel, about 8 minutes per run.
+
+| Run | Mutants | Killed | Survived | Timeout |
+|---|---|---|---|---|
+| round 1, first | 1246 | 1231 | 15 | 0 |
+| round 1, final | 1246 | 1241 | 5 | 0 |
+
+First → final: the warning text of a non-list reply, a failure only without the brief, the
+in-process checkout without the extractor (message, type, exit code), a proposal read after an
+unusable one in `conflicts()`, the exact name of the term file (`'BEFORE'` passed the earlier
+test only because this file system ignores case).
+
+Remaining, each equivalent on any machine:
+
+| mutant(s) | why equivalent |
+|---|---|
+| `translate_segment` 4 (`if context` → `if context or True` in the diagnostics) | with `context` None, `_request_text` unpacks `*None`, raises `TypeError` inside its own `try` and returns `''`, the same as the `else` branch |
+| `_candidate_line` 2, extraction `run` 84 (`ensure_ascii=None`) | `json` tests the flag for truth: `None` acts as `False` |
+| extraction `main` 61, 87 (`default=None` dropped for `--chunks` / `--name`) | argparse's default for an optional argument is `None` |
+
+The survivors of the first Phase 8 entry that held "on this machine only" (file name case,
+locale encoding, `sys.path`) are all killed now; no remaining justification depends on the
+machine.
+
+### Checks and tests
+
+- `python3 -m pytest tests/ -q -p no:cacheprovider`: 2514 passed; three suites at once:
+  2514 passed each, no failure. No existing test removed; changed: the earlier test with an
+  empty `--code` (now refused), the brief sample's page and result expectations (text cells;
+  exit 1 when a translation failed).
+- The four older check scripts (phase 3 to 6, `--anonymize`): the same TOTAL lines as in the
+  Phase 8 entry; the projects fingerprint `a7197555c962562a530d6de80fa045af` before and after
+  every run of this round.
+
+### Not verified
+
+- The text area's behaviour (H) in a browser: only the rendered page was checked.
+- The quality of the two whole-book term lists (the owner's).
+
+## Phase 8 — review round 2
+
+Date: 2026-11-22. GPT requested changes, Opus and Gemini approved. Each accepted claim was
+checked against the code first; all were real (F: the double `init()` is real and older than
+this phase, see below).
+
+### Accepted
+
+| Item | Fix | Test |
+|---|---|---|
+| A. Consolidation reply is one list | `_top_level_list`: after removing a Markdown fence the whole reply must decode to a JSON list; no array is searched for inside other text, so a cut-off `{"rejected":[…]` is unusable (frequency rule). The extraction replies keep `_parse_response` and its recovery | `TestRound2::test_cut_off_object_is_not_a_consolidation_answer`, `test_consolidation_answer_is_the_whole_reply` (both forms, and the extraction recovery unchanged), `test_top_level_list`, `TestRound2Survivors::test_fenced_list_over_several_lines` |
+| B. Web POST of an existing term | the CLI rule everywhere: a person field that is not sent keeps the stored value, one sent as `''` clears it. The add form sends `gender` / `note` only when the category is person (when the fields are shown), so it never wipes fields it hides; the edit row already sends the values it loaded | `test_web_post_keeps_person_fields_not_sent`, `test_add_form_sends_person_fields_only_when_shown` |
+| C. Extraction rewrote the glossary per term | real: both the web task and the CLI read the glossary after the model calls, but then saved the whole file once per term, so an edit saved during that loop could be reverted. Now `add_term(save=False)` for every extracted term and one `save()` after the loop (no new locking) | `test_cli_extraction_merges_after_the_calls_and_saves_once`, `test_web_extraction_merges_after_the_calls_and_saves_once` (an edit made during the model call survives; one save by the extraction) |
+| D. Import with a missing key | `_entries` (shared by `load()` and `import_json`) builds every `GlossaryEntry` before anything is applied; a missing or unknown field raises `ValueError('a glossary entry has a missing or unknown field')` (before: `load()` raised `TypeError`, the import skipped the entry). The import saves once | `test_import_with_a_missing_or_unknown_field` (both cases, file unchanged, and `load()`), `test_import_saves_once`, `test_import_keeps_the_frequency` |
+| E. `--code` accepted a nested checkout | `loaded_from`: each module must be exactly `<code>/<package path>.py` (or `…/__init__.py` for a package) | `TestPhase8Round2Scripts::test_modules_of_a_checkout_nested_in_code_refused` (a stub under `<main>/.worktree/branch` already imported, `--code <main>`: refused), `test_loaded_from` |
+| F. Double `init()` | real, and older than this phase: Alpine 3 calls a component's `init()` by itself and `x-init="init()"` called it again, so on the translation page `fetchModel`, `fetchStatus` (which opens the SSE stream when a run is active, so a second stream replaced the first) and, from this phase, `fetchBrief` ran twice. The `x-init` attribute is removed from that page. The glossary and export pages have the same pattern (`loadTerms` / extraction status, the export page's `init()`); left as on `main`, outside this item | `test_translation_page_initialized_once` (rendered page; not run in a browser) |
+| G. No proposal at all | the comparison exits 1 with `FAIL project-N: no batch proposed a term` when no batch proposed anything (no per-batch failure tracking) | `test_no_proposal_at_all_fails` (every call a transient error); the tests whose fake answered `[]` now answer one term |
+| H. Brief file over the limit | the sample refuses a brief longer than `MAX_BRIEF_CHARS` (the setter's rule, after stripping) with `ERROR the brief is longer than 2000 characters`, exit 2, before the copy and any call. Project loading unchanged | `test_brief_over_the_limit_refused_before_any_call` (2001 refused, 2000 accepted) |
+| I. Batch delete body | a non-object body, a `terms` that is not a list, or a non-text term: 400, nothing deleted | `test_batch_delete_refused` (5 cases) |
+| J. Report text | `readable` uses the project's parser: one line per `validation.top_level_units` unit, its text from `validation.plain_text` (parsed, tags, script and style removed, entities decoded), whitespace collapsed, then escaped; markup that cannot be cut or parsed is shown as it is (escaped). A quoted `>` in an attribute no longer leaks | `test_readable` (attribute with `>`, script, unparsable markup) |
+| K. Empty category | an empty category is no vote; `_most_common` of no votes is `''` | `test_an_empty_category_is_no_vote` |
+| L. Person fields on one line | `gender` / `note` have every whitespace run (also line breaks) collapsed to one space when stored (`add_term`, `update_term`) | `test_person_fields_one_line` |
+
+### Rejected (considered, not done)
+
+- GPT 5 (`--out` with `..` through a not-yet-existing projects subdirectory), GPT 6 (the before
+  checkout unpacked inside the projects directory), GPT 7 (argparse echoing a mistyped
+  argument): not realistic for hand-run scripts.
+- GPT 11 (stored keys with surrounding spaces): entries are stripped on the way in.
+- GPT 14 (the separator counted twice at the exact 8000 boundary): at most one extra call in a
+  boundary case.
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, parallel.
+
+| Run | Mutants | Killed | Survived | Timeout |
+|---|---|---|---|---|
+| round 2, first | 1319 | 1309 | 10 | 0 |
+| round 2, final | 1319 | 1313 | 6 | 0 |
+
+First → final: a fenced list over several lines (kills the joiner and `split(None)` mutants),
+an imported frequency; `readable` no longer carries the unused third value of a unit (its
+mutant was equivalent). Remaining, each equivalent on any machine: the five of round 1
+(`translate_segment` 4, `_candidate_line` 2, extraction `run` 84, `main` 61 and 87, reasons as
+recorded there) and `import_json` 9 (`save=False` → `save=None`: `add_term` tests it for
+truth, so `None` saves as little as `False`).
+
+### Checks and tests
+
+- `python3 -m pytest tests/ -q -p no:cacheprovider`: three suites at once, 2539 passed each, no
+  failure. No existing test removed; changed: the tests whose fake extraction answered `[]`
+  (now one term, item G) and the `readable` expectations (item J: one line per top-level
+  block, so a `<br>` inside a paragraph no longer breaks the line).
+- The four older check scripts (phase 3 to 6, `--anonymize`): the same TOTAL lines; projects
+  fingerprint `a7197555c962562a530d6de80fa045af`. No real model call in this round.
+
+### Not verified
+
+- In a browser: the add form (B), the single `init()` (F) and the brief text area of round 1 (H); only the rendered pages were checked.
+
+## Phase 8 — review round 3
+
+Date: 2026-11-22. Opus and Gemini approved, GPT requested changes; a final small pass on the
+accepted items, each checked against the code first (all real).
+
+| Item | Fix | Test |
+|---|---|---|
+| 1. Add form wiped stored person fields left empty | the add form sends `gender` / `note` only for a person and only when filled in; clearing them is done in the edit row | `TestRound3::test_add_form_sends_only_filled_person_fields` (and the round 2 form test updated) |
+| 2. One line also on load and import | the shared entry builder `_entries` (used by `load()` and `import_json`) applies `_one_line` to `gender` and `note` | `test_loaded_and_imported_person_fields_one_line` |
+| 3. Old brief error left visible | the brief has its own `briefError`, shown next to its save button and cleared by a successful save; the task error (`error`) is no longer used for it | `test_brief_error_is_its_own_and_cleared_on_success` (rendered page) |
+| 4. Report text at breaks and cells | a space after `<br/>` and after `</td>` / `</th>` before the text is taken; still one line per top-level block | `TestPhase8Round3Scripts::test_readable_spaces_at_breaks_and_cells`; the round 1 `readable` expectation is now `One two three` |
+| 5. "No batch proposed a term" | counts only proposals whose term and translation are non-blank text (`usable`) | `test_no_usable_proposal_fails`, `test_usable` |
+
+Rejected (considered, not done):
+
+- GPT 1 (an atomic load–modify–save across glossary writers, for example a batch delete at the
+  instant extraction saves): a single owner, a window of milliseconds now that extraction saves
+  once, and this race between glossary writers predates the phase.
+- GPT 3 (text after a closing fence on the same line): not a realistic reply.
+
+Mutation (`scripts/verify/mutation.sh main`, parallel): 1336 mutants, 1330 killed, 6 survived,
+0 timeout. The six are the equivalent ones recorded in round 2 (`translate_segment` 4,
+`_candidate_line` 2, extraction `run` 84, `main` 61 and 87, `import_json` 9).
+
+Checks: three suites at once, 2545 passed each, no failure (no test removed; the two changed
+expectations are named above); the four older check scripts give the same TOTAL lines; the
+projects fingerprint is `a7197555c962562a530d6de80fa045af`. No real model call.
+
+Not verified: items 1 and 3 in a browser (rendered pages only).
