@@ -29,6 +29,11 @@ def _get_glossary_manager(project_name: str) -> GlossaryManager:
     return gm
 
 
+def _bad_person_fields(data: dict) -> bool:
+    """`gender` or `note` given and not text."""
+    return any(not isinstance(data[k], str) for k in ('gender', 'note') if k in data)
+
+
 def _get_pm(project_name: str) -> ProjectManager:
     """Get ProjectManager for the specified project."""
     projects_dir = current_app.config['PROJECTS_DIR']
@@ -52,13 +57,17 @@ def add_term(project_name: str):
     data = request.get_json()
     if not data or 'term' not in data or 'translation' not in data:
         return jsonify({'error': '請提供 term 和 translation'}), 400
+    if _bad_person_fields(data):
+        return jsonify({'error': 'gender 和 note 必須是文字'}), 400
 
     gm = _get_glossary_manager(project_name)
     entry = gm.add_term(
         term=data['term'],
         translation=data['translation'],
         category=data.get('category', ''),
-        frequency=data.get('frequency', 0)
+        frequency=data.get('frequency', 0),
+        gender=data.get('gender', ''),
+        note=data.get('note', ''),
     )
     return jsonify({'status': 'ok', 'entry': asdict(entry)})
 
@@ -69,12 +78,16 @@ def update_term(project_name: str, term: str):
     data = request.get_json()
     if not data:
         return jsonify({'error': '請提供更新資料'}), 400
+    if _bad_person_fields(data):
+        return jsonify({'error': 'gender 和 note 必須是文字'}), 400
 
     gm = _get_glossary_manager(project_name)
     entry = gm.update_term(
         term=term,
         translation=data.get('translation'),
-        category=data.get('category')
+        category=data.get('category'),
+        gender=data.get('gender'),
+        note=data.get('note'),
     )
     if entry is None:
         return jsonify({'error': f'找不到術語：{term}'}), 404
