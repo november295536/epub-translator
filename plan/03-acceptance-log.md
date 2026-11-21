@@ -5119,3 +5119,32 @@ equivalent or not reachable in a test process:
 | throughput `run` 6 (`str(None)`) | only the copy directory's name |
 | throughput `run` 72 (`""` for `None`) | no call is made outside a segment |
 | throughput `run` 83 (`is None`) | the counting backend already wraps the backend `--backend` names, so whether `--backend` is also passed on does not change where the calls go |
+
+## Phase 7 — part A, pre-merge stability
+
+Date: 2026-11-21. The orchestrator ran the full suite 12 times, three suites at once, on the
+round 4 commit. 9 runs passed (2356 tests); 3 runs failed one test each, three different
+tests. Cause of each:
+
+| Test | Cause | Fix |
+|---|---|---|
+| `TestStopKillsCallInFlight::test_stop` (a worker thread still alive after the coordinator ended; `active_workers` 0, 12 ticks: the coordinator had not hung) | **product**: the coordinator ended as soon as the worker count reached 0, which a worker decrements in its `finally`, so the thread could still be finishing. Nothing more was written, but `threads_alive()` was briefly true after the run ended, and a new start right after a stop could be refused as still running | the coordinator joins its worker threads after the last one left its loop, before the final save and state, so an ended run has no thread left. Deterministic test `TestPreMergeRunEndsWithItsThreads`: a worker lingers after its loop; the run's `complete` comes only after that thread ended (it fails without the join) |
+| `TestRound3StaleResultInFailureDrain::test_edited_in_flight_segment_not_unsaved` (`in_flight.wait(10)` false) | **test**: it assumed the second worker's call starts before the first result's save fails and stops the run. Under load the stop came first, and a stopping run makes no new call | the first segment's reply now waits until the second call is in flight |
+| `TestRound2WindowInBatches::test_web` (the run failed: the patched coordinator step timed out waiting for 45 queued results) | **test**: it assumed the coordinator's first held step comes while at least 45 results are still to come. Under load the coordinator had already applied more than 15 | deterministic batches as in round 4 item 1: the first result is applied alone (every other call waits for it), then the coordinator is held until the other 59 are queued |
+
+The tests added or changed in this phase that start a web task or CLI workers were checked
+for the same assumptions: batch order, a thread having reached a point, time bounds. One more
+was found and changed: `TestStopKillsCallInFlight::test_pause_kills_and_resume_goes_on`
+asserted that the segment was back in the queue as soon as the child was gone. The worker
+puts it back only after its call has ended, so the test now waits for that. The CLI batch
+test's hold got a longer bound (a condition wait, not a time assertion).
+
+After these changes: the full suite 12 times, four series of three suites at once
+(`-p no:cacheprovider`): **12 of 12 passed, 2357 tests each, no failure** (each run 4 to 4.5
+minutes under that load).
+
+The coordinator's join is a product change, so the mutation run was repeated
+(`scripts/verify/mutation.sh main`): 1796 mutants, 1734 killed, 53 survived, 9 timeout.
+The new lines' mutants were all killed. The survivors are round 4's final list without
+`_start_parallel` 32 (`break` → `return` after an auth stop), which is now killed. The
+reasons are the ones given in round 4.
