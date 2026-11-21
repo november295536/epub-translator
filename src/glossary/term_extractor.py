@@ -85,6 +85,11 @@ def _batches(segments: list[dict]) -> list[str]:
     return batches
 
 
+def _text(value) -> str:
+    """`value` stripped when it is text, else ''."""
+    return value.strip() if isinstance(value, str) else ''
+
+
 def _most_common(counter: Counter) -> str:
     """The most frequent key; the first counted on a tie."""
     return max(counter, key=counter.get)  # max keeps the first of equal ones
@@ -212,8 +217,10 @@ class TermExtractor:
     def collect_candidates(self, segments: list[dict]) -> dict:
         """The proposals of every batch, by lowercased term: {'term': the
         first spelling, 'translations': Counter, 'categories': Counter},
-        counted once per batch that proposed them. Raises ExtractionError
-        (with the terms of the batches before) like extract_from_segments."""
+        counted once per batch that proposed them (a reply listing a term
+        twice counts once). Texts are stripped; a proposal without a term or
+        a translation is skipped. Raises ExtractionError (with the terms of
+        the batches before) like extract_from_segments."""
         groups: dict = {}
         for batch_text in _batches(segments):
             try:
@@ -221,41 +228,53 @@ class TermExtractor:
             except ExtractionError as e:
                 # Stop, but keep the terms of the batches already done
                 raise ExtractionError(str(e), terms=_final(groups, {})) from e
+            counted = set()  # (term key, field, value) of this batch
             for t in terms:
-                term, translation = t['term'], t['translation']
-                if not isinstance(term, str) or not isinstance(translation, str) \
-                        or not term.strip() or not translation.strip():
+                term, translation = _text(t['term']), _text(t['translation'])
+                if not term or not translation:
                     continue
-                category = t.get('category')
+                category = _text(t.get('category'))
                 group = groups.setdefault(term.lower(), {
                     'term': term, 'translations': Counter(), 'categories': Counter()})
-                group['translations'][translation] += 1
-                group['categories'][category if isinstance(category, str) else ''] += 1
+                for field, value in (('translations', translation), ('categories', category)):
+                    if (term.lower(), field, value) not in counted:
+                        counted.add((term.lower(), field, value))
+                        group[field][value] += 1
         return groups
 
     def consolidate(self, groups: list[dict]) -> dict:
         """One call that decides a translation and a category for each of
         `groups` (see collect_candidates). Returns {lowercased term: entry}
-        for the terms the reply decided with a non-empty translation; {}
-        when the call or its reply is unusable. Raises ExtractionError on a
-        rate limit, an expired login or an unusable backend."""
+        for the terms the reply decided with a non-empty translation (texts
+        stripped; an empty category keeps the batches' most common one); a
+        term that two rows decide differently stays undecided. {} when the
+        call or its reply is unusable (also when parsing it raises). Raises
+        ExtractionError on a rate limit, an expired login or an unusable
+        backend."""
         lines = '\n'.join(_candidate_line(g) for g in groups)
         reply = self._call(CONSOLIDATE_PROMPT.format(candidates=lines))
         if reply is None:
             return {}
+        try:
+            items = self._parse_response(reply.strip())
+        except Exception as e:  # noqa: BLE001 - e.g. a too deeply nested reply
+            logger.warning("Term consolidation error: %s", type(e).__name__)
+            items = []
         wanted = {g['term'].lower(): g for g in groups}
-        decided = {}
-        for item in self._parse_response(reply.strip()):
-            term, translation = item['term'], item['translation']
-            if not isinstance(term, str) or term.lower() not in wanted \
-                    or not isinstance(translation, str) or not translation.strip():
+        decided: dict = {}
+        contradicted = set()
+        for item in items:
+            key, translation = _text(item['term']).lower(), _text(item['translation'])
+            if key not in wanted or not translation:
                 continue
-            group = wanted[term.lower()]
-            category = item.get('category')
-            if not isinstance(category, str):
-                category = _most_common(group['categories'])
-            decided[term.lower()] = {'term': group['term'], 'translation': translation,
-                                     'category': category}
+            if key in decided and decided[key]['translation'] != translation:
+                contradicted.add(key)
+            group = wanted[key]
+            category = _text(item.get('category')) or _most_common(group['categories'])
+            decided.setdefault(key, {'term': group['term'], 'translation': translation,
+                                     'category': category})
+        for key in contradicted:
+            del decided[key]
         if len(decided) < len(wanted):
             logger.warning("Term consolidation decided %d of %d terms",
                            len(decided), len(wanted))
@@ -273,14 +292,17 @@ class TermExtractor:
             lines = [l for l in lines if not l.strip().startswith('```')]
             output = '\n'.join(lines)
 
-        # Try parsing directly
+        # Try parsing directly; JSON that is not a list is no answer
         try:
             data = json.loads(output)
+        except json.JSONDecodeError:
+            pass
+        else:
             if isinstance(data, list):
                 return [d for d in data
                         if isinstance(d, dict) and 'term' in d and 'translation' in d]
-        except json.JSONDecodeError:
-            pass
+            logger.warning("Could not parse term extraction response")
+            return []
 
         # Try to find JSON array within the text
         start = output.find('[')

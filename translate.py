@@ -699,8 +699,10 @@ def glossary_show(project):
 @click.argument('term')
 @click.argument('translation')
 @click.option('--category', '-c', default='', help='Term category')
-@click.option('--gender', '-g', default='', help='Gender of a person (shown in the prompt)')
-@click.option('--note', '-n', default='', help='Note on a person (shown in the prompt)')
+@click.option('--gender', '-g', default=None,
+              help="Gender of a person (shown in the prompt); omitted: the entry's stays")
+@click.option('--note', '-n', default=None,
+              help="Note on a person (shown in the prompt); omitted: the entry's stays")
 @click.option('--project', '-p', default=None, help='Project directory path')
 def glossary_add(term, translation, category, gender, note, project):
     """Add a term to the glossary, or replace it."""
@@ -711,6 +713,11 @@ def glossary_add(term, translation, category, gender, note, project):
 
     gm = GlossaryManager(_get_glossary_path(project_dir))
     gm.load()
+    old = gm.get_term(term)  # an omitted -g / -n keeps its value; '' clears it
+    if gender is None:
+        gender = old.gender if old else ''
+    if note is None:
+        note = old.note if old else ''
     gm.add_term(term, translation, category=category, gender=gender, note=note)
     click.echo(f"已新增：{term} → {translation}")
 
@@ -766,7 +773,11 @@ def glossary_import(json_file, project):
 
     gm = GlossaryManager(_get_glossary_path(project_dir))
     gm.load()
-    count = gm.import_json(json_file)
+    try:
+        count = gm.import_json(json_file)
+    except ValueError as e:  # also JSON that does not decode; nothing was imported
+        click.echo(f"無法匯入：{e}")
+        sys.exit(1)
     click.echo(f"已匯入 {count} 筆術語")
 
 
@@ -821,7 +832,7 @@ def brief_set(text, project):
             pm.load()
             pm.set_brief(text)
             pm.save()
-    except ProjectLockedError as e:
+    except (ProjectLockedError, ValueError) as e:  # ValueError: too long, nothing saved
         click.echo(str(e))
         sys.exit(1)
     click.echo("已設定書籍簡介。" if pm.data.brief else "已移除書籍簡介。")
