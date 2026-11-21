@@ -5682,7 +5682,7 @@ shared virtualenv. Copilot CLI 1.0.114, model `claude-haiku-4.5`, invented text 
 | 1 | Plugin | `src/llm/copilot_plugin/plugin.json` and `extensions/system-prompt/extension.mjs`: `joinSession({systemMessage: {mode: "replace", content: process.env.EPUB_TRANSLATOR_SYSTEM_PROMPT}})`. Kept next to the backend module; `PLUGIN_DIR` is its absolute path, computed from the module's file, so the working directory does not matter, and it is passed as one argument (no shell), so spaces do not matter. | `src/llm/copilot_plugin/` |
 | 2 | One system prompt | `SYSTEM_PROMPT` moved to `src/llm/cli.py`; `ClaudeCLI` passes it with `--system-prompt`, `CopilotCLI.environment()` adds it as `EPUB_TRANSLATOR_SYSTEM_PROMPT` (the environment variable is how the prompt reaches the extension; the file has no copy of the text). | `src/llm/cli.py`, `claude_cli.py`, `copilot_cli.py` |
 | 3 | Command | `CopilotCLI` adds `--experimental --plugin-dir <PLUGIN_DIR>` (the owner's settings have `experimental: true`, but the backend does not depend on it). | `src/llm/copilot_cli.py` |
-| 4 | Check | Every run that `classify_error` would accept is also checked by `_replaced`: every `session.usage_checkpoint` must have `promptCacheBreakState[].models.<model>.system_segments`, and every model call's segment list must be exactly `[agent_replacement]`. Otherwise `BackendUnavailableError(NOT_REPLACED_MESSAGE)` (raw output kept for the diagnostics): the web task pauses waiting for the user, the CLI run stops (exit 1), nothing is stored. A failed run keeps its own class (rate limit, auth, …). | `src/llm/copilot_cli.py` |
+| 4 | Check | Every run that `classify_error` would accept is also checked by `_replaced`: every `session.usage_checkpoint` must have `promptCacheBreakState[].models.<model>.system_segments`, and every model call's segment list must be exactly `[agent_replacement]`. Otherwise `BackendUnavailableError(NOT_REPLACED_MESSAGE)`: the web task pauses waiting for the user, the CLI run stops (exit 1), nothing is stored. A failed run keeps its own class (rate limit, auth, …). | `src/llm/copilot_cli.py` |
 | 5 | Check script | `scripts/verify/phase9_copilot_overhead.py` | — |
 
 ### The detection signal
@@ -5825,7 +5825,7 @@ extension reading that variable; a replaced reply returned with its usage; a 112
 prompt with 30 000 input tokens and the replacement passes; 14 forms of a reply without the
 replacement (built-in segments, replacement plus another segment, one of two model calls or of
 two checkpoints not replaced, empty or missing lists, malformed state, no checkpoint) raise the
-unavailable error with the raw output kept; an answer beside an ignored error event is checked
+unavailable error (`CLIBackend.complete` sets its `raw`, but run-level errors are not written to the failure diagnostics, so only the message reaches the owner; corrected in review round 1); an answer beside an ignored error event is checked
 too; a failed run keeps its class; a CLI run (1 and 2 workers, real `CopilotCLI`, fake process)
 stops with exit 1 and the message after at most one call per worker, every segment still pending
 with no translation, and the same run with the replacement completes.
@@ -5859,7 +5859,8 @@ counted as a detection; the script's failure records no longer carry a wall time
 the built-in command is cut with `del cmd[plugin - 1:]`, and the two prompts are built in one
 expression (removing equivalent mutants).
 
-Remaining, each equivalent:
+Remaining, each equivalent (corrected in review round 1: the three `flush` mutants are not, see
+there; 15 equivalent):
 
 | mutant(s) | why equivalent |
 |---|---|
@@ -5901,3 +5902,65 @@ Remaining, each equivalent:
 - Models other than `claude-haiku-4.5`; Copilot versions other than 1.0.114.
 - Translation quality with the short system prompt compared to Copilot's own; the replies were
   plain translations in every real call.
+
+## Phase 9 — review round 1
+
+Date: 2026-11-22. Opus and Gemini approved, GPT requested changes. Accepted items, each checked
+against the code (and A and B against real output) first; all were real.
+
+| Item | Finding | Fix | Test |
+|---|---|---|---|
+| A | `_replaced` pooled the calls of all checkpoints, so a good checkpoint followed (or preceded) by one with an empty `promptCacheBreakState` or `models` passed | every checkpoint must report at least one state, every state at least one model, each with exactly `[agent_replacement]` | six more cases in `test_not_replaced_stops` |
+| B | Copilot rejecting the extension's system message (`ProtocolSystemMessageConfig`, exit 1) was transient: 4 calls and the backoff per segment, for the whole book | that text on an unanswered run → `BackendUnavailableError` with the not-replaced message and the CLI's text | `TestRound1::test_rejected_system_message_stops`, `test_cli_run_stops_without_retries` (1 and 2 workers: at most one call per worker, all pending) |
+| C | exit 0, no reply, a rate-limit or auth message on stderr was reported as a missing plugin | an unanswered clean exit goes through the patterns first; only an unrecognized one reaches the replacement check (replaced: an empty reply, as before) | `test_clean_exit_without_reply_*` |
+| D | the message blamed the extension, gave an absolute path, and did not show what the CLI printed (web pause, CLI stop and re-translate show only `str(e)`; `raw` of a run-level error is not written anywhere) | `無法確認 … 已停止。可能原因：外掛沒有載入（… src/llm/copilot_plugin 資料夾存在），或 Copilot 更新後改變了擴充功能的介面或 system_segments 的回報。` followed by `CLI 訊息：<redacted error texts and stderr, at most 500 characters>` when there are any; the Phase 9 entry's two "raw output kept" sentences corrected | `test_message`, `test_answered_with_warning_on_stderr_quotes_it`, `test_message_redacts_and_is_bounded` |
+| E | the script's `--only` took any name or none, `--repetitions 0` was allowed, and a run without calls exited 0 | `--only NAME [NAME ...]` with the configuration names as choices, `--repetitions` at least 1 (`positive`), exit 1 when no call was made | `TestPhase9ScriptRound1` |
+| F | the three `flush=True` mutants were recorded as equivalent; they are not when stdout is a pipe | killed with the observing-stream test of the Phase 7 script; the Phase 9 entry's count corrected (15 equivalent) | `TestPhase9ScriptRound1::test_raw_lines_flushed` |
+| G | the script's header said it writes nothing | it names the sessions the CLI saves and the `plugin-data/_direct/` folder per plugin location | `test_header_names_the_side_effects` |
+| H | two tests replaced `time.monotonic` for the whole process with a two-value iterator | they replace the script module's `time` with a `SimpleNamespace` (Phase 9 script and the Phase 7 overhead script's `_clock`) | the existing tests, changed |
+
+Evidence for A: the 22 research outputs and one more invented call with the long prompt each have
+exactly one usage checkpoint with one state and one model, and no real run emitted an empty
+report; so requiring a report in every checkpoint rejects no real run. Evidence for B: one invented
+call with the extension's variable removed: exit 1, stdout only a `result` event, stderr `Error
+executing prompt: Error: GenericFailure, data did not match any variant of untagged enum
+ProtocolSystemMessageConfig` (no model call; premium requests 0).
+
+On the intermittent warning seen on `main` (item H): with a process-wide two-value clock, any
+other thread that reads `time.monotonic` during the test (a worker or `run_process` poll loop
+left running by an earlier test, `_wait`) takes a value or gets `StopIteration`. In that thread
+the exception is unhandled and pytest reports it as `PytestUnhandledThreadExceptionWarning`,
+possibly under a later test, and the test itself can see a wrong wall time or `StopIteration`. A
+plausible cause, not shown to be the one seen.
+
+Rejected (recorded, not done):
+
+- GPT 2 (segment evidence for every model the accounting lists): every real call named one
+  model; not realistic.
+- GPT 6 (run the extension under a stubbed `joinSession` in the suite): would make the suite
+  depend on Node; the check script proves the extension end to end.
+
+Mutation (`scripts/verify/mutation.sh main`, parallel): 412 mutants, 398 killed, 14 survived, 0
+timeout. The 14 are equivalent ones of the Phase 9 entry (`command` 6, 7, 9, 14, 15, 16, 19, 20,
+21; `median` 6; `prompt_text` 2, 6, 7, 18); the `flush` ones are killed and the `--only` default
+no longer exists. None in `src/llm/`. A first run stopped at the clean-run stage: the new location
+test checked `src/` in `PLUGIN_DIR`, which the mutation copy renames; it now checks `llm/copilot_plugin`.
+
+Real calls this round: 2 (above; one made no model call). Phase total: 30.
+
+Tests: 2608 passed (was 2581), alone and three suites at once (2608 each), with `-rfw`: no
+failure and no warning in any of the four runs. No test removed; changed: the two clock tests
+(H), the Phase 9 help-text expectation for `--only` (E) and the message expectations (D). The
+only warning seen in this phase was in the very first suite run, before any `.pyc` existed:
+
+```
+src/glossary/glossary_manager.py:30
+  <worktree>/src/glossary/glossary_manager.py:30: DeprecationWarning: invalid escape sequence \w
+    """Regex for a glossary term: it starts at a word boundary, with any
+```
+
+Python emits it only when it compiles that file (a docstring with `\w` that is not raw), so it
+appears on a run that finds no cached bytecode and not on the next: a likelier source of the
+intermittent warning on `main` than a thread. Not changed here (outside this phase).
+
+The projects fingerprint is `a7197555c962562a530d6de80fa045af` after this round.
