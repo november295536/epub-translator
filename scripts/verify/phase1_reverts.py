@@ -9,6 +9,9 @@ fail. Prints OK/MISS per revert and the number not detected.
 Round 4 moved the code of 2, R3-1 and R3-9 (web), whose reverts follow it,
 and adds the reverts "R4-<item>".
 
+The cleanup after Phase 9 moved the reverts whose code Phases 2-7 rewrote
+to the new text (the same old behaviour at the new place).
+
 Usage:
     python3 scripts/verify/phase1_reverts.py [name-prefix ...]
 
@@ -60,8 +63,8 @@ r('3 apply_outcome check and write not atomic',
   [(P, 'with self.mutex:  # the check and the write are one step', 'if True:')],
   ['tests/test_project.py::TestApplyOutcomeAtomic'])
 r('3 mark_reviewed outside the mutex',
-  [(P, '        with self.mutex:\n            seg = self._find(segment_id)\n            if text:',
-    '        if True:\n            seg = self._find(segment_id)\n            if text:')],
+  [(P, '        with self.mutex:\n            seg = self._changeable(segment_id)\n            if text:',
+    '        if True:\n            seg = self._changeable(segment_id)\n            if text:')],
   ['tests/test_project.py::TestApplyOutcomeAtomic::test_mark_reviewed_waits_for_the_mutex'])
 r('4 timed-out join treated as an end',
   [(T, '            if existing.threads_alive():\n                raise', '            if False:\n                raise')],
@@ -71,8 +74,8 @@ r('4 starts not serialized',
     '        if True:\n            return self._start_locked')],
   ['tests/test_web.py::TestOverlappingTasks::test_simultaneous_starts'])
 r('5 logging set up outside the try',
-  [(T, '        handler = None\n        unsaved = []', '        handler = setup_project_logging(project_dir)\n        unsaved = []'),
-   (T, '            handler = setup_project_logging(project_dir)\n            pm = task.pm', '            pm = task.pm')],
+  [(T, '        handler = None\n        log_dir', '        handler = setup_project_logging(project_dir)\n        log_dir'),
+   (T, '        try:\n            handler = setup_project_logging(project_dir)\n', '        try:\n')],
   ['tests/test_web.py::TestStartFailures::test_logging_setup_failure'])
 r('5 coordinator start failure keeps the lock',
   [(T, '                if task.project_lock is None or not task.threads_alive():\n                    # Nothing started that would release it\n                    task.state = \'failed\'\n                    lock.release()',
@@ -86,16 +89,16 @@ r('6 web coordinator failure does not join workers',
   [(T, '        for t in list(task._threads):\n            t.join()\n', '')],
   ['tests/test_web.py::TestCoordinatorFailure'])
 r('6 web coordinator failure does not wake paused workers',
-  [(T, "            task.stop_event.set()\n            task.pause_event.set()\n        for t in",
-    "            task.stop_event.set()\n        for t in")],
+  [(T, "            task.cancel_event.set()\n            task.pause_event.set()\n        for t in",
+    "            task.cancel_event.set()\n        for t in")],
   ['tests/test_web.py::TestCoordinatorFailure::test_save_failure_wakes_paused_worker'])
 r('6 CLI supervisor failure does not join workers',
-  [(CLI, '        click.echo("翻譯中斷，等待進行中的段落結束……")\n        for t in threads:\n            t.join()\n',
-    '        click.echo("翻譯中斷，等待進行中的段落結束……")\n')],
+  [(CLI, '        try:\n            for t in threads:\n                t.join()\n        finally:',
+    '        try:\n            pass\n        finally:')],
   ['tests/test_cli.py::TestCLISupervisorFailure'])
 r('7 late run error after stop pauses the task',
-  [(T, '                        if task.stop_event.is_set():\n                            break\n                        # Only first',
-    '                        # Only first')],
+  [(T, '                        if task.stop_event.is_set():\n                            break\n                        if task.cancel_event is generation:',
+    '                        if task.cancel_event is generation:')],
   ['tests/test_web.py::TestStopThenLateRunError'])
 r('8 KeyboardInterrupt leaves the child running',
   [(LLM, '        # Also when the program itself has ended: what it started may still run\n        stdout, stderr = _kill_group(proc)\n',
@@ -136,14 +139,14 @@ r('11 review save ignores a refused save',
     "        }\n    }));\n}\n\nfunction approveSegment")],
   ['tests/test_web.py::TestTemplatesHandleErrors'])
 r('11 model select keeps a refused model',
-  [('src/web/templates/project/translation.html', '                this.model = previous;\n', '')],
+  [('src/web/templates/project/translation.html', "                document.getElementById('model-select').value = previous;\n", '')],
   ['tests/test_web.py::TestTemplatesHandleErrors'])
 r('22 retry button rendered by the server only',
   [('src/web/templates/project/translation.html', "                this.refreshFailedCount();\n                this.eventSource.close();\n                this.eventSource = null;\n            });\n\n            this.eventSource.addEventListener('error'",
     "                this.eventSource.close();\n                this.eventSource = null;\n            });\n\n            this.eventSource.addEventListener('error'")],
   ['tests/test_web.py::TestTemplatesHandleErrors'])
 r('12 model list from the Claude module',
-  [(TR, '    return [asdict(m) for m in llm.default_backend().list_models()]',
+  [(TR, '    return [asdict(m) for m in llm.backend_for(backend).list_models()]',
     '    from src.llm.claude_cli import MODELS\n    return [asdict(m) for m in MODELS]')],
   ['tests/test_web.py::TestBackendModels', 'tests/test_cli.py::TestCLIBackendModels'])
 r('12 engine default model hard-coded',
@@ -155,7 +158,7 @@ r('12 auth hint hard-coded in the page',
     "'Claude CLI 認證已過期，請在終端執行 claude /login 重新登入'")],
   ['tests/test_web.py::TestBackendModels::test_pages_have_no_claude_specifics'])
 r('13 issue detail unbounded',
-  [(TR, 'detail=str(e)[:ERROR_MESSAGE_CHARS], blocking=True)', 'detail=str(e), blocking=True)')],
+  [(TR, 'detail=message[:ERROR_MESSAGE_CHARS], blocking=True)]', 'detail=message, blocking=True)]')],
   ['tests/test_translator.py::TestBoundedErrorText'])
 r('13 messages in the failure log unbounded',
   [(TR, "f'=== attempt {i}: {message[:ERROR_MESSAGE_CHARS]} ==='", "f'=== attempt {i}: {message} ==='"),
@@ -165,7 +168,7 @@ r('13 stderr quoted whole in the Claude error',
   [('src/llm/claude_cli.py', "f'{stderr.strip()[:ERROR_CHARS]}')", "f'{stderr.strip()}')")],
   ['tests/test_llm.py::TestClassificationOfReplies::test_error_messages_bounded'])
 r('14 timeout drops the output',
-  [(LLM, "                                 raw=(_text(e.output) + _text(e.stderr))[:KEPT_OUTPUT_CHARS])", "                                 )")],
+  [(LLM, "                                 raw=self.redact(_text(e.output) + _text(e.stderr))[:KEPT_OUTPUT_CHARS])", "                                 )")],
   ['tests/test_llm.py::TestTimeoutKeepsOutput'])
 r('15 missing program is a per-segment error',
   [(LLM, '            raise BackendUnavailableError(', '            raise LLMError(')],
@@ -179,7 +182,7 @@ r('17 revision taken when the worker picks the segment',
     '                revision, queued_status = seg.revision, seg.status')],
   ['tests/test_web.py::TestQueuedEdits::test_queued_segment_edited_before_pickup'])
 r('17 edit keeps FAILED and issues',
-  [(P, '            if seg.status == SegmentStatus.FAILED:\n                seg.status = SegmentStatus.TRANSLATED\n            seg.issues = []\n',
+  [(P, '            if seg.status == SegmentStatus.FAILED:\n                seg.status = SegmentStatus.TRANSLATED\n            seg.issues = list(issues or [])\n',
     '')],
   ['tests/test_project.py::TestManualEditClearsFailure', 'tests/test_web.py::TestEditRemovesFailureLog'])
 r('18 delete ignores a running task',
@@ -213,8 +216,8 @@ r('24 edit leaves the failure log',
   [(REV, "            # A person's version replaces the failed one: its diagnostics go too\n            remove_failure_log(_log_dir(pm), segment_id)\n", '')],
   ['tests/test_web.py::TestEditRemovesFailureLog'])
 r('24 approve leaves the failure log',
-  [(REV, '            pm.mark_reviewed(segment_id, text=text)\n            pm.save()\n            remove_failure_log(_log_dir(pm), segment_id)\n',
-    '            pm.mark_reviewed(segment_id, text=text)\n            pm.save()\n')],
+  [(REV, "            pm.save()\n            remove_failure_log(_log_dir(pm), segment_id)\n            # the warnings",
+    "            pm.save()\n            # the warnings")],
   ['tests/test_web.py::TestEditRemovesFailureLog'])
 r('25 call spent on a segment edited after queueing',
   [(T, '                if skip:\n', '                if False:\n')],
@@ -268,8 +271,8 @@ r('R2-10 web success removes the log before acceptance',
     "        outcome = res.outcome\n        if outcome is not None and outcome.status == SegmentStatus.TRANSLATED:\n            record_failure_log(os.path.join(pm.project_dir, 'log'), res.segment_id, outcome)\n        if outcome is None:")],
   ['tests/test_web.py::TestRound2FailureLogAtAcceptance::test_stale_success_keeps_newer_failure_log'])
 r('R2-10 re-translate records the log before acceptance and save',
-  [(REV, '        outcome = translate_segment(engine, seg, segments, gm)\n',
-    "        outcome = translate_segment(engine, seg, segments, gm)\n        record_failure_log(os.path.join(project_dir, 'log'), segment_id, outcome)\n")],
+  [(REV, '                                    brief=brief)\n',
+    "                                    brief=brief)\n        record_failure_log(os.path.join(project_dir, 'log'), segment_id, outcome)\n")],
   ['tests/test_web.py::TestRound2FailureLogAtAcceptance::test_success_whose_save_is_refused_keeps_the_log',
    'tests/test_web.py::TestRound2FailureLogAtAcceptance::test_stale_retranslation_writes_no_log'])
 r('R2-17 web failure log written before acceptance',
@@ -277,17 +280,17 @@ r('R2-17 web failure log written before acceptance',
     "        outcome = res.outcome\n        if outcome is not None:\n            record_failure_log(os.path.join(pm.project_dir, 'log'), res.segment_id, outcome)\n        if outcome is None:")],
   ['tests/test_web.py::TestRound2FailureLogAtAcceptance::test_stale_failure_writes_no_log'])
 r('R2-17 edit removes the log outside the transaction',
-  [(REV, "            pm.save()\n            # A person's version replaces the failed one: its diagnostics go too\n            remove_failure_log(_log_dir(pm), segment_id)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 404\n",
-    "            pm.save()\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 404\n    remove_failure_log(_log_dir(pm), segment_id)\n")],
+  [(REV, "            pm.save()\n            # A person's version replaces the failed one: its diagnostics go too\n            remove_failure_log(_log_dir(pm), segment_id)\n            answer = _answer(pm, gm, issues, status='ok', segment_id=segment_id)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 404\n",
+    "            pm.save()\n            answer = _answer(pm, gm, issues, status='ok', segment_id=segment_id)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 404\n    remove_failure_log(_log_dir(pm), segment_id)\n")],
   ['tests/test_web.py::TestRound2FailureLogAtAcceptance::test_edit_removes_the_log_inside_the_transaction'])
 r('R2-11 run-level error not kept on the task',
-  [(T, '                            task.error = str(e)  # for a page opened later\n', '')],
+  [(T, '        task.error = str(error)  # for a page opened later\n', '')],
   ['tests/test_web.py::TestRound2RunErrorVisible'])
 r('R2-11 resume keeps the old error',
   [(T, '            task.error = None  # the run-level error that paused it\n', '')],
   ['tests/test_web.py::TestRound2RunErrorVisible::test_resume_clears_it'])
 r('R2-12 stored model not shown',
-  [(TPL, "                if (!this.availableModels.some(m => m.alias === this.model)) {", '                if (false) {')],
+  [(TPL, "                if (!this.availableModels.some(m => m.key === this.modelKey())) {", '                if (false) {')],
   ['tests/test_web.py::TestRound2StoredModelOption'])
 r('R2-13 Unicode in the file name',
   [(TR, "re.sub(r'[^A-Za-z0-9_.-]', '_', segment_id)", "re.sub(r'[^\\w.-]', '_', segment_id)")],
@@ -311,8 +314,8 @@ r('R2-19 lock descriptor leaked when the holder cannot be read',
     '                    holder = os.read(fd, 32).decode().strip()\n                    os.close(fd)\n')],
   ['tests/test_project.py::TestRound2DescriptorLeaks'])
 r('R2-20 stale and skipped results reported as unsaved',
-  [(T, '                    unsaved.extend(res.segment_id for res in accepted)',
-    '                    unsaved.extend(res.segment_id for res in batch)'),
+  [(T, '                        if self._apply_result(task, pm, res):\n',
+    '                        if self._apply_result(task, pm, res) or True:\n'),
    (T, '                if (res.outcome is not None\n                        and task.pm._find(res.segment_id).revision == res.revision):\n', '                if True:\n')],
   ['tests/test_web.py::TestRound2UnsavedReport'])
 r('R2-21 rate-limit message cut from long stdout',
@@ -329,7 +332,7 @@ r('R3-2 no Start for a stopped task',
   [(TPL, " || state === 'failed' || state === 'stopped'\">", " || state === 'failed'\">")],
   ['tests/test_web.py::TestRound3StoppedTaskRestartable'])
 r('R3-2 stopped event leaves state and stream',
-  [(TPL, "                this.state = 'stopped';\n                this.currentSegment = null;\n                this.refreshFailedCount();\n                this.eventSource.close();\n                this.eventSource = null;\n",
+  [(TPL, "                this.state = 'stopped';\n                this.autoResume = false;\n                this.currentSegment = null;\n                this.refreshFailedCount();\n                this.eventSource.close();\n                this.eventSource = null;\n",
     '                this.refreshFailedCount();\n')],
   ['tests/test_web.py::TestRound3StoppedTaskRestartable'])
 r('R3-3 echo rule hides stderr',
@@ -344,7 +347,7 @@ r('R3-5 unstarted workers joined',
     '                task._threads.append(t)\n                t.start()\n')],
   ['tests/test_web.py::TestRound3WorkerStartFailure'])
 r('R3-6 initial status without the error',
-  [(TRL, "'total': task.total, 'error': task.error}", "'total': task.total}")],
+  [(TRL, "'total': task.total, 'error': task.error,", "'total': task.total,")],
   ['tests/test_web.py::TestRound3InitialStatusError'])
 r('R3-6 cursor taken after the snapshot',
   [(TRL, '        cursor = task.progress.cursor_end\n        # Initial status', '        # Initial status'),
@@ -374,7 +377,7 @@ r('R3-9 web run goes on after five unexpected failures',
   [(T, '                if stop and streak_stop is None:\n', '                if False:\n')],
   ['tests/test_web.py::TestRound3UnexpectedStreakWeb'])
 r('R3-9 sequential CLI goes on after five unexpected failures',
-  [(CLI, '        if stop:\n            _stop_run(stop)\n', '')],
+  [(CLI, '            stop = streak.add(outcome)\n            if stop:\n                raise _RunStopped(stop)\n', '')],
   ['tests/test_cli.py::TestCLIRound3UnexpectedStreak'])
 r('R3-9 parallel CLI goes on after five unexpected failures',
   [(CLI, '            stop_errors.append(stop)\n            error_event.set()\n', '            pass\n')],
@@ -402,7 +405,7 @@ r('R3-12 late finish keeps unbounded output',
     'output=stdout, stderr=stderr)')],
   ['tests/test_llm.py::TestRound3TimeoutOutputBounded'])
 r('R3-12 timeout raw not bounded',
-  [(LLM, 'raw=(_text(e.output) + _text(e.stderr))[:KEPT_OUTPUT_CHARS])', 'raw=_text(e.output) + _text(e.stderr))')],
+  [(LLM, 'raw=self.redact(_text(e.output) + _text(e.stderr))[:KEPT_OUTPUT_CHARS])', 'raw=self.redact(_text(e.output) + _text(e.stderr)))')],
   ['tests/test_llm.py::TestRound3TimeoutOutputBounded'])
 
 r('R4-1 re-translation applied to a replaced project',
@@ -410,11 +413,11 @@ r('R4-1 re-translation applied to a replaced project',
     '            if current is None:\n')],
   ['tests/test_web.py::TestRound4RetranslateAcrossReplacement'])
 r('R4-2 worker added on resume listed and counted before its start',
-  [(T, "                            task.active_workers += 1\n                            try:\n                                t.start()\n                            except Exception as e:\n                                # Not started: neither listed nor counted; the\n                                # task stays paused with the workers it has\n                                task.active_workers -= 1\n                                task.error = f'無法增加 worker：{e}'\n                                return False\n                            task._threads.append(t)\n",
-    '                            task._threads.append(t)\n                            task.active_workers += 1\n                            t.start()\n')],
+  [(T, "            task.active_workers += 1\n            try:\n                t.start()\n            except Exception as e:\n                # Not started: neither listed nor counted\n                task.active_workers -= 1\n                task.error = f'無法增加 worker：{e}'\n                return False\n            task._threads.append(t)\n",
+    '            task._threads.append(t)\n            task.active_workers += 1\n            t.start()\n')],
   ['tests/test_web.py::TestRound4ResumeWorkerStartFailure'])
 r('R4-3 streak stop discards in-flight results',
-  [(T, '                    streak_stop = stop\n                    with task._lock:\n                        task.stop_event.set()\n                        task.pause_event.set()\n',
+  [(T, '                    streak_stop = stop\n                    with task._lock:\n                        task.stop_event.set()  # resume_translation refuses it now\n                        task.pause_event.set()\n',
     '                    raise RuntimeError(stop)\n')],
   ['tests/test_web.py::TestRound4StreakKeepsInFlightResults'])
 r('R4-4 source.epub written before the project is saved',
