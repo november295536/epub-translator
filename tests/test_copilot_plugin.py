@@ -166,7 +166,8 @@ class TestReplacementChecked:
             'src/llm/copilot_plugin 資料夾存在），或 Copilot 更新後改變了擴充功能的介面或 '
             'system_segments 的回報。')
         assert PLUGIN_LOCATION == 'src/llm/copilot_plugin'
-        assert PLUGIN_DIR.endswith(os.path.join('src', 'llm', 'copilot_plugin'))
+        # the package's own folder name is not checked: mutation testing renames it
+        assert PLUGIN_DIR.endswith(os.path.join('llm', 'copilot_plugin'))
         assert os.path.isfile(os.path.join(PLUGIN_DIR, 'plugin.json'))
 
     def test_answer_beside_an_ignored_error_is_checked_too(self):
