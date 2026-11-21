@@ -4897,3 +4897,63 @@ The 13 survivors of run 2, all equivalent:
 
 - No real model call in this round (the orchestrator's browser and throughput runs above are
   the real checks).
+
+## Phase 7 — part A, review round 2
+
+Date: 2026-11-21. Same branch and worktree. Each fix has a test that fails without it
+(checked by reverting each fix alone and running its test).
+
+### Changes
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| 1 | a pause for a run-level error only closed the pause gate: other workers' calls went on with the old cancel event, which nothing set after the resume replaced it (child alive, result stored while paused, stop hanging on the join) | that pause also sets the current cancel event, like a user pause (the calls end, their segments go back to the queue); resume sets the retiring event before it installs the new one; the `is generation` check for stale run errors stays | `TestRound2RunLevelPauseCancels` (real sleeping children: W1's rate limit ends W2's child, both segments pending; after resume, a pause ends every child; after another resume, stop ends them and the coordinator ends) |
+| 2 | `resume_delay(10**400)` raised `OverflowError` | ints skip `math.isfinite` and are clamped before the float conversion | `test_huge_retry_after` |
+| 3 | `flush()` decided "nothing pending" before taking the mutex | decided under the mutex; the web coordinator applies and adds a result under it, so a flush from the export sees it | `test_flush_decides_under_the_mutex` |
+| 4 | the stream's first `status` did not carry an automatic wait in progress | `resume_in` (seconds left, at least 0; `null` without a wait) in the snapshot; the page then shows the pause button and the message | `test_stream_snapshot_has_the_wait`; two existing snapshot assertions gain `"resume_in": null` |
+| 5 | a later, longer rate limit extended the wait silently | it sends `rate_limit` with the new `resume_in` | `test_extension_sends_the_new_wait` |
+| 6 | the whole drained batch was added before the window was checked | `maybe_save()` after every accepted result (web coordinator and CLI `apply`) | `TestRound2WindowInBatches` (web and CLI: the coordinator held until 45 results are queued, at most 20 unsaved at any save); `TestHundredResults` now also requires at least 5 saves (it would fail if saving happened only at the end) |
+| 7 | the final snapshot ran before the copy's removal and could skip it | removal first, in the `finally`; the snapshot after it | `TestThroughputScriptRound2` (a failing final snapshot: the copy is gone, `ERROR the measurement stopped (FileNotFoundError)`) |
+| 8 | `src/web/blueprints/home.py` was not mutated | added to `FILES` in `scripts/verify/mutation.py` | the mutation run below |
+| 9 | `start -b/-m` normalised and checked against an unlocked load | moved into `_start`, against the project loaded under the lock | `TestRound2CliBackendUnderTheLock` (the web switches backend and model just before the lock is taken: the stored model stays) |
+| A | a rejected reply with cancel set was recorded as `FAILED` | `translate_segment` raises `CancelledError` instead of returning a failure when cancel is set (also covers a session that fails without a call) | `test_cancelled_rejected_reply_is_not_a_failure` |
+| B | a stopping run could resume by itself (failure-streak stop during a rate-limit wait); the CLI tick could announce or reopen after a stop | `resume_translation` refuses a stopping task (this covers the streak stop, which then ends the run as failed); `stop_translation` also clears `resume_at`; the CLI tick returns after the flush once `error_event` is set | `test_stopping_task_does_not_resume`, `test_cli_stopping_run_does_not_reopen_the_gate` (the stop moves the clock past the deadline and waits for two ticks: no `繼續翻譯`) |
+| C | the page kept `autoResume` across runs | reset in `startTranslation()` and in the `stopped`, `complete` and failed-run `error` listeners | `test_page_resets_the_wait` |
+| D | a worker woken by a resume that found the task paused again exited for good | it goes back to the top of its loop, which waits for the pause, checks stop and the worker count | `test_worker_goes_on_after_a_resume_and_a_new_pause` |
+| E | `_top_up_workers` counted alive threads, including one that has ended its loop | counts `active_workers` (callers hold the task lock) | `test_top_up` (a thread alive but no longer counted gets replaced) |
+| F | a segment that failed in the run and was translated again from the review page inside the save window got the run's failure diagnostics | written only when the segment's status is still the outcome's | `test_no_failure_log_for_a_segment_translated_again` |
+
+All of the third reviewer's items A to F were true; each was a small change.
+
+### Checks
+
+Before and after: `stat -f '%m %z' <repo>/projects/*/project.json | md5` =
+`a7197555c962562a530d6de80fa045af`, unchanged. The four older read-only checks: TOTAL lines
+identical to round 1 (the four lines above).
+
+### Tests
+
+2322 passed (round 1: 2307). Changed existing tests: the two stream-snapshot assertions in
+`test_web.py` gain `"resume_in": null` (item 4); `TestHundredResults` gains the lower bound
+(item 6); `TestRound1Survivors::test_top_up` adds a thread that is alive but no longer
+counted (E).
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, now also over `src/web/blueprints/home.py`:
+
+| Run | Mutants | Killed | Survived | Timeout |
+|---|---|---|---|---|
+| 1 (after the fixes) | 1766 | 1746 | 15 | 5 |
+| 2 (final) | 1765 | 1743 | 13 | 9 |
+
+Run 1's two new survivors: `_pause_for` 31 (`remaining` sign in the extension event), killed
+by giving the test a completed count; `_run_translation` 35 (`resume_at = ""` in the
+failure-streak stop), removed with the line itself, because `resume_translation` already
+refuses a stopping task. Every mutant of `home.py` was killed. Timeouts count as detected
+(the same inverted gates and waits as in round 1). The 13 survivors of run 2 are the 13
+equivalent mutants of round 1, with the reasons given there.
+
+### Not verified
+
+- No real model call in this round.
