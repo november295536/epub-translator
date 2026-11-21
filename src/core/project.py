@@ -49,6 +49,11 @@ def check_rules(value) -> int:
     return value
 
 
+# Upper bound of a book's brief: it goes into every text prompt, which the
+# CLI backends pass as one command-line argument
+MAX_BRIEF_CHARS = 2000
+
+
 def check_backend(value) -> str:
     """`value` when it names a backend (src.llm.BACKENDS); raises ValueError
     otherwise."""
@@ -144,6 +149,10 @@ class ProjectData:
     # file has no such key, which means the Claude CLI and is never written,
     # so existing files round-trip unchanged
     backend: str | None = None
+    # The book's brief (genre, tone, audience), placed at the top of the
+    # translation prompt; None: the file has no such key, which is never
+    # written, so existing files round-trip unchanged
+    brief: str | None = None
     segments: list[SegmentState] = field(default_factory=list)
 
 
@@ -260,6 +269,8 @@ class ProjectManager:
             raw['model'] = llm.backend_for(raw.get('backend')).default_model
         if 'segmentation' in raw:  # absent: rules 1 (None)
             check_rules(raw['segmentation'])
+        if not isinstance(raw.get('brief', ''), str):
+            raise ValueError('the brief is not text')
         self.data = ProjectData(**raw, segments=segments)
         return self.data
 
@@ -281,6 +292,8 @@ class ProjectManager:
             del raw['segmentation']  # the file had none: saved as before
         if raw['backend'] is None:
             del raw['backend']  # the default backend: saved as before
+        if raw['brief'] is None:
+            del raw['brief']  # no brief: saved as before
         for seg in raw['segments']:
             for key, default in _SEGMENT_DEFAULTS.items():
                 if seg[key] == default:
@@ -327,6 +340,18 @@ class ProjectManager:
             if backend is not None:
                 self.data.backend = backend
             self.data.model = model
+
+    def set_brief(self, text: str) -> None:
+        """Set the book's brief (in-memory only; call save() to persist).
+        Surrounding whitespace is dropped; an empty brief removes it. One
+        longer than MAX_BRIEF_CHARS raises ValueError and changes nothing."""
+        if not self.data:
+            raise RuntimeError("No project loaded.")
+        text = text.strip()
+        if len(text) > MAX_BRIEF_CHARS:
+            raise ValueError(f'書籍簡介最多 {MAX_BRIEF_CHARS} 字（目前 {len(text)} 字）')
+        with self.mutex:
+            self.data.brief = text or None
 
     def mark_translated(self, segment_id: str, translated_text: str) -> None:
         """Mark a segment as translated (in-memory only; call save() to persist)."""

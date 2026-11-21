@@ -230,3 +230,42 @@ def set_model(project_name: str):
         return jsonify({'error': str(e)}), 404
 
     return jsonify({'status': 'ok', 'model': model, 'backend': chosen})
+
+
+@translation_bp.route('/api/projects/<project_name>/brief')
+def get_brief(project_name: str):
+    """The book's brief ('' when there is none)."""
+    try:
+        pm = _get_task_manager().get_or_load_pm(project_name, current_app.config['PROJECTS_DIR'])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 404
+    with pm.mutex:  # a PUT in progress may still restore the previous one
+        brief = pm.data.brief or ''
+    return jsonify({'brief': brief})
+
+
+@translation_bp.route('/api/projects/<project_name>/brief', methods=['PUT'])
+def set_brief(project_name: str):
+    """Set the book's brief; an empty one removes it. A running translation
+    uses it from its next segment."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get('brief'), str):
+        return jsonify({'error': '請提供 brief 文字'}), 400
+    try:
+        with _get_task_manager().transaction(project_name,
+                                             current_app.config['PROJECTS_DIR']) as pm:
+            with pm.mutex:  # a running task reads it under the mutex
+                previous = pm.data.brief
+                try:
+                    pm.set_brief(data['brief'])
+                except ValueError as e:  # too long: nothing changed
+                    return jsonify({'error': str(e)}), 400
+                try:
+                    pm.save()
+                except BaseException:
+                    pm.data.brief = previous  # not saved: the workers keep the old one
+                    raise
+                brief = pm.data.brief or ''
+    except (FileNotFoundError, ValueError) as e:
+        return jsonify({'error': str(e)}), 404
+    return jsonify({'status': 'ok', 'brief': brief})

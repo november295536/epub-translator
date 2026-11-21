@@ -213,6 +213,7 @@ def retranslate_segment(project_name: str, segment_id: str):
             return _passthrough_refused()
         model, backend = pm.data.model, pm.data.backend
         translations = pm.data.segmentation == 2
+        brief = pm.data.brief or ''
         segments = copy.deepcopy(pm.data.segments)
         seg = next(s for s in segments if s.segment_id == segment_id)
     project_dir = pm.project_dir
@@ -223,7 +224,8 @@ def retranslate_segment(project_name: str, segment_id: str):
     try:
         engine = TranslationEngine(model=model, backend=llm.backend_for(backend))
         logger.info("重新翻譯段落: %s (模型: %s)", segment_id, engine.model)
-        outcome = translate_segment(engine, seg, segments, gm, translations=translations)
+        outcome = translate_segment(engine, seg, segments, gm, translations=translations,
+                                    brief=brief)
         with transaction(project_name) as pm:
             current = next((s for s in pm.data.segments if s.segment_id == segment_id), None)
             if current is None or (current.html, current.text) != source:

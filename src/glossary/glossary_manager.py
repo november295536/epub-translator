@@ -46,7 +46,11 @@ def term_pattern(term: str) -> str:
 logger = logging.getLogger(__name__)
 
 # The fields of a stored entry that must be strings where present
-TEXT_FIELDS = ('term', 'translation', 'category', 'notes', 'context')
+TEXT_FIELDS = ('term', 'translation', 'category', 'notes', 'context', 'gender', 'note')
+
+# Optional fields of an entry (for persons): stored only when not empty, so
+# a glossary without them keeps its file format
+OPTIONAL_FIELDS = ('gender', 'note')
 
 
 def load_glossary(path: str):
@@ -69,6 +73,48 @@ class GlossaryEntry:
     translation: str
     category: str = ''
     frequency: int = 0
+    gender: str = ''
+    note: str = ''
+
+
+def _check_entries(raw) -> None:
+    """ValueError unless `raw` is a list of entries whose text fields
+    (TEXT_FIELDS) are strings where present."""
+    if not isinstance(raw, list):
+        raise ValueError('the glossary is not a list')
+    for item in raw:
+        if not isinstance(item, dict) or not isinstance(item.get('term'), str) \
+                or any(not isinstance(item[k], str) for k in TEXT_FIELDS if k in item):
+            raise ValueError('a glossary entry is not an object with text fields')
+
+
+def _entries(raw) -> list:
+    """The entries of a stored or imported glossary, gender and note on one
+    line (_one_line); ValueError when one is not an entry (_check_entries,
+    or a missing or unknown field)."""
+    _check_entries(raw)
+    try:
+        entries = [GlossaryEntry(**item) for item in raw]
+    except TypeError:
+        raise ValueError('a glossary entry has a missing or unknown field') from None
+    for e in entries:  # a hand-edited file too: one prompt line per entry
+        e.gender, e.note = _one_line(e.gender), _one_line(e.note)
+    return entries
+
+
+def _one_line(value: str) -> str:
+    """`value` with every run of whitespace (also a line break) one space,
+    none at the ends: an entry stays one prompt line."""
+    return ' '.join(value.split())
+
+
+def entry_dict(entry: GlossaryEntry) -> dict:
+    """The stored form of an entry: OPTIONAL_FIELDS only when not empty."""
+    raw = asdict(entry)
+    for key in OPTIONAL_FIELDS:
+        if not raw[key]:
+            del raw[key]
+    return raw
 
 
 class GlossaryManager:
@@ -85,20 +131,13 @@ class GlossaryManager:
     def load(self) -> None:
         """Load glossary from JSON file. Raises ValueError (also for JSON
         that does not decode) when the file is not a list of entries whose
-        text fields (TEXT_FIELDS) are strings where present."""
+        text fields (TEXT_FIELDS) are strings where present and that have
+        exactly the fields of an entry (see _entries)."""
         if not os.path.isfile(self.glossary_path):
             return
         with open(self.glossary_path, 'r', encoding='utf-8') as f:
             raw = json.load(f)
-        if not isinstance(raw, list):
-            raise ValueError('the glossary is not a list')
-        entries = {}
-        for item in raw:
-            if not isinstance(item, dict) or not isinstance(item.get('term'), str) \
-                    or any(not isinstance(item[k], str) for k in TEXT_FIELDS if k in item):
-                raise ValueError('a glossary entry is not an object with text fields')
-            entries[item['term'].lower()] = GlossaryEntry(**item)
-        self.entries = entries
+        self.entries = {e.term.lower(): e for e in _entries(raw)}
 
     def save(self) -> None:
         """Save glossary to JSON file, atomically: written to a temporary
@@ -110,7 +149,7 @@ class GlossaryManager:
         target = os.path.realpath(self.glossary_path)
         directory = os.path.dirname(target)
         os.makedirs(directory, exist_ok=True)
-        raw = [asdict(e) for e in self.entries.values()]
+        raw = [entry_dict(e) for e in self.entries.values()]
         raw.sort(key=lambda x: x['term'].lower())
         try:
             mode = os.stat(target).st_mode & 0o777
@@ -132,15 +171,18 @@ class GlossaryManager:
             raise
 
     def add_term(self, term: str, translation: str,
-                 category: str = '', frequency: int = 0) -> GlossaryEntry:
-        """Add or update a glossary entry."""
+                 category: str = '', frequency: int = 0,
+                 gender: str = '', note: str = '', save: bool = True) -> GlossaryEntry:
+        """Add or update a glossary entry; save=False: in memory only (the
+        caller saves once after several)."""
         key = term.lower()
         entry = GlossaryEntry(
-            term=term, translation=translation,
-            category=category, frequency=frequency,
+            term=term, translation=translation, category=category, frequency=frequency,
+            gender=_one_line(gender), note=_one_line(note),
         )
         self.entries[key] = entry
-        self.save()
+        if save:
+            self.save()
         return entry
 
     def remove_term(self, term: str) -> bool:
@@ -153,8 +195,10 @@ class GlossaryManager:
         return False
 
     def update_term(self, term: str, translation: str | None = None,
-                    category: str | None = None) -> GlossaryEntry | None:
-        """Update an existing glossary entry. Returns None if not found."""
+                    category: str | None = None, gender: str | None = None,
+                    note: str | None = None) -> GlossaryEntry | None:
+        """Update an existing glossary entry (None: that field stays).
+        Returns None if not found."""
         key = term.lower()
         entry = self.entries.get(key)
         if entry is None:
@@ -163,6 +207,10 @@ class GlossaryManager:
             entry.translation = translation
         if category is not None:
             entry.category = category
+        if gender is not None:
+            entry.gender = _one_line(gender)
+        if note is not None:
+            entry.note = _one_line(note)
         self.save()
         return entry
 
@@ -203,31 +251,33 @@ class GlossaryManager:
             if e.category:
                 label = CATEGORY_LABELS.get(e.category, e.category)
                 line += f' [{label}]'
+            details = [f'{name}：{value}' for name, value in
+                       (('性別', e.gender), ('備註', e.note)) if value]
+            if details:
+                line += '（' + '；'.join(details) + '）'
             lines.append(line)
         return '\n'.join(lines)
 
     def import_json(self, json_path: str) -> int:
-        """Import entries from a JSON file. Returns number of entries imported."""
+        """Import entries from a JSON file. Returns number of entries
+        imported. Raises ValueError, before anything is written, when the
+        file is not a glossary that load() would accept."""
         with open(json_path, 'r', encoding='utf-8') as f:
             raw = json.load(f)
         count = 0
-        for item in raw:
-            term = item.get('term', '')
-            translation = item.get('translation', '')
-            if term and translation:
-                self.add_term(
-                    term=term,
-                    translation=translation,
-                    category=item.get('category', ''),
-                    frequency=item.get('frequency', 0),
-                )
+        for e in _entries(raw):
+            if e.term and e.translation:  # an empty one is skipped, as before
+                self.add_term(e.term, e.translation, category=e.category,
+                              frequency=e.frequency, gender=e.gender, note=e.note, save=False)
                 count += 1
+        if count:
+            self.save()
         return count
 
     def export_json(self, json_path: str) -> int:
         """Export entries to a JSON file. Returns number of entries exported."""
         entries = self.get_all_terms()
-        raw = [asdict(e) for e in entries]
+        raw = [entry_dict(e) for e in entries]
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(raw, f, ensure_ascii=False, indent=2)
         return len(raw)

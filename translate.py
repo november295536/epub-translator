@@ -265,7 +265,8 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
             while True:
                 try:
                     outcome = translate_segment(engine, seg, all_segments, gm,
-                                                translations=pm.data.segmentation == 2)
+                                                translations=pm.data.segmentation == 2,
+                                                brief=pm.data.brief or '')
                     break
                 except RUN_ERRORS as e:
                     delay = resume_delay(e)
@@ -344,7 +345,7 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
                 outcome = translate_segment(engine, seg, all_segments, gm,
                                             cancel=cancel,
                                             translations=pm.data.segmentation == 2,
-                                            mutex=pm.mutex)
+                                            mutex=pm.mutex, brief=pm.data.brief or '')
             except CancelledError:
                 if cancel.is_set() or error_event.is_set():
                     break  # interrupted or stopped: the segment stays pending
@@ -687,6 +688,10 @@ def glossary_show(project):
         line = f"  {e.term} → {e.translation}"
         if e.category:
             line += f"  [{e.category}]"
+        if e.gender:
+            line += f"  性別：{e.gender}"
+        if e.note:
+            line += f"  備註：{e.note}"
         click.echo(line)
 
 
@@ -694,9 +699,13 @@ def glossary_show(project):
 @click.argument('term')
 @click.argument('translation')
 @click.option('--category', '-c', default='', help='Term category')
+@click.option('--gender', '-g', default=None,
+              help="Gender of a person (shown in the prompt); omitted: the entry's stays")
+@click.option('--note', '-n', default=None,
+              help="Note on a person (shown in the prompt); omitted: the entry's stays")
 @click.option('--project', '-p', default=None, help='Project directory path')
-def glossary_add(term, translation, category, project):
-    """Add a term to the glossary."""
+def glossary_add(term, translation, category, gender, note, project):
+    """Add a term to the glossary, or replace it."""
     project_dir = _find_project(project)
     if not project_dir:
         click.echo("找不到專案。")
@@ -704,7 +713,12 @@ def glossary_add(term, translation, category, project):
 
     gm = GlossaryManager(_get_glossary_path(project_dir))
     gm.load()
-    gm.add_term(term, translation, category=category)
+    old = gm.get_term(term)  # an omitted -g / -n keeps its value; '' clears it
+    if gender is None:
+        gender = old.gender if old else ''
+    if note is None:
+        note = old.note if old else ''
+    gm.add_term(term, translation, category=category, gender=gender, note=note)
     click.echo(f"已新增：{term} → {translation}")
 
 
@@ -739,7 +753,11 @@ def glossary_extract(project):
         gm = GlossaryManager(_get_glossary_path(project_dir))
         gm.load()
         for t in terms:
-            gm.add_term(t['term'], t['translation'], category=t.get('category', ''))
+            old = gm.get_term(t['term'])  # a person's gender and note stay
+            gm.add_term(t['term'], t['translation'], category=t.get('category', ''),
+                        gender=old.gender if old else '', note=old.note if old else '',
+                        save=False)
+        gm.save()  # once, right after the glossary was read
         click.echo(f"已儲存到 {_get_glossary_path(project_dir)}")
     if stopped is not None:
         sys.exit(1)
@@ -757,7 +775,11 @@ def glossary_import(json_file, project):
 
     gm = GlossaryManager(_get_glossary_path(project_dir))
     gm.load()
-    count = gm.import_json(json_file)
+    try:
+        count = gm.import_json(json_file)
+    except ValueError as e:  # also JSON that does not decode; nothing was imported
+        click.echo(f"無法匯入：{e}")
+        sys.exit(1)
     click.echo(f"已匯入 {count} 筆術語")
 
 
@@ -775,6 +797,47 @@ def glossary_export(json_file, project):
     gm.load()
     count = gm.export_json(json_file)
     click.echo(f"已匯出 {count} 筆術語到 {json_file}")
+
+
+# --- Book brief ---
+
+@cli.group()
+def brief():
+    """Show or set the book's brief (genre, tone, audience) for the prompt."""
+
+
+@brief.command('show')
+@click.option('--project', '-p', default=None, help='Project directory path')
+def brief_show(project):
+    """Show the book's brief."""
+    project_dir = _find_project(project)
+    if not project_dir:
+        click.echo("找不到專案。")
+        sys.exit(1)
+    pm = ProjectManager(project_dir)
+    pm.load()
+    click.echo(pm.data.brief or "尚未設定書籍簡介。")
+
+
+@brief.command('set')
+@click.argument('text')
+@click.option('--project', '-p', default=None, help='Project directory path')
+def brief_set(text, project):
+    """Set the book's brief; an empty TEXT removes it."""
+    project_dir = _find_project(project)
+    if not project_dir:
+        click.echo("找不到專案。")
+        sys.exit(1)
+    try:
+        with ProjectLock(project_dir):
+            pm = ProjectManager(project_dir)
+            pm.load()
+            pm.set_brief(text)
+            pm.save()
+    except (ProjectLockedError, ValueError) as e:  # ValueError: too long, nothing saved
+        click.echo(str(e))
+        sys.exit(1)
+    click.echo("已設定書籍簡介。" if pm.data.brief else "已移除書籍簡介。")
 
 
 def _find_project(project_dir: str | None) -> str | None:

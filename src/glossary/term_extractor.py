@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from collections import Counter
 
 import src.llm as llm
 from src.llm import (
@@ -49,6 +50,96 @@ EXTRACT_PROMPT = """你是一位專業的術語提取專家。請從以下英文
 MAX_CHARS_PER_BATCH = 5000
 
 
+CONSOLIDATE_PROMPT = """你是一位專業的術語編輯。以下術語是從同一本書的不同段落分別提取的，每個術語都得到了不只一種翻譯建議（數字是該翻譯被提出的次數）。請為每個術語決定全書統一使用的一個翻譯（繁體中文，台灣用語）和一個類別。
+
+輸出要求：
+1. 輸出 JSON 陣列，每個術語一個物件，包含 term（照抄下列的 term）、translation、category
+2. 類別可選：person, place, work, organization, term, expression, other
+3. 直接輸出 JSON，不要加任何說明或 markdown 格式
+
+術語與翻譯建議（每行一個 JSON 物件）：
+{candidates}"""
+
+# Upper bound of the candidate lines sent in one consolidating call
+MAX_CHARS_PER_CONSOLIDATION = 8000
+
+
+def _batches(segments: list[dict]) -> list[str]:
+    """The texts of the extraction calls: the segments' texts, split into
+    chunks of at most MAX_CHARS_PER_BATCH (_split_text) and packed into
+    batches of at most that size, joined by a blank line."""
+    batches = []
+    current_batch: list[str] = []
+    current_len = 0
+    texts = (chunk for seg in segments
+             for chunk in _split_text(seg.get('text', ''), MAX_CHARS_PER_BATCH))
+    for text in texts:
+        if current_len + len(text) > MAX_CHARS_PER_BATCH and current_batch:
+            batches.append('\n\n'.join(current_batch))
+            current_batch = []
+            current_len = 0
+        current_batch.append(text)
+        current_len += len(text) + 2  # the '\n\n' separator counts too
+    if current_batch:
+        batches.append('\n\n'.join(current_batch))
+    return batches
+
+
+def _top_level_list(reply: str) -> list:
+    """The entries of a consolidation reply: it must be one JSON list (a
+    surrounding Markdown fence is removed). No array is searched for inside
+    other text, so a cut-off object cannot pass for an answer (the extraction
+    replies keep that recovery, _parse_response). Raises when it is not JSON;
+    [] when it is JSON but not a list."""
+    text = reply.strip()
+    if text.startswith('```'):
+        text = '\n'.join(line for line in text.split('\n') if not line.strip().startswith('```'))
+    data = json.loads(text)
+    if not isinstance(data, list):
+        return []
+    return [d for d in data if isinstance(d, dict) and 'term' in d and 'translation' in d]
+
+
+def _text(value) -> str:
+    """`value` stripped when it is text, else ''."""
+    return value.strip() if isinstance(value, str) else ''
+
+
+def _most_common(counter: Counter) -> str:
+    """The most frequent key; the first counted on a tie; '' for none."""
+    return max(counter, key=counter.get, default='')  # max keeps the first of equal ones
+
+
+def _candidate_line(group: dict) -> str:
+    return json.dumps({'term': group['term'], 'category': _most_common(group['categories']),
+                       'translations': dict(group['translations'])}, ensure_ascii=False)
+
+
+def _consolidation_batches(groups: list[dict]) -> list[list[dict]]:
+    """`groups` in order, cut so that each part's candidate lines stay
+    within MAX_CHARS_PER_CONSOLIDATION (a longer single line is a part)."""
+    parts: list[list[dict]] = []
+    for group in groups:
+        length = len(_candidate_line(group)) + 1
+        if parts and size + length <= MAX_CHARS_PER_CONSOLIDATION:
+            parts[-1].append(group)
+            size += length
+        else:
+            parts.append([group])
+            size = length
+    return parts
+
+
+def _final(groups: dict, decided: dict) -> list[dict]:
+    """One entry per group: the decided one, else the most frequent
+    proposal; sorted by term."""
+    terms = [decided.get(key) or {'term': g['term'],
+                                  'translation': _most_common(g['translations']),
+                                  'category': _most_common(g['categories'])}
+             for key, g in groups.items()]
+    return sorted(terms, key=lambda x: x['term'].lower())
+
+
 def _split_text(text: str, limit: int) -> list[str]:
     """Split text into chunks of at most `limit` characters, without loss.
 
@@ -79,80 +170,131 @@ class TermExtractor:
         self.timeout = timeout
         self.backend = backend if backend is not None else llm.default_backend()
 
+    def _call(self, prompt: str) -> str | None:
+        """The reply to one prompt; None when the call failed (logged).
+        Raises ExtractionError on an error every further call would hit too."""
+        request = LLMRequest(system='', messages=[Message('user', prompt)],
+                             model=self.model, timeout=self.timeout)
+        try:
+            return self.backend.complete(request, threading.Event()).text
+        except (AuthError, RateLimitError, BackendUnavailableError) as e:
+            # Every further call would fail the same way
+            raise ExtractionError(str(e))
+        except LLMError as e:
+            logger.warning("Term extraction failed: %s", e)
+            return None
+
     def extract_from_text(self, text: str) -> list[dict]:
         """Extract terms from a single text chunk.
 
         Returns list of dicts with 'term', 'translation', 'category' keys.
         """
-        prompt = EXTRACT_PROMPT.format(text=text[:MAX_CHARS_PER_BATCH])
-        request = LLMRequest(system='', messages=[Message('user', prompt)],
-                             model=self.model, timeout=self.timeout)
-
-        try:
-            response = self.backend.complete(request, threading.Event())
-        except (AuthError, RateLimitError, BackendUnavailableError) as e:
-            # Every further batch would fail the same way
-            raise ExtractionError(str(e))
-        except LLMError as e:
-            logger.warning("Term extraction failed: %s", e)
+        reply = self._call(EXTRACT_PROMPT.format(text=text[:MAX_CHARS_PER_BATCH]))
+        if reply is None:
             return []
-
         try:
-            return self._parse_response(response.text.strip())
+            return self._parse_response(reply.strip())
         except Exception as e:
             logger.warning("Term extraction error: %s", e)
             return []
 
     def extract_from_segments(self, segments: list[dict]) -> list[dict]:
-        """Extract terms from multiple segments in batches.
+        """Extract terms from multiple segments in batches, then consolidate.
+
+        Every batch proposes terms; the proposals are grouped by term
+        (case-insensitive). A term proposed with more than one translation
+        is decided by one consolidating call (more than one only when the
+        conflicts exceed MAX_CHARS_PER_CONSOLIDATION). A term the
+        consolidation does not decide (no reply, an unusable reply, left
+        out) keeps its most frequent proposal, the first proposed on a tie.
 
         Args:
             segments: List of dicts with 'text' key.
 
         Returns:
-            Deduplicated list of term dicts.
+            One entry per term ('term', 'translation', 'category'), sorted.
 
         Raises:
             ExtractionError: a rate limit, an expired login or an unusable
                 backend stopped the extraction; its `terms` are those of the
-                batches finished before.
+                batches finished before, each with its most frequent proposal.
         """
-        all_terms = {}
-        batches = []
-        current_batch = []
-        current_len = 0
+        groups = self.collect_candidates(segments)
+        decided = {}
+        try:
+            for batch in _consolidation_batches(
+                    [g for g in groups.values() if len(g['translations']) > 1]):
+                decided.update(self.consolidate(batch))
+        except ExtractionError as e:
+            raise ExtractionError(str(e), terms=_final(groups, decided)) from e
+        return _final(groups, decided)
 
-        # A text longer than one batch is split into bounded chunks first, so
-        # extract_from_text() never has to truncate it.
-        texts = (chunk for seg in segments
-                 for chunk in _split_text(seg.get('text', ''), MAX_CHARS_PER_BATCH))
-        for text in texts:
-            if current_len + len(text) > MAX_CHARS_PER_BATCH and current_batch:
-                batches.append('\n\n'.join(current_batch))
-                current_batch = []
-                current_len = 0
-
-            current_batch.append(text)
-            current_len += len(text) + 2  # the '\n\n' separator counts too
-
-        if current_batch:
-            batches.append('\n\n'.join(current_batch))
-
-        def found():
-            return sorted(all_terms.values(), key=lambda x: x['term'].lower())
-
-        for batch_text in batches:
+    def collect_candidates(self, segments: list[dict]) -> dict:
+        """The proposals of every batch, by lowercased term: {'term': the
+        first spelling, 'translations': Counter, 'categories': Counter},
+        counted once per batch that proposed them (a reply listing a term
+        twice counts once). Texts are stripped; a proposal without a term or
+        a translation is skipped. Raises ExtractionError (with the terms of
+        the batches before) like extract_from_segments."""
+        groups: dict = {}
+        for batch_text in _batches(segments):
             try:
                 terms = self.extract_from_text(batch_text)
             except ExtractionError as e:
                 # Stop, but keep the terms of the batches already done
-                raise ExtractionError(str(e), terms=found()) from e
+                raise ExtractionError(str(e), terms=_final(groups, {})) from e
+            counted = set()  # (term key, field, value) of this batch
             for t in terms:
-                key = t['term'].lower()
-                if key not in all_terms:
-                    all_terms[key] = t
+                term, translation = _text(t['term']), _text(t['translation'])
+                if not term or not translation:
+                    continue
+                category = _text(t.get('category'))
+                group = groups.setdefault(term.lower(), {
+                    'term': term, 'translations': Counter(), 'categories': Counter()})
+                for field, value in (('translations', translation), ('categories', category)):
+                    # an empty category is no vote (see _most_common)
+                    if value and (term.lower(), field, value) not in counted:
+                        counted.add((term.lower(), field, value))
+                        group[field][value] += 1
+        return groups
 
-        return found()
+    def consolidate(self, groups: list[dict]) -> dict:
+        """One call that decides a translation and a category for each of
+        `groups` (see collect_candidates). Returns {lowercased term: entry}
+        for the terms the reply decided with a non-empty translation (texts
+        stripped; an empty category keeps the batches' most common one); a
+        term that two rows decide differently stays undecided. {} when the
+        call or its reply is unusable (also when parsing it raises). Raises
+        ExtractionError on a rate limit, an expired login or an unusable
+        backend."""
+        lines = '\n'.join(_candidate_line(g) for g in groups)
+        reply = self._call(CONSOLIDATE_PROMPT.format(candidates=lines))
+        if reply is None:
+            return {}
+        try:
+            items = _top_level_list(reply)
+        except Exception as e:  # noqa: BLE001 - e.g. not JSON, or a too deeply nested reply
+            logger.warning("Term consolidation error: %s", type(e).__name__)
+            items = []
+        wanted = {g['term'].lower(): g for g in groups}
+        decided: dict = {}
+        contradicted = set()
+        for item in items:
+            key, translation = _text(item['term']).lower(), _text(item['translation'])
+            if key not in wanted or not translation:
+                continue
+            if key in decided and decided[key]['translation'] != translation:
+                contradicted.add(key)
+            group = wanted[key]
+            category = _text(item.get('category')) or _most_common(group['categories'])
+            decided.setdefault(key, {'term': group['term'], 'translation': translation,
+                                     'category': category})
+        for key in contradicted:
+            del decided[key]
+        if len(decided) < len(wanted):
+            logger.warning("Term consolidation decided %d of %d terms",
+                           len(decided), len(wanted))
+        return decided
 
     @staticmethod
     def _parse_response(output: str) -> list[dict]:
@@ -166,14 +308,17 @@ class TermExtractor:
             lines = [l for l in lines if not l.strip().startswith('```')]
             output = '\n'.join(lines)
 
-        # Try parsing directly
+        # Try parsing directly; JSON that is not a list is no answer
         try:
             data = json.loads(output)
+        except json.JSONDecodeError:
+            pass
+        else:
             if isinstance(data, list):
                 return [d for d in data
                         if isinstance(d, dict) and 'term' in d and 'translation' in d]
-        except json.JSONDecodeError:
-            pass
+            logger.warning("Could not parse term extraction response")
+            return []
 
         # Try to find JSON array within the text
         start = output.find('[')
