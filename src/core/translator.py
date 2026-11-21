@@ -330,6 +330,10 @@ class _Session:
         request = LLMRequest(system='', messages=list(messages), model=engine.model,
                              timeout=engine.timeout)
         while self.left > 0:
+            if engine.interrupted is not None and engine.interrupted():
+                # Paused or stopped (also before a feedback or split call):
+                # no call; the segment goes back
+                raise CancelledError('cancelled')
             self.left -= 1
             try:
                 response = engine.backend.complete(request, self.cancel)

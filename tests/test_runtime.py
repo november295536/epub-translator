@@ -1386,8 +1386,8 @@ class TestRound1BackoffInterrupted:
         stopped = []
         fake = FakeBackend([TransientError('t'), '<p k="1">譯</p>'])
 
-        def interrupted():
-            return bool(stopped)
+        def interrupted():  # stopped once the first call was made (round 4: none before)
+            return bool(stopped) and len(fake.requests) >= 1
 
         engine = TranslationEngine(model='m', backend=fake, interrupted=interrupted)
         stopped.append(1)
@@ -2452,16 +2452,18 @@ class TestRound3:
 
     def test_save_failing_in_a_batch_reports_the_rest(self, tmp_path, fresh_tm, clock,
                                                        monkeypatch):
-        """6."""
+        """6. Deterministic batches: the first result is applied alone (the
+        other calls wait for it); the other four then form one batch."""
         import src.core.runcontrol as runcontrol
         _make_project(tmp_path / 'projects', n=5)
+        calls = []
+        first_applied = threading.Event()
         real_done = tasks_module.TaskManager._workers_done
-        held = []
 
         def done(self, task):
-            if not held:
-                held.append(1)
-                _wait(lambda: task.result_queue.qsize() >= 4)
+            if task.completed >= 1 and not first_applied.is_set():
+                first_applied.set()  # the batch [r1] is applied: the rest may come
+                _wait(lambda: task.result_queue.qsize() == 4)
             return real_done(self, task)
 
         monkeypatch.setattr(tasks_module.TaskManager, '_workers_done', done)
@@ -2473,12 +2475,20 @@ class TestRound3:
             return real_maybe(self)
 
         monkeypatch.setattr(runcontrol.DebouncedSaver, 'maybe_save', maybe_save)
-        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+
+        def respond(request):
+            calls.append(1)
+            if len(calls) > 1:
+                assert first_applied.wait(20)
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
             task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
             task._coordinator.join(timeout=20)
         assert task.state == 'failed'
         event = task.progress.get_all()[-1]
-        assert event['event'] == 'error' and len(event['data']['unsaved']) == 3
+        assert event['event'] == 'error'
+        assert event['data']['unsaved'] == ['c1_seg0003', 'c1_seg0004', 'c1_seg0005']
 
     def test_cli_second_interrupt_during_the_join_still_saves(self, tmp_path, monkeypatch):
         """7 (parallel)."""
@@ -2531,3 +2541,67 @@ class TestRound3:
         assert result.exit_code == 1
         assert ('未儲存的結果（2 個段落，下次 start 會重新翻譯）：c1_seg0001, c1_seg0002'
                 in result.output)
+
+
+class TestRound4:
+
+    def test_page_takes_the_server_state_on_paused_and_resumed(self, tmp_path):
+        """3."""
+        from src.web.server import create_app
+        _make_project(tmp_path / 'projects', n=1)
+        client = create_app(projects_dir=str(tmp_path / 'projects')).test_client()
+        html = client.get(f'/project/{PROJECT}/translation').get_data(as_text=True)
+        for name in ('paused', 'resumed'):
+            start = html.index(f"addEventListener('{name}'")
+            body = html[start:html.index('});', start)]
+            assert 'this.fetchStatus(false);' in body and 'this.state =' not in body
+        assert 'async fetchStatus(connect = true) {' in html
+        assert 'if (connect) this.connectSSE();' in html
+
+    def test_cli_saved_message_only_after_the_save(self, tmp_path, monkeypatch):
+        """4: a stop whose final save fails does not claim the progress was saved."""
+        import src.core.runcontrol as runcontrol
+        path = _make_project(tmp_path, n=2)
+        real_flush = runcontrol.DebouncedSaver.flush
+
+        def flush(self, force=False):
+            if force:
+                raise OSError('disk full')
+            return real_flush(self, force)
+
+        monkeypatch.setattr(runcontrol.DebouncedSaver, 'flush', flush)
+
+        def respond(request):
+            if '>Line 2.<' in request.messages[0].content:
+                raise AuthError('expired')
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            result = CliRunner().invoke(translate.cli, ['start', '--project', path])
+        assert result.exit_code == 1
+        assert '已完成的進度已儲存' not in result.output
+        assert '未儲存的結果（1 個段落，下次 start 會重新翻譯）：c1_seg0001' in result.output
+
+    def test_cli_saved_message_after_a_good_save(self, tmp_path):
+        path = _make_project(tmp_path, n=2)
+        with use_fake_backend(FakeBackend(responder=_limited_once(AuthError('expired')))):
+            result = CliRunner().invoke(translate.cli, ['start', '--project', path])
+        assert result.exit_code == 1
+        assert result.output.endswith('  ✗ expired\n翻譯中斷。已完成的進度已儲存，可用 start 繼續。\n')
+
+    def test_after_save_error_is_logged(self, tmp_path, caplog):
+        """5."""
+        import logging
+        path = _make_project(tmp_path, n=1)
+        pm = ProjectManager(path)
+        pm.load()
+
+        def after_save(items):
+            raise OSError('log dir gone')
+
+        saver = DebouncedSaver(pm, after_save, clock=FakeClock())
+        saver.add('a')
+        with caplog.at_level(logging.ERROR, logger='src.core.runcontrol'):
+            assert saver.flush() is True
+        assert saver.pending == [] and saver.saves == 1
+        assert '儲存後寫入失敗紀錄時出錯' in caplog.messages

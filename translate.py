@@ -246,6 +246,14 @@ def _report_unsaved(saver):
                    + ', '.join(item[0] for item in saver.pending))
 
 
+class _RunStopped(Exception):
+    """A run-level stop inside the sequential loop, reported after the save."""
+
+    def __init__(self, error):
+        super().__init__(str(error))
+        self.error = error
+
+
 def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
     """Single-worker sequential translation. Returns the number of failed segments."""
     engine = TranslationEngine(model=pm.data.model, backend=llm.backend_for(pm.data.backend))
@@ -253,6 +261,7 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
     streak = UnexpectedStreak()
     saver = _saver(pm, log_dir)
 
+    stopped = None
     try:
         for i, seg in enumerate(pending, 1):
             click.echo(f"[{progress['translated'] + i}/{progress['total']}] 翻譯段落 {seg.segment_id}...")
@@ -264,7 +273,7 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
                 except RUN_ERRORS as e:
                     delay = resume_delay(e)
                     if delay is None:
-                        _stop_run(e)
+                        raise _RunStopped(e)
                     saver.flush()  # a pause saves what is waiting
                     click.echo(_rate_limit_message(e, delay))
                     _sleep(delay)
@@ -278,7 +287,9 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
                 click.echo(f"  ✓ 完成（{seg.word_count} 字）")
             stop = streak.add(outcome)
             if stop:
-                _stop_run(stop)
+                raise _RunStopped(stop)
+    except _RunStopped as s:
+        stopped = s.error  # reported once the save below succeeded
     finally:
         # Also on Ctrl-C (the call in flight was killed, its segment stays
         # pending; one applied between apply_outcome and add is saved too:
@@ -288,6 +299,8 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
         except BaseException:
             _report_unsaved(saver)
             raise
+    if stopped is not None:
+        _stop_run(stopped)  # "已完成的進度已儲存": now true
     return failed
 
 
