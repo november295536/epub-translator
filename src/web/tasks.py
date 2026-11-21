@@ -529,8 +529,7 @@ class TaskManager:
                     # received and saved, then the run fails
                     streak_stop = stop
                     with task._lock:
-                        task.stop_event.set()
-                        task.resume_at = None  # a stopping run does not resume
+                        task.stop_event.set()  # resume_translation refuses it now
                         task.pause_event.set()
                 self._tick(task, saver)
 

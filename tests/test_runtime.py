@@ -2061,9 +2061,10 @@ class TestRound2Events:
                                             total=4)
         task.resume_at = clock.now + 10
         task.error = 'first'
+        task.completed = 1
         fresh_tm._pause_for(task, RateLimitError('later', retry_after=60), 'rate_limit')
         assert task.progress.get_all()[-1] == {'event': 'rate_limit', 'data': {
-            'error': 'first', 'completed': 0, 'remaining': 4, 'resume_in': 60.0}}
+            'error': 'first', 'completed': 1, 'remaining': 3, 'resume_in': 60.0}}
 
     def test_stream_snapshot_has_the_wait(self, tmp_path, fresh_tm, clock):
         """Item 4: a rate limit before the stream opened."""
