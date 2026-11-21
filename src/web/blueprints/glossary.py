@@ -61,13 +61,14 @@ def add_term(project_name: str):
         return jsonify({'error': 'gender 和 note 必須是文字'}), 400
 
     gm = _get_glossary_manager(project_name)
+    old = gm.get_term(data['term'])  # a person field not sent keeps its value, as in the CLI
     entry = gm.add_term(
         term=data['term'],
         translation=data['translation'],
         category=data.get('category', ''),
         frequency=data.get('frequency', 0),
-        gender=data.get('gender', ''),
-        note=data.get('note', ''),
+        gender=data['gender'] if 'gender' in data else (old.gender if old else ''),
+        note=data['note'] if 'note' in data else (old.note if old else ''),
     )
     return jsonify({'status': 'ok', 'entry': asdict(entry)})
 
@@ -106,8 +107,9 @@ def delete_term(project_name: str, term: str):
 @glossary_bp.route('/api/projects/<project_name>/glossary/batch', methods=['DELETE'])
 def batch_delete_terms(project_name: str):
     """Delete multiple glossary terms at once."""
-    data = request.get_json()
-    if not data or 'terms' not in data or not isinstance(data['terms'], list):
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get('terms'), list) \
+            or not all(isinstance(t, str) for t in data['terms']):
         return jsonify({'error': '請提供 terms 陣列'}), 400
 
     gm = _get_glossary_manager(project_name)
@@ -160,12 +162,11 @@ def extract_terms(project_name: str):
             count = 0
             for t in terms:
                 if not gm.get_term(t['term']):
-                    gm.add_term(
-                        term=t['term'],
-                        translation=t['translation'],
-                        category=t.get('category', '')
-                    )
+                    gm.add_term(term=t['term'], translation=t['translation'],
+                                category=t.get('category', ''), save=False)
                     count += 1
+            if count:
+                gm.save()  # once: an edit saved meanwhile is overwritten only in this instant
 
             _extraction_tasks[project_name]['extracted_count'] = count
             if stopped is not None:

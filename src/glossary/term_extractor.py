@@ -85,14 +85,29 @@ def _batches(segments: list[dict]) -> list[str]:
     return batches
 
 
+def _top_level_list(reply: str) -> list:
+    """The entries of a consolidation reply: it must be one JSON list (a
+    surrounding Markdown fence is removed). No array is searched for inside
+    other text, so a cut-off object cannot pass for an answer (the extraction
+    replies keep that recovery, _parse_response). Raises when it is not JSON;
+    [] when it is JSON but not a list."""
+    text = reply.strip()
+    if text.startswith('```'):
+        text = '\n'.join(line for line in text.split('\n') if not line.strip().startswith('```'))
+    data = json.loads(text)
+    if not isinstance(data, list):
+        return []
+    return [d for d in data if isinstance(d, dict) and 'term' in d and 'translation' in d]
+
+
 def _text(value) -> str:
     """`value` stripped when it is text, else ''."""
     return value.strip() if isinstance(value, str) else ''
 
 
 def _most_common(counter: Counter) -> str:
-    """The most frequent key; the first counted on a tie."""
-    return max(counter, key=counter.get)  # max keeps the first of equal ones
+    """The most frequent key; the first counted on a tie; '' for none."""
+    return max(counter, key=counter.get, default='')  # max keeps the first of equal ones
 
 
 def _candidate_line(group: dict) -> str:
@@ -237,7 +252,8 @@ class TermExtractor:
                 group = groups.setdefault(term.lower(), {
                     'term': term, 'translations': Counter(), 'categories': Counter()})
                 for field, value in (('translations', translation), ('categories', category)):
-                    if (term.lower(), field, value) not in counted:
+                    # an empty category is no vote (see _most_common)
+                    if value and (term.lower(), field, value) not in counted:
                         counted.add((term.lower(), field, value))
                         group[field][value] += 1
         return groups
@@ -256,8 +272,8 @@ class TermExtractor:
         if reply is None:
             return {}
         try:
-            items = self._parse_response(reply.strip())
-        except Exception as e:  # noqa: BLE001 - e.g. a too deeply nested reply
+            items = _top_level_list(reply)
+        except Exception as e:  # noqa: BLE001 - e.g. not JSON, or a too deeply nested reply
             logger.warning("Term consolidation error: %s", type(e).__name__)
             items = []
         wanted = {g['term'].lower(): g for g in groups}
