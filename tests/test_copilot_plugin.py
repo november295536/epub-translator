@@ -275,6 +275,12 @@ class TestRound2:
         found = CopilotCLI().classify_error(ProcessResult(0, 'something odd\n', ''))
         assert str(found) == NOT_REPLACED_MESSAGE + 'CLI 訊息：something odd'
 
+    @pytest.mark.parametrize('code', [1, 2])
+    def test_plain_stdout_of_a_failed_run_with_a_reply_is_quoted(self, code):
+        replied = _output('答', code=code)
+        found = CopilotCLI().classify_error(ProcessResult(code, 'boom\n' + replied.stdout, ''))
+        assert str(found) == f'copilot CLI exited with code {code}: boom'
+
     def test_plain_stdout_beside_a_reply_is_not_an_error_text(self):
         replied = _output('答', _checkpoint({'m': REPLACED}))
         result = ProcessResult(0, 'Rate limited.\n' + replied.stdout, '')
