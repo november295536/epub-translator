@@ -771,6 +771,9 @@ class TestCopilotCLI:
         bad = json.dumps({'type': 'session.usage_checkpoint', 'data': {'accountingSnapshot': {
             'modelMetrics': {'a': {'usage': {'inputTokens': 'many'}}}}}})
         assert CopilotCLI().parse_output(ProcessResult(0, bad, ''), _req()).usage is None
+        none = json.dumps({'type': 'session.usage_checkpoint', 'data': {'accountingSnapshot': {
+            'modelMetrics': {}}}})
+        assert CopilotCLI().parse_output(ProcessResult(0, none, ''), _req()).usage is None
         empty = json.dumps({'type': 'session.usage_checkpoint', 'data': {}})
         assert CopilotCLI().parse_output(ProcessResult(0, empty, ''), _req()).usage is None
         assert CopilotCLI().parse_output(ProcessResult(0, '[1]\n', ''), _req()).text == ''
@@ -979,7 +982,8 @@ class TestPhase7Survivors:
             time.sleep(0.1)
             assert _statuses(path) == [SegmentStatus.PENDING] * 2  # window open
             clock.now += SAVE_INTERVAL_SECONDS
-            _wait(lambda: _statuses(path)[0] == SegmentStatus.TRANSLATED)
+            # well within the real 10 s: only the injected clock can have closed the window
+            _wait(lambda: _statuses(path)[0] == SegmentStatus.TRANSLATED, timeout=5)
             assert task.state == 'running'
             gate.set()
             task._coordinator.join(timeout=20)
@@ -987,15 +991,23 @@ class TestPhase7Survivors:
     def test_resumed_event_and_log(self, tmp_path, fresh_tm, clock, caplog):
         import logging
         caplog.set_level(logging.INFO, logger='src.web.tasks')
-        _make_project(tmp_path / 'projects', n=2)
-        respond = _limited_once(RateLimitError('limit', retry_after=5))
+        _make_project(tmp_path / 'projects', n=3)
+        calls = []
+
+        def respond(request):  # the second call is limited
+            calls.append(1)
+            if len(calls) == 2:
+                raise RateLimitError('limit', retry_after=5)
+            return like(request, '譯')
+
         with use_fake_backend(FakeBackend(responder=respond)):
             task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
             _wait(lambda: task.state == 'paused')
+            _wait(lambda: task.completed == 1)
             clock.now += 5
             task._coordinator.join(timeout=20)
         resumed = [e for e in task.progress.get_all() if e['event'] == 'resumed']
-        assert resumed == [{'event': 'resumed', 'data': {'completed': 0, 'remaining': 2}}]
+        assert resumed == [{'event': 'resumed', 'data': {'completed': 1, 'remaining': 2}}]
         assert '翻譯自動繼續（使用量限制的等待結束）' in caplog.messages
 
     def test_failed_save_logged(self, tmp_path, fresh_tm, clock, monkeypatch, caplog):
@@ -1007,8 +1019,10 @@ class TestPhase7Survivors:
             task._coordinator.join(timeout=20)
         assert '無法儲存專案' in caplog.messages
 
-    def test_backend_switched_mid_run(self, tmp_path, fresh_tm, monkeypatch):
+    def test_backend_switched_mid_run(self, tmp_path, fresh_tm, monkeypatch, caplog):
         """The worker follows the project's backend from the next segment on."""
+        import logging
+        caplog.set_level(logging.INFO, logger='src.web.tasks')
         _make_project(tmp_path / 'projects', n=2)
         other = FakeBackend(responder=lambda r: like(r, '乙'))
         monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: other)
@@ -1029,3 +1043,4 @@ class TestPhase7Survivors:
         assert task.state == 'completed'
         # one worker: the second segment went to the new backend
         assert (len(default.requests), len(other.requests)) == (1, 1)
+        assert '[W0] 模型切換: sonnet → fake-model' in caplog.messages
