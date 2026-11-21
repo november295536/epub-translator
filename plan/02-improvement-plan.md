@@ -590,12 +590,13 @@ Acceptance:
 
 ### Phase 7 — Runtime control, speed, second backend
 
-Depends on Phase 1.
+Depends on Phase 1. Split after measurement into part A (built) and part B (not scheduled).
+
+Part A:
 
 - Stop and pause terminate the in-flight process instead of waiting for it.
 - Failed attempts are classified. Transient errors are re-queued with backoff. A rate limit
   pauses and resumes automatically, using `retry_after` when the backend provides it.
-- Concurrency adapts: grow slowly while calls succeed, halve after consecutive failures.
 - Saves are debounced; `project.json` is 3.7–7.2 MB and is currently rewritten per result batch.
 - Prompt reordered so that stable content (rules, book brief) comes first.
 - Measure the per-call overhead of the Claude CLI with `--system-prompt`, `--tools ""`,
@@ -603,15 +604,48 @@ Depends on Phase 1.
 - `CopilotCLI` backend. The installed CLI (1.0.105) has `-p`, `--model`, `--silent`,
   `--output-format`, `--no-custom-instructions`, `--available-tools`; its output and error
   formats still need to be characterized.
+
+Part B (decided after the part A measurements; not scheduled):
+
+- Concurrency adapts: grow slowly while calls succeed, halve after consecutive failures.
 - Optional failover: when one backend is rate-limited, dispatch to another. The review tab
   already shows which model produced each segment.
 
-Acceptance:
+As built, part A (2026-11-21), where it differs from the list above:
 
-- Tests with the fake backend: stop returns within 2 seconds while a call is in flight and no
-  child process remains; a simulated rate limit pauses and resumes without user action; a
-  transient error is retried and a permanent one is not; concurrency falls after consecutive
-  failures and rises again; 100 results cause far fewer than 100 writes of `project.json`.
+- Transient errors are retried inside the per-segment call budget of Phase 4 (`MAX_CALLS`
+  4), now with a wait of 5, 15, 45 s before each retry (`TRANSIENT_BACKOFF_SECONDS`); no
+  second, run-level retry layer. A segment that runs out of calls fails (`transient`) as
+  before and is retried with `--retry-failed`.
+- A rate limit pauses the run (web: state `paused`, event `rate_limit` with `resume_in`; CLI:
+  a message and a wait) and resumes after `retry_after`, or 300 s when the backend gives none
+  (neither CLI gives one). Auth and backend-unavailable errors pause the web task and stop a
+  CLI run, as before. One rule for both paths: `src/core/runcontrol.resume_delay`.
+- Saves: at most every 10 s or 20 results (`src/core/runcontrol.DebouncedSaver`), and always
+  on pause, stop, completion, error and before the lock is released. A crash loses at most
+  the last window.
+- The prompt order is unchanged. Both CLI backends send the prompt as one user message;
+  prompt caching works on whole messages up to a cache breakpoint, so moving text inside the
+  message is not expected to help (reasoning, not measured). And in the HTML prompt the
+  per-segment context would then sit directly before the source, with nothing marking where
+  the source starts: that changes what the model reads. Left for an API backend with a
+  separate system prompt.
+- `ClaudeCLI` passes `--system-prompt <one line> --tools "" --strict-mcp-config
+  --setting-sources "" --no-session-persistence`: measured, input per call 29831 → 2294
+  tokens, median wall time 3.06 → 2.43 s on haiku (`scripts/verify/phase7_cli_overhead.py`).
+- `CopilotCLI` (`copilot-cli`, CLI 1.0.114): `--output-format json`, no tools, no custom
+  instructions, no built-in MCP servers; reports usage. `project.json` has `backend` (absent
+  means the Claude CLI and is never written); `start --backend`, and the web model selector
+  lists every backend's models.
+- Throughput before/after: `scripts/verify/phase7_throughput.py` (`--code <checkout of main>`
+  for the before numbers), run by the owner.
+
+Acceptance (part A):
+
+- Tests with the fake backend: stop returns within the test's bound while a call is in flight
+  and no child process remains; a simulated rate limit pauses and resumes without user action;
+  a transient error is retried and a permanent one is not; 100 results cause far fewer than
+  100 writes of `project.json`.
 - Measurement, logged with raw numbers: seconds per segment and segments per minute on the same
   50 segments of one book, before and after, same model and worker count. Each CLI flag is
   adopted only if its measured effect is shown.

@@ -3471,3 +3471,192 @@ class TestSegmentationCheckRound2:
         assert segmentation_check.without_body(ex, []) == 1
         ex.spine[0].is_nav = True
         assert segmentation_check.without_body(ex, []) == 0
+
+
+# --- Phase 7: throughput and CLI overhead measurements ----------------------------
+
+throughput = _load('phase7_throughput')
+overhead = _load('phase7_cli_overhead')
+
+
+def _invented_projects(projects_dir, n=4):
+    """Two invented projects (a, b); b has n text segments and one code
+    segment, the first one already translated."""
+    from src.core.project import ProjectManager
+    from src.core.segmenter import Segment, SegmentType
+    for name in ('a', 'b'):
+        segments = [Segment(id=f'c1_seg{i:04d}', html=f'<p>Line {i}.</p>', text=f'Line {i}.',
+                            word_count=2, segment_type=SegmentType.TEXT)
+                    for i in range(1, n + 1)]
+        segments.insert(1, Segment(id='c1_code', html='<pre># c\nx</pre>', text='# c\nx',
+                                   word_count=2, segment_type=SegmentType.CODE))
+        pm = ProjectManager(os.path.join(projects_dir, name))
+        pm.create('/nowhere/book.epub', 'Invented', 'Nobody', segments)
+        pm.mark_translated('c1_seg0001', '<p>舊譯</p>')
+        pm.save()
+
+
+class TestThroughputScript:
+
+    def _respond(self, calls):
+        from src.llm import LLMError, TransientError
+        from tests.conftest import like
+
+        def respond(request):
+            content = request.messages[0].content
+            calls.append(content)
+            if '>Line 2.<' in content and len([c for c in calls if '>Line 2.<' in c]) == 1:
+                raise TransientError('exit 1')
+            if '>Line 3.<' in content:
+                raise LLMError('bad request')
+            return like(request, '譯')
+        return respond
+
+    def test_measures_a_copy(self, tmp_path, capsys):
+        from src.llm.fake import FakeBackend
+        from tests.conftest import use_fake_backend
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+        before = throughput.snapshot(str(projects))
+        calls = []
+        with use_fake_backend(FakeBackend(responder=self._respond(calls))):
+            code = throughput.main(['--projects-dir', str(projects), '--project-index', '2',
+                                    '--segments', '3', '--model', 'fake-model',
+                                    '--workers', '2', '--anonymize'])
+        out = capsys.readouterr().out
+        assert code == 0, out
+        lines = out.splitlines()
+        assert lines[0].startswith('project-2: segments 3  wall ')
+        assert 'seconds per segment ' in lines[0] and 'segments per minute ' in lines[0]
+        assert lines[1].startswith('calls 4  per call median ')
+        assert lines[2:] == ['status failed 1, translated 2', 'failures by code error 1',
+                             'needed a retry 1  needed a split 0']
+        assert 'Line' not in out and 'c1_seg' not in out
+        # the first 3 text segments only (the translated one again), not segment 4
+        assert sum('>Line 4.<' in c for c in calls) == 0
+        assert sum('>Line 1.<' in c for c in calls) == 1
+        assert throughput.snapshot(str(projects)) == before
+        assert not any(n.startswith('phase7-throughput-') for n in os.listdir(
+            os.path.realpath(throughput.tempfile.gettempdir())))
+        from src.llm import default_backend
+        assert default_backend().name == 'claude-cli'  # replaced names restored
+
+    def test_named_without_anonymize_and_backend_option(self, tmp_path, capsys, monkeypatch):
+        import src.llm as llm
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+        fake = FakeBackend(responder=lambda r: like(r, '譯'))
+        monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: fake)
+        code = throughput.main(['--projects-dir', str(projects), '--project-index', '1',
+                                '--segments', '2', '--model', 'fake-model',
+                                '--backend', 'copilot-cli'])
+        out = capsys.readouterr().out
+        assert code == 0, out
+        assert out.startswith('a: segments 2  ')
+        assert 'status translated 2' in out and 'failures by code none' in out
+        assert len(fake.requests) == 2
+
+    @pytest.mark.parametrize('args, message', [
+        (['--project-index', '3'], 'ERROR no project 3 (there are 2)'),
+        (['--project-index', '0'], 'ERROR no project 0 (there are 2)'),
+        (['--project-index', '2', '--segments', '9'], 'ERROR project-2 has only 4 such segments'),
+    ])
+    def test_refused(self, tmp_path, capsys, args, message):
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+        code = throughput.main(['--projects-dir', str(projects), '--anonymize'] + args)
+        assert code == 2
+        assert capsys.readouterr().out.strip() == message
+
+    def test_refused_inside_a_work_tree_or_the_projects(self, tmp_path, capsys, monkeypatch):
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+        args = ['--projects-dir', str(projects), '--project-index', '1']
+        monkeypatch.setattr(throughput.tempfile, 'gettempdir', lambda: ROOT)
+        assert throughput.main(args) == 2
+        assert 'inside a git work tree' in capsys.readouterr().out
+        monkeypatch.setattr(throughput.tempfile, 'gettempdir', lambda: str(projects))
+        assert throughput.main(args) == 2
+        assert 'inside the projects directory' in capsys.readouterr().out
+        assert throughput.main(['--projects-dir', str(tmp_path / 'none'),
+                                '--project-index', '1']) == 2
+
+    def test_segment_stats(self):
+        calls = {'a': [(1, 'p', 1.0)], 'b': [(1, 'p', 1.0), (3, 'p', 1.0)],
+                 'c': [(1, 'p', 1.0), (3, 'p', 1.0), (1, 'h1', 1.0), (1, 'h2', 1.0)],
+                 'd': [(1, 'p', 1.0), (1, 'p', 1.0)]}
+        assert throughput.segment_stats(calls, ['a', 'b', 'c', 'd', 'e']) == \
+            {'retried': 3, 'split': 1}
+
+
+class TestCliOverheadScript:
+
+    def _fake_run(self, config_dir, payload, returncode=0, write_transcript=True):
+        seen = []
+
+        def run(cmd, **kwargs):
+            seen.append((cmd, kwargs))
+            if write_transcript and '--no-session-persistence' not in cmd:
+                folder = overhead.transcript_dir(kwargs['cwd'])
+                os.makedirs(folder, exist_ok=True)
+                with open(os.path.join(folder, f'{len(seen)}.jsonl'), 'w') as f:
+                    f.write('{}')
+            from src.llm.cli import ProcessResult
+            return ProcessResult(returncode, json.dumps(payload), '')
+        return run, seen
+
+    PAYLOAD = {'result': 'x', 'duration_api_ms': 1500, 'total_cost_usd': 0.0003,
+               'usage': {'input_tokens': 10, 'cache_creation_input_tokens': 20,
+                         'cache_read_input_tokens': 300, 'output_tokens': 40}}
+
+    def test_run(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(tmp_path / 'config'))
+        monkeypatch.setenv('CLAUDECODE', '1')
+        run, seen = self._fake_run(tmp_path, self.PAYLOAD)
+        monkeypatch.setattr(overhead, 'run_process', run)
+        code = overhead.main(['--repetitions', '2', '--raw', '--only', 'base', 'all'])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert len(seen) == 4
+        base_cmd = seen[0][0]
+        assert base_cmd[:2] == ['claude', '-p'] and base_cmd[3:] == [
+            '--model', 'haiku', '--output-format', 'json']
+        assert seen[1][0][7:] == ['--system-prompt', overhead.SYSTEM_PROMPT, '--tools', '',
+                                  '--strict-mcp-config', '--setting-sources', '',
+                                  '--no-session-persistence']
+        assert 'CLAUDECODE' not in seen[0][1]['env']
+        assert seen[0][1]['timeout'] == 120
+        assert 'robot' in base_cmd[2] and '術語表' in base_cmd[2]  # the engine's prompt
+        assert 'in      330  cache_read      300  out    40  cost $0.00030' in out
+        assert 'api   1.50 s' in out
+        assert 'transcripts 2/2' in out.splitlines()[-2]
+        assert 'transcripts 0/2' in out.splitlines()[-1]
+        assert '  1 base ' in out and 'transcript 1' in out
+
+    def test_failed_calls(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(tmp_path / 'config'))
+        run, _ = self._fake_run(tmp_path, {'is_error': True}, write_transcript=False)
+        monkeypatch.setattr(overhead, 'run_process', run)
+        assert overhead.main(['--repetitions', '1', '--only', 'base', '--raw']) == 1
+        out = capsys.readouterr().out
+        assert 'FAILED exit 0' in out and 'n=1 failed=1' in out
+
+        def broken(cmd, **kwargs):
+            raise OSError('x')
+
+        monkeypatch.setattr(overhead, 'run_process', broken)
+        assert overhead.one_call([], 'p', 'haiku', 5)['error'] == 'OSError'
+
+        from src.llm.cli import ProcessResult
+        monkeypatch.setattr(overhead, 'run_process', lambda cmd, **kw: ProcessResult(1, 'no', ''))
+        assert overhead.one_call([], 'p', 'haiku', 5)['error'] == 'exit 1, not JSON'
+
+    def test_transcript_dir(self, monkeypatch, tmp_path):
+        monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(tmp_path))
+        assert overhead.transcript_dir('/a/b.c') == os.path.join(str(tmp_path), 'projects',
+                                                                 '-a-b-c')
+        monkeypatch.delenv('CLAUDE_CONFIG_DIR')
+        assert overhead.transcript_dir('/x').startswith(os.path.expanduser('~/.claude'))
+        assert overhead.transcripts(str(tmp_path / 'missing')) == set()
