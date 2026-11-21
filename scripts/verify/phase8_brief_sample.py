@@ -15,7 +15,8 @@ translation run would (its glossary, its context), once without a brief
 and once with the brief of --brief-file. Nothing is stored in the copy.
 
 Writes `brief-sample.html` to --out: the brief, then per segment the source
-and both translations side by side, for the owner to judge. Prints counts
+and both translations side by side as plain text (tags removed, one line
+per block; no book markup is rendered), for the owner to judge. Prints counts
 only: the sample size, the model calls, and translated / failed per variant.
 The copy is removed at the end, also on an error or Ctrl-C (a failure to
 remove it is reported, without its path). The projects directory is only
@@ -29,26 +30,35 @@ Usage:
     python3 scripts/verify/phase8_brief_sample.py --projects-dir projects
         --project-index N --brief-file FILE --out DIR [--model haiku] [--anonymize]
 
-Exit code: 0 when every call answered (translated or failed) and the
-projects directory is unchanged, 1 otherwise (also when a rate limit or a
-login stopped it), 2 when the setup is refused (no such project, fewer than
-10 such segments, an empty brief, a place refused above).
+Exit code: 0 when all ten segments have both translations and the projects
+directory is unchanged, 1 otherwise (the file and the counts are still
+written when some translation failed; nothing when a rate limit or a login
+stopped the run), 2 when the setup is refused (no such project, fewer than
+10 such segments, an empty brief, a copy that migration leaves at schema 1,
+a place refused above).
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import html
-import io
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
 import threading
 
 HERE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+# Run as a file, sys.path[0] is this script's directory (no src there)
+sys.path.insert(0, HERE)
+
+import src.core.migrate as migrate  # noqa: E402
+import src.llm as llm  # noqa: E402
+from src.core.project import ProjectManager  # noqa: E402
+from src.core.translator import TranslationEngine, translate_segment  # noqa: E402
+from src.glossary.glossary_manager import load_glossary  # noqa: E402
 PROJECT_FILE = 'project.json'
 COPIED = (PROJECT_FILE, 'source.epub', 'glossary.json')
 SAMPLE = 10
@@ -114,22 +124,37 @@ def pick(segments: list) -> list:
     return [eligible[i * len(eligible) // SAMPLE] for i in range(SAMPLE)]
 
 
+# The end of a block (a line break in the readable text) and any other tag
+_BLOCK_END = re.compile(r'<br\s*/?>|</(?:p|h[1-6]|li|div|blockquote|pre|tr|dt|dd|caption|figcaption)\s*>',
+                        re.IGNORECASE)
+_TAG = re.compile(r'<[^>]*>')
+
+
+def readable(markup: str) -> str:
+    """The text of book markup, escaped: one line per block, tags removed,
+    entities decoded. The page shows text only, so nothing of the book is
+    run or loaded by the browser."""
+    text = html.unescape(_TAG.sub('', _BLOCK_END.sub('\n', markup)))
+    return html.escape('\n'.join(line.strip() for line in text.splitlines() if line.strip()))
+
+
 def cell(outcome) -> str:
-    """A translation as HTML, or the reason it failed."""
+    """A translation as readable text, or the reason it failed."""
     if outcome.text is None:
-        return f'<p class="failed">（翻譯失敗：{html.escape(outcome.issues[0].code)}）</p>'
-    return outcome.text
+        return f'<span class="failed">（翻譯失敗：{html.escape(outcome.issues[0].code)}）</span>'
+    return readable(outcome.text)
 
 
 def page(brief: str, rows: list) -> str:
     """The side-by-side file: rows of (segment id, source html, without, with)."""
     body = ''.join(
         f'<tr><th colspan="3">{html.escape(seg_id)}</th></tr>'
-        f'<tr><td>{source}</td><td>{cell(without)}</td><td>{cell(with_brief)}</td></tr>\n'
+        f'<tr><td>{readable(source)}</td><td>{cell(without)}</td><td>{cell(with_brief)}</td></tr>\n'
         for seg_id, source, without, with_brief in rows)
     return ('<!doctype html>\n<html><head><meta charset="utf-8"><title>Brief sample</title>'
             '<style>table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;'
-            'padding:.5em;vertical-align:top;width:33%}th{background:#eee;text-align:left}'
+            'padding:.5em;vertical-align:top;width:33%;white-space:pre-wrap}'
+            'th{background:#eee;text-align:left}'
             '.failed{color:#a00}</style></head><body>\n'
             f'<h1>Brief</h1><pre>{html.escape(brief)}</pre>\n'
             '<table><tr><th>原文</th><th>無簡介</th><th>有簡介</th></tr>\n'
@@ -185,19 +210,11 @@ def sample(args) -> int:
             print(f'ERROR {what} would be inside the projects directory')
             return 2
 
-    sys.path.insert(0, HERE)
-    import src.llm as llm  # noqa: E402
-    from src.core.migrate import migrate_project  # noqa: E402
-    from src.core.project import ProjectManager  # noqa: E402
-    from src.core.translator import TranslationEngine, translate_segment  # noqa: E402
-    from src.glossary.glossary_manager import load_glossary  # noqa: E402
-
     before = snapshot(args.projects_dir)
     work = None
     try:
         work = tempfile.mkdtemp(prefix='phase8-brief-')  # in `parent`
-        code = run(args, brief, label, project_dir, work, llm, migrate_project, ProjectManager,
-                   TranslationEngine, translate_segment, load_glossary)
+        code = run(args, brief, label, project_dir, work)
     finally:
         if work is not None:  # first: a failing snapshot below cannot skip it
             try:
@@ -211,20 +228,20 @@ def sample(args) -> int:
     return code
 
 
-def run(args, brief, label, project_dir, work, llm, migrate_project, ProjectManager,
-        TranslationEngine, translate_segment, load_glossary) -> int:
+def run(args, brief, label, project_dir, work) -> int:
     """The sample on a copy in `work`."""
     copy = os.path.join(work, str(args.project_index))  # no project name in a path
     os.makedirs(copy)
     for file in COPIED:
         if os.path.isfile(os.path.join(project_dir, file)):
             shutil.copy2(os.path.join(project_dir, file), copy)
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        pm = ProjectManager(copy)
-        if pm.load().schema != 2:
-            migrate_project(copy)
-            pm.load()
-        gm = load_glossary(os.path.join(copy, 'glossary.json'))
+    pm = ProjectManager(copy)
+    if pm.load().schema != 2:
+        migrate.migrate_project(copy)
+        if pm.load().schema != 2:  # a chapter that did not match: nothing written
+            print(f'ERROR {label}: the copy could not be migrated')
+            return 2
+    gm = load_glossary(os.path.join(copy, 'glossary.json'))
     chosen = pick(pm.data.segments)
     if not chosen:
         print(f'ERROR {label} has fewer than {SAMPLE} text segments of {MIN_WORDS} words or more')
@@ -255,6 +272,9 @@ def run(args, brief, label, project_dir, work, llm, migrate_project, ProjectMana
         counts.append(f'{variant} brief: translated {done} failed {len(rows) - done}')
     print(f'{label}: sampled {len(rows)}  calls {backend.calls}  ' + '  '.join(counts))
     print(f'wrote {OUT_FILE}')
+    if not all(row[2].text is not None and row[3].text is not None for row in rows):
+        print(f'FAIL {label}: not every sampled segment has both translations')
+        return 1
     return 0
 
 
