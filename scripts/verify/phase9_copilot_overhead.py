@@ -22,13 +22,19 @@ i.e. raises the BackendUnavailableError of a system prompt that was not
 replaced. Per configuration it prints the median wall time (seconds, the
 whole process), the median input and output tokens, the median number of
 system prompt segments the CLI reports and their tokens, and how many calls
-passed. With --raw also one line per call. The script writes nothing.
+passed. With --raw also one line per call.
+
+The script writes no file itself, but the CLI does, as in every Copilot
+call: each call is saved as a session in the user's Copilot directory, and
+the CLI makes an empty folder under its `plugin-data/_direct/` for each
+plugin location it is given (the checkout's and the missing one).
 
 Usage:
     python3 scripts/verify/phase9_copilot_overhead.py [--model claude-haiku-4.5]
         [--repetitions 3] [--timeout 120] [--raw] [--only NAME ...]
 
-Exit code: 0 when every call passed, 1 otherwise.
+Exit code: 0 when at least one call was made and every call passed, 1
+otherwise (2 for invalid options, from argparse).
 """
 
 from __future__ import annotations
@@ -130,7 +136,7 @@ def one_call(name: str, replaced: bool, prompt: str, model: str, timeout: float)
         segments, tokens = 0, 0
     error = backend.classify_error(result)
     detected = (isinstance(error, BackendUnavailableError)
-                and str(error) == copilot_cli.NOT_REPLACED_MESSAGE)
+                and str(error).startswith(copilot_cli.NOT_REPLACED_MESSAGE))
     return {'ok': error is None if replaced else detected, 'wall': wall,
             'in': usage.input_tokens, 'out': usage.output_tokens,
             'segments': segments, 'system_tokens': tokens,
@@ -151,14 +157,21 @@ def summary_line(name: str, calls: list) -> str:
             f'({median([c["system_tokens"] for c in done]):5.0f} tokens)')
 
 
+def positive(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f'must be at least 1: {text}')
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--model', default='claude-haiku-4.5', help='Model (default: claude-haiku-4.5)')
-    parser.add_argument('--repetitions', type=int, default=3, help='Calls per configuration')
+    parser.add_argument('--repetitions', type=positive, default=3, help='Calls per configuration')
     parser.add_argument('--timeout', type=float, default=120, help='Seconds per call')
     parser.add_argument('--raw', action='store_true', help='Also print every call')
-    parser.add_argument('--only', nargs='*', default=None,
-                        help='Run only these configurations (names as printed)')
+    parser.add_argument('--only', nargs='+', choices=[name for name, _, _ in CONFIGS],
+                        metavar='NAME', help='Run only these configurations (names as printed)')
     args = parser.parse_args(argv)
     configs = [c for c in CONFIGS if args.only is None or c[0] in args.only]
     prompts = {long: prompt_text(long) for long in (False, True)}
@@ -177,7 +190,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f'  {rep} {name:<18} {verdict} {call["error"]} {detail}'.rstrip(), flush=True)
     for name, _, _ in configs:
         print(summary_line(name, calls[name]))
-    return 0 if all(c['ok'] for cs in calls.values() for c in cs) else 1
+    made = [c for cs in calls.values() for c in cs]
+    return 0 if made and all(c['ok'] for c in made) else 1
 
 
 if __name__ == '__main__':
