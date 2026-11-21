@@ -146,6 +146,8 @@ class TranslationTask:
     resume_at: float | None = None
     # Coordinator ticks so far (tests wait for ticks instead of sleeping)
     ticks: int = 0
+    # A pause asks the coordinator to save at its next tick
+    flush_due: bool = False
     # The coordinator's saver while it runs (the export flushes it)
     saver: DebouncedSaver | None = field(default=None, repr=False)
 
@@ -367,6 +369,7 @@ class TaskManager:
                 return False
             task.state = 'paused'
             task.resume_at = None
+            task.flush_due = True  # saved at the next tick, also if resumed before it
             task.pause_event.clear()
             task.cancel_event.set()  # the calls in flight end; their segments wait
         task.progress.put({'event': 'paused', 'data': {
@@ -415,6 +418,11 @@ class TaskManager:
             # can go on holding an event that nothing will set any more
             task.cancel_event.set()
             task.cancel_event = threading.Event()  # before the workers go on
+            if due is not None:  # automatic: announced before anything can pause again
+                task.progress.put({'event': 'resumed', 'data': {
+                    'completed': task.completed,
+                    'remaining': task.total - task.completed,
+                }})
             task.pause_event.set()
         return True
 
@@ -449,11 +457,11 @@ class TaskManager:
 
         def after_save(items):
             # Under the mutex, right after the save: the diagnostics of each
-            # result saved, unless its segment was edited since
-            for segment_id, outcome, revision in items:
+            # result saved, unless its segment changed since it was applied
+            # (edited, or translated again, as from the review page)
+            for segment_id, outcome, revision, status in items:
                 seg = pm._find(segment_id)
-                # (also not for a segment translated again meanwhile, as from the review page)
-                if seg.revision == revision and seg.status == outcome.status:
+                if seg.revision == revision and seg.status == status:
                     record_failure_log(log_dir, segment_id, outcome)
 
         saver = DebouncedSaver(pm, after_save, clock=self.clock)
@@ -515,10 +523,18 @@ class TaskManager:
                 # Apply the batch in memory under the mutex, so an edit
                 # cannot come between; saved by the window (_tick)
                 with pm.mutex:
-                    for res in batch:
+                    for i, res in enumerate(batch):
                         if self._apply_result(task, pm, res):
-                            saver.add((res.segment_id, res.outcome, res.revision))
-                            saver.maybe_save()  # the window, after every result
+                            # with the status it has now, for after_save
+                            saver.add((res.segment_id, res.outcome, res.revision,
+                                       pm._find(res.segment_id).status))
+                            try:
+                                saver.maybe_save()  # the window, after every result
+                            except Exception:
+                                # The rest of the batch is reported as not saved
+                                for rest in batch[i + 1:]:
+                                    task.result_queue.put(rest)
+                                raise
 
                 # Too many unexpected failures in a row: a run-level error
                 stop = None
@@ -580,9 +596,10 @@ class TaskManager:
         """Save a full or expired window, everything when the task is not
         running (paused, stopping); resume a run paused by a rate limit once
         its time has come."""
-        if task.state == 'running' and not task.stop_event.is_set():
+        if task.state == 'running' and not task.stop_event.is_set() and not task.flush_due:
             saver.maybe_save()
         else:
+            task.flush_due = False  # before the flush: a pause meanwhile asks again
             saver.flush()
         with task._lock:
             task.ticks += 1
@@ -590,12 +607,9 @@ class TaskManager:
             if task.state != 'paused' or due is None or self.clock() < due:
                 due = None
         # resume_translation checks the deadline again, under the lock
+        # (and publishes 'resumed' with the state change)
         if due is not None and self.resume_translation(task.project_name, due=due):
             logger.info("翻譯自動繼續（使用量限制的等待結束）")
-            task.progress.put({'event': 'resumed', 'data': {
-                'completed': task.completed,
-                'remaining': task.total - task.completed,
-            }})
 
     def _fail_task(self, task: TranslationTask, error: Exception,
                    saver: DebouncedSaver) -> None:
@@ -604,6 +618,7 @@ class TaskManager:
         before the caller releases the lock."""
         with task._lock:
             task.state = 'failed'
+            task.resume_at = None  # a failed run does not resume
             task.stop_event.set()
             task.cancel_event.set()
             task.pause_event.set()
@@ -696,6 +711,7 @@ class TaskManager:
         else:
             return  # paused by the user, or by an error that waits for the user
         task.state = 'paused'
+        task.flush_due = True  # saved at the next tick, also if resumed before it
         task.error = str(error)  # for a page opened later
         task.resume_at = None if delay is None else self.clock() + delay
         task.progress.put({'event': event_name, 'data': {

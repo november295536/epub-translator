@@ -9,6 +9,7 @@ from __future__ import annotations
 import atexit
 import errno
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -32,6 +33,9 @@ KILL_WAIT_SECONDS = 2
 
 # Characters of output kept from a call that timed out or was killed
 KEPT_OUTPUT_CHARS = 20000
+# An option the installed CLI does not know (an older version): no retry helps
+UNKNOWN_OPTION_PATTERN = re.compile(r'unknown option|unrecogni[sz]ed (?:option|argument)',
+                                    re.IGNORECASE)
 
 # Start errors caused by a temporary shortage of system resources
 RESOURCE_ERRNOS = (errno.EAGAIN, errno.ENOMEM, errno.EMFILE, errno.ENFILE)

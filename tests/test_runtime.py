@@ -2339,3 +2339,195 @@ class TestRound2Minor:
         assert "this.state = 'completed';\n                this.autoResume = false;" in html
         assert ('if (e.data) {  // the run failed (not a dropped connection)\n'
                 '                    this.autoResume = false;') in html
+
+
+# --- review round 3 ----------------------------------------------------------------
+
+class TestRound3:
+
+    def test_failed_retranslation_of_a_translated_segment_keeps_diagnostics(
+            self, tmp_path, fresh_tm, clock):
+        """1: a failing segment_ids run on a TRANSLATED segment (its status
+        stays) writes the diagnostics."""
+        path = _make_project(tmp_path / 'projects', n=1)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.mark_translated('c1_seg0001', '<p>舊譯</p>')
+        pm.save()
+
+        def respond(request):
+            raise LLMError('bad request')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'),
+                                              segment_ids=['c1_seg0001'])
+            task._coordinator.join(timeout=20)
+        assert _statuses(path) == [SegmentStatus.TRANSLATED]
+        assert len(os.listdir(os.path.join(path, 'log', 'failed'))) == 1
+
+    def _task_with_pm(self, tmp_path, state):
+        path = _make_project(tmp_path / 'projects', n=1)
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path / 'projects'),
+                                            state=state, total=1)
+        task.pm = ProjectManager(path)
+        task.pm.load()
+        return task
+
+    def test_failed_task_does_not_wait(self, tmp_path, fresh_tm, clock):
+        """2."""
+        task = self._task_with_pm(tmp_path, 'paused')
+        task.resume_at = clock.now + 30
+        fresh_tm._fail_task(task, RuntimeError('boom'), DebouncedSaver(task.pm))
+        assert task.state == 'failed' and task.resume_at is None
+
+    def test_resumed_event_before_the_workers_wake(self, tmp_path, fresh_tm, clock):
+        """3."""
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path), state='paused')
+        alive = threading.Event()
+        keeper = threading.Thread(target=alive.wait, daemon=True)
+        keeper.start()
+        task._coordinator = keeper
+        fresh_tm.tasks[PROJECT] = task
+        task.resume_at = clock.now
+        seen = []
+        real_set = task.pause_event.set
+
+        def set_():
+            seen.append([e['event'] for e in task.progress.get_all()])
+            real_set()
+
+        task.pause_event.set = set_
+        assert fresh_tm.resume_translation(PROJECT, due=clock.now)
+        assert seen == [['resumed']]
+        seen.clear()
+        task.state = 'paused'
+        assert fresh_tm.resume_translation(PROJECT)  # the user's: no event
+        assert seen == [['resumed']]
+        alive.set()
+        keeper.join()
+
+    def test_pause_flush_survives_a_quick_resume(self, tmp_path, fresh_tm, clock):
+        """4."""
+        task = self._task_with_pm(tmp_path, 'running')
+        alive = threading.Event()
+        keeper = threading.Thread(target=alive.wait, daemon=True)
+        keeper.start()
+        task._coordinator = keeper
+        fresh_tm.tasks[PROJECT] = task
+        calls = []
+
+        class Saver:
+            def flush(self):
+                calls.append('flush')
+
+            def maybe_save(self):
+                calls.append('maybe')
+
+        assert fresh_tm.pause_translation(PROJECT)
+        assert fresh_tm.resume_translation(PROJECT)
+        fresh_tm._tick(task, Saver())
+        fresh_tm._tick(task, Saver())
+        assert calls == ['flush', 'maybe']
+        task.state = 'running'
+        fresh_tm._pause_for(task, AuthError('x'), 'auth_error')
+        task.state = 'running'
+        fresh_tm._tick(task, Saver())
+        assert calls[-1] == 'flush'
+        alive.set()
+        keeper.join()
+
+    def test_unknown_option_is_unavailable(self):
+        """5."""
+        claude = ClaudeCLI().classify_error(
+            ProcessResult(1, '', "error: unknown option '--setting-sources'"))
+        assert type(claude) is BackendUnavailableError
+        assert str(claude) == ("claude CLI rejected an option (update it): "
+                               "error: unknown option '--setting-sources'")
+        copilot = CopilotCLI().classify_error(
+            ProcessResult(1, "error: unknown option '--no-color'", ''))
+        assert type(copilot) is BackendUnavailableError
+        assert type(ClaudeCLI().classify_error(
+            ProcessResult(1, '', 'unrecognized argument: -x'))) is BackendUnavailableError
+        assert type(ClaudeCLI().classify_error(ProcessResult(1, '', 'boom'))) is TransientError
+
+    def test_save_failing_in_a_batch_reports_the_rest(self, tmp_path, fresh_tm, clock,
+                                                       monkeypatch):
+        """6."""
+        import src.core.runcontrol as runcontrol
+        _make_project(tmp_path / 'projects', n=5)
+        real_done = tasks_module.TaskManager._workers_done
+        held = []
+
+        def done(self, task):
+            if not held:
+                held.append(1)
+                _wait(lambda: task.result_queue.qsize() >= 4)
+            return real_done(self, task)
+
+        monkeypatch.setattr(tasks_module.TaskManager, '_workers_done', done)
+        real_maybe = runcontrol.DebouncedSaver.maybe_save
+
+        def maybe_save(self):
+            if len(self.pending) == 2:
+                raise OSError('disk full')
+            return real_maybe(self)
+
+        monkeypatch.setattr(runcontrol.DebouncedSaver, 'maybe_save', maybe_save)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            task._coordinator.join(timeout=20)
+        assert task.state == 'failed'
+        event = task.progress.get_all()[-1]
+        assert event['event'] == 'error' and len(event['data']['unsaved']) == 3
+
+    def test_cli_second_interrupt_during_the_join_still_saves(self, tmp_path, monkeypatch):
+        """7 (parallel)."""
+        import src.core.runcontrol as runcontrol
+        path = _make_project(tmp_path, n=2)
+        forced = []
+        real_flush = runcontrol.DebouncedSaver.flush
+        monkeypatch.setattr(runcontrol.DebouncedSaver, 'flush', lambda self, force=False: (
+            forced.append(force), real_flush(self, force))[1])
+        real_apply = ProjectManager.apply_outcome
+        interrupted = []
+
+        def apply(self, *a, **kw):
+            if not interrupted:
+                interrupted.append(1)
+                raise KeyboardInterrupt  # the first Ctrl-C
+            return real_apply(self, *a, **kw)
+
+        monkeypatch.setattr(ProjectManager, 'apply_outcome', apply)
+        real_join = threading.Thread.join
+        joins = []
+
+        def join(self, *a, **kw):
+            if interrupted and not joins:
+                joins.append(1)
+                raise KeyboardInterrupt  # the second, during the join
+            return real_join(self, *a, **kw)
+
+        monkeypatch.setattr(threading.Thread, 'join', join)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            result = CliRunner().invoke(translate.cli, ['start', '--project', path,
+                                                        '--workers', '2'])
+        assert result.exit_code == 1 and joins
+        assert True in forced
+
+    def test_cli_sequential_failed_final_save_is_reported(self, tmp_path, monkeypatch):
+        """7 (sequential)."""
+        import src.core.runcontrol as runcontrol
+        path = _make_project(tmp_path, n=2)
+        real_flush = runcontrol.DebouncedSaver.flush
+
+        def flush(self, force=False):
+            if force:
+                raise OSError('disk full')
+            return real_flush(self, force)
+
+        monkeypatch.setattr(runcontrol.DebouncedSaver, 'flush', flush)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            result = CliRunner().invoke(translate.cli, ['start', '--project', path])
+        assert result.exit_code == 1
+        assert ('未儲存的結果（2 個段落，下次 start 會重新翻譯）：c1_seg0001, c1_seg0002'
+                in result.output)
