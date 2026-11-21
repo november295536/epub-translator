@@ -131,8 +131,8 @@ def readable(markup: str) -> str:
     (validation.plain_text: parsed, tags, script and style removed, entities
     decoded). The page shows text only, so nothing of the book is run or
     loaded by the browser. Markup that does not parse is shown as it is."""
-    units = validation.top_level_units(markup) or [(0, len(markup), False)]  # none: as one
-    lines = (' '.join(validation.plain_text(markup[start:end]).split()) for start, end, _ in units)
+    units = [unit[:2] for unit in validation.top_level_units(markup)] or [(0, len(markup))]
+    lines = (' '.join(validation.plain_text(markup[start:end]).split()) for start, end in units)
     return html.escape('\n'.join(line for line in lines if line))
 
 
