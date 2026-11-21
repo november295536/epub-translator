@@ -5010,3 +5010,112 @@ equivalent:
 | `_tick` 8 (`flush_due = None` for `False`) | the flag is only read as `not task.flush_due`; `None` is false like `False` |
 | `_tick` 21 (`due = ""` for `None`) | round 1's `_tick` 17 under its new number: `resume_translation(due="")` refuses it |
 | `classify_error` 1, overhead `main` 65, `median` 6, `prompt_text` 2–9, 20 | as in rounds 1 and 2 |
+
+## Phase 7 — part A, review round 4
+
+Date: 2026-11-21. All three reviewers approved round 3. This is one last small pass before
+the merge; each fix has a test that fails without it (checked by reverting each fix alone).
+
+### Changes
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| 1 | `test_save_failing_in_a_batch_reports_the_rest` depended on scheduling: under load the coordinator's batches differed, and calls cancelled by the failure reported fewer unsaved segments (seen once by the orchestrator: 1 failure, 2329 passed) | the test fixes its batches: every call after the first waits until the first result has been applied alone; the coordinator is then held until the other four are queued, so they form one batch; the exact unsaved list is asserted | the same test. The other tests added in this phase were checked for the same pattern; the throughput tests that asserted no `phase7-throughput-*` directory anywhere in the system temp directory (which another suite running at the same time can have) now check only the directory they made. The repeated runs below found two more, older tests made racy by this round's item 2: `TestRound3UnexpectedStreakWeb::test_run_stops_after_five` and `TestRound4StreakKeepsInFlightResults::test_good_result_after_streak_saved` in `test_web.py` need a sixth call in flight when the failure streak stops the run, and a worker now makes no call once the run is stopping. Under load the stop sometimes came first (1 failure each in 6 runs). Both now hold the streak's stop until the sixth call has started. `TestRound1BackoffInterrupted::test_engine` now becomes interrupted after the first call, since no call is made at all when interrupted before it |
+| 2 | feedback retries and split calls went to `backend.complete` while the parallel CLI gate was closed or the web run paused | `_Session.call` checks `interrupted` before every call and raises `CancelledError` (the segment goes back) | `TestPhase7Round4Interrupted` in `test_translator.py` (a feedback call and a split call not made once interrupted; uninterrupted unchanged) |
+| 3 | the page's `paused` listener did nothing and `resumed` set running unconditionally: a reordered or second-tab event showed the wrong state | both refresh from the status (`fetchStatus(false)`, which sets state, error and `autoResume` without reconnecting the stream) | `test_page_takes_the_server_state_on_paused_and_resumed` |
+| 4 | sequential CLI: "已完成的進度已儲存" was printed before the forced flush | a run-level stop inside the loop (`_RunStopped`) is reported after the `finally` saved; a failing save prints the unsaved segments and not that line | `test_cli_saved_message_only_after_the_save`, `test_cli_saved_message_after_a_good_save` |
+| 5 | an `after_save` that raised after a successful save made the save look failed | logged; the save stands (only diagnostics are lost) | `test_after_save_error_is_logged` |
+
+### Settled / known limitations (not done, as decided)
+
+- Copilot error text: only e-mail-like strings are redacted; other login names that the CLI
+  may print are not.
+- A second Ctrl-C in the throughput script can race the removal of its copy (the copy may
+  then be left in the system temp directory).
+
+### Repeated suites under load
+
+Six full suites, three times two at once on the same machine (`-p no:cacheprovider`):
+
+- First series, after the round's fixes: 4 of 6 runs passed. The other two failed once
+  each, in the two failure-streak tests named under item 1 (`2336 passed, 1 failed`). Two
+  further failures, in every run, were tests this round's changes had broken:
+  `TestRound1BackoffInterrupted::test_engine` and a page-source slice in `test_web.py`
+  (`async fetchStatus()` renamed). All four tests were corrected.
+- Second series, after the corrections: 6 of 6 runs passed, 2337 tests each, no failure.
+
+### Checks
+
+Before and after: `stat -f '%m %z' <repo>/projects/*/project.json | md5` =
+`a7197555c962562a530d6de80fa045af`, unchanged. The four older read-only checks: TOTAL lines
+identical to round 1 (md5 of the four lines the same).
+
+### Tests
+
+2356 passed (round 3: 2330). Changed existing tests:
+- `TestRound1BackoffInterrupted::test_engine`: becomes interrupted after the first call, since
+  no call is made at all when interrupted before it (item 2).
+- The page-source slice in `test_web.py` ends at `async fetchStatus(connect = true)` (item 3).
+- `test_save_failing_in_a_batch_reports_the_rest` and the two failure-streak tests are now
+  deterministic (item 1).
+- The two throughput tests check only the directory they made (item 1).
+- `TestRound1ParallelCliGate::test_gate` also requires the pause to be announced exactly once
+  and `繼續翻譯` on a line of its own.
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`:
+
+| Run | Mutants | Killed | Survived | Timeout |
+|---|---|---|---|---|
+| 1 (after the fixes) | 1804 | 1580 | 209 | 15 |
+| 2 (the same commit again, no other load) | 1804 | 1586 | 208 | 10 |
+| 3 (after the survivor tests) | 1795 | 1724 | 62 | 9 |
+| 4 (final) | 1795 | 1732 | 54 | 9 |
+
+**Earlier mutation counts were too high.** Up to round 3, `TestThroughputScript::test_measures_a_copy`
+asserted that no `phase7-throughput-*` directory existed anywhere in the system temporary
+directory. mutmut runs many mutants at once, and their copies of that test made such
+directories at the same time. So the test failed for reasons unrelated to the mutant and
+"killed" every mutant linked to it: the throughput script's, and those of `translate.py` and
+`translator.py` that the measurement runs. With item 1's correction (the test checks only
+its own directory), runs 1 and 2 showed about 195 survivors that earlier rounds had counted
+as killed. The flaky failure-streak tests in `test_web.py` had the same effect on a smaller
+scale. Rounds 1–3's mutation tables above are therefore too optimistic for those three
+files; this round's numbers are the first reliable ones for them.
+
+Run 3's tests cover them: the script's help text, required options, defaults and types, the
+exact report lines (arithmetic, defaults, split detection), `prepare`, `snapshot`,
+`in_work_tree`, `Recorder`, `CountingBackend`, the error messages without a path, the
+temporary directory's arguments, a fake clock for the wall and call times, the logging
+handler removed, the copy's backend, `--backend` reaching the run, warnings not counted as
+failures, and the exit code for unfinished segments. In the CLI they cover: a second pause
+announced again, the announcement made once, the project's backend in parallel runs, the
+`使用模型` line, queued results saved at Ctrl-C with their diagnostics, and the sequential
+window on the injected clock. They also cover the `CancelledError` messages, the backoff
+wait getting `interrupted`, and the save count. Two changes simplify the code: the pause
+record starts empty, and `_RunStopped` carries its error in `args`.
+
+Timeouts count as detected (inverted gates and waits). The 54 survivors of run 4, all
+equivalent or not reachable in a test process:
+
+| Mutants | Why |
+|---|---|
+| `classify_error` 1, `_tick` 8 and 21, overhead `main` 65, `median` 6, `prompt_text` 2–9, 20 | as in rounds 1–3 |
+| `_worker_loop` 4 (`and` for `or` in the re-check after `get()`) | since item 2 the engine raises `CancelledError` before any call while paused, so the segment is put back either way |
+| `_start_parallel` 19 (gate poll 1.5 s for 0.5 s) | only how often a waiting worker looks at the gate |
+| `_start_parallel` 23, 27 (`continue` → `break` after putting a segment back) | that worker ends; the worker that hit the rate limit always goes on, so the run completes with fewer workers |
+| `_start_parallel` 24 (`and` for `or`), 25, 32 (`break` → `return`) | with `error_event` set the loop ends at its next check; nothing follows the loop in the worker |
+| `_start_parallel` 35, throughput `prepare` 12 (`None` for `False`) | read only as `not …`: `None` is false like `False` |
+| throughput `in_work_tree` 10 (`.GIT`) | this machine's file system ignores case |
+| throughput `main` 75 (no `default=None`) | argparse's default is `None` |
+| throughput `measure` 49, 52, 55, 63–67 | the `--code` path: in a test process `src` is already imported, so another checkout's code only takes effect in a new process (tested there, not linked by mutmut) |
+| throughput `measure` 85, `run` 27 (migration) | only for a project of the old schema; invented projects cannot be migrated back without real old data |
+| throughput `run` 21, 22, 118, 119 (`redirect_*(None)`) | `print` and `click.echo` write nothing when the stream is `None`: output suppressed as before |
+| throughput `run` 121, 123, 124 (`standalone_mode`) | `SystemExit` is caught around the call; `None` is false like `False` |
+| throughput `run` 135, 137, 143 (encoding) | the locale is UTF-8 here; `UTF-8` is the same codec |
+| throughput `run` 152, 154, 157, 158 (status default) | every stored segment has a status |
+| throughput `run` 55, 58 | the `getattr` default and the `else` branch serve the code of `main` only (no `backend_for`): reachable with `--code` in a new process |
+| throughput `run` 6 (`str(None)`) | only the copy directory's name |
+| throughput `run` 72 (`""` for `None`) | no call is made outside a segment |
+| throughput `run` 83 (`is None`) | the counting backend already wraps the backend `--backend` names, so whether `--backend` is also passed on does not change where the calls go |
