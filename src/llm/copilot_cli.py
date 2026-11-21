@@ -20,11 +20,26 @@ prompts (plan/03-acceptance-log.md, Phase 7 part A):
 
 Only error messages and stderr are searched, never the reply itself, so a
 translation that mentions a rate limit is never taken for one.
+
+System prompt (Phase 9, plan/03-acceptance-log.md): the CLI has no flag for
+it, but an extension can replace it. `--experimental --plugin-dir
+PLUGIN_DIR` loads the plugin kept next to this module; its extension reads
+the prompt from SYSTEM_PROMPT_ENV, which `environment()` sets to the one
+SYSTEM_PROMPT of every CLI backend. An extension that does not load is
+silent (exit 0, the full built-in prompt of about 2000 tokens is sent), so
+every successful run is checked: the usage checkpoint lists the system
+prompt segments sent with each model call (`promptCacheBreakState[].models.
+<model>.system_segments`), and with the replacement in effect that is one
+segment named REPLACED_SEGMENT (the built-in prompt is 18 segments). A run
+without that report, or with any other segment, raises
+BackendUnavailableError: the run stops instead of paying for the full prompt
+on every call. The report does not depend on the prompt's length.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import List, Optional
 
@@ -32,7 +47,9 @@ from src.llm.base import (
     AuthError, BackendUnavailableError, Capabilities, LLMError, LLMRequest,
     LLMResponse, ModelInfo, RateLimitError, RefusalError, TransientError, Usage,
 )
-from src.llm.cli import ERROR_CHARS, UNKNOWN_OPTION_PATTERN, CLIBackend, ProcessResult, _text
+from src.llm.cli import (
+    ERROR_CHARS, SYSTEM_PROMPT, UNKNOWN_OPTION_PATTERN, CLIBackend, ProcessResult, _text,
+)
 
 # From the account's model catalog when this backend was written; the
 # multiplier is what Copilot counts per request
@@ -48,6 +65,16 @@ AUTH_HINT = '請在終端執行 copilot login 重新登入'
 # No tool for the model: an unknown tool name leaves none available
 # (`--available-tools` with no name keeps all of them)
 NO_TOOLS = 'none'
+
+# The plugin whose extension replaces the system prompt, and the variable
+# it reads the prompt from
+PLUGIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'copilot_plugin')
+SYSTEM_PROMPT_ENV = 'EPUB_TRANSLATOR_SYSTEM_PROMPT'
+# The one system prompt segment the CLI reports when an extension replaced it
+REPLACED_SEGMENT = 'agent_replacement'
+NOT_REPLACED_MESSAGE = (
+    'Copilot CLI 沒有套用翻譯用的系統提示（擴充功能未載入），為免每次呼叫都送出完整的內建提示，'
+    f'已停止。請確認 copilot 版本支援 --experimental 與 --plugin-dir，且外掛資料夾存在：{PLUGIN_DIR}')
 
 # Every documented message says "rate limit" ("Rate limited." too)
 _RATE_LIMIT_PATTERN = re.compile(r'rate.?limit', re.IGNORECASE)
@@ -105,6 +132,27 @@ def _usage(events: list) -> Optional[Usage]:
         return None
 
 
+def _replaced(events: list) -> bool:
+    """Whether the run reported its system prompt segments and every model
+    call was sent only the replacement."""
+    calls = []
+    for event in events:
+        if event.get('type') != 'session.usage_checkpoint':
+            continue
+        try:
+            for state in _data(event)['promptCacheBreakState']:
+                for model in state['models'].values():
+                    calls.append([s['segment'] for s in model['system_segments']])
+        except (AttributeError, KeyError, TypeError):
+            return False
+    return bool(calls) and all(c == [REPLACED_SEGMENT] for c in calls)
+
+
+def _replacement_error(events: list) -> Optional[LLMError]:
+    """None when the system prompt was replaced, else the error that stops the run."""
+    return None if _replaced(events) else BackendUnavailableError(NOT_REPLACED_MESSAGE)
+
+
 def _reply(events: list) -> str:
     """The content of the last `assistant.message` event ('' when none)."""
     messages = [e for e in events if e.get('type') == 'assistant.message']
@@ -129,7 +177,10 @@ class CopilotCLI(CLIBackend):
             cmd += ['--model', request.model]
         return cmd + ['--output-format', 'json', '--available-tools', NO_TOOLS,
                       '--no-custom-instructions', '--disable-builtin-mcps', '--no-ask-user',
-                      '--no-auto-update']
+                      '--no-auto-update', '--experimental', '--plugin-dir', PLUGIN_DIR]
+
+    def environment(self) -> dict:
+        return {**super().environment(), SYSTEM_PROMPT_ENV: SYSTEM_PROMPT}
 
     def parse_output(self, result: ProcessResult, request: LLMRequest) -> LLMResponse:
         events = _events(result.stdout)
@@ -153,7 +204,7 @@ class CopilotCLI(CLIBackend):
                 texts.insert(0, redact(plain))
         joined = ' | '.join(texts)[:ERROR_CHARS]
         if result.returncode == 0 and not errors:
-            return None
+            return _replacement_error(events)
         # A successful run with a reply fails only for a rate limit or
         # expired credentials; any other error event beside the reply is ignored
         answered = result.returncode == 0 and bool(_reply(events))
@@ -168,5 +219,5 @@ class CopilotCLI(CLIBackend):
                     return AuthError(f'Copilot CLI 認證失敗，{AUTH_HINT}：{joined}')
                 return cls(f'copilot CLI: {joined}')
         if answered:
-            return None
+            return _replacement_error(events)
         return TransientError(f'copilot CLI exited with code {result.returncode}: {joined}')
