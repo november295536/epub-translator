@@ -5148,3 +5148,130 @@ The coordinator's join is a product change, so the mutation run was repeated
 The new lines' mutants were all killed. The survivors are round 4's final list without
 `_start_parallel` 32 (`break` → `return` after an auth stop), which is now killed. The
 reasons are the ones given in round 4.
+
+### Second pass: mechanisms
+
+The orchestrator's own 12-run series (three at once) on the commit above: 10 clean, 2 runs
+with one failure each. Each failure below gives its interleaving, a forced reproduction (a
+temporary test, not committed, that holds one thread at the exact point and fails every
+time), the decision and the fix. The same write-up is given for the first pass's three
+failures.
+
+**1. `TestCoordinatorFailure::test_save_failure_wakes_paused_worker`**: coordinator alive
+after 20 s; the only log line is `[W1] rate_limit, pausing: limit`.
+
+- Interleaving: two workers, queue `[ch1_seg0003, ch2_seg0001]`.
+  1. Worker A takes ch1_seg0003, but has not reached its call yet.
+  2. Worker B takes ch2_seg0001, gets `RateLimitError` at once and runs `_pause_for`,
+     `pause_event.clear()` and `cancel_event.set()` (round 2 item 1).
+  3. Worker A arrives in `_Session.call`, finds `engine.interrupted()` true (round 4 item 2)
+     and raises `CancelledError` without a call. It puts its segment back and waits at the
+     top of its loop on `pause_event.wait()`.
+  4. The coordinator ticks: the state is paused, so `saver.flush()` runs, but nothing is
+     pending and it returns without saving. The mocked failing `save` is never called, so
+     there is no failure. `_workers_done` is false (two workers in their loops).
+  5. The run correctly waits for its automatic resume in 300 s. The test's `paused.set()`
+     releases a call that never started, and `_finish` times out.
+- Forced: worker A held at `translate_segment` until the state is paused. The e967fd2 test
+  body then failed 5 of 5 times with "coordinator did not end". State paused, both segments
+  queued, nothing pending, events `['rate_limit']`: the same picture as the failing run. A
+  stop then ends it at once.
+- Decision: **test**. No thread is blocked; the product does what a paused run should. The
+  test assumed worker A's call was in flight before worker B's rate limit.
+- Fix: the rate limit is raised only once the other call is in flight. With worker A held as
+  late as the new test allows (until worker B's call has started), it passed 5 of 5.
+
+**2. `TestTimeoutKeepsOutput::test_output_kept_is_bounded`**: `output == ''`.
+
+- Interleaving: `run_process` sets `deadline = monotonic() + 1` before the child exists. The
+  child interpreter is still starting (not yet at its `print`) when `communicate(timeout=…)`
+  last times out after the deadline. `run_process` then raises `TimeoutExpired`, and
+  `_kill_group` kills the group and collects stdout and stderr: nothing had been written, so
+  both are empty.
+- Forced: the e967fd2 body with a child that sleeps 1.5 s before writing (as a start slowed
+  by load) failed 5 of 5 times with `'' == 'x' * 20000`.
+- Decision: **test**. `run_process` keeps everything written before the kill. `communicate()`
+  keeps what it has read across its timeouts, and `_kill_group` drains the pipes after the
+  kill. The new form shows this even with the 1.5 s slow start (3 of 3).
+- Fix: both timeout tests replace `run_process`'s clock. It stands still until the child,
+  after writing and flushing, creates a `ready` file, and is past every deadline after.
+
+**First pass, retroactively:**
+
+- `TestStopKillsCallInFlight::test_stop` (**product**, fixed in ad61da8):
+  - A worker runs `active_workers -= 1` in its `finally` and is then still executing as a
+    thread.
+  - The coordinator's `_workers_done` sees 0 and the coordinator ends.
+  - The test's `threads_alive()` sees the worker thread.
+  - Forced by `TestPreMergeRunEndsWithItsThreads`: a worker lingers after its loop; it fails
+    without the join.
+- `TestRound3StaleResultInFailureDrain::test_edited_in_flight_segment_not_unsaved` (**test**):
+  - Worker B has taken ch2_seg0001 but not called yet.
+  - Worker A's ch1_seg0003 result arrives. With a window of one, `maybe_save` raises and
+    `_fail_task` sets stop and cancel.
+  - Worker B's `interrupted` check raises `CancelledError`, so there is no call, and the
+    test's `in_flight.wait(10)` returns false.
+  - Forced: worker B held at `translate_segment` until the state is failed; failed 3 of 3.
+- `TestRound2WindowInBatches::test_web` (**test**):
+  - The coordinator's first batch took 16 or more results.
+  - The hook after it waited for 45 queued results while at most 44 remained.
+  - The 20 s condition wait expired, so the coordinator failed.
+  - Forced: the coordinator's first `get` held until 16 results were queued; the e967fd2 body
+    failed every time ("timed out waiting", state failed).
+
+**Classes of cause, and where else they were looked for (by reading):**
+
+- **A. A test assumes thread A reaches X (its call in flight, a coordinator step) before
+  thread B reaches Y (a pause, a stop, a failure, a number of results).** Behind
+  `test_save_failure_wakes_paused_worker`, the stale-drain test, the window-batch test,
+  round 4's batch-failure test and the two streak tests. Round 4 item 2 (no call once paused
+  or stopped) widened the window for every test of this kind. Checked:
+  - every test in `test_web.py`, `test_runtime.py` and `test_cli.py` that starts a web task
+    with 2 or more workers or the CLI with `--workers` 2 or more;
+  - in `test_web.py`: `test_multi_worker_completes_all_segments`,
+    `test_rate_limit_pauses_all_workers`,
+    `test_save_failure_joins_workers_and_reports_unsaved`, `test_unwritable_failure_log`,
+    `test_unexpected_exception`, `test_failure_report_lists_several_ids` (a barrier), the
+    thread-start failure test (events), and the fixed ones;
+  - in `test_cli.py`: `test_parallel_output`, `test_parallel_counts_continue_from_translated`,
+    `test_failed_left_over_message`, `TestCLISupervisorFailure::test_save_failure`,
+    `test_workers_are_daemons`, `test_slow_result_still_applied`,
+    `test_supervisor_failure_output` (a barrier), the second-start failure test, and the
+    streak test `test_parallel`;
+  - every `TestRound*` CLI and web test in `test_runtime.py` (barriers, events, a counting
+    clock, `task.ticks`).
+
+  No other instance was found. The CLI tests `test_save_failure` and the second-start test
+  keep a call in flight with a sleep, but their assertions hold whether the call is still in
+  flight or not (the save fails at the end in every order; the stop message is printed in
+  every order). There the sleep only makes the scenario likely.
+- **B. A fixed time bound stands in for a condition.** Behind the two `run_process` timeout
+  tests (1 s had to cover the child's start and its writing) and round 4's pause test (the
+  segment back in the queue at once). Checked: every time bound in this phase's tests and in
+  the older tests touched by it. The remaining bounds are upper limits on condition waits
+  (`_wait`, `Event.wait`, `join(timeout=…)`) that are met within milliseconds. Two
+  exceptions are harmless: `test_rate_limit_pauses_all_workers` (`join(5)` always waits the
+  5 s, then checks a state reached in milliseconds) and `test_slow_result_still_applied`
+  (passes in every order).
+- **C. A count is lowered before the thread ends.** Behind `test_stop` (product). Checked
+  every place that treats a count or a flag as "the thread has ended":
+  - web: `_workers_done` (now followed by the join), `_fail_task` (joins), the dynamic
+    reduction (the thread returns right after), `threads_alive` (uses `is_alive`);
+  - CLI parallel: the main loop and its shutdown use `t.is_alive()` and `join()`, not a count.
+
+  No other instance was found.
+
+No product code changed in this pass, so the mutation run was not repeated.
+
+Targeted runs, before the emphasis moved to the mechanisms (confirmation only). The six
+tests (the two above, the two timeout tests, the three of the first pass) were run in three
+loops at once:
+- 201 runs on an otherwise idle machine: all passed.
+- 201 more during a full-suite series: 197 runs ended with a passed summary. In 4 runs the
+  last output line was a `warnings.warn(` line, and their output was not kept (the loop kept
+  only runs with "failed"), so their result is not known.
+- 90 more runs with every output kept: all passed. The warning did not appear again.
+
+Confirmation series, after the mechanisms were forced and fixed: the full suite 12 times,
+four series of three at once (`-rf`, every run's tail kept): **12 of 12 passed, 2357 tests
+each, no failure**.
