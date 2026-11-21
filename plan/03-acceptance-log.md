@@ -5639,3 +5639,33 @@ truth, so `None` saves as little as `False`).
 ### Not verified
 
 - In a browser: the add form (B), the single `init()` (F) and the brief text area of round 1 (H); only the rendered pages were checked.
+
+## Phase 8 — review round 3
+
+Date: 2026-11-22. Opus and Gemini approved, GPT requested changes; a final small pass on the
+accepted items, each checked against the code first (all real).
+
+| Item | Fix | Test |
+|---|---|---|
+| 1. Add form wiped stored person fields left empty | the add form sends `gender` / `note` only for a person and only when filled in; clearing them is done in the edit row | `TestRound3::test_add_form_sends_only_filled_person_fields` (and the round 2 form test updated) |
+| 2. One line also on load and import | the shared entry builder `_entries` (used by `load()` and `import_json`) applies `_one_line` to `gender` and `note` | `test_loaded_and_imported_person_fields_one_line` |
+| 3. Old brief error left visible | the brief has its own `briefError`, shown next to its save button and cleared by a successful save; the task error (`error`) is no longer used for it | `test_brief_error_is_its_own_and_cleared_on_success` (rendered page) |
+| 4. Report text at breaks and cells | a space after `<br/>` and after `</td>` / `</th>` before the text is taken; still one line per top-level block | `TestPhase8Round3Scripts::test_readable_spaces_at_breaks_and_cells`; the round 1 `readable` expectation is now `One two three` |
+| 5. "No batch proposed a term" | counts only proposals whose term and translation are non-blank text (`usable`) | `test_no_usable_proposal_fails`, `test_usable` |
+
+Rejected (considered, not done):
+
+- GPT 1 (an atomic load–modify–save across glossary writers, for example a batch delete at the
+  instant extraction saves): a single owner, a window of milliseconds now that extraction saves
+  once, and this race between glossary writers predates the phase.
+- GPT 3 (text after a closing fence on the same line): not a realistic reply.
+
+Mutation (`scripts/verify/mutation.sh main`, parallel): 1336 mutants, 1330 killed, 6 survived,
+0 timeout. The six are the equivalent ones recorded in round 2 (`translate_segment` 4,
+`_candidate_line` 2, extraction `run` 84, `main` 61 and 87, `import_json` 9).
+
+Checks: three suites at once, 2545 passed each, no failure (no test removed; the two changed
+expectations are named above); the four older check scripts give the same TOTAL lines; the
+projects fingerprint is `a7197555c962562a530d6de80fa045af`. No real model call.
+
+Not verified: items 1 and 3 in a browser (rendered pages only).
