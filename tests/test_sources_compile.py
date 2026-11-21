@@ -10,22 +10,38 @@ import warnings
 
 import pytest
 
+import src.llm as llm  # the package, found as the mutation runner renames it
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PACKAGE = os.path.dirname(os.path.dirname(os.path.abspath(llm.__file__)))
+
+
+def _skipped(folder, name):
+    return (name.startswith('.') or name == '__pycache__'
+            or os.path.exists(os.path.join(folder, name, 'pyvenv.cfg')))  # a virtualenv
 
 
 def _sources():
-    paths = [os.path.join(ROOT, 'translate.py')]
-    for top in ('src', 'scripts', 'tests'):
-        for folder, dirs, files in os.walk(os.path.join(ROOT, top)):
-            dirs[:] = [d for d in dirs if d != '__pycache__']
-            paths += [os.path.join(folder, f) for f in files if f.endswith('.py')]
-    return sorted(paths)
+    """Every .py file under the repository root and the package (the same
+    folder in a checkout), without hidden folders, bytecode and virtualenvs."""
+    found = set()
+    for top in (ROOT, PACKAGE):
+        for folder, dirs, files in os.walk(top):
+            dirs[:] = [d for d in dirs if not _skipped(folder, d)]
+            found.update(os.path.join(folder, f) for f in files if f.endswith('.py'))
+    return sorted(found)
 
 
-def test_sources_found():
-    names = {os.path.relpath(p, ROOT) for p in _sources()}
-    assert 'translate.py' in names and len(names) > 50
-    assert os.path.join('tests', 'test_sources_compile.py') in names
+def test_known_sources_found():
+    sources = _sources()
+    for path in (os.path.join(ROOT, 'translate.py'), os.path.abspath(__file__),
+                 os.path.join(ROOT, 'scripts', 'verify', 'mutation.py'),
+                 os.path.join(PACKAGE, 'llm', 'copilot_cli.py'),
+                 os.path.join(PACKAGE, 'glossary', 'glossary_manager.py')):
+        assert path in sources, path
+    experiment = os.path.join(ROOT, 'plan', 'experiments', 'migrate_dryrun.py')
+    if os.path.isdir(os.path.join(ROOT, 'plan')):  # not in the mutation runner's copy
+        assert experiment in sources
 
 
 @pytest.mark.parametrize('path', _sources(), ids=lambda p: os.path.relpath(p, ROOT))

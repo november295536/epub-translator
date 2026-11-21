@@ -128,13 +128,14 @@ def one_call(name: str, replaced: bool, prompt: str, model: str, timeout: float)
     wall = time.monotonic() - start
     events = copilot_cli._events(result.stdout)
     usage = copilot_cli._usage(events)
+    error = backend.classify_error(result)
     if usage is None:
-        return {'ok': False, 'error': f'no usage in the output (exit {result.returncode})'}
+        found = type(error).__name__ if error else 'no error'
+        return {'ok': False, 'error': f'no usage in the output (exit {result.returncode}, {found})'}
     try:
         segments, tokens = system_segments(events)
     except (KeyError, TypeError, AttributeError):
         segments, tokens = 0, 0
-    error = backend.classify_error(result)
     detected = (isinstance(error, BackendUnavailableError)
                 and str(error).startswith(copilot_cli.NOT_REPLACED_MESSAGE))
     return {'ok': error is None if replaced else detected, 'wall': wall,
