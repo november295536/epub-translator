@@ -7,7 +7,8 @@ import os
 from flask import Blueprint, Response, jsonify, request, current_app
 
 from src.core.project import ProjectLockedError, ProjectManager
-from src.core.translator import available_models
+import src.llm as llm
+from src.core.translator import available_backends, available_models
 from src.web.tasks import TaskManager
 
 
@@ -179,9 +180,12 @@ def get_model(project_name: str):
     except Exception as e:
         return jsonify({'error': str(e)}), 404
 
+    backend = pm.data.backend or llm.default_backend().name
     return jsonify({
         'current': pm.data.model,
-        'available': available_models(),
+        'available': available_models(pm.data.backend),  # of the project's backend
+        'backend': backend,
+        'backends': available_backends(),
     })
 
 
@@ -195,16 +199,22 @@ def set_model(project_name: str):
         return jsonify({'error': '未提供模型名稱'}), 400
 
     model = data['model']
-    valid_aliases = [m['alias'] for m in available_models()]
-    if model not in valid_aliases:
-        return jsonify({'error': f'無效的模型：{model}，可用模型：{", ".join(valid_aliases)}'}), 400
+    backend = data.get('backend')  # None: the project's backend stays
+    if backend is not None and backend not in llm.BACKENDS:
+        return jsonify({'error': f'無效的後端：{backend}'}), 400
 
     tm = _get_task_manager()
     try:
         with tm.transaction(project_name, projects_dir) as pm:
-            pm.set_model(model)
+            chosen = backend if backend is not None else pm.data.backend
+            valid_aliases = [m['alias'] for m in available_models(chosen)]
+            if model not in valid_aliases:
+                return jsonify({'error': f'無效的模型：{model}，'
+                                         f'可用模型：{", ".join(valid_aliases)}'}), 400
+            pm.set_model(model, backend=backend)
             pm.save()
+            chosen = pm.data.backend or llm.default_backend().name
     except (FileNotFoundError, ValueError) as e:
         return jsonify({'error': str(e)}), 404
 
-    return jsonify({'status': 'ok', 'model': model})
+    return jsonify({'status': 'ok', 'model': model, 'backend': chosen})

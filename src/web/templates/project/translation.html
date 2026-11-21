@@ -39,9 +39,9 @@
                             :disabled="modelLoading"
                             @change="setModel($event.target.value)"
                             style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
-                        <template x-for="m in availableModels" :key="m.alias">
-                            <option :value="m.alias" :selected="m.alias === model"
-                                    x-text="m.label + ' — ' + m.description"></option>
+                        <template x-for="m in availableModels" :key="m.key">
+                            <option :value="m.key" :selected="m.key === modelKey()"
+                                    x-text="m.backend + '：' + m.label + ' — ' + m.description"></option>
                         </template>
                     </select>
                     <span x-show="modelLoading" class="spinner" style="margin-left: 0.5rem;"></span>
@@ -143,6 +143,7 @@ function translationController() {
         eventSource: null,
         logCounter: 0,
         model: '',
+        backend: '',
         failedCount: {{ progress.failed }},
         availableModels: [],
         modelLoading: false,
@@ -172,12 +173,18 @@ function translationController() {
             try {
                 const res = await fetch('/api/projects/{{ project_name }}/model');
                 const data = await res.json();
-                this.availableModels = data.available;
                 this.model = data.current;
+                this.backend = data.backend;
+                // Every backend's models; the project's backend first
+                const lists = (data.backends || []).filter(b => b.name !== data.backend);
+                lists.unshift({ name: data.backend, models: data.available });
+                this.availableModels = lists.flatMap(b => b.models.map(m => ({
+                    ...m, backend: b.name, key: b.name + '/' + m.alias })));
                 // A stored model the backend does not list: shown as it is,
                 // changed only when another one is picked
-                if (!this.availableModels.some(m => m.alias === this.model)) {
-                    this.availableModels = [{ alias: this.model, label: this.model, description: '目前設定，後端未列出' },
+                if (!this.availableModels.some(m => m.key === this.modelKey())) {
+                    this.availableModels = [{ alias: this.model, label: this.model, description: '目前設定，後端未列出',
+                                              backend: this.backend, key: this.modelKey() },
                                             ...this.availableModels];
                 }
             } catch (e) {
@@ -185,9 +192,15 @@ function translationController() {
             }
         },
 
-        async setModel(alias) {
-            const previous = this.model;
-            this.model = alias;
+        modelKey() {
+            return this.backend + '/' + this.model;
+        },
+
+        async setModel(key) {
+            const previous = this.modelKey();
+            const chosen = this.availableModels.find(m => m.key === key);
+            if (!chosen) return;
+            const alias = chosen.alias;
             this.modelLoading = true;
             let data = {};
             let ok = false;
@@ -195,7 +208,7 @@ function translationController() {
                 const res = await fetch('/api/projects/{{ project_name }}/model', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model: alias }),
+                    body: JSON.stringify({ model: alias, backend: chosen.backend }),
                 });
                 data = await res.json();
                 ok = res.ok && data.status === 'ok';
@@ -204,9 +217,9 @@ function translationController() {
             }
             if (ok) {
                 this.model = data.model;
+                this.backend = data.backend;
             } else {
                 // Not saved: show the stored model again
-                this.model = previous;
                 document.getElementById('model-select').value = previous;
                 this.error = data.error || '模型設定失敗';
             }
@@ -388,8 +401,15 @@ function translationController() {
             this.eventSource.addEventListener('rate_limit', (e) => {
                 const data = JSON.parse(e.data);
                 this.state = 'paused';
-                this.error = data.error || 'API 使用量已達上限，請稍後再繼續';
+                this.error = (data.error || 'API 使用量已達上限') +
+                    (data.resume_in ? `（${Math.round(data.resume_in)} 秒後自動繼續）` : '');
                 this.refreshFailedCount();
+            });
+
+            this.eventSource.addEventListener('resumed', (e) => {
+                // Resumed by itself after a rate limit
+                this.state = 'running';
+                this.error = null;
             });
 
             this.eventSource.addEventListener('auth_error', (e) => {
