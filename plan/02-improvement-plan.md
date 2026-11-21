@@ -668,11 +668,58 @@ Acceptance:
   the user to compare. Translation quality itself is judged by the user on a fixed sample of 10
   segments translated with and without the brief; this part is not automatable.
 
+### Phase 9 — Copilot CLI completion
+
+Depends on Phase 7. The owner translates books with Copilot, but `CopilotCLI` still sends
+Copilot's built-in system prompt (a coding agent's, about 2000 tokens) with every call, and
+replies to a bare sentence come back with alternatives and explanations. Copilot CLI 1.0.114 has
+no flag, environment variable or setting for the system prompt; an extension can replace it.
+
+- A plugin kept in the repository (`src/llm/copilot_plugin/`: `plugin.json` and
+  `extensions/system-prompt/extension.mjs`) is loaded with `--experimental --plugin-dir <its
+  absolute path>`. Its extension calls `joinSession({systemMessage: {mode: "replace", content}})`
+  with the content read from `EPUB_TRANSLATOR_SYSTEM_PROMPT`, which `CopilotCLI` sets to the same
+  one-line prompt `ClaudeCLI` passes with `--system-prompt` (`src/llm/cli.SYSTEM_PROMPT`, one
+  definition for both).
+- The CLI says nothing when the extension does not load. Every successful run is checked: the
+  usage checkpoint reports the system prompt segments sent with each model call, and with the
+  replacement that is exactly one `agent_replacement` segment. Anything else (the 18 built-in
+  segments, no report) raises `BackendUnavailableError`: nothing is stored and the run stops
+  with a message naming what to check. No fallback to the built-in prompt.
+- Cancellation, error classification, e-mail redaction and usage accounting unchanged.
+
+Acceptance:
+
+- Tests with a fake process: the command (flags, plugin path) and the prompt handed to the
+  extension; a reply without the replacement raises the unavailable error and a run stores
+  nothing; a long prompt with the replacement passes.
+- `scripts/verify/phase9_copilot_overhead.py`: input tokens per call with and without the
+  replacement on invented text; exits non-zero unless every replaced call passes the check and
+  every broken setup (`--no-experimental`, a wrong plugin folder) is detected.
+- Real runs, invented text: a short invented book with 2 workers completes; a cancelled call
+  leaves no `copilot` or extension process.
+
+Risks:
+
+- Extensions are an experimental feature, and replacing the system prompt from an extension
+  loaded with `--plugin-dir` in `-p` mode is not documented; the segment report the check reads
+  is undocumented telemetry. A CLI update can break either. Then the check stops the run (it does
+  not translate on with the full prompt) and the backend needs updating.
+- `mode: "replace"` removes Copilot's built-in guardrails along with the rest of its prompt
+  (the SDK documentation says so). The calls have no tools, so the model can only answer text.
+- One more process per call (the extension runs in Node, started by the CLI).
+
+### Phase 10 — Copilot SDK backend
+
+An additional backend beside `copilot-cli`, built on the Copilot SDK. To be specified after a
+feasibility check: authentication with the logged-in account and how usage is billed,
+availability of a Python SDK, and how pause and cancel map to a long-lived session.
+
 ## 6. Order
 
 ```
 Phase 0 ── independent
-Phase 1 ─┬─> Phase 7
+Phase 1 ─┬─> Phase 7 ─> Phase 9 ─> Phase 10
          └─┐
 Phase 2 ───┼─> Phase 3 ─┐
            └─> Phase 4 ─┼─> Phase 5

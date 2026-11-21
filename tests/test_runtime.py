@@ -28,7 +28,7 @@ from src.llm import (
 from src.llm.claude_cli import ClaudeCLI
 from src.llm.cli import CLIBackend, ProcessResult
 from src.llm.cli import run_process as real_run_process
-from src.llm.copilot_cli import CopilotCLI
+from src.llm.copilot_cli import PLUGIN_DIR, CopilotCLI
 from src.llm.fake import FakeBackend
 from src.web import tasks as tasks_module
 from src.web.tasks import TaskManager
@@ -613,7 +613,11 @@ def _copilot_ok(text, tokens=(10, 3)):
         {'type': 'assistant.message', 'data': {'content': 'draft'}},
         {'type': 'assistant.message', 'data': {'content': text, 'model': 'm'}},
         {'type': 'session.usage_checkpoint', 'data': {'accountingSnapshot': {'modelMetrics': {
-            'm': {'usage': {'inputTokens': tokens[0], 'outputTokens': tokens[1]}}}}}},
+            'm': {'usage': {'inputTokens': tokens[0], 'outputTokens': tokens[1]}}}},
+            # Phase 9: the system prompt was replaced (as the plugin does)
+            'promptCacheBreakState': [{'conversation': 'main', 'models': {'m': {
+                'system_segments': [{'segment': 'agent_replacement', 'hash': 'h', 'tokens': 14}],
+            }}}]}},
         {'type': 'result', 'exitCode': 0},
     ]
     return ProcessResult(0, '\n'.join(json.dumps(e) for e in events) + '\n', '')
@@ -736,7 +740,8 @@ class TestCopilotCLI:
         cmd = CopilotCLI().build_command('PROMPT', _req(model='gpt-x'))
         assert cmd == ['copilot', '-p', 'PROMPT', '--model', 'gpt-x', '--output-format', 'json',
                        '--available-tools', 'none', '--no-custom-instructions',
-                       '--disable-builtin-mcps', '--no-ask-user', '--no-auto-update']
+                       '--disable-builtin-mcps', '--no-ask-user', '--no-auto-update',
+                       '--experimental', '--plugin-dir', PLUGIN_DIR]  # Phase 9
         assert '--model' not in CopilotCLI().build_command('P', _req(model=''))
 
     def test_identity(self):
@@ -1639,12 +1644,14 @@ class TestRound1Copilot:
         return ProcessResult(code, '\n'.join(json.dumps(e) for e in events), stderr)
 
     REPLY = {'type': 'assistant.message', 'data': {'content': '譯文'}}
+    # Phase 9: a successful run also reports that the system prompt was replaced
+    REPLACED = json.loads(_copilot_ok('x').stdout.splitlines()[3])
 
     def test_error_beside_a_reply(self):
-        result = self._events(self.REPLY, {'type': 'session.error', 'data': {
+        result = self._events(self.REPLY, self.REPLACED, {'type': 'session.error', 'data': {
             'errorType': 'query', 'message': 'telemetry upload failed'}})
         assert CopilotCLI().classify_error(result) is None
-        result = self._events(self.REPLY, {'type': 'session.error', 'data': {
+        result = self._events(self.REPLY, self.REPLACED, {'type': 'session.error', 'data': {
             'errorType': 'query', 'message': 'Model "x" is not available'}})
         assert CopilotCLI().classify_error(result) is None
         limited = self._events(self.REPLY, {'type': 'session.error', 'data': {
