@@ -910,3 +910,173 @@ class TestRound1Brief:
         assert 'briefLoaded: false' in page and 'this.briefLoaded = true;' in page
         assert 'if (this.brief === sent) this.brief = data.brief;' in page
         assert 'body: JSON.stringify({ brief: sent })' in page
+
+
+# --- Review round 2 -----------------------------------------------------------------
+
+class TestRound2:
+
+    def test_cut_off_object_is_not_a_consolidation_answer(self, small_batches):
+        fake = FakeBackend([_reply(('Orrin', '歐林', 'person')), _reply(('Orrin', '奧林', 'person')),
+                            _reply(('Orrin', '奧林', 'person')),
+                            '{"rejected": [{"term": "Orrin", "translation": "歐倫"}]'])
+        terms = TermExtractor(backend=fake).extract_from_segments(_segments(3))
+        assert terms == [{'term': 'Orrin', 'translation': '奧林', 'category': 'person'}]
+
+    @pytest.mark.parametrize('reply', ['Here: [{"term": "Orrin", "translation": "歐倫"}]',
+                                       '[{"term": "Orrin", "translation": "歐倫"}] done'])
+    def test_consolidation_answer_is_the_whole_reply(self, small_batches, reply):
+        fake = FakeBackend([_reply(('Orrin', '歐林', 'person')), _reply(('Orrin', '奧林', 'person')),
+                            _reply(('Orrin', '奧林', 'person')), reply])
+        terms = TermExtractor(backend=fake).extract_from_segments(_segments(3))
+        assert terms[0]['translation'] == '奧林'
+        # the extraction replies keep their recovery
+        assert TermExtractor(backend=FakeBackend([reply])).extract_from_text('x') == [
+            {'term': 'Orrin', 'translation': '歐倫'}]
+
+    def test_top_level_list(self):
+        assert te._top_level_list('```json\n[{"term": "a", "translation": "b"}, 5, {"term": "c"}]\n```') \
+            == [{'term': 'a', 'translation': 'b'}]
+        assert te._top_level_list(' {"term": "a", "translation": "b"} ') == []
+        with pytest.raises(ValueError):
+            te._top_level_list('[{"term": "a"')
+
+    def test_an_empty_category_is_no_vote(self, small_batches):
+        fake = FakeBackend([_reply(('Orrin', '奧林', '')), _reply(('Orrin', '奧林', 'person')),
+                            _reply(('Tess', '泰絲', ''))])
+        terms = TermExtractor(backend=fake).extract_from_segments(_segments(3))
+        assert terms == [{'term': 'Orrin', 'translation': '奧林', 'category': 'person'},
+                         {'term': 'Tess', 'translation': '泰絲', 'category': ''}]
+        assert te._most_common(Counter()) == ''
+
+    def test_person_fields_one_line(self, tmp_path):
+        gm = GlossaryManager(str(tmp_path / 'g.json'))
+        gm.add_term('Tess', '泰絲', gender=' fe\nmale ', note='the\n  baker\tof town ')
+        assert (gm.get_term('Tess').gender, gm.get_term('Tess').note) == \
+            ('fe male', 'the baker of town')
+        gm.update_term('Tess', note='a\r\nmiller')
+        assert gm.get_term('Tess').note == 'a miller'
+        assert gm.format_for_prompt().count('\n') == 0
+
+    @pytest.mark.parametrize('bad', [{'term': 'B'}, {'term': 'B', 'translation': 'x', 'extra': 'y'}])
+    def test_import_with_a_missing_or_unknown_field(self, tmp_path, bad):
+        gm = GlossaryManager(str(tmp_path / 'g.json'))
+        gm.add_term('Orrin', '奧林')
+        before = (tmp_path / 'g.json').read_text(encoding='utf-8')
+        source = tmp_path / 'in.json'
+        source.write_text(json.dumps([{'term': 'Orrin', 'translation': '歐林'}, bad]), encoding='utf-8')
+        with pytest.raises(ValueError) as info:
+            gm.import_json(str(source))
+        assert str(info.value) == 'a glossary entry has a missing or unknown field'
+        assert (tmp_path / 'g.json').read_text(encoding='utf-8') == before
+        assert gm.get_term('Orrin').translation == '奧林'
+        # load() has the same rule
+        (tmp_path / 'g.json').write_text(json.dumps([bad]), encoding='utf-8')
+        with pytest.raises(ValueError):
+            GlossaryManager(str(tmp_path / 'g.json')).load()
+
+    def test_import_saves_once(self, tmp_path, monkeypatch):
+        gm = GlossaryManager(str(tmp_path / 'g.json'))
+        source = tmp_path / 'in.json'
+        source.write_text(json.dumps([{'term': 'A', 'translation': '甲'}, {'term': 'B', 'translation': '乙'},
+                                      {'term': 'C', 'translation': ''}]), encoding='utf-8')
+        saves = []
+        real = GlossaryManager.save
+        monkeypatch.setattr(GlossaryManager, 'save', lambda self: saves.append(1) or real(self))
+        assert gm.import_json(str(source)) == 2
+        assert saves == [1]
+        other = GlossaryManager(gm.glossary_path)
+        other.load()
+        assert [e.term for e in other.get_all_terms()] == ['A', 'B']
+        empty = tmp_path / 'empty.json'
+        empty.write_text('[]', encoding='utf-8')
+        assert GlossaryManager(str(tmp_path / 'none.json')).import_json(str(empty)) == 0
+        assert not (tmp_path / 'none.json').exists()
+
+    def test_cli_extraction_merges_after_the_calls_and_saves_once(self, tmp_path, monkeypatch):
+        path = _project(tmp_path)
+        glossary = os.path.join(path, 'glossary.json')
+        GlossaryManager(glossary).add_term('Tess', '泰絲', category='person')
+
+        def respond(request):  # meanwhile, a note saved elsewhere
+            other = GlossaryManager(glossary)
+            other.load()
+            other.add_term('Wren', '雷恩', category='person', note='a bird')
+            return _reply(('Tess', '黛絲', 'person'), ('Orrin', '奧林', 'person'))
+
+        saves = []
+        real = GlossaryManager.save
+        with use_fake_backend(FakeBackend(responder=respond)):
+            monkeypatch.setattr(GlossaryManager, 'save', lambda self: saves.append(1) or real(self))
+            result = CliRunner().invoke(_cli(), ['glossary', 'extract', '-p', path])
+        assert result.exit_code == 0, result.output
+        assert len(saves) == 2  # the note written meanwhile, then the extraction once
+        gm = GlossaryManager(glossary)
+        gm.load()
+        assert [(e.term, e.translation, e.note) for e in gm.get_all_terms()] == [
+            ('Orrin', '奧林', ''), ('Tess', '黛絲', ''), ('Wren', '雷恩', 'a bird')]
+
+    def test_web_extraction_merges_after_the_calls_and_saves_once(self, web, monkeypatch):
+        from src.web.blueprints.glossary import _extraction_tasks
+        from tests.test_web import _wait
+        client, root = web
+        glossary = str(root / 'book' / 'glossary.json')
+        GlossaryManager(glossary).add_term('Tess', '泰絲', category='person', note='the baker')
+
+        def respond(request):
+            other = GlossaryManager(glossary)
+            other.load()
+            other.update_term('Tess', note='the miller')  # edited while extracting
+            return _reply(('Tess', '黛絲', 'person'), ('Orrin', '奧林', 'person'),
+                          ('Wren', '雷恩', 'person'))
+
+        saves = []
+        real = GlossaryManager.save
+        monkeypatch.setattr(GlossaryManager, 'save', lambda self: saves.append(1) or real(self))
+        _extraction_tasks.pop('book', None)
+        with use_fake_backend(FakeBackend(responder=respond)):
+            client.post('/api/projects/book/glossary/extract')
+            _wait(lambda: not _extraction_tasks['book']['running'])
+        assert _extraction_tasks.pop('book')['extracted_count'] == 2
+        assert len(saves) == 2
+        gm = GlossaryManager(glossary)
+        gm.load()
+        assert [(e.term, e.translation, e.note) for e in gm.get_all_terms()] == [
+            ('Orrin', '奧林', ''), ('Tess', '泰絲', 'the miller'), ('Wren', '雷恩', '')]
+
+    def test_web_post_keeps_person_fields_not_sent(self, web):
+        client, root = web
+        client.post('/api/projects/book/glossary', json={
+            'term': 'Tess', 'translation': '泰絲', 'category': 'person', 'gender': 'female',
+            'note': 'the baker'})
+        res = client.post('/api/projects/book/glossary',
+                          json={'term': 'tess', 'translation': '黛絲', 'category': 'term'})
+        assert res.get_json()['entry'] == {'term': 'tess', 'translation': '黛絲', 'category': 'term',
+                                           'frequency': 0, 'gender': 'female', 'note': 'the baker'}
+        res = client.post('/api/projects/book/glossary',
+                          json={'term': 'Tess', 'translation': '黛絲', 'note': ''})
+        assert (res.get_json()['entry']['gender'], res.get_json()['entry']['note']) == ('female', '')
+        res = client.post('/api/projects/book/glossary', json={'term': 'Orrin', 'translation': '奧林'})
+        assert (res.get_json()['entry']['gender'], res.get_json()['entry']['note']) == ('', '')
+
+    def test_add_form_sends_person_fields_only_when_shown(self, web):
+        client, _ = web
+        page = client.get('/project/book/glossary').get_data(as_text=True)
+        assert "const body = entry.category === 'person' ? { ...entry, gender, note } : entry;" in page
+        assert 'body: JSON.stringify(body)' in page
+
+    @pytest.mark.parametrize('body', [5, ['a'], {'terms': 'a'}, {'terms': ['Tess', 5]}, None])
+    def test_batch_delete_refused(self, web, body):
+        client, root = web
+        client.post('/api/projects/book/glossary', json={'term': 'Tess', 'translation': '泰絲'})
+        res = client.delete('/api/projects/book/glossary/batch', data=json.dumps(body),
+                            content_type='application/json')
+        assert (res.status_code, res.get_json()) == (400, {'error': '請提供 terms 陣列'})
+        assert [t['term'] for t in client.get('/api/projects/book/glossary').get_json()] == ['Tess']
+
+    def test_translation_page_initialized_once(self, web):
+        client, _ = web
+        page = client.get('/project/book/translation').get_data(as_text=True)
+        # Alpine 3 calls init() itself; x-init="init()" ran it a second time
+        assert '<div x-data="translationController()">' in page
+        assert 'x-init="init()"' not in page

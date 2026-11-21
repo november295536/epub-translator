@@ -4248,7 +4248,7 @@ class TestExtractionCompareScript:
         _phase8_projects(str(projects), n=2)
         other = tmp_path / 'checkout'
         other.mkdir()
-        with use_fake_backend(FakeBackend(responder=lambda r: '[]')):
+        with use_fake_backend(FakeBackend(responder=lambda r: '[{"term": "Orrin", "translation": "奧林"}]')):
             # src is imported already, from this checkout: not the code of --code
             assert extraction.main(['--projects-dir', str(projects), '--project-index', '1',
                                     '--out', str(out), '--code', str(other)]) == 2
@@ -4258,10 +4258,10 @@ class TestExtractionCompareScript:
             assert extraction.main(['--projects-dir', str(projects), '--project-index', '1',
                                     '--out', str(out), '--name', 'before']) == 0
             assert capsys.readouterr().out.splitlines() == [
-                'a before: batches sent 1  calls 1  proposals 0  terms 0  '
+                'a before: batches sent 1  calls 1  proposals 1  terms 1  '
                 'terms with conflicting translations 0', 'wrote terms-before.json']
-        assert json.loads((out / 'terms-before.json').read_text()) == {'terms': [],
-                                                                        'conflicts': {}}
+        assert json.loads((out / 'terms-before.json').read_text()) == {
+            'terms': [{'term': 'Orrin', 'translation': '奧林', 'category': ''}], 'conflicts': {}}
 
     def test_stopped_extraction_writes_what_it_has(self, tmp_path, capsys, monkeypatch):
         from src.llm import RateLimitError
@@ -4302,7 +4302,7 @@ class TestExtractionCompareScript:
         raw['schema'] = 1
         file.write_text(json.dumps(raw))
         before = extraction.snapshot(str(projects))
-        with use_fake_backend(FakeBackend(responder=lambda r: '[]')):
+        with use_fake_backend(FakeBackend(responder=lambda r: '[{"term": "Orrin", "translation": "奧林"}]')):
             assert extraction.main(self._args(projects, out)) == 0
         assert migrated == ['2']  # the copy, named by its index
         assert extraction.snapshot(str(projects)) == before
@@ -4696,7 +4696,7 @@ class TestPhase8ScriptSurvivors:
         made = _mkdtemps(script, monkeypatch)
         args = (self._extract_args(tmp_path, projects) if module == 'extraction'
                 else self._brief_args(tmp_path, projects))
-        fake = FakeBackend(responder=lambda r: '[]' if module == 'extraction' else like(r, '譯'))
+        fake = FakeBackend(responder=lambda r: '[{"term": "Orrin", "translation": "奧林"}]' if module == 'extraction' else like(r, '譯'))
         with use_fake_backend(fake):
             assert script.main(args) == 0
         prefix = 'phase8-extraction-' if module == 'extraction' else 'phase8-brief-'
@@ -4744,7 +4744,7 @@ class TestPhase8ScriptSurvivors:
 
         def respond(request):
             logging.getLogger('src.anything').warning('LOGGED-LINE')
-            return '[]' if module == 'extraction' else like(request, '譯')
+            return '[{"term": "Orrin", "translation": "奧林"}]' if module == 'extraction' else like(request, '譯')
 
         fake = FakeBackend(responder=respond)
         monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: fake)
@@ -4782,7 +4782,7 @@ class TestPhase8ScriptSurvivors:
         (tmp_path / 'out').mkdir()  # an existing --out is used
         args = (self._extract_args(tmp_path, projects) if module == 'extraction'
                 else self._brief_args(tmp_path, projects))
-        fake = FakeBackend(responder=lambda r: '[]' if module == 'extraction' else like(r, '譯'))
+        fake = FakeBackend(responder=lambda r: '[{"term": "Orrin", "translation": "奧林"}]' if module == 'extraction' else like(r, '譯'))
         with use_fake_backend(fake):
             assert script.main(args) == 0, capsys.readouterr().out
         assert migrated == ['2']
@@ -5021,7 +5021,7 @@ class TestPhase8Round1Scripts:
 
         monkeypatch.setattr(script, 'open', recording, raising=False)
         if module == 'extraction':
-            fake = FakeBackend(responder=lambda r: '[]')
+            fake = FakeBackend(responder=lambda r: '[{"term": "Orrin", "translation": "奧林"}]')
             args = self._extract_args(tmp_path, projects)
             expected = [('terms-after.json', 'w', {'encoding': 'utf-8'})]
         else:
@@ -5059,9 +5059,12 @@ class TestPhase8Round1Scripts:
         markup = ('<h2 class="c" id="x">Title &amp; more</h2>\n<p>One <em>two</em><br/>three'
                   '<img src="https://example.invalid/i.png" onerror="alert(1)"/></p>'
                   '<script>alert("x")</script><p>  </p>')
-        assert brief_sample.readable(markup) == \
-            'Title &amp; more\nOne two\nthree\nalert(&quot;x&quot;)'
-        assert brief_sample.readable('<P>a</P><LI>b</LI><blockquote>c</blockquote>d') == 'a\nb\nc\nd'
+        # one line per top-level block; script removed; attributes never shown
+        assert brief_sample.readable(markup) == 'Title &amp; more\nOne twothree'
+        assert brief_sample.readable('<p>a</p><li>b</li><blockquote>c</blockquote>d') == 'a\nb\nc\nd'
+        assert brief_sample.readable('<p title="a > b">word</p>') == 'word'
+        assert brief_sample.readable('<p>one\n  two</p>') == 'one two'
+        assert brief_sample.readable('<p>a <b>b</p>') == '&lt;p&gt;a &lt;b&gt;b&lt;/p&gt;'  # unparsable: as it is
         assert brief_sample.readable('&lt;b&gt; x') == '&lt;b&gt; x'  # decoded, then escaped
 
     def test_conflicts_count_once_per_batch_and_skip_blanks(self):
@@ -5123,3 +5126,83 @@ class TestPhase8Round1Survivors:
         assert code == 1
         assert capsys.readouterr().out.splitlines()[-1] == \
             'FAIL project-2: not every sampled segment has both translations'
+
+
+# --- Phase 8 review round 2 ----------------------------------------------------------
+
+class TestPhase8Round2Scripts:
+
+    def test_modules_of_a_checkout_nested_in_code_refused(self, tmp_path, capsys, monkeypatch):
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=1)
+        main_code = _stub_checkout(tmp_path / 'main', '甲')
+        nested = _stub_checkout(tmp_path / 'main' / '.worktree' / 'branch', '乙')
+        package = _package()
+        saved = {k: v for k, v in sys.modules.items() if k == package or k.startswith(package + '.')}
+        monkeypatch.setattr(sys, 'path', [nested] + sys.path)
+        try:
+            for k in saved:
+                del sys.modules[k]
+            __import__(package + '.glossary.term_extractor')  # the branch's, already loaded
+            for name in ('llm', 'core.migrate', 'core.project'):
+                __import__(f'{package}.{name}')
+            result = extraction.main(['--code', main_code, '--projects-dir', str(projects),
+                                      '--project-index', '1', '--out', str(tmp_path / 'out')])
+        finally:
+            for k in [k for k in sys.modules if k == package or k.startswith(package + '.')]:
+                del sys.modules[k]
+            sys.modules.update(saved)
+        assert result == 2
+        assert capsys.readouterr().out == \
+            'ERROR the code that was loaded is not the one of --code\n'
+        assert not (tmp_path / 'out').exists()
+
+    def test_loaded_from(self, tmp_path):
+        import types
+        module = types.ModuleType('pkg.sub.mod')
+        module.__file__ = str(tmp_path / 'pkg' / 'sub' / 'mod.py')
+        assert extraction.loaded_from(module, str(tmp_path))
+        assert not extraction.loaded_from(module, str(tmp_path / 'pkg'))
+        package = types.ModuleType('pkg.sub')
+        package.__path__ = []
+        package.__file__ = str(tmp_path / 'pkg' / 'sub' / '__init__.py')
+        assert extraction.loaded_from(package, str(tmp_path))
+        package.__file__ = str(tmp_path / 'pkg' / 'sub.py')
+        assert not extraction.loaded_from(package, str(tmp_path))
+
+    def test_no_proposal_at_all_fails(self, tmp_path, capsys, monkeypatch):
+        from src.llm import TransientError
+        from src.llm.fake import FakeBackend
+        from tests.conftest import use_fake_backend
+        monkeypatch.setattr('src.glossary.term_extractor.MAX_CHARS_PER_BATCH', 400)
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=2)
+        with use_fake_backend(FakeBackend(responder=lambda r: (_ for _ in ()).throw(
+                TransientError('timed out')))):
+            code = extraction.main(['--projects-dir', str(projects), '--project-index', '2',
+                                    '--out', str(tmp_path / 'out'), '--anonymize'])
+        assert code == 1
+        assert capsys.readouterr().out.splitlines() == [
+            'project-2 after: batches sent 3  calls 3  proposals 0  terms 0  '
+            'terms with conflicting translations 0', 'wrote terms-after.json',
+            'FAIL project-2: no batch proposed a term']
+
+    def test_brief_over_the_limit_refused_before_any_call(self, tmp_path, capsys, monkeypatch):
+        from src.llm.fake import FakeBackend
+        from tests.conftest import use_fake_backend
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=10)
+        made = _mkdtemps(brief_sample, monkeypatch)
+        brief = tmp_path / 'brief.txt'
+        args = ['--projects-dir', str(projects), '--project-index', '2', '--brief-file',
+                str(brief), '--out', str(tmp_path / 'out'), '--anonymize']
+        fake = FakeBackend()
+        brief.write_text(' ' + 'x' * 2001 + '\n', encoding='utf-8')
+        with use_fake_backend(fake):
+            assert brief_sample.main(args) == 2
+        assert capsys.readouterr().out == 'ERROR the brief is longer than 2000 characters\n'
+        assert fake.requests == [] and made == []
+        brief.write_text(' ' + 'x' * 2000 + '\n', encoding='utf-8')  # the limit itself is fine
+        from tests.conftest import like
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            assert brief_sample.main(args) == 0

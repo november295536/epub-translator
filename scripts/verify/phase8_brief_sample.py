@@ -15,8 +15,8 @@ translation run would (its glossary, its context), once without a brief
 and once with the brief of --brief-file. Nothing is stored in the copy.
 
 Writes `brief-sample.html` to --out: the brief, then per segment the source
-and both translations side by side as plain text (tags removed, one line
-per block; no book markup is rendered), for the owner to judge. Prints counts
+and both translations side by side as plain text (one line per top-level
+block; no book markup is rendered), for the owner to judge. Prints counts
 only: the sample size, the model calls, and translated / failed per variant.
 The copy is removed at the end, also on an error or Ctrl-C (a failure to
 remove it is reported, without its path). The projects directory is only
@@ -34,7 +34,8 @@ Exit code: 0 when all ten segments have both translations and the projects
 directory is unchanged, 1 otherwise (the file and the counts are still
 written when some translation failed; nothing when a rate limit or a login
 stopped the run), 2 when the setup is refused (no such project, fewer than
-10 such segments, an empty brief, a copy that migration leaves at schema 1,
+10 such segments, an empty brief or one longer than the project's limit of
+2000 characters, a copy that migration leaves at schema 1,
 a place refused above).
 """
 
@@ -44,7 +45,6 @@ import argparse
 import html
 import logging
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -56,7 +56,8 @@ sys.path.insert(0, HERE)
 
 import src.core.migrate as migrate  # noqa: E402
 import src.llm as llm  # noqa: E402
-from src.core.project import ProjectManager  # noqa: E402
+import src.core.validation as validation  # noqa: E402
+from src.core.project import MAX_BRIEF_CHARS, ProjectManager  # noqa: E402
 from src.core.translator import TranslationEngine, translate_segment  # noqa: E402
 from src.glossary.glossary_manager import load_glossary  # noqa: E402
 PROJECT_FILE = 'project.json'
@@ -124,18 +125,15 @@ def pick(segments: list) -> list:
     return [eligible[i * len(eligible) // SAMPLE] for i in range(SAMPLE)]
 
 
-# The end of a block (a line break in the readable text) and any other tag
-_BLOCK_END = re.compile(r'<br\s*/?>|</(?:p|h[1-6]|li|div|blockquote|pre|tr|dt|dd|caption|figcaption)\s*>',
-                        re.IGNORECASE)
-_TAG = re.compile(r'<[^>]*>')
-
-
 def readable(markup: str) -> str:
-    """The text of book markup, escaped: one line per block, tags removed,
-    entities decoded. The page shows text only, so nothing of the book is
-    run or loaded by the browser."""
-    text = html.unescape(_TAG.sub('', _BLOCK_END.sub('\n', markup)))
-    return html.escape('\n'.join(line.strip() for line in text.splitlines() if line.strip()))
+    """The text of book markup, escaped: one line per top-level block
+    (validation.top_level_units), its text as a reader sees it
+    (validation.plain_text: parsed, tags, script and style removed, entities
+    decoded). The page shows text only, so nothing of the book is run or
+    loaded by the browser. Markup that does not parse is shown as it is."""
+    units = validation.top_level_units(markup) or [(0, len(markup), False)]  # none: as one
+    lines = (' '.join(validation.plain_text(markup[start:end]).split()) for start, end, _ in units)
+    return html.escape('\n'.join(line for line in lines if line))
 
 
 def cell(outcome) -> str:
@@ -187,6 +185,9 @@ def sample(args) -> int:
         return 2
     if not brief:
         print('ERROR the brief file is empty')
+        return 2
+    if len(brief) > MAX_BRIEF_CHARS:  # the rule of ProjectManager.set_brief
+        print(f'ERROR the brief is longer than {MAX_BRIEF_CHARS} characters')
         return 2
     try:
         names = sorted(n for n in os.listdir(args.projects_dir)
