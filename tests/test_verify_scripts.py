@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -3672,7 +3673,8 @@ class TestCliOverheadScriptSurvivors:
 
     def _clock(self, monkeypatch, *times):
         ticks = iter(times)
-        monkeypatch.setattr(overhead.time, 'monotonic', lambda: next(ticks))
+        # the script's own `time`: the process-wide clock stays real for other threads
+        monkeypatch.setattr(overhead, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
 
     def test_call_values(self, monkeypatch):
         from src.llm.cli import ProcessResult
@@ -5355,7 +5357,7 @@ class TestPhase9CopilotOverheadScript:
 
     def test_call_values(self, monkeypatch):
         ticks = iter([10.0, 12.5])
-        monkeypatch.setattr(copilot_overhead.time, 'monotonic', lambda: next(ticks))
+        monkeypatch.setattr(copilot_overhead, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
         monkeypatch.setattr(copilot_overhead, 'run_process',
                             _copilot_run(_segments_as_copilot, [], tokens=(4079, 2447)))
         assert copilot_overhead.one_call('replaced', True, 'p', 'm', 5) == {
@@ -5425,5 +5427,62 @@ class TestPhase9CopilotOverheadScript:
         for line in ('--model MODEL Model (default: claude-haiku-4.5)',
                      '--repetitions REPETITIONS Calls per configuration',
                      '--timeout TIMEOUT Seconds per call', '--raw Also print every call',
-                     '...] Run only these configurations (names as printed)'):
+                     '--only NAME [NAME ...] Run only these configurations (names as printed)'):
             assert line in help_text
+
+
+class TestPhase9ScriptRound1:
+    """Review round 1, items E and F."""
+
+    def _never(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(copilot_overhead, 'one_call', lambda *a: seen.append(a) or {
+            'ok': True, 'wall': 0.0, 'error': 'x'})
+        return seen
+
+    @pytest.mark.parametrize('args', [['--only'], ['--only', 'replace'],
+                                      ['--only', 'built-in', 'replace'], ['--repetitions', '0'],
+                                      ['--repetitions', '-1'], ['--repetitions', 'x']])
+    def test_invalid_options_refused(self, monkeypatch, capsys, args):
+        seen = self._never(monkeypatch)
+        with pytest.raises(SystemExit) as info:
+            copilot_overhead.main(args)
+        assert info.value.code == 2 and seen == []
+        assert 'error: argument' in capsys.readouterr().err
+
+    def test_positive(self):
+        assert copilot_overhead.positive('1') == 1 and copilot_overhead.positive('7') == 7
+        with pytest.raises(Exception) as info:
+            copilot_overhead.positive('0')
+        assert str(info.value) == 'must be at least 1: 0'
+
+    def test_no_call_is_no_pass(self, monkeypatch):
+        seen = self._never(monkeypatch)
+        monkeypatch.setattr(copilot_overhead, 'CONFIGS', [])
+        assert copilot_overhead.main(['--repetitions', '1']) == 1 and seen == []
+
+    def test_raw_lines_flushed(self, monkeypatch):
+        import io
+
+        class Observed(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.flushed_at = []
+
+            def flush(self):
+                self.flushed_at.append(self.getvalue().count('\n'))
+                super().flush()
+
+        stream = Observed()
+        monkeypatch.setattr(sys, 'stdout', stream)
+        self._never(monkeypatch)
+        copilot_overhead.main(['--repetitions', '2', '--only', 'replaced', '--raw'])
+        lines = stream.getvalue().splitlines()
+        raw = [i + 1 for i, line in enumerate(lines) if line.startswith('  ')]
+        assert raw == [2, 3]
+        assert all(n in stream.flushed_at for n in raw)  # flushed right after each
+
+    def test_header_names_the_side_effects(self):
+        doc = ' '.join(copilot_overhead.__doc__.split())
+        assert 'each call is saved as a session in the user\'s Copilot directory' in doc
+        assert '`plugin-data/_direct/`' in doc
