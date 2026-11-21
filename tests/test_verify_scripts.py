@@ -3751,3 +3751,133 @@ class TestCliOverheadScriptSurvivors:
                      '--only [ONLY ...] Run only these configurations (names as printed)'):
             assert text in help_text
         assert 'Makes REAL' not in help_text  # the description is the first line only
+
+
+class TestCliOverheadScriptRound1:
+    """Review round 1, item 14: each --raw line is flushed as it is printed."""
+
+    def test_raw_lines_flushed(self, monkeypatch):
+        import io
+
+        class Observed(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.flushed_at = []
+
+            def flush(self):
+                self.flushed_at.append(self.getvalue().count('\n'))
+                super().flush()
+
+        stream = Observed()
+        monkeypatch.setattr(sys, 'stdout', stream)
+        monkeypatch.setattr(overhead, 'one_call', lambda *a: {
+            'ok': False, 'wall': 0.0, 'error': 'x', 'transcript': False})
+        overhead.main(['--repetitions', '2', '--only', 'base', '--raw'])
+        lines = stream.getvalue().splitlines()
+        raw = [i + 1 for i, line in enumerate(lines) if line.startswith('  ')]
+        assert raw == [2, 3]
+        assert all(n in stream.flushed_at for n in raw)  # flushed right after each
+
+
+class TestThroughputScriptRound1:
+    """Review round 1, item 12."""
+
+    def _args(self, projects, *extra):
+        return ['--projects-dir', str(projects), '--project-index', '2', '--segments', '2',
+                '--model', 'fake-model', '--anonymize', *extra]
+
+    def test_interrupt_prints_only_the_type(self, tmp_path, capsys, monkeypatch):
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+
+        def interrupt(*a, **kw):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(throughput, 'run', interrupt)
+        assert throughput.main(self._args(projects)) == 1
+        assert capsys.readouterr().out == 'ERROR the measurement stopped (KeyboardInterrupt)\n'
+        assert not any(n.startswith('phase7-throughput-') for n in os.listdir(
+            os.path.realpath(throughput.tempfile.gettempdir())))
+
+    def test_cleanup_failure_reported_without_a_path(self, tmp_path, capsys, monkeypatch):
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+        made = []
+        real_mkdtemp = throughput.tempfile.mkdtemp
+        monkeypatch.setattr(throughput.tempfile, 'mkdtemp',
+                            lambda **kw: made.append(real_mkdtemp(**kw)) or made[-1])
+
+        real_rmtree = shutil.rmtree
+
+        def broken(path):
+            raise OSError('busy')
+
+        monkeypatch.setattr(throughput.shutil, 'rmtree', broken)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            code = throughput.main(self._args(projects))
+        out = capsys.readouterr().out
+        assert code == 1
+        assert out.splitlines()[-1] == 'ERROR cannot remove the temporary directory (OSError)'
+        assert made[0] not in out
+        real_rmtree(made[0])
+
+    def test_mkdtemp_failure_inside_the_try(self, tmp_path, capsys, monkeypatch):
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+
+        def fail(**kw):
+            raise OSError('no space')
+
+        monkeypatch.setattr(throughput.tempfile, 'mkdtemp', fail)
+        assert throughput.main(self._args(projects)) == 1
+        assert capsys.readouterr().out == 'ERROR the measurement stopped (OSError)\n'
+
+    def test_any_change_under_the_projects_directory_fails(self, tmp_path, capsys, monkeypatch):
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+
+        def respond(request):
+            with open(os.path.join(str(projects), 'a', 'note.txt'), 'w') as f:
+                f.write('x')  # another project changes during the run
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            code = throughput.main(self._args(projects))
+        assert code == 1
+        assert capsys.readouterr().out.splitlines()[-1] == \
+            'FAIL project-2: files in the projects directory changed'
+
+    def test_backend_of_the_copy(self, tmp_path, capsys, monkeypatch):
+        import src.llm as llm
+        from src.core.project import ProjectManager
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+        pm = ProjectManager(os.path.join(str(projects), 'b'))
+        pm.load()
+        pm.set_model('fake-model', backend='copilot-cli')
+        pm.save()
+        fake = FakeBackend(responder=lambda r: like(r, '譯'))
+        monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: fake)
+        assert throughput.main(self._args(projects)) == 0, capsys.readouterr().out
+        assert len(fake.requests) == 2
+
+    def test_setup_output_suppressed(self, tmp_path, capsys, monkeypatch):
+        projects = tmp_path / 'projects'
+        _invented_projects(str(projects))
+        real_prepare = throughput.prepare
+
+        def noisy(pm, count, statuses):
+            print('SEGMENT TEXT')
+            return real_prepare(pm, count, statuses)
+
+        monkeypatch.setattr(throughput, 'prepare', noisy)
+        args = self._args(projects)
+        args[args.index('--segments') + 1] = '9'  # too few: stops after the setup
+        assert throughput.main(args) == 2
+        assert 'SEGMENT TEXT' not in capsys.readouterr().out

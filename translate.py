@@ -144,11 +144,15 @@ def start(project, backend, model, workers, retry_failed):
     if not project_dir:
         click.echo("找不到專案。請先執行 init 指令，或用 --project 指定專案目錄。")
         sys.exit(1)
-    if backend is not None and model is None:
-        model = llm.backend_for(backend).default_model
-    if model is not None:
-        stored = ProjectManager(project_dir)
-        _check_model(model, backend if backend is not None else stored.load().backend)
+    if backend is not None or model is not None:
+        stored = ProjectManager(project_dir).load()
+        current = stored.backend or llm.default_backend().name
+        if backend == current:
+            backend = None  # the project's backend already: nothing to store
+        if backend is not None and model is None:
+            model = llm.backend_for(backend).default_model  # a model of the new backend
+        if model is not None:
+            _check_model(model, backend if backend is not None else stored.backend)
 
     # One writer per project: held for the whole run, released on any exit
     lock = ProjectLock(project_dir)
@@ -272,8 +276,9 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
                 _stop_run(stop)
     finally:
         # Also on Ctrl-C (the call in flight was killed, its segment stays
-        # pending) and on a stopped run
-        saver.flush()
+        # pending; one applied between apply_outcome and add is saved too:
+        # forced) and on a stopped run
+        saver.flush(force=True)
     return failed
 
 
@@ -299,7 +304,11 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
 
     def worker(worker_id):
         tag = f"W{worker_id}"
-        engine = TranslationEngine(model=pm.data.model, backend=llm.backend_for(pm.data.backend))
+        # A retry's backoff wait ends, and no call is made, once the run
+        # stops or a rate limit pauses it
+        engine = TranslationEngine(
+            model=pm.data.model, backend=llm.backend_for(pm.data.backend),
+            interrupted=lambda: error_event.is_set() or not gate.is_set())
 
         while not error_event.is_set():
             if not gate.wait(timeout=0.5):
@@ -308,6 +317,9 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
                 seg = seg_queue.get(timeout=1)
             except queue_mod.Empty:
                 break
+            if not gate.is_set():  # paused while this worker waited for it
+                seg_queue.put(seg)
+                continue
 
             try:
                 outcome = translate_segment(engine, seg, all_segments, gm,
@@ -315,18 +327,24 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
                                             translations=pm.data.segmentation == 2,
                                             mutex=pm.mutex)
             except CancelledError:
-                break  # interrupted: the segment stays pending
+                if cancel.is_set() or error_event.is_set():
+                    break  # interrupted or stopped: the segment stays pending
+                seg_queue.put(seg)  # a backoff ended by a rate-limit pause
+                continue
             except RUN_ERRORS as e:
-                seg_queue.put(seg)  # pending again, for after the pause
                 delay = resume_delay(e)
                 if delay is None:
                     stop_errors.append(e)
-                    error_event.set()
+                    error_event.set()  # wins over a rate-limit wait: the run stops
+                    cancel.set()  # the other calls in flight end; their segments stay pending
                     break
                 with pause_lock:
                     if gate.is_set():  # the first worker to hit it
                         gate.clear()
                         pause.update(until=_clock() + delay, error=e, shown=False)
+                    else:  # a later limit during the wait extends it
+                        pause['until'] = max(pause['until'], _clock() + delay)
+                seg_queue.put(seg)  # pending again, once the gate is closed
                 continue
             result_queue.put((seg.segment_id, outcome, seg.word_count, tag))
 

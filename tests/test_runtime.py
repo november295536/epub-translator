@@ -74,6 +74,12 @@ def _gone(pid, wait=10):
     return False
 
 
+def _ticks(task, n=3):
+    """Wait until the coordinator has looked at the task n more times."""
+    start = task.ticks
+    _wait(lambda: task.ticks >= start + n)
+
+
 class FakeClock:
     """A clock the test moves by hand."""
 
@@ -290,7 +296,7 @@ class TestWebRateLimitResumes:
             event = next(e for e in task.progress.get_all() if e['event'] == 'rate_limit')
             assert event['data']['resume_in'] == wait
             clock.now += wait - 1
-            time.sleep(0.1)  # several ticks: not yet
+            _ticks(task)  # not yet
             assert task.state == 'paused'
             clock.now += 1
             task._coordinator.join(timeout=20)
@@ -308,7 +314,7 @@ class TestWebRateLimitResumes:
             _wait(lambda: task.state == 'paused')
             assert task.resume_at is None
             clock.now += 10 ** 6
-            time.sleep(0.1)
+            _ticks(task)
             assert task.state == 'paused'
             assert fresh_tm.resume_translation(PROJECT)  # the user
             task._coordinator.join(timeout=20)
@@ -327,7 +333,7 @@ class TestWebRateLimitResumes:
 
 class TestCliRateLimitResumes:
 
-    @pytest.mark.parametrize('workers', ['1', '3'])
+    @pytest.mark.parametrize('workers', ['1'])
     @pytest.mark.parametrize('retry_after, wait', [(7, 7), (None, RATE_LIMIT_WAIT_SECONDS)])
     def test_resumes_without_user(self, tmp_path, clock, monkeypatch, workers, retry_after, wait):
         path = _make_project(tmp_path, n=3)
@@ -339,28 +345,16 @@ class TestCliRateLimitResumes:
 
         monkeypatch.setattr(translate, '_sleep', sleep)
 
-        def advance():  # parallel: the main loop's clock moves on by itself
-            clock.now += 1000
-            return clock.now
-
-        if workers != '1':
-            monkeypatch.setattr(translate, '_clock', advance)
         respond = _limited_once(RateLimitError('limit reached', retry_after=retry_after))
         with use_fake_backend(FakeBackend(responder=respond)):
             result = CliRunner().invoke(translate.cli, ['start', '--project', path,
                                                         '--workers', workers])
         assert result.exit_code == 0, result.output
-        if workers == '1':
-            assert ('  ✗ limit reached\n'
-                    f'  使用量已達上限：{wait:.0f} 秒後自動繼續（Ctrl-C 停止）\n') in result.output
-        else:  # announced by the main loop, which has moved its clock on
-            assert '  ✗ limit reached\n  使用量已達上限：' in result.output
+        assert ('  ✗ limit reached\n'
+                f'  使用量已達上限：{wait:.0f} 秒後自動繼續（Ctrl-C 停止）\n') in result.output
         assert _statuses(path) == [SegmentStatus.TRANSLATED] * 3
         assert len(respond.calls) == 4  # the limited call is made again
-        if workers == '1':
-            assert slept == [wait]
-        else:
-            assert slept == [] and '繼續翻譯' in result.output
+        assert slept == [wait]
 
     @pytest.mark.parametrize('workers', ['1', '3'])
     def test_auth_stops(self, tmp_path, workers, monkeypatch):
@@ -420,7 +414,7 @@ class TestTransientBackoff:
     def test_injected_wait_and_cancel_during_backoff(self):
         waits = []
 
-        def wait(seconds, cancel):
+        def wait(seconds, cancel, interrupted):
             waits.append(seconds)
             return True  # cancelled meanwhile
 
@@ -544,7 +538,7 @@ class TestHundredResults:
         with use_fake_backend(FakeBackend(responder=respond)):
             task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
             _wait(lambda: task.completed == 1)
-            time.sleep(0.1)  # ticks: the window (1 of 20, no time passed) is not saved
+            _ticks(task)  # the window (1 of 20, no time passed) is not saved
             assert _statuses(path) == [SegmentStatus.PENDING] * 2
             gate.set()
             _wait(lambda: task.state == 'paused')
@@ -793,7 +787,8 @@ class TestCopilotCLI:
          'copilot CLI: Execution failed: Rate limited.'),
         (_copilot_error('Unauthorized', 'authentication'), AuthError,
          'Copilot CLI 認證失敗，請在終端執行 copilot login 重新登入：authentication Unauthorized'),
-        (ProcessResult(2, 'garbage', ''), TransientError, 'copilot CLI exited with code 2: '),
+        # review round 1, G: plain text on stdout is the message
+        (ProcessResult(2, 'garbage', ''), TransientError, 'copilot CLI exited with code 2: garbage'),
         (_copilot_error('boom', code=0), TransientError,
          'copilot CLI exited with code 0: query boom'),
     ])
@@ -946,7 +941,8 @@ class TestClaudeLeanFlags:
 class TestPhase7Survivors:
 
     def test_short_positive_retry_after(self):
-        assert resume_delay(RateLimitError('x', retry_after=0.5)) == 0.5
+        assert resume_delay(RateLimitError('x', retry_after=0.5)) == 1.0  # round 1: at least 1 s
+        assert resume_delay(RateLimitError('x', retry_after=1.5)) == 1.5
 
     def test_default_model_of_a_backend(self):
         from src.core.translator import default_model
@@ -979,11 +975,11 @@ class TestPhase7Survivors:
         with use_fake_backend(FakeBackend(responder=respond)):
             task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
             _wait(lambda: task.completed == 1)
-            time.sleep(0.1)
+            _ticks(task)
             assert _statuses(path) == [SegmentStatus.PENDING] * 2  # window open
             clock.now += SAVE_INTERVAL_SECONDS
-            # well within the real 10 s: only the injected clock can have closed the window
-            _wait(lambda: _statuses(path)[0] == SegmentStatus.TRANSLATED, timeout=5)
+            _ticks(task)  # the injected clock closed the window
+            assert _statuses(path)[0] == SegmentStatus.TRANSLATED
             assert task.state == 'running'
             gate.set()
             task._coordinator.join(timeout=20)
@@ -1044,3 +1040,762 @@ class TestPhase7Survivors:
         # one worker: the second segment went to the new backend
         assert (len(default.requests), len(other.requests)) == (1, 1)
         assert '[W0] 模型切換: sonnet → fake-model' in caplog.messages
+
+
+# --- review round 1 ----------------------------------------------------------------
+
+def _run_cli_in_thread(args):
+    """CliRunner.invoke in a thread; returns (thread, holder of the result)."""
+    holder = {}
+
+    def run():
+        holder['result'] = CliRunner().invoke(translate.cli, args)
+
+    t = threading.Thread(target=run, daemon=True)  # a failing test does not hang
+    t.start()
+    return t, holder
+
+
+class _CountingClock(FakeClock):
+    def __init__(self, now=1000.0):
+        super().__init__(now)
+        self.reads = 0
+
+    def __call__(self):
+        self.reads += 1
+        return self.now
+
+
+class TestRound1CancelGenerations:
+    """Item 1: resume installs a new cancel event; a call from before the
+    pause stays cancelled."""
+
+    def test_quick_resume_does_not_revive_the_old_call(self, tmp_path, fresh_tm, monkeypatch):
+        monkeypatch.setattr('src.llm.cli.run_process', real_run_process)
+        pid_dir = tmp_path / 'pids'
+        pid_dir.mkdir()
+        sleeper = SleeperBackend(str(pid_dir))
+        path = _make_project(tmp_path / 'projects', n=1)
+        with use_fake_backend(sleeper):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            _wait(lambda: sleeper.pids())
+            first = task.cancel_event
+            assert fresh_tm.pause_translation(PROJECT)
+            assert fresh_tm.resume_translation(PROJECT)  # at once
+            assert first.is_set() and task.cancel_event is not first
+            assert not task.cancel_event.is_set()
+            assert _gone(sleeper.pids()[0])
+            _wait(lambda: len(sleeper.pids()) == 2)  # sent again, new child
+            fresh_tm.stop_translation(PROJECT)
+            task._coordinator.join(timeout=20)
+        assert all(_gone(p) for p in sleeper.pids())
+        assert _statuses(path) == [SegmentStatus.PENDING]
+
+
+class TestRound1PauseResumeActions:
+    """Item 2: explicit, idempotent pause/resume; the tick's deadline check."""
+
+    def _client(self, tmp_path):
+        from src.web.server import create_app
+        return create_app(projects_dir=str(tmp_path / 'projects')).test_client()
+
+    def test_user_pause_during_the_automatic_wait(self, tmp_path, fresh_tm, clock):
+        path = _make_project(tmp_path / 'projects', n=2)
+        client = self._client(tmp_path)
+        url = f'/api/projects/{PROJECT}/translate/pause'
+        respond = _limited_once(RateLimitError('limit', retry_after=30))
+        with use_fake_backend(FakeBackend(responder=respond)):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            _wait(lambda: task.state == 'paused')
+            status = client.get(f'/api/projects/{PROJECT}/translate/status').get_json()
+            assert status['auto_resume'] is True
+            for _ in range(2):  # idempotent
+                answer = client.post(url, json={'action': 'pause'})
+                assert answer.status_code == 200 and answer.get_json()['state'] == 'paused'
+            assert task.resume_at is None
+            assert client.get(f'/api/projects/{PROJECT}/translate/status'
+                              ).get_json()['auto_resume'] is False
+            clock.now += 10 ** 6
+            _ticks(task)
+            assert task.state == 'paused'  # a lasting user pause
+            for _ in range(2):
+                answer = client.post(url, json={'action': 'resume'})
+                assert answer.status_code == 200 and answer.get_json()['state'] == 'running'
+            task._coordinator.join(timeout=20)
+        assert task.state == 'completed'
+        assert _statuses(path) == [SegmentStatus.TRANSLATED] * 2
+        assert client.post(url, json={}).status_code == 400
+        assert client.post(url, json={'action': 'toggle'}).get_json() == {
+            'error': 'action 必須是 pause 或 resume'}
+
+    def test_automatic_resume_only_for_the_deadline_that_was_due(self, tmp_path, fresh_tm):
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path), state='paused')
+        alive = threading.Event()
+        keeper = threading.Thread(target=alive.wait, daemon=True)
+        keeper.start()
+        task._coordinator = keeper
+        fresh_tm.tasks[PROJECT] = task
+        task.resume_at = 50.0
+        assert not fresh_tm.resume_translation(PROJECT, due=40.0)  # a newer deadline
+        assert task.state == 'paused'
+        task.resume_at = None  # a user pause meanwhile
+        assert not fresh_tm.resume_translation(PROJECT, due=50.0)
+        task.resume_at = 50.0
+        assert fresh_tm.resume_translation(PROJECT, due=50.0) and task.state == 'running'
+        assert not fresh_tm.resume_translation(PROJECT, due=50.0)  # running: no second resume
+        alive.set()
+        keeper.join()
+
+    def test_page_sends_actions_and_offers_pause_during_the_wait(self, tmp_path):
+        _make_project(tmp_path / 'projects', n=1)
+        html = self._client(tmp_path).get(f'/project/{PROJECT}/translation').get_data(as_text=True)
+        assert "x-if=\"state === 'running' || (state === 'paused' && autoResume)\"" in html
+        assert "@click=\"pauseTranslation('pause')\"" in html
+        assert "@click=\"pauseTranslation('resume')\"" in html
+        assert 'const body = { action: action };' in html
+        # item E: the banner is cleared once running again
+        assert "if (data.state === 'running') this.error = null;" in html
+
+
+class TestRound1ErrorPrecedence:
+    """Item 3: an error that waits for the user wins over a rate-limit
+    wait; a later, longer limit extends it; a user pause stays."""
+
+    def _task(self, tmp_path, state, resume_at):
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path), state=state)
+        task.resume_at = resume_at
+        return task
+
+    def test_web(self, tmp_path, fresh_tm, clock):
+        task = self._task(tmp_path, 'paused', clock.now + 10)
+        fresh_tm._pause_for(task, RateLimitError('later', retry_after=60), 'rate_limit')
+        assert task.resume_at == clock.now + 60  # extended
+        fresh_tm._pause_for(task, RateLimitError('sooner', retry_after=5), 'rate_limit')
+        assert task.resume_at == clock.now + 60  # never shortened
+        fresh_tm._pause_for(task, AuthError('expired'), 'auth_error')
+        assert task.resume_at is None and task.error == 'expired'
+        assert task.progress.get_all()[-1]['event'] == 'auth_error'
+        fresh_tm._pause_for(task, RateLimitError('again', retry_after=5), 'rate_limit')
+        assert task.resume_at is None and task.error == 'expired'  # waits for the user
+        user = self._task(tmp_path, 'paused', None)
+        fresh_tm._pause_for(user, RateLimitError('x', retry_after=5), 'rate_limit')
+        assert user.resume_at is None and user.error is None
+
+    def test_cli_auth_during_the_wait_stops(self, tmp_path, monkeypatch):
+        clock = _CountingClock()
+        monkeypatch.setattr(translate, '_clock', clock)
+        path = _make_project(tmp_path, n=2)
+        announced = threading.Event()
+        real_message = translate._rate_limit_message
+
+        def message(e, delay):
+            announced.set()
+            return real_message(e, delay)
+
+        monkeypatch.setattr(translate, '_rate_limit_message', message)
+
+        both = threading.Barrier(2)
+
+        def respond(request):
+            both.wait(20)  # both calls in flight before the gate closes
+            if '>Line 1.<' in request.messages[0].content:
+                raise RateLimitError('limit', retry_after=30)
+            assert announced.wait(20)  # during the wait
+            raise AuthError('expired')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            result = CliRunner().invoke(translate.cli, ['start', '--project', path,
+                                                        '--workers', '2'])
+        assert result.exit_code == 1 and 'expired' in result.output
+        assert '  繼續翻譯\n' not in result.output  # the gate never reopened
+
+    def test_cli_later_limit_extends_the_wait(self, tmp_path, monkeypatch):
+        clock = _CountingClock()
+        monkeypatch.setattr(translate, '_clock', clock)
+        path = _make_project(tmp_path, n=2)
+        announced, calls = threading.Event(), []
+        real_message = translate._rate_limit_message
+        monkeypatch.setattr(translate, '_rate_limit_message',
+                            lambda e, d: (announced.set(), real_message(e, d))[1])
+
+        both = threading.Barrier(2)
+
+        def respond(request):
+            calls.append(request)
+            if len(calls) <= 2:
+                both.wait(20)  # both calls in flight before the gate closes
+            if request is calls[0]:
+                raise RateLimitError('first', retry_after=7)
+            if request is calls[1]:
+                assert announced.wait(20)
+                raise RateLimitError('second', retry_after=20)
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            thread, holder = _run_cli_in_thread(['start', '--project', path, '--workers', '2'])
+            _wait(lambda: len(calls) == 2)
+            start = clock.reads
+            _wait(lambda: clock.reads > start + 4)
+            clock.now += 7  # the first deadline: the wait was extended
+            start = clock.reads
+            _wait(lambda: clock.reads > start + 4)
+            assert len(calls) == 2
+            clock.now += 13
+            thread.join(timeout=30)
+        assert holder['result'].exit_code == 0, holder['result'].output
+        assert len(calls) == 4
+
+
+class TestRound1ParallelCliGate:
+    """Item 13: a stationary clock; the gate stays closed before the
+    deadline and opens after it; the printed seconds."""
+
+    @pytest.mark.parametrize('retry_after, wait', [(7, 7), (None, RATE_LIMIT_WAIT_SECONDS)])
+    def test_gate(self, tmp_path, monkeypatch, retry_after, wait):
+        clock = _CountingClock()
+        monkeypatch.setattr(translate, '_clock', clock)
+        path = _make_project(tmp_path, n=4)
+        calls, release = [], threading.Event()
+
+        both = threading.Barrier(2)
+
+        def respond(request):
+            calls.append(request)
+            if len(calls) <= 2:
+                both.wait(20)  # both calls in flight before the gate closes
+            if request is calls[0]:
+                raise RateLimitError('limit reached', retry_after=retry_after)
+            if request is calls[1]:
+                assert release.wait(20)  # in flight while the gate closes
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            thread, holder = _run_cli_in_thread(['start', '--project', path, '--workers', '2'])
+            _wait(lambda: len(calls) == 2)
+            release.set()
+            start = clock.reads
+            _wait(lambda: clock.reads > start + 6)  # the main loop keeps ticking
+            assert len(calls) == 2  # closed: no new call before the deadline
+            clock.now += wait
+            thread.join(timeout=30)
+        result = holder['result']
+        assert result.exit_code == 0, result.output
+        assert len(calls) == 5
+        assert (f'  ✗ limit reached\n  使用量已達上限：{wait:.0f} 秒後自動繼續（Ctrl-C 停止）\n'
+                in result.output)
+        assert '  繼續翻譯' in result.output
+        assert _statuses(path) == [SegmentStatus.TRANSLATED] * 4
+
+
+class _HookQueue:
+    """A queue whose first successful get() runs `hook` before returning."""
+
+    def __init__(self, inner, hook):
+        self.inner, self.hook, self.done = inner, hook, False
+
+    def get(self, *a, **kw):
+        item = self.inner.get(*a, **kw)
+        if not self.done:
+            self.done = True
+            self.hook()
+        return item
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+class TestRound1RecheckAfterGet:
+    """Items 4 and C: a segment taken from the queue while the run pauses
+    is put back, not sent."""
+
+    def test_web(self, tmp_path, fresh_tm):
+        from src.glossary.glossary_manager import GlossaryManager
+        path = _make_project(tmp_path / 'projects', n=1)
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path / 'projects'),
+                                            state='running', total=1)
+        task.pm = ProjectManager(path)
+        task.pm.load()
+        task._gm = GlossaryManager(os.path.join(path, 'glossary.json'))
+        task.active_workers = 1
+        task.segment_queue.put(task.pm.data.segments[0])
+        task.segment_queue = _HookQueue(task.segment_queue, task.pause_event.clear)
+        fake = FakeBackend(responder=lambda r: like(r, '譯'))
+        with use_fake_backend(fake):
+            worker = threading.Thread(target=fresh_tm._worker_loop, args=(task, 0), daemon=True)
+            worker.start()
+            try:
+                _wait(lambda: task.segment_queue.done and task.segment_queue.qsize() == 1)
+            finally:
+                task.stop_event.set()
+                task.pause_event.set()
+                worker.join(timeout=20)
+        assert fake.requests == []
+        assert task.segment_queue.qsize() == 1
+
+    def test_cli(self, tmp_path, monkeypatch):
+        """A worker waiting in get() when the segment is put back does not
+        send it while the gate is closed (gate checked after get)."""
+        import queue
+        clock = _CountingClock()
+        monkeypatch.setattr(translate, '_clock', clock)
+        path = _make_project(tmp_path, n=2)
+        calls, made = [], []
+
+        class Watched(queue.Queue):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.waiting = 0
+                made.append(self)
+
+            def get(self, *a, **kw):
+                self.waiting += 1
+                try:
+                    return super().get(*a, **kw)
+                finally:
+                    self.waiting -= 1
+
+        monkeypatch.setattr(queue, 'Queue', Watched)
+
+        limited = []
+
+        def respond(request):
+            calls.append(request)
+            if '>Line 1.<' in request.messages[0].content and not limited:
+                limited.append(1)
+                # the other worker has done Line 2 and waits in get()
+                _wait(lambda: made[0].waiting > 0)
+                raise RateLimitError('limit', retry_after=7)
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            thread, holder = _run_cli_in_thread(['start', '--project', path, '--workers', '2'])
+            _wait(lambda: limited and len(calls) == 2)
+            start = clock.reads
+            _wait(lambda: clock.reads > start + 6)
+            assert len(calls) == 2  # the waiting worker got Line 1 back and did not send it
+            clock.now += 7
+            thread.join(timeout=30)
+        assert holder['result'].exit_code == 0 and len(calls) == 3
+
+
+class TestRound1BackoffInterrupted:
+    """Item 5: a retry's backoff ends on a run-level stop or pause and no
+    call follows."""
+
+    def test_engine(self, backoff_waits):
+        stopped = []
+        fake = FakeBackend([TransientError('t'), '<p k="1">譯</p>'])
+
+        def interrupted():
+            return bool(stopped)
+
+        engine = TranslationEngine(model='m', backend=fake, interrupted=interrupted)
+        stopped.append(1)
+        with pytest.raises(CancelledError):
+            engine.translate_reply('Line.', SegmentType.TEXT, '', '', '', '<p>Line.</p>')
+        assert len(fake.requests) == 1 and backoff_waits == [5]
+        FakeBackend.overcalls.clear()
+
+    def test_default_wait_ends_on_interrupted(self):
+        assert wait_or_cancel(30, threading.Event(), lambda: True) is True
+        assert wait_or_cancel(0, threading.Event(), lambda: False) is False
+
+    def test_web_worker_interrupted_by_a_pause(self, tmp_path, fresh_tm):
+        """The worker's check: stop, or the pause gate closed."""
+        _make_project(tmp_path / 'projects', n=1)
+        seen = {}
+        real = tasks_module.TranslationEngine
+
+        def engine(**kw):
+            seen['interrupted'] = kw['interrupted']
+            return real(**kw)
+
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))), \
+                pytest.MonkeyPatch.context() as mp:
+            mp.setattr(tasks_module, 'TranslationEngine', engine)
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            task._coordinator.join(timeout=20)
+        check = seen['interrupted']
+        task.stop_event.clear()
+        task.pause_event.set()
+        assert check() is False
+        task.pause_event.clear()
+        assert check() is True
+        task.pause_event.set()
+        task.stop_event.set()
+        assert check() is True
+
+    def test_cli_backoff_during_a_rate_limit_pause(self, tmp_path, monkeypatch, backoff_waits):
+        clock = _CountingClock()
+        monkeypatch.setattr(translate, '_clock', clock)
+        path = _make_project(tmp_path, n=2)
+        announced, calls = threading.Event(), []
+        real_message = translate._rate_limit_message
+        monkeypatch.setattr(translate, '_rate_limit_message',
+                            lambda e, d: (announced.set(), real_message(e, d))[1])
+
+        both = threading.Barrier(2)
+
+        def respond(request):
+            calls.append(request)
+            if len(calls) <= 2:
+                both.wait(20)  # both calls in flight before the gate closes
+            if request is calls[0]:
+                raise RateLimitError('limit', retry_after=7)
+            if request is calls[1]:
+                assert announced.wait(20)
+                raise TransientError('exit 1')  # its backoff falls in the pause
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            thread, holder = _run_cli_in_thread(['start', '--project', path, '--workers', '2'])
+            _wait(lambda: backoff_waits)
+            start = clock.reads
+            _wait(lambda: clock.reads > start + 6)
+            assert len(calls) == 2  # no retry during the pause
+            clock.now += 7
+            thread.join(timeout=30)
+        assert holder['result'].exit_code == 0, holder['result'].output
+        assert len(calls) == 4
+        assert _statuses(path) == [SegmentStatus.TRANSLATED] * 2
+
+
+class TestRound1ResumeDelay:
+    """Item 6."""
+
+    @pytest.mark.parametrize('value, expected', [
+        (0.2, 1.0), (1, 1.0), (90, 90.0), (10 ** 9, 3600.0), (float('inf'), 300.0),
+        (float('nan'), 300.0), (True, 300.0), ('12', 300.0), (-1, 300.0), (None, 300.0),
+        (object(), 300.0)])
+    def test_values(self, value, expected):
+        error = RateLimitError('x')
+        error.retry_after = value
+        assert resume_delay(error) == expected
+
+
+class TestRound1ModelReadUnderMutex:
+    """Item 7: the worker reads (backend, model) as one, under the mutex."""
+
+    def test_read_under_mutex(self, tmp_path, fresh_tm):
+        from src.core.project import ProjectData
+        _make_project(tmp_path / 'projects', n=1)
+        held, box = [], {}
+
+        class Watched(ProjectData):
+            @property
+            def backend(self):
+                held.append(box['mutex']._is_owned())
+                return self.__dict__.get('backend')
+
+        original = tasks_module.TaskManager._worker_loop
+
+        def worker(self, task, wid):
+            box['mutex'] = task.pm.mutex
+            task.pm.data.__class__ = Watched
+            return original(self, task, wid)
+
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))), \
+                pytest.MonkeyPatch.context() as mp:
+            mp.setattr(tasks_module.TaskManager, '_worker_loop', worker)
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            task._coordinator.join(timeout=20)
+        assert held and all(held)
+
+
+class TestRound1SequentialForcedFlush:
+    """Item 8: Ctrl-C between apply_outcome and the saver keeps the result."""
+
+    def test_interrupt_after_apply(self, tmp_path, monkeypatch):
+        path = _make_project(tmp_path, n=2)
+        real_apply = ProjectManager.apply_outcome
+
+        def interrupt(self, *a, **kw):
+            real_apply(self, *a, **kw)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(ProjectManager, 'apply_outcome', interrupt)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            result = CliRunner().invoke(translate.cli, ['start', '--project', path])
+        assert result.exit_code == 1
+        assert _statuses(path) == [SegmentStatus.TRANSLATED, SegmentStatus.PENDING]
+
+
+class TestRound1ExportFlushes:
+    """Item 9: an export during a run first saves the window."""
+
+    def test_export_sees_the_window(self, tmp_path, fresh_tm, clock, monkeypatch):
+        from src.web.server import create_app
+        path = _make_project(tmp_path / 'projects', n=2)
+        gate = threading.Event()
+        read = []
+        import src.web.blueprints.export as export_bp
+
+        def fake_export(project_dir, output_path, fmt):
+            read.append(_statuses(project_dir))
+            raise RuntimeError('stop here')
+
+        monkeypatch.setattr(export_bp, 'export_project', fake_export)
+
+        def respond(request):
+            if '>Line 2.<' in request.messages[0].content:
+                assert gate.wait(20)
+            return like(request, '譯')
+
+        client = create_app(projects_dir=str(tmp_path / 'projects')).test_client()
+        with use_fake_backend(FakeBackend(responder=respond)):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            _wait(lambda: task.completed == 1)
+            assert _statuses(path)[0] == SegmentStatus.PENDING  # in the window
+            answer = client.post(f'/api/projects/{PROJECT}/export',
+                                 json={'format': 'chinese-only'})
+            assert answer.status_code == 200
+            _wait(lambda: read)
+            gate.set()
+            task._coordinator.join(timeout=20)
+        assert read[0][0] == SegmentStatus.TRANSLATED
+
+    def test_failed_flush_answers_500(self, tmp_path, fresh_tm, monkeypatch):
+        from src.web.server import create_app
+        _make_project(tmp_path / 'projects', n=1)
+        pm = ProjectManager(os.path.join(str(tmp_path / 'projects'), PROJECT))
+        pm.load()
+        pm.mark_translated('c1_seg0001', '<p>譯</p>')
+        pm.save()
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path / 'projects'),
+                                            state='running')
+        task.pm = pm
+
+        class Broken:
+            def flush(self):
+                raise OSError('disk full')
+
+        task.saver = Broken()
+        fresh_tm.tasks[PROJECT] = task
+        client = create_app(projects_dir=str(tmp_path / 'projects')).test_client()
+        answer = client.post(f'/api/projects/{PROJECT}/export', json={'format': 'chinese-only'})
+        assert answer.status_code == 500
+        assert answer.get_json() == {'error': '無法儲存專案：OSError: disk full'}
+        task.state = 'completed'
+
+
+class TestRound1BackendKey:
+    """Item 10: no backend key for the project's own backend."""
+
+    def test_web_claude_model_change_writes_no_key(self, tmp_path):
+        from src.web.server import create_app
+        path = _make_project(tmp_path, n=1)
+        client = create_app(projects_dir=str(tmp_path)).test_client()
+        answer = client.put(f'/api/projects/{PROJECT}/model',
+                            json={'model': 'opus', 'backend': 'claude-cli'})
+        assert answer.get_json() == {'status': 'ok', 'model': 'opus', 'backend': 'claude-cli'}
+        with open(os.path.join(path, 'project.json'), encoding='utf-8') as f:
+            raw = json.load(f)
+        assert raw['model'] == 'opus' and 'backend' not in raw
+
+    def test_web_non_string_backend(self, tmp_path):
+        """Item F."""
+        from src.web.server import create_app
+        _make_project(tmp_path, n=1)
+        client = create_app(projects_dir=str(tmp_path)).test_client()
+        for value in (['claude-cli'], {'a': 1}, 3):
+            answer = client.put(f'/api/projects/{PROJECT}/model',
+                                json={'model': 'opus', 'backend': value})
+            assert answer.status_code == 400
+
+    def test_cli_backend_option_keeps_the_stored_model(self, tmp_path, monkeypatch):
+        path = _make_project(tmp_path, n=1)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.set_model('gpt-6.2-sol', backend='copilot-cli')
+        pm.save()
+        pm.mark_translated('c1_seg0001', '<p>譯</p>')  # nothing to translate
+        pm.save()
+        result = CliRunner().invoke(translate.cli, ['start', '--project', path,
+                                                    '-b', 'copilot-cli'])
+        assert result.exit_code == 0, result.output
+        pm.load()
+        assert (pm.data.backend, pm.data.model) == ('copilot-cli', 'gpt-6.2-sol')
+
+    def test_cli_implicit_backend_writes_no_key(self, tmp_path):
+        path = _make_project(tmp_path, n=1)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.mark_translated('c1_seg0001', '<p>譯</p>')
+        pm.save()
+        result = CliRunner().invoke(translate.cli, ['start', '--project', path,
+                                                    '-b', 'claude-cli', '-m', 'opus'])
+        assert result.exit_code == 0, result.output
+        with open(os.path.join(path, 'project.json'), encoding='utf-8') as f:
+            raw = json.load(f)
+        assert raw['model'] == 'opus' and 'backend' not in raw
+
+
+class TestRound1Copilot:
+    """Items 11 and G."""
+
+    def _events(self, *events, code=0, stderr=''):
+        return ProcessResult(code, '\n'.join(json.dumps(e) for e in events), stderr)
+
+    REPLY = {'type': 'assistant.message', 'data': {'content': '譯文'}}
+
+    def test_error_beside_a_reply(self):
+        result = self._events(self.REPLY, {'type': 'session.error', 'data': {
+            'errorType': 'query', 'message': 'telemetry upload failed'}})
+        assert CopilotCLI().classify_error(result) is None
+        result = self._events(self.REPLY, {'type': 'session.error', 'data': {
+            'errorType': 'query', 'message': 'Model "x" is not available'}})
+        assert CopilotCLI().classify_error(result) is None
+        limited = self._events(self.REPLY, {'type': 'session.error', 'data': {
+            'errorType': 'query', 'message': "You've hit your rate limit."}})
+        assert type(CopilotCLI().classify_error(limited)) is RateLimitError
+        auth = self._events(self.REPLY, {'type': 'session.error', 'data': {
+            'errorType': 'authentication', 'message': 'not authenticated'}})
+        assert type(CopilotCLI().classify_error(auth)) is AuthError
+
+    def test_error_without_a_reply_is_classified(self):
+        result = self._events({'type': 'session.error', 'data': {'message': 'socket hang up'}})
+        found = CopilotCLI().classify_error(result)
+        assert type(found) is TransientError
+        assert str(found) == 'copilot CLI exited with code 0: socket hang up'
+
+    def test_filtered_alone_is_not_a_refusal(self):
+        result = self._events({'type': 'session.error', 'data': {
+            'message': 'results filtered by policy'}}, code=1)
+        assert type(CopilotCLI().classify_error(result)) is TransientError
+
+    def test_plain_stdout_only_without_error_events(self):
+        result = ProcessResult(1, 'plain text\n{"type": "x"}\nmore', '')
+        assert str(CopilotCLI().classify_error(result)) == \
+            'copilot CLI exited with code 1: plain text more'
+        with_event = self._events({'type': 'session.error', 'data': {'message': 'boom'}},
+                                  code=1)
+        with_event = ProcessResult(1, with_event.stdout + '\nnoise', '')
+        assert str(CopilotCLI().classify_error(with_event)) == \
+            'copilot CLI exited with code 1: boom'
+
+    def test_emails_redacted_in_message_and_raw(self, monkeypatch):
+        output = self._events({'type': 'session.error', 'data': {
+            'message': 'Account someone.x@example.org cannot use this'}}, code=1,
+            stderr='signed in as a-b@mail.example.com')
+        monkeypatch.setattr('src.llm.cli.run_process', lambda cmd, **kw: output)
+        with pytest.raises(TransientError) as info:
+            CopilotCLI().complete(_req(), threading.Event())
+        assert '@' not in str(info.value) and '@' not in info.value.raw
+        assert str(info.value) == ('copilot CLI exited with code 1: Account <redacted> cannot '
+                                   'use this | signed in as <redacted>')
+        assert '<redacted>' in info.value.raw
+
+    def test_timeout_output_redacted(self, monkeypatch):
+        import subprocess
+
+        def timeout(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, 9, output='x@y.io', stderr='')
+        monkeypatch.setattr('src.llm.cli.run_process', timeout)
+        with pytest.raises(TransientError) as info:
+            CopilotCLI().complete(_req(), threading.Event())
+        assert info.value.raw == '<redacted>'
+
+    def test_claude_keeps_its_output(self):
+        assert ClaudeCLI().redact('a@b.io') == 'a@b.io'
+
+
+class TestRound1WorkersComeBack:
+    """Item B: no completion while a segment is queued; resume tops up."""
+
+    def test_queued_segment_gets_a_worker(self, tmp_path, fresh_tm):
+        from src.glossary.glossary_manager import GlossaryManager
+        path = _make_project(tmp_path / 'projects', n=1)
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path / 'projects'),
+                                            state='running', total=1, num_workers=1)
+        task.pm = ProjectManager(path)
+        task.pm.load()
+        task._gm = GlossaryManager(os.path.join(path, 'glossary.json'))
+        task.segment_queue.put(task.pm.data.segments[0])
+        fake = FakeBackend(responder=lambda r: like(r, '譯'))
+        with use_fake_backend(fake):
+            assert fresh_tm._workers_done(task) is False  # a worker was started
+            assert len(task._threads) == 1
+            task._threads[0].join(timeout=20)
+        assert len(fake.requests) == 1
+        assert task.result_queue.qsize() == 1
+        assert fresh_tm._workers_done(task) is False  # a result is waiting
+        task.result_queue.get()
+        assert fresh_tm._workers_done(task) is True
+        task.segment_queue.put(task.pm.data.segments[0])
+        task.stop_event.set()
+        assert fresh_tm._workers_done(task) is True  # stopping: queued is fine
+
+    def test_resume_tops_up_without_a_count(self, tmp_path, fresh_tm):
+        task = tasks_module.TranslationTask('t', PROJECT, str(tmp_path), state='paused',
+                                            num_workers=2)
+        alive = threading.Event()
+        keeper = threading.Thread(target=alive.wait, daemon=True)
+        keeper.start()
+        task._coordinator = keeper
+        task.pm, task._gm = object(), object()
+        fresh_tm.tasks[PROJECT] = task
+        started = []
+
+        def worker(self, t, wid):
+            started.append(wid)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(tasks_module.TaskManager, '_worker_loop', worker)
+            assert fresh_tm.resume_translation(PROJECT)
+        for t in task._threads:
+            t.join()
+        assert sorted(started) == [0, 1]
+        alive.set()
+        keeper.join()
+
+
+class TestRound1StaleRunError:
+    """Item D: a call from before a pause and resume that ends in a
+    rate limit does not pause the resumed run."""
+
+    def test_stale_rate_limit(self, tmp_path, fresh_tm, clock):
+        path = _make_project(tmp_path / 'projects', n=1)
+        in_flight, release, calls = threading.Event(), threading.Event(), []
+
+        def respond(request):  # the fake ignores cancel: the call goes on
+            calls.append(1)
+            if len(calls) == 1:
+                in_flight.set()
+                assert release.wait(20)
+                raise RateLimitError('old limit', retry_after=30)
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            assert in_flight.wait(20)
+            assert fresh_tm.pause_translation(PROJECT)
+            assert fresh_tm.resume_translation(PROJECT)
+            release.set()
+            task._coordinator.join(timeout=20)
+        assert task.state == 'completed'
+        assert not [e for e in task.progress.get_all() if e['event'] == 'rate_limit']
+        assert _statuses(path) == [SegmentStatus.TRANSLATED]
+
+
+class TestRound1HomeListing:
+    """Item H: the listing shows a running task's project from memory."""
+
+    def test_running_task_in_memory(self, tmp_path, fresh_tm, clock):
+        from src.web.server import create_app
+        _make_project(tmp_path / 'projects', n=2)
+        gate = threading.Event()
+
+        def respond(request):
+            if '>Line 2.<' in request.messages[0].content:
+                assert gate.wait(20)
+            return like(request, '譯')
+
+        client = create_app(projects_dir=str(tmp_path / 'projects')).test_client()
+        with use_fake_backend(FakeBackend(responder=respond)):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            _wait(lambda: task.completed == 1)
+            listed = client.get('/api/projects').get_json()
+            gate.set()
+            task._coordinator.join(timeout=20)
+        entry = listed[0] if isinstance(listed, list) else listed['projects'][0]
+        assert entry['translated'] == 1

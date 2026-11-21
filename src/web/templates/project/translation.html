@@ -18,13 +18,13 @@
                 <button class="btn btn-secondary" @click="startTranslation(true)" :disabled="starting"
                         x-show="failedCount > 0 && (state === 'idle' || state === 'completed' || state === 'failed' || state === 'stopped')"
                         x-text="'重試失敗段落（' + failedCount + '）'">重試失敗段落（{{ progress.failed }}）</button>
-                <template x-if="state === 'running'">
-                    <button class="btn btn-secondary" @click="pauseTranslation()">
+                <template x-if="state === 'running' || (state === 'paused' && autoResume)">
+                    <button class="btn btn-secondary" @click="pauseTranslation('pause')">
                         ⏸ 暫停
                     </button>
                 </template>
                 <template x-if="state === 'paused'">
-                    <button class="btn btn-success" @click="pauseTranslation()">
+                    <button class="btn btn-success" @click="pauseTranslation('resume')">
                         ▶ 繼續翻譯
                     </button>
                 </template>
@@ -150,6 +150,7 @@ function translationController() {
         workers: 1,
         activeWorkers: 0,
         _pauseInFlight: false,
+        autoResume: false,  // paused by a rate limit, resumes by itself
 
         init() {
             this.fetchModel();
@@ -257,6 +258,7 @@ function translationController() {
                 this.error = data.error;
                 if (data.workers) this.workers = data.workers;
                 if (data.active_workers !== undefined) this.activeWorkers = data.active_workers;
+                this.autoResume = !!data.auto_resume;
 
                 if (this.state === 'running' || this.state === 'paused') {
                     this.connectSSE();
@@ -303,19 +305,22 @@ function translationController() {
             }
         },
 
-        async pauseTranslation() {
+        async pauseTranslation(action) {
             if (this._pauseInFlight) return;
             this._pauseInFlight = true;
             try {
-                const opts = { method: 'POST' };
-                if (this.state === 'paused') {
-                    opts.headers = { 'Content-Type': 'application/json' };
-                    opts.body = JSON.stringify({ workers: parseInt(this.workers) });
-                }
-                const res = await fetch('/api/projects/{{ project_name }}/translate/pause', opts);
+                const body = { action: action };
+                if (action === 'resume') body.workers = parseInt(this.workers);
+                const res = await fetch('/api/projects/{{ project_name }}/translate/pause', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
                 const data = await res.json();
                 if (data.state) {
                     this.state = data.state;
+                    this.autoResume = false;  // a user pause lasts; a resume ends any wait
+                    if (data.state === 'running') this.error = null;  // the pause's reason is over
                 }
                 if (data.error) {
                     this.error = data.error;
@@ -403,12 +408,14 @@ function translationController() {
                 this.state = 'paused';
                 this.error = (data.error || 'API 使用量已達上限') +
                     (data.resume_in ? `（${Math.round(data.resume_in)} 秒後自動繼續）` : '');
+                this.autoResume = !!data.resume_in;
                 this.refreshFailedCount();
             });
 
             this.eventSource.addEventListener('resumed', (e) => {
                 // Resumed by itself after a rate limit
                 this.state = 'running';
+                this.autoResume = false;
                 this.error = null;
             });
 
@@ -416,12 +423,14 @@ function translationController() {
                 const data = JSON.parse(e.data);
                 this.state = 'paused';
                 this.error = data.error || {{ auth_hint|tojson }};
+                this.autoResume = false;  // waits for the user
                 this.refreshFailedCount();
             });
 
             this.eventSource.addEventListener('backend_error', (e) => {
                 const data = JSON.parse(e.data);
                 this.state = 'paused';
+                this.autoResume = false;
                 this.error = data.error;
                 this.refreshFailedCount();
             });

@@ -283,10 +283,22 @@ MAX_CALLS = 4
 TRANSIENT_BACKOFF_SECONDS = (5, 15, 45)
 
 
-def wait_or_cancel(seconds: float, cancel: threading.Event) -> bool:
-    """Wait `seconds`; True when `cancel` was set meanwhile (the default
-    wait of TranslationEngine; tests inject their own)."""
-    return cancel.wait(seconds)
+# How often a backoff wait looks at `interrupted` (latency only)
+WAIT_SLICE_SECONDS = 0.1
+
+
+def wait_or_cancel(seconds: float, cancel: threading.Event, interrupted=None) -> bool:
+    """Wait `seconds`; True as soon as `cancel` is set or `interrupted()`
+    is true (the default wait of TranslationEngine; tests inject their own)."""
+    deadline = time.monotonic() + seconds
+    while True:
+        if interrupted is not None and interrupted():
+            return True
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        if cancel.wait(min(left, WAIT_SLICE_SECONDS)):
+            return True
 
 
 class _Rejected(Exception):
@@ -331,7 +343,7 @@ class _Session:
                 if self.left > 0:
                     backoff = TRANSIENT_BACKOFF_SECONDS
                     delay = backoff[min(self.transient, len(backoff)) - 1]
-                    if (engine.wait or wait_or_cancel)(delay, self.cancel):
+                    if (engine.wait or wait_or_cancel)(delay, self.cancel, engine.interrupted):
                         raise CancelledError('cancelled')
                 continue
             except LLMError as e:
@@ -437,11 +449,13 @@ class TranslationEngine:
 
     def __init__(self, max_calls: int = MAX_CALLS, model: str | None = None,
                  backend: llm.LLMBackend | None = None, timeout: float = 120,
-                 wait=None):
-        """`wait(seconds, cancel) -> bool` waits before a retry after a
-        transient error and returns True when cancelled; None:
-        wait_or_cancel."""
+                 wait=None, interrupted=None):
+        """`wait(seconds, cancel, interrupted) -> bool` waits before a retry
+        after a transient error and returns True when cancelled or
+        interrupted; None: wait_or_cancel. `interrupted() -> bool`: the run
+        stopped or paused (no retry is made then); None: never."""
         self.wait = wait
+        self.interrupted = interrupted
         self.max_calls = max_calls
         self.backend = backend if backend is not None else llm.default_backend()
         self.model = model if model is not None else self.backend.default_model
