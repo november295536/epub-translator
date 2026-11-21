@@ -240,6 +240,12 @@ def _saver(pm, log_dir):
     return DebouncedSaver(pm, after_save, clock=_clock)
 
 
+def _report_unsaved(saver):
+    if saver.pending:
+        click.echo(f"未儲存的結果（{len(saver.pending)} 個段落，下次 start 會重新翻譯）："
+                   + ', '.join(item[0] for item in saver.pending))
+
+
 def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
     """Single-worker sequential translation. Returns the number of failed segments."""
     engine = TranslationEngine(model=pm.data.model, backend=llm.backend_for(pm.data.backend))
@@ -277,7 +283,11 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
         # Also on Ctrl-C (the call in flight was killed, its segment stays
         # pending; one applied between apply_outcome and add is saved too:
         # forced) and on a stopped run
-        saver.flush(force=True)
+        try:
+            saver.flush(force=True)
+        except BaseException:
+            _report_unsaved(saver)
+            raise
     return failed
 
 
@@ -421,22 +431,22 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
         error_event.set()
         cancel.set()
         click.echo("翻譯中斷，正在停止進行中的段落……")
-        for t in threads:
-            t.join()
-        while True:
-            try:
-                seg_id, outcome, _, _ = result_queue.get_nowait()
-            except queue_mod.Empty:
-                break
-            pm.apply_outcome(seg_id, outcome)
-            saver.add((seg_id, outcome))
         try:
-            saver.flush(force=True)
-        except BaseException:  # noqa: BLE001 - reported below (the save itself may be what failed)
-            pass
-        if saver.pending:
-            click.echo(f"未儲存的結果（{len(saver.pending)} 個段落，下次 start 會重新翻譯）："
-                       + ', '.join(item[0] for item in saver.pending))
+            for t in threads:
+                t.join()
+        finally:  # also on a second Ctrl-C during the join
+            while True:
+                try:
+                    seg_id, outcome, _, _ = result_queue.get_nowait()
+                except queue_mod.Empty:
+                    break
+                pm.apply_outcome(seg_id, outcome)
+                saver.add((seg_id, outcome))
+            try:
+                saver.flush(force=True)
+            except BaseException:  # noqa: BLE001 - reported below (the save itself may be what failed)
+                pass
+            _report_unsaved(saver)
         raise
 
     for t in threads:

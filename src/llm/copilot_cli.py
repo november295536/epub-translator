@@ -32,7 +32,7 @@ from src.llm.base import (
     AuthError, BackendUnavailableError, Capabilities, LLMError, LLMRequest,
     LLMResponse, ModelInfo, RateLimitError, RefusalError, TransientError, Usage,
 )
-from src.llm.cli import ERROR_CHARS, CLIBackend, ProcessResult, _text
+from src.llm.cli import ERROR_CHARS, UNKNOWN_OPTION_PATTERN, CLIBackend, ProcessResult, _text
 
 # From the account's model catalog when this backend was written; the
 # multiplier is what Copilot counts per request
@@ -160,6 +160,7 @@ class CopilotCLI(CLIBackend):
         patterns = ((_RATE_LIMIT_PATTERN, RateLimitError), (_AUTH_PATTERN, AuthError))
         if not answered:
             patterns += ((_UNAVAILABLE_PATTERN, BackendUnavailableError),
+                         (UNKNOWN_OPTION_PATTERN, BackendUnavailableError),
                          (_REFUSAL_PATTERN, RefusalError))
         for pattern, cls in patterns:
             if any(pattern.search(t) for t in texts):

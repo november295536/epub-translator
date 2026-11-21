@@ -6,10 +6,10 @@ import re
 from typing import List, Optional
 
 from src.llm.base import (
-    AuthError, Capabilities, LLMError, LLMRequest, LLMResponse, ModelInfo,
+    AuthError, BackendUnavailableError, Capabilities, LLMError, LLMRequest, LLMResponse, ModelInfo,
     RateLimitError, TransientError,
 )
-from src.llm.cli import ERROR_CHARS, CLIBackend, ProcessResult, _text
+from src.llm.cli import ERROR_CHARS, UNKNOWN_OPTION_PATTERN, CLIBackend, ProcessResult, _text
 
 MODELS = [
     ModelInfo('sonnet', 'Sonnet', '快速且高品質，適合大多數翻譯'),
@@ -100,6 +100,9 @@ class ClaudeCLI(CLIBackend):
             return RateLimitError(source.strip()[:ERROR_CHARS])
         if found(_AUTH_ERROR_PATTERN):
             return AuthError(AUTH_MESSAGE)
+        if result.returncode != 0 and UNKNOWN_OPTION_PATTERN.search(stderr + stdout):
+            return BackendUnavailableError(
+                f'claude CLI rejected an option (update it): {stderr.strip()[:ERROR_CHARS]}')
         if result.returncode != 0:
             return TransientError(
                 f'claude CLI exited with code {result.returncode}: '
