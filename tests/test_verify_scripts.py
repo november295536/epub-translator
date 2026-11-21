@@ -3966,7 +3966,7 @@ class TestThroughputScriptRound4:
                      'Checkout whose code runs (default: this one); a checkout of main '
                      'measures the behaviour before Phase 7',
                      'Print project-N, no names or paths'):
-            assert text in out
+            assert f' {text}\n' in out  # the whole help text, nothing around it
 
     @pytest.mark.parametrize('argv', [['--project-index', '1'], ['--projects-dir', 'p']])
     def test_required(self, argv, capsys):
@@ -4005,6 +4005,8 @@ class TestThroughputScriptRound4:
             'failures by code none',
             'needed a retry 0  needed a split 0',
         ]
+        assert throughput.report_lines('p', 60.0, ['a'], {'a': 'failed'}, {}, Counter())[0] \
+            == 'p: segments 1  wall 60.0 s  seconds per segment 60.00  segments per minute 0.00'
         assert throughput.report_lines('p', 0.5, ['a'], {'a': 'translated'}, {}, Counter())[0] \
             == 'p: segments 1  wall 0.5 s  seconds per segment 0.50  segments per minute 120.00'
 
