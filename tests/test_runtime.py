@@ -190,7 +190,8 @@ class TestStopKillsCallInFlight:
             assert _gone(pid)
             assert task.state == 'paused' and task.completed == 0
             assert _statuses(path) == [SegmentStatus.PENDING]
-            assert task.segment_queue.qsize() == 1  # back in the queue
+            # back in the queue (the worker puts it back once its call has ended)
+            _wait(lambda: task.segment_queue.qsize() == 1)
             # resumed: the segment is sent again (a new child)
             assert fresh_tm.resume_translation(PROJECT)
             _wait(lambda: len(sleeper.pids()) == 2)
@@ -2113,22 +2114,33 @@ class TestRound2WindowInBatches:
     """Item 6: a batch of more than 20 results is saved every 20."""
 
     def test_web(self, tmp_path, fresh_tm, clock, monkeypatch):
+        """Deterministic batches (pre-merge): the first result is applied
+        alone (every other call waits for it); the coordinator is then held
+        until the other 59 are queued, so they form one batch."""
         path = _make_project(tmp_path / 'projects', n=60)
         counts = _record_saves(monkeypatch)
         real_done = tasks_module.TaskManager._workers_done
-        held = []
+        first_applied = threading.Event()
+        calls = []
 
         def done(self, task):
-            if not held:  # the coordinator waits once until a big batch is queued
-                held.append(1)
-                _wait(lambda: task.result_queue.qsize() >= 45)
+            if task.completed >= 1 and not first_applied.is_set():
+                first_applied.set()
+                _wait(lambda: task.result_queue.qsize() == 59, timeout=120)
             return real_done(self, task)
 
         monkeypatch.setattr(tasks_module.TaskManager, '_workers_done', done)
-        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+
+        def respond(request):
+            calls.append(1)
+            if len(calls) > 1:
+                assert first_applied.wait(120)
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
             task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'), num_workers=4)
-            task._coordinator.join(timeout=60)
-        assert task.state == 'completed'
+            task._coordinator.join(timeout=240)
+        assert task.state == 'completed', task.error
         assert _most_unsaved(counts) <= SAVE_EVERY_RESULTS
         assert _statuses(path) == [SegmentStatus.TRANSLATED] * 60
 
@@ -2147,7 +2159,7 @@ class TestRound2WindowInBatches:
             def get(self, *a, **kw):
                 if self is made[1] and not self.held:  # the result queue
                     self.held = True
-                    _wait(lambda: self.qsize() >= 45)
+                    _wait(lambda: self.qsize() >= 45, timeout=120)
                 return super().get(*a, **kw)
 
         monkeypatch.setattr(queue, 'Queue', Held)
@@ -2756,3 +2768,38 @@ class TestRound4Survivors:
             saver.add(item)
             assert saver.flush()
         assert saver.saves == 2
+
+
+class TestPreMergeRunEndsWithItsThreads:
+    """A run has ended only once its worker threads have: the coordinator
+    waits for them after the last worker left its loop (it used to end as
+    soon as the count of workers reached 0, while a thread could still be
+    finishing)."""
+
+    def test_coordinator_waits_for_a_finishing_worker(self, tmp_path, fresh_tm, monkeypatch):
+        _make_project(tmp_path / 'projects', n=1)
+        order = []
+        real_loop = tasks_module.TaskManager._worker_loop
+
+        def worker(self, task, wid):
+            real_loop(self, task, wid)  # active_workers is 0 after this
+            # still finishing: wait (bounded) for the run to end without us
+            _wait_until = time.monotonic() + 2
+            while time.monotonic() < _wait_until and 'complete' not in order:
+                time.sleep(0.01)
+            order.append('worker ended')
+
+        monkeypatch.setattr(tasks_module.TaskManager, '_worker_loop', worker)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path / 'projects'))
+            real_put = task.progress.put
+
+            def put(event):
+                if event['event'] == 'complete':
+                    order.append('complete')
+                real_put(event)
+
+            task.progress.put = put
+            task._coordinator.join(timeout=30)
+        assert order == ['worker ended', 'complete']
+        assert not task.threads_alive()

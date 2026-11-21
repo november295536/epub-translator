@@ -3270,7 +3270,9 @@ class TestRound3StaleResultInFailureDrain:
         def respond(request):
             if '>Chapter 2<' in request.messages[-1].content:
                 in_flight.set()
-                assert release.wait(10)
+                assert release.wait(60)
+            else:  # pre-merge: the failing save waits until this call is in flight
+                assert in_flight.wait(60)
             return like(request, '譯')
 
         TaskManager._instance = None
@@ -3282,8 +3284,8 @@ class TestRound3StaleResultInFailureDrain:
             task, patcher = _start(project_with_translations, respond,
                                    segment_ids=['ch1_seg0003', 'ch2_seg0001'],
                                    num_workers=2)
-            assert in_flight.wait(10)
-            _wait(lambda: task.state == 'failed')  # the drain waits for this call
+            assert in_flight.wait(60)
+            _wait(lambda: task.state == 'failed', timeout=60)  # the drain waits for this call
             task.pm.update_translation('ch2_seg0001', '人工')  # edited while in flight
             release.set()
             _finish(task, patcher)
