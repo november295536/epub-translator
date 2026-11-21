@@ -5638,4 +5638,4 @@ truth, so `None` saves as little as `False`).
 
 ### Not verified
 
-- Items B (form), F and H of round 1 in a browser: only the rendered pages were checked.
+- In a browser: the add form (B), the single `init()` (F) and the brief text area of round 1 (H); only the rendered pages were checked.
