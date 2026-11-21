@@ -9,6 +9,9 @@ EPUB 智能翻譯系統 - Translates English EPUB books to Traditional Chinese u
 ## Development Commands
 
 ```bash
+# Activate venv (required before all commands)
+source venv/bin/activate
+
 # Install dependencies
 pip install -r requirements.txt
 
