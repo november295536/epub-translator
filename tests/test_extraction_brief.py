@@ -702,3 +702,208 @@ class TestMutationSurvivors:
                             _reply(('Someone', '某人', 'person'), ('Orrin', '歐倫', 'person'))])
         terms = TermExtractor(backend=fake).extract_from_segments(_segments(2))
         assert terms == [{'term': 'Orrin', 'translation': '歐倫', 'category': 'person'}]
+
+
+# --- Review round 1 -----------------------------------------------------------------
+
+class TestRound1Consolidation:
+
+    def test_a_reply_counts_once_per_batch(self, small_batches):
+        fake = FakeBackend([
+            _reply(('Orrin', '歐林', 'person'), ('orrin', '歐林', 'person'), (' Orrin ', '歐林 ', 'person')),
+            _reply(('Orrin', '奧林', 'place')),
+            _reply(('Orrin', '奧林', 'place')),
+            'no json'])
+        terms = TermExtractor(backend=fake).extract_from_segments(_segments(3))
+        assert _candidates(fake.prompts[3]) == [
+            {'term': 'Orrin', 'category': 'place', 'translations': {'歐林': 1, '奧林': 2}}]
+        assert terms == [{'term': 'Orrin', 'translation': '奧林', 'category': 'place'}]
+
+    def test_decoded_reply_that_is_not_a_list_is_unusable(self, small_batches):
+        fake = FakeBackend([_reply(('Orrin', '歐林', 'person')), _reply(('Orrin', '奧林', 'person')),
+                            _reply(('Orrin', '奧林', 'person')),
+                            '{"rejected": [{"term": "Orrin", "translation": "歐倫"}]}'])
+        terms = TermExtractor(backend=fake).extract_from_segments(_segments(3))
+        assert terms == [{'term': 'Orrin', 'translation': '奧林', 'category': 'person'}]
+        # the same rule for an extraction reply
+        assert TermExtractor(backend=FakeBackend(
+            ['{"terms": [{"term": "A", "translation": "甲"}]}'])).extract_from_text('x') == []
+
+    def test_reply_that_cannot_be_parsed_is_unusable(self, small_batches, caplog):
+        caplog.set_level(logging.WARNING, logger='src.glossary.term_extractor')
+        deep = '[' * 100000 + ']' * 100000  # the decoder raises RecursionError
+        fake = FakeBackend([_reply(('Orrin', '歐林', 'person')), _reply(('Orrin', '奧林', 'person')),
+                            _reply(('Orrin', '奧林', 'person')), deep])
+        terms = TermExtractor(backend=fake).extract_from_segments(_segments(3))
+        assert terms == [{'term': 'Orrin', 'translation': '奧林', 'category': 'person'}]
+        assert [r.getMessage() for r in caplog.records][-2:] == [
+            'Term consolidation error: RecursionError', 'Term consolidation decided 0 of 1 terms']
+
+    def test_contradicting_rows_leave_the_term_undecided(self, small_batches):
+        fake = FakeBackend([
+            _reply(('Orrin', '歐林', 'person'), ('Tess', '泰絲', 'person')),
+            _reply(('Orrin', '奧林', 'person'), ('Tess', '黛絲', 'person')),
+            _reply(('Orrin', '奧林', 'person')),
+            _reply(('Orrin', '歐倫', 'person'), ('orrin', '歐林', 'person'),
+                   ('Tess', '黛絲', 'person'), ('TESS', '黛絲', 'place'))])
+        terms = TermExtractor(backend=fake).extract_from_segments(_segments(3))
+        # Orrin: two decisions, by frequency; Tess: the same twice, decided (first row's category)
+        assert terms == [{'term': 'Orrin', 'translation': '奧林', 'category': 'person'},
+                         {'term': 'Tess', 'translation': '黛絲', 'category': 'person'}]
+
+    @pytest.mark.parametrize('category', ['', '  ', None])
+    def test_stripped_reply_and_empty_category(self, small_batches, category):
+        fake = FakeBackend([_reply(('Orrin', '歐林', 'work')), _reply(('Orrin', '奧林', 'work')),
+                            json.dumps([{'term': ' orrin\n', 'translation': ' 歐倫\n',
+                                         'category': category}], ensure_ascii=False)])
+        terms = TermExtractor(backend=fake).extract_from_segments(_segments(2))
+        assert terms == [{'term': 'Orrin', 'translation': '歐倫', 'category': 'work'}]
+
+    def test_stripped_category(self, small_batches):
+        fake = FakeBackend([_reply(('Orrin', '歐林', 'work')), _reply(('Orrin', '奧林', 'work')),
+                            _reply(('Orrin', '歐倫', ' place\n'))])
+        terms = TermExtractor(backend=fake).extract_from_segments(_segments(2))
+        assert terms == [{'term': 'Orrin', 'translation': '歐倫', 'category': 'place'}]
+
+    def test_candidates_stripped(self, small_batches):
+        fake = FakeBackend([_reply((' Orrin ', ' 奧林\n', ' person '))])
+        assert TermExtractor(backend=fake).extract_from_segments(_segments(1)) == [
+            {'term': 'Orrin', 'translation': '奧林', 'category': 'person'}]
+
+
+class TestRound1Glossary:
+
+    @pytest.fixture
+    def gm(self, tmp_path):
+        return GlossaryManager(str(tmp_path / 'glossary.json'))
+
+    @pytest.mark.parametrize('content', [
+        [{'term': 'Orrin', 'translation': '奧林'}, {'term': 'Tess', 'translation': '泰絲', 'gender': 1}],
+        [{'term': 'Orrin', 'translation': '奧林'}, {'term': 'Tess', 'translation': '泰絲', 'note': []}],
+        [{'term': 'Orrin', 'translation': '奧林'}, 'Tess'],
+        {'term': 'Orrin', 'translation': '奧林'},
+    ])
+    def test_import_checked_before_anything_is_written(self, gm, tmp_path, content):
+        source = tmp_path / 'in.json'
+        source.write_text(json.dumps(content), encoding='utf-8')
+        with pytest.raises(ValueError):
+            gm.import_json(str(source))
+        assert gm.entries == {} and not os.path.exists(gm.glossary_path)
+
+    def test_cli_import_refused(self, tmp_path):
+        path = _project(tmp_path)
+        source = tmp_path / 'in.json'
+        source.write_text('[{"term": "Tess", "translation": "泰絲", "gender": 1}]', encoding='utf-8')
+        result = CliRunner().invoke(_cli(), ['glossary', 'import', str(source), '-p', path])
+        assert (result.exit_code, result.output) == (
+            1, '無法匯入：a glossary entry is not an object with text fields\n')
+        assert not os.path.exists(os.path.join(path, 'glossary.json'))
+
+    def test_person_fields_stripped(self, gm):
+        gm.add_term('Tess', '泰絲', gender=' female ', note=' the baker\n')
+        assert (gm.get_term('Tess').gender, gm.get_term('Tess').note) == ('female', 'the baker')
+        gm.update_term('Tess', gender='  ', note=' a miller ')
+        assert (gm.get_term('Tess').gender, gm.get_term('Tess').note) == ('', 'a miller')
+        with open(gm.glossary_path, encoding='utf-8') as f:
+            assert 'gender' not in json.load(f)[0]
+
+    def test_cli_add_keeps_omitted_person_fields(self, tmp_path):
+        path = _project(tmp_path)
+        cli, runner = _cli(), CliRunner()
+        runner.invoke(cli, ['glossary', 'add', 'Tess', '泰絲', '-c', 'person', '-g', 'female',
+                            '-n', 'the baker', '-p', path])
+        gm = GlossaryManager(os.path.join(path, 'glossary.json'))
+
+        def entry():
+            gm.load()
+            return gm.get_term('Tess')
+
+        runner.invoke(cli, ['glossary', 'add', 'Tess', '黛絲', '-c', 'person', '-p', path])
+        assert entry() == GlossaryEntry('Tess', '黛絲', 'person', 0, 'female', 'the baker')
+        runner.invoke(cli, ['glossary', 'add', 'Tess', '黛絲', '-c', 'person', '-n', '', '-p', path])
+        assert entry() == GlossaryEntry('Tess', '黛絲', 'person', 0, 'female', '')
+        runner.invoke(cli, ['glossary', 'add', 'Tess', '黛絲', '-c', 'person', '-g', '', '-p', path])
+        assert entry() == GlossaryEntry('Tess', '黛絲', 'person', 0, '', '')
+        runner.invoke(cli, ['glossary', 'add', 'Orrin', '奧林', '-p', path])
+        gm.load()
+        assert gm.get_term('Orrin') == GlossaryEntry('Orrin', '奧林')
+
+    @pytest.mark.parametrize('body', [['term', 'translation'], 'term', 5])
+    def test_web_non_object_body(self, web, body):
+        client, tmp_path = web
+        res = client.post('/api/projects/book/glossary', data=json.dumps(body),
+                          content_type='application/json')
+        assert (res.status_code, res.get_json()) == (400, {'error': '請提供 term 和 translation'})
+        client.post('/api/projects/book/glossary', json={'term': 'Tess', 'translation': '泰絲'})
+        res = client.put('/api/projects/book/glossary/Tess', data=json.dumps(body),
+                         content_type='application/json')
+        assert (res.status_code, res.get_json()) == (400, {'error': '請提供更新資料'})
+
+
+class TestRound1Brief:
+
+    def test_limit_in_the_setter(self, tmp_path):
+        from src.core.project import MAX_BRIEF_CHARS
+        assert MAX_BRIEF_CHARS == 2000
+        path = _project(tmp_path)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.set_brief(' ' + 'x' * 2000 + ' ')
+        assert pm.data.brief == 'x' * 2000
+        with pytest.raises(ValueError) as info:
+            pm.set_brief('y' * 2001)
+        assert str(info.value) == '書籍簡介最多 2000 字（目前 2001 字）'
+        assert pm.data.brief == 'x' * 2000
+
+    def test_limit_in_the_cli_and_web(self, tmp_path, web):
+        client, root = web
+        before = (root / 'book' / 'project.json').read_text()
+        res = client.put('/api/projects/book/brief', json={'brief': 'y' * 2001})
+        assert (res.status_code, res.get_json()) == (
+            400, {'error': '書籍簡介最多 2000 字（目前 2001 字）'})
+        assert (root / 'book' / 'project.json').read_text() == before
+        result = CliRunner().invoke(_cli(), ['brief', 'set', 'y' * 2001, '-p', str(root / 'book')])
+        assert (result.exit_code, result.output) == (1, '書籍簡介最多 2000 字（目前 2001 字）\n')
+        assert (root / 'book' / 'project.json').read_text() == before
+
+    def test_failed_save_restores_the_previous_brief(self, web, monkeypatch):
+        from src.web.tasks import TaskManager
+        client, root = web
+        pm = ProjectManager(str(root / 'book'))
+        pm.load()
+        pm.set_brief('Old brief.')
+        monkeypatch.setattr(TaskManager, 'get_or_load_pm', lambda self, name, d: pm)
+
+        def broken():
+            assert pm.data.brief == BRIEF  # the save sees the new one
+            raise OSError('disk full')
+
+        monkeypatch.setattr(pm, 'save', broken)
+        with pytest.raises(OSError):
+            client.put('/api/projects/book/brief', json={'brief': BRIEF})
+        assert pm.data.brief == 'Old brief.'
+
+    def test_get_reads_under_the_mutex(self, web, monkeypatch):
+        from src.web.tasks import TaskManager
+        client, root = web
+        pm = ProjectManager(str(root / 'book'))
+        pm.load()
+
+        class Mutex:
+            def __enter__(self):
+                pm.data.brief = 'set while held'
+
+            def __exit__(self, *exc):
+                pm.data.brief = 'set after'
+
+        pm.mutex = Mutex()
+        monkeypatch.setattr(TaskManager, 'get_or_load_pm', lambda self, name, d: pm)
+        assert client.get('/api/projects/book/brief').get_json() == {'brief': 'set while held'}
+
+    def test_text_area_waits_for_the_load_and_keeps_a_newer_draft(self, web):
+        client, _ = web
+        page = client.get('/project/book/translation').get_data(as_text=True)
+        assert ':disabled="!briefLoaded"' in page
+        assert 'briefLoaded: false' in page and 'this.briefLoaded = true;' in page
+        assert 'if (this.brief === sent) this.brief = data.brief;' in page
+        assert 'body: JSON.stringify({ brief: sent })' in page

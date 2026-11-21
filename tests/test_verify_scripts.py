@@ -4249,14 +4249,17 @@ class TestExtractionCompareScript:
         other = tmp_path / 'checkout'
         other.mkdir()
         with use_fake_backend(FakeBackend(responder=lambda r: '[]')):
-            # src is imported already: the code of this checkout runs, named as asked
+            # src is imported already, from this checkout: not the code of --code
             assert extraction.main(['--projects-dir', str(projects), '--project-index', '1',
-                                    '--out', str(out), '--code', str(other)]) == 0
+                                    '--out', str(out), '--code', str(other)]) == 2
+            assert capsys.readouterr().out == \
+                'ERROR the code that was loaded is not the one of --code\n'
+            assert not out.exists()
+            assert extraction.main(['--projects-dir', str(projects), '--project-index', '1',
+                                    '--out', str(out), '--name', 'before']) == 0
             assert capsys.readouterr().out.splitlines() == [
                 'a before: batches sent 1  calls 1  proposals 0  terms 0  '
                 'terms with conflicting translations 0', 'wrote terms-before.json']
-            assert extraction.main(['--projects-dir', str(projects), '--project-index', '1',
-                                    '--out', str(out), '--name', 'before']) == 0
         assert json.loads((out / 'terms-before.json').read_text()) == {'terms': [],
                                                                         'conflicts': {}}
 
@@ -4459,11 +4462,12 @@ class TestBriefSampleScript:
         with use_fake_backend(fake):
             code = brief_sample.main(self._args(tmp_path, projects))
         printed = capsys.readouterr().out
-        assert code == 0, printed
+        assert code == 1, printed  # one translation failed: written, but not a full sample
         assert printed.splitlines() == [
             'project-2: sampled 10  calls 20  without brief: translated 10 failed 0  '
             'with brief: translated 9 failed 1',
-            'wrote brief-sample.html']
+            'wrote brief-sample.html',
+            'FAIL project-2: not every sampled segment has both translations']
         # positions i * 21 // 10 of the 21 long segments: Line1, 3, 5, 7, 9, 11, 13, 15, 17, 19
         sent = [p.split('<p k="1">Line', 1)[1].split(' ', 1)[0] for p in fake.prompts]
         assert sent == [str(n) for n in (1, 1, 3, 3, 5, 5, 7, 7, 9, 9, 11, 11, 13, 13, 15, 15,
@@ -4474,10 +4478,10 @@ class TestBriefSampleScript:
             'An invented brief: plain tone, general readers.\n\n')
         assert {r.model for r in fake.requests} == {'fake-model'}
         page = (tmp_path / 'out' / 'brief-sample.html').read_text(encoding='utf-8')
-        assert page.count('<p>無簡介譯文</p>') == 10 and page.count('<p>有簡介譯文</p>') == 9
+        assert page.count('<td>無簡介譯文</td>') == 10 and page.count('<td>有簡介譯文</td>') == 9
         assert '（翻譯失敗：error）' in page
         assert '<pre>An invented brief: plain tone, general readers.</pre>' in page
-        assert '<th colspan="3">c1_seg0005</th></tr><tr><td><p>Line5 lantern' in page
+        assert '<th colspan="3">c1_seg0005</th></tr><tr><td>Line5 lantern' in page
         for secret in ('Line', 'invented brief', 'Invented', 'lantern', '譯文'):
             assert secret not in printed
         assert brief_sample.snapshot(str(projects)) == before
@@ -4604,8 +4608,8 @@ class TestBriefSampleScript:
         assert page.startswith('<!doctype html>\n<html><head><meta charset="utf-8">')
         assert '<h1>Brief</h1><pre>a &lt;b&gt; brief</pre>\n' in page
         assert '<table><tr><th>原文</th><th>無簡介</th><th>有簡介</th></tr>\n' in page
-        assert ('<tr><th colspan="3">c1&amp;s</th></tr><tr><td><p>Src.</p></td><td><p>譯</p></td>'
-                '<td><p class="failed">（翻譯失敗：tag&lt;count）</p></td></tr>\n'
+        assert ('<tr><th colspan="3">c1&amp;s</th></tr><tr><td>Src.</td><td>譯</td>'
+                '<td><span class="failed">（翻譯失敗：tag&lt;count）</span></td></tr>\n'
                 '</table></body></html>\n') in page
 
     def test_help_and_defaults(self, capsys, monkeypatch):
@@ -4825,14 +4829,15 @@ class TestPhase8ScriptSurvivors:
         assert page == (
             '<!doctype html>\n<html><head><meta charset="utf-8"><title>Brief sample</title>'
             '<style>table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;'
-            'padding:.5em;vertical-align:top;width:33%}th{background:#eee;text-align:left}'
+            'padding:.5em;vertical-align:top;width:33%;white-space:pre-wrap}'
+            'th{background:#eee;text-align:left}'
             '.failed{color:#a00}</style></head><body>\n'
             '<h1>Brief</h1><pre>b</pre>\n'
             '<table><tr><th>原文</th><th>無簡介</th><th>有簡介</th></tr>\n'
-            '<tr><th colspan="3">i</th></tr><tr><td><p>s</p></td><td><p>t</p></td>'
-            '<td><p>u</p></td></tr>\n'
-            '<tr><th colspan="3">j</th></tr><tr><td><p>v</p></td><td><p>w</p></td>'
-            '<td><p>x</p></td></tr>\n'
+            '<tr><th colspan="3">i</th></tr><tr><td>s</td><td>t</td>'
+            '<td>u</td></tr>\n'
+            '<tr><th colspan="3">j</th></tr><tr><td>v</td><td>w</td>'
+            '<td>x</td></tr>\n'
             '</table></body></html>\n')
 
     def test_extraction_file_text_and_name_after(self, tmp_path, capsys):
@@ -4851,3 +4856,216 @@ class TestPhase8ScriptSurvivors:
     def test_conflicts_case_folding(self):
         proposals = [[{'term': 'Straße', 'translation': '街'}], [{'term': 'STRASSE', 'translation': '路'}]]
         assert extraction.conflicts(proposals) == {}  # lowercase keys: two different terms
+
+
+# --- Phase 8 review round 1 ----------------------------------------------------------
+
+def _package():
+    """The name of this repository's package (renamed in a mutation run)."""
+    import src.glossary.term_extractor as module
+    return module.__name__.split('.')[0]
+
+
+_STUB = {
+    '__init__.py': '',
+    'llm/__init__.py': '''
+class _Backend:
+    name, capabilities, default_model, auth_hint = 'stub', None, 'stub-model', ''
+def backend_for(name):
+    return _Backend()
+''',
+    'core/__init__.py': '',
+    'core/migrate.py': 'def migrate_project(path):\n    raise AssertionError("not schema 1")\n',
+    'core/project.py': '''
+import json, os
+class _Data:
+    pass
+class _Segment:
+    def __init__(self, raw):
+        self.text, self.segment_type = raw.get('text', ''), raw.get('segment_type', 'text')
+class ProjectManager:
+    def __init__(self, path):
+        self.path = path
+    def load(self):
+        with open(os.path.join(self.path, 'project.json'), encoding='utf-8') as f:
+            raw = json.load(f)
+        self.data = _Data()
+        self.data.schema, self.data.backend = 2, None
+        self.data.segments = [_Segment(s) for s in raw['segments']]
+        return self.data
+''',
+    'glossary/__init__.py': '',
+    'glossary/term_extractor.py': '''
+class ExtractionError(Exception):
+    terms = []
+class TermExtractor:
+    def __init__(self, model, backend):
+        self.model = model
+    def extract_from_text(self, text):
+        return [{'term': 'Stub', 'translation': MARK}]
+    def extract_from_segments(self, segments):
+        self.extract_from_text('x')
+        return [{'term': 'Stub', 'translation': MARK, 'category': self.model}]
+''',
+}
+
+
+def _stub_checkout(root, mark):
+    """A checkout whose term extractor answers `mark` without any call."""
+    package = os.path.join(str(root), _package())
+    for name, text in _STUB.items():
+        path = os.path.join(package, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text.replace('MARK', repr(mark)))
+    return str(root)
+
+
+class TestPhase8Round1Scripts:
+
+    def _extract_args(self, tmp_path, projects, *extra):
+        return ['--projects-dir', str(projects), '--project-index', '2',
+                '--out', str(tmp_path / 'out'), '--model', 'other-model', '--anonymize', *extra]
+
+    def _brief_args(self, tmp_path, projects, *extra):
+        brief = tmp_path / 'brief.txt'
+        brief.write_text('A brief.', encoding='utf-8')
+        return ['--projects-dir', str(projects), '--project-index', '2', '--brief-file',
+                str(brief), '--out', str(tmp_path / 'out'), '--model', 'm', '--anonymize', *extra]
+
+    def test_code_of_two_checkouts_in_fresh_interpreters(self, tmp_path):
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=1)
+        script = os.path.join(ROOT, 'scripts', 'verify', 'phase8_extraction_compare.py')
+        for mark, name in (('甲', 'before'), ('乙', 'after')):
+            code = _stub_checkout(tmp_path / f'code-{name}', mark)
+            run = subprocess.run([sys.executable, script, '--name', name, '--code', code]
+                                 + self._extract_args(tmp_path, projects),
+                                 capture_output=True, text=True, cwd=str(tmp_path), timeout=60)
+            assert run.returncode == 0, run.stdout + run.stderr
+            assert run.stdout.splitlines()[0] == (
+                f'project-2 {name}: batches sent 1  calls 0  proposals 1  terms 1  '
+                'terms with conflicting translations 0')
+        for mark, name in (('甲', 'before'), ('乙', 'after')):
+            written = json.loads((tmp_path / 'out' / f'terms-{name}.json').read_text('utf-8'))
+            assert written['terms'] == [{'term': 'Stub', 'translation': mark,
+                                         'category': 'other-model'}]
+        (tmp_path / 'empty').mkdir()
+        run = subprocess.run([sys.executable, script, '--code', str(tmp_path / 'empty')]
+                             + self._extract_args(tmp_path, projects),
+                             capture_output=True, text=True, cwd=str(tmp_path), timeout=60)
+        assert (run.returncode, run.stdout) == (
+            2, 'ERROR --code has no term extractor (ModuleNotFoundError)\n')
+
+    def test_code_loaded_from_the_checkout_in_process(self, tmp_path, capsys, monkeypatch):
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=1)
+        code = _stub_checkout(tmp_path / 'code', '丙')
+        package = _package()
+        saved = {k: v for k, v in sys.modules.items() if k == package or k.startswith(package + '.')}
+        # another checkout (this one) already first on the path: --code must still win
+        monkeypatch.setattr(sys, 'path', [ROOT] + sys.path)
+        try:
+            for k in saved:
+                del sys.modules[k]
+            result = extraction.main(['--code', code] + self._extract_args(tmp_path, projects))
+        finally:
+            for k in [k for k in sys.modules if k == package or k.startswith(package + '.')]:
+                del sys.modules[k]
+            sys.modules.update(saved)
+        assert result == 0, capsys.readouterr().out
+        written = json.loads((tmp_path / 'out' / 'terms-before.json').read_text('utf-8'))
+        assert written['terms'][0]['translation'] == '丙'
+
+    @pytest.mark.parametrize('module', ['extraction', 'brief'])
+    def test_looks_for_dot_git(self, tmp_path, monkeypatch, module):
+        script = extraction if module == 'extraction' else brief_sample
+        looked = []
+        real = script.os.path.lexists
+
+        def lexists(path):
+            looked.append(os.path.basename(path))
+            return real(path)
+
+        monkeypatch.setattr(script.os.path, 'lexists', lexists)
+        script.in_work_tree(str(tmp_path))
+        assert looked and set(looked) == {'.git'}
+
+    def test_brief_glossary_file_name(self, tmp_path, capsys, monkeypatch):
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=10)
+        paths = []
+        real = brief_sample.load_glossary
+        monkeypatch.setattr(brief_sample, 'load_glossary',
+                            lambda path: paths.append(os.path.basename(path)) or real(path))
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            assert brief_sample.main(self._brief_args(tmp_path, projects)) == 0
+        assert paths == ['glossary.json']
+
+    @pytest.mark.parametrize('module', ['extraction', 'brief'])
+    def test_files_read_and_written_as_utf8(self, tmp_path, capsys, monkeypatch, module):
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        script = extraction if module == 'extraction' else brief_sample
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=10)
+        opened = []
+        real = open
+
+        def recording(path, mode='r', **kwargs):
+            opened.append((os.path.basename(path), mode, kwargs))
+            return real(path, mode, **kwargs)
+
+        monkeypatch.setattr(script, 'open', recording, raising=False)
+        if module == 'extraction':
+            fake = FakeBackend(responder=lambda r: '[]')
+            args = self._extract_args(tmp_path, projects)
+            expected = [('terms-after.json', 'w', {'encoding': 'utf-8'})]
+        else:
+            fake = FakeBackend(responder=lambda r: like(r, '譯'))
+            args = self._brief_args(tmp_path, projects)
+            expected = [('brief.txt', 'r', {'encoding': 'utf-8'}),
+                        ('brief-sample.html', 'w', {'encoding': 'utf-8'})]
+        with use_fake_backend(fake):
+            assert script.main(args) == 0
+        assert opened == expected
+
+    @pytest.mark.parametrize('module', ['extraction', 'brief'])
+    def test_copy_left_at_schema_1_refused(self, tmp_path, capsys, monkeypatch, module):
+        from src.llm.fake import FakeBackend
+        from tests.conftest import use_fake_backend
+        script = extraction if module == 'extraction' else brief_sample
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=10)
+        file = projects / 'b' / 'project.json'
+        raw = json.loads(file.read_text())
+        raw['schema'] = 1
+        file.write_text(json.dumps(raw))
+        monkeypatch.setattr('src.core.migrate.migrate_project', lambda path: None)  # unmatched
+        made = _mkdtemps(script, monkeypatch)
+        fake = FakeBackend()
+        args = (self._extract_args(tmp_path, projects) if module == 'extraction'
+                else self._brief_args(tmp_path, projects))
+        with use_fake_backend(fake):
+            assert script.main(args) == 2
+        assert capsys.readouterr().out == 'ERROR project-2: the copy could not be migrated\n'
+        assert fake.requests == [] and not (tmp_path / 'out').exists()
+        assert not os.path.exists(made[0])
+
+    def test_readable(self):
+        markup = ('<h2 class="c" id="x">Title &amp; more</h2>\n<p>One <em>two</em><br/>three'
+                  '<img src="https://example.invalid/i.png" onerror="alert(1)"/></p>'
+                  '<script>alert("x")</script><p>  </p>')
+        assert brief_sample.readable(markup) == \
+            'Title &amp; more\nOne two\nthree\nalert(&quot;x&quot;)'
+        assert brief_sample.readable('<P>a</P><LI>b</LI><blockquote>c</blockquote>d') == 'a\nb\nc\nd'
+        assert brief_sample.readable('&lt;b&gt; x') == '&lt;b&gt; x'  # decoded, then escaped
+
+    def test_conflicts_count_once_per_batch_and_skip_blanks(self):
+        proposals = [[{'term': 'Orrin', 'translation': '奧林'}, {'term': 'orrin ', 'translation': ' 奧林'},
+                      {'term': 'Orrin', 'translation': ' '}, {'term': ' ', 'translation': '空'}],
+                     [{'term': 'Orrin', 'translation': '歐林'}],
+                     [{'term': 'Orrin', 'translation': '歐林'}]]
+        assert extraction.conflicts(proposals) == {'Orrin': {'奧林': 1, '歐林': 2}}

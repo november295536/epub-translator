@@ -40,14 +40,14 @@ Usage:
 
 Exit code: 0 when the extraction ran to the end and the projects directory
 is unchanged, 1 otherwise (also when a rate limit or a login stopped it),
-2 when the setup is refused.
+2 when the setup is refused (no such project; --code without the term
+extractor, or code loaded from somewhere else than --code; a copy that
+migration leaves at schema 1; a place refused above).
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
 import json
 import logging
 import os
@@ -112,12 +112,20 @@ class CountingBackend:
 
 def conflicts(proposals: list) -> dict:
     """{term: {translation: batches}} for every term (case-insensitive, the
-    first spelling) that the batches proposed with more than one translation."""
+    first spelling) that the batches proposed with more than one translation.
+    The rules of the extractor's collect_candidates, so that both codes are
+    counted alike: texts stripped, a blank term or translation skipped, a
+    translation counted once per batch."""
     seen: dict = {}
     for terms in proposals:
+        counted = set()
         for t in terms:
             term, translation = t.get('term'), t.get('translation')
-            if isinstance(term, str) and isinstance(translation, str):
+            if not isinstance(term, str) or not isinstance(translation, str):
+                continue
+            term, translation = term.strip(), translation.strip()
+            if term and translation and (term.lower(), translation) not in counted:
+                counted.add((term.lower(), translation))
                 spelling, counts = seen.setdefault(term.lower(), (term, Counter()))
                 counts[translation] += 1
     return {spelling: dict(counts) for spelling, counts in seen.values() if len(counts) > 1}
@@ -173,10 +181,19 @@ def compare(args) -> int:
             return 2
 
     sys.path.insert(0, os.path.abspath(args.code))
-    import src.llm as llm  # noqa: E402 - from --code
-    from src.core.migrate import migrate_project  # noqa: E402
-    from src.core.project import ProjectManager  # noqa: E402
-    from src.glossary.term_extractor import ExtractionError, TermExtractor  # noqa: E402
+    try:
+        import src.llm as llm  # noqa: E402 - from --code
+        import src.core.migrate as migrate  # noqa: E402
+        import src.core.project as project  # noqa: E402
+        import src.glossary.term_extractor as extractor  # noqa: E402
+    except ImportError as e:
+        print(f'ERROR --code has no term extractor ({type(e).__name__})')
+        return 2
+    if not all(inside(m.__file__, args.code) for m in (llm, migrate, project, extractor)):
+        print('ERROR the code that was loaded is not the one of --code')
+        return 2
+    migrate_project, ProjectManager = migrate.migrate_project, project.ProjectManager
+    ExtractionError, TermExtractor = extractor.ExtractionError, extractor.TermExtractor
 
     before = snapshot(args.projects_dir)
     work = None
@@ -205,11 +222,12 @@ def run(args, label, project_dir, work, llm, migrate_project, ProjectManager,
     for file in COPIED:
         if os.path.isfile(os.path.join(project_dir, file)):
             shutil.copy2(os.path.join(project_dir, file), copy)
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        pm = ProjectManager(copy)
-        if pm.load().schema != 2:
-            migrate_project(copy)
-            pm.load()
+    pm = ProjectManager(copy)
+    if pm.load().schema != 2:
+        migrate_project(copy)
+        if pm.load().schema != 2:  # a chapter that did not match: nothing written
+            print(f'ERROR {label}: the copy could not be migrated')
+            return 2
     segments = [{'text': s.text} for s in pm.data.segments if s.segment_type != 'code']
 
     backend = CountingBackend(llm.backend_for(pm.data.backend))
