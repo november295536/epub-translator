@@ -3,10 +3,13 @@ paused by a run-level error goes on by itself, and when results are saved."""
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 
 from src.llm import RateLimitError
+
+logger = logging.getLogger(__name__)
 
 # A rate limit without a usable `retry_after`: the run resumes after this long
 RATE_LIMIT_WAIT_SECONDS = 300
@@ -85,5 +88,8 @@ class DebouncedSaver:
             self.saves += 1
             self._last = self.clock()
             if self.after_save is not None:
-                self.after_save(items)
+                try:
+                    self.after_save(items)
+                except Exception:  # noqa: BLE001 - saved; only the diagnostics are lost
+                    logger.exception("儲存後寫入失敗紀錄時出錯")
         return True

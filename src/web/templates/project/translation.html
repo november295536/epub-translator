@@ -246,7 +246,7 @@ function translationController() {
             }
         },
 
-        async fetchStatus() {
+        async fetchStatus(connect = true) {
             try {
                 const res = await fetch('/api/projects/{{ project_name }}/translate/status');
                 const data = await res.json();
@@ -261,7 +261,7 @@ function translationController() {
                 this.autoResume = !!data.auto_resume;
 
                 if (this.state === 'running' || this.state === 'paused') {
-                    this.connectSSE();
+                    if (connect) this.connectSSE();
                 } else if (['completed', 'failed', 'stopped'].includes(this.state)) {
                     this.refreshFailedCount();  // a run that ended since the page was rendered
                 }
@@ -404,9 +404,8 @@ function translationController() {
             });
 
             this.eventSource.addEventListener('paused', (e) => {
-                // User-initiated pause state is set by the API response.
-                // This handler is kept for potential multi-tab scenarios but
-                // does NOT overwrite state to avoid oscillation with resume.
+                // From this tab or another: the server's state, not the event's
+                this.fetchStatus(false);
             });
 
             this.eventSource.addEventListener('rate_limit', (e) => {
@@ -419,10 +418,9 @@ function translationController() {
             });
 
             this.eventSource.addEventListener('resumed', (e) => {
-                // Resumed by itself after a rate limit
-                this.state = 'running';
-                this.autoResume = false;
-                this.error = null;
+                // Resumed by itself after a rate limit; a pause may have
+                // followed already: the server's state, not the event's
+                this.fetchStatus(false);
             });
 
             this.eventSource.addEventListener('auth_error', (e) => {

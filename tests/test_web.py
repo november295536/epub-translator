@@ -3042,7 +3042,7 @@ class TestRound2StartChecks:
 
 # --- Review round 3 ---------------------------------------------------------------
 
-from src.core.translator import MAX_CONSECUTIVE_UNEXPECTED
+from src.core.translator import MAX_CONSECUTIVE_UNEXPECTED, UnexpectedStreak
 
 
 def _dir_snapshot(path):
@@ -3303,9 +3303,10 @@ class TestRound3UnexpectedStreakWeb:
             Segment(id=f'ch1_seg{i:04d}', html=f'<p>Line {i}.</p>', text=f'Line {i}.',
                     word_count=2, segment_type=SegmentType.TEXT) for i in range(1, n + 1)])
 
-    def test_run_stops_after_five(self, project_with_translations):
+    def test_run_stops_after_five(self, project_with_translations, monkeypatch):
         self._project(project_with_translations, 8)
         holder, calls = {}, []
+        _stop_once_the_sixth_call_runs(monkeypatch, calls)
 
         def respond(request):
             calls.append(1)
@@ -3496,9 +3497,10 @@ class TestRound4StreakKeepsInFlightResults:
     """Item 3: after five unexpected failures in a row the calls in flight
     are awaited and their results saved, then the task fails."""
 
-    def test_good_result_after_streak_saved(self, project_with_translations):
+    def test_good_result_after_streak_saved(self, project_with_translations, monkeypatch):
         TestRound3UnexpectedStreakWeb()._project(project_with_translations, 8)
         holder, calls = {}, []
+        _stop_once_the_sixth_call_runs(monkeypatch, calls)
 
         def respond(request):
             calls.append(1)
@@ -3847,7 +3849,7 @@ class TestPhase4HeaderProgress:
     def test_header_bar_refreshed_when_a_run_ends(self, client):
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
         start = html.index('async refreshFailedCount()')
-        body = html[start:html.index('async fetchStatus()')]
+        body = html[start:html.index('async fetchStatus(connect = true)')]  # Phase 7 round 4
         assert "document.querySelector('.project-header .progress-bar')" in body
         assert "header.querySelector('.progress-fill').style.width = data.percent + '%';" in body
         assert ('`${data.translated + data.reviewed}/${data.total} (${data.percent}%)`'
@@ -4329,3 +4331,18 @@ class TestReviewPageGlossaryNotice(TestReviewPageScript):
     def test_notice_in_the_page(self, client):
         html = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1').get_data(as_text=True)
         assert html.count('<p class="glossary-notice" hidden>術語表無法讀取，這次未檢查術語。</p>') == 3
+
+
+def _stop_once_the_sixth_call_runs(monkeypatch, calls):
+    """The coordinator stops the run after the fifth failure only once the
+    worker's sixth call has started (Phase 7 round 4: a worker makes no call
+    once the run is stopping, so without this the sixth call raced the stop)."""
+    real = UnexpectedStreak.add
+
+    def add(self, outcome):
+        stop = real(self, outcome)
+        if stop:
+            _wait(lambda: len(calls) > MAX_CONSECUTIVE_UNEXPECTED)
+        return stop
+
+    monkeypatch.setattr(UnexpectedStreak, 'add', add)

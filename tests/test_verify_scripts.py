@@ -3512,11 +3512,12 @@ class TestThroughputScript:
             return like(request, '譯')
         return respond
 
-    def test_measures_a_copy(self, tmp_path, capsys):
+    def test_measures_a_copy(self, tmp_path, capsys, monkeypatch):
         from src.llm.fake import FakeBackend
         from tests.conftest import use_fake_backend
         projects = tmp_path / 'projects'
         _invented_projects(str(projects))
+        made = _record_mkdtemp(monkeypatch)
         before = throughput.snapshot(str(projects))
         calls = []
         with use_fake_backend(FakeBackend(responder=self._respond(calls))):
@@ -3536,8 +3537,8 @@ class TestThroughputScript:
         assert sum('>Line 4.<' in c for c in calls) == 0
         assert sum('>Line 1.<' in c for c in calls) == 1
         assert throughput.snapshot(str(projects)) == before
-        assert not any(n.startswith('phase7-throughput-') for n in os.listdir(
-            os.path.realpath(throughput.tempfile.gettempdir())))
+        # its own copy is gone (not "no such directory at all": another run may have one)
+        assert len(made) == 1 and not os.path.exists(made[0])
         from src.llm import default_backend
         assert default_backend().name == 'claude-cli'  # replaced names restored
 
@@ -3794,10 +3795,10 @@ class TestThroughputScriptRound1:
             raise KeyboardInterrupt
 
         monkeypatch.setattr(throughput, 'run', interrupt)
+        made = _record_mkdtemp(monkeypatch)
         assert throughput.main(self._args(projects)) == 1
         assert capsys.readouterr().out == 'ERROR the measurement stopped (KeyboardInterrupt)\n'
-        assert not any(n.startswith('phase7-throughput-') for n in os.listdir(
-            os.path.realpath(throughput.tempfile.gettempdir())))
+        assert len(made) == 1 and not os.path.exists(made[0])
 
     def test_cleanup_failure_reported_without_a_path(self, tmp_path, capsys, monkeypatch):
         from src.llm.fake import FakeBackend
@@ -3931,3 +3932,12 @@ class TestThroughputScriptRound2:
         assert capsys.readouterr().out.splitlines()[-1] == \
             'ERROR the measurement stopped (FileNotFoundError)'
         assert len(made) == 1 and not os.path.exists(made[0])
+
+
+def _record_mkdtemp(monkeypatch):
+    """The temporary directories the throughput script makes."""
+    made = []
+    real = throughput.tempfile.mkdtemp
+    monkeypatch.setattr(throughput.tempfile, 'mkdtemp',
+                        lambda **kw: made.append(real(**kw)) or made[-1])
+    return made
