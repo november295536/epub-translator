@@ -553,6 +553,10 @@ class TaskManager:
                 if self._workers_done(task):
                     break
 
+            # Every worker has left its loop (active_workers is 0); wait for
+            # the threads themselves, so an ended run has no thread left
+            for t in list(task._threads):
+                t.join()
             saver.flush()  # before the final state: readers then load the file
             if streak_stop:
                 raise RuntimeError(streak_stop)
