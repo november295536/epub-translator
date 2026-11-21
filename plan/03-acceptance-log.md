@@ -5578,3 +5578,64 @@ machine.
 
 - The text area's behaviour (H) in a browser: only the rendered page was checked.
 - The quality of the two whole-book term lists (the owner's).
+
+## Phase 8 — review round 2
+
+Date: 2026-11-22. GPT requested changes, Opus and Gemini approved. Each accepted claim was
+checked against the code first; all were real (F: the double `init()` is real and older than
+this phase, see below).
+
+### Accepted
+
+| Item | Fix | Test |
+|---|---|---|
+| A. Consolidation reply is one list | `_top_level_list`: after removing a Markdown fence the whole reply must decode to a JSON list; no array is searched for inside other text, so a cut-off `{"rejected":[…]` is unusable (frequency rule). The extraction replies keep `_parse_response` and its recovery | `TestRound2::test_cut_off_object_is_not_a_consolidation_answer`, `test_consolidation_answer_is_the_whole_reply` (both forms, and the extraction recovery unchanged), `test_top_level_list`, `TestRound2Survivors::test_fenced_list_over_several_lines` |
+| B. Web POST of an existing term | the CLI rule everywhere: a person field that is not sent keeps the stored value, one sent as `''` clears it. The add form sends `gender` / `note` only when the category is person (when the fields are shown), so it never wipes fields it hides; the edit row already sends the values it loaded | `test_web_post_keeps_person_fields_not_sent`, `test_add_form_sends_person_fields_only_when_shown` |
+| C. Extraction rewrote the glossary per term | real: both the web task and the CLI read the glossary after the model calls, but then saved the whole file once per term, so an edit saved during that loop could be reverted. Now `add_term(save=False)` for every extracted term and one `save()` after the loop (no new locking) | `test_cli_extraction_merges_after_the_calls_and_saves_once`, `test_web_extraction_merges_after_the_calls_and_saves_once` (an edit made during the model call survives; one save by the extraction) |
+| D. Import with a missing key | `_entries` (shared by `load()` and `import_json`) builds every `GlossaryEntry` before anything is applied; a missing or unknown field raises `ValueError('a glossary entry has a missing or unknown field')` (before: `load()` raised `TypeError`, the import skipped the entry). The import saves once | `test_import_with_a_missing_or_unknown_field` (both cases, file unchanged, and `load()`), `test_import_saves_once`, `test_import_keeps_the_frequency` |
+| E. `--code` accepted a nested checkout | `loaded_from`: each module must be exactly `<code>/<package path>.py` (or `…/__init__.py` for a package) | `TestPhase8Round2Scripts::test_modules_of_a_checkout_nested_in_code_refused` (a stub under `<main>/.worktree/branch` already imported, `--code <main>`: refused), `test_loaded_from` |
+| F. Double `init()` | real, and older than this phase: Alpine 3 calls a component's `init()` by itself and `x-init="init()"` called it again, so on the translation page `fetchModel`, `fetchStatus` (which opens the SSE stream when a run is active, so a second stream replaced the first) and, from this phase, `fetchBrief` ran twice. The `x-init` attribute is removed from that page. The glossary and export pages have the same pattern (`loadTerms` / extraction status, the export page's `init()`); left as on `main`, outside this item | `test_translation_page_initialized_once` (rendered page; not run in a browser) |
+| G. No proposal at all | the comparison exits 1 with `FAIL project-N: no batch proposed a term` when no batch proposed anything (no per-batch failure tracking) | `test_no_proposal_at_all_fails` (every call a transient error); the tests whose fake answered `[]` now answer one term |
+| H. Brief file over the limit | the sample refuses a brief longer than `MAX_BRIEF_CHARS` (the setter's rule, after stripping) with `ERROR the brief is longer than 2000 characters`, exit 2, before the copy and any call. Project loading unchanged | `test_brief_over_the_limit_refused_before_any_call` (2001 refused, 2000 accepted) |
+| I. Batch delete body | a non-object body, a `terms` that is not a list, or a non-text term: 400, nothing deleted | `test_batch_delete_refused` (5 cases) |
+| J. Report text | `readable` uses the project's parser: one line per `validation.top_level_units` unit, its text from `validation.plain_text` (parsed, tags, script and style removed, entities decoded), whitespace collapsed, then escaped; markup that cannot be cut or parsed is shown as it is (escaped). A quoted `>` in an attribute no longer leaks | `test_readable` (attribute with `>`, script, unparsable markup) |
+| K. Empty category | an empty category is no vote; `_most_common` of no votes is `''` | `test_an_empty_category_is_no_vote` |
+| L. Person fields on one line | `gender` / `note` have every whitespace run (also line breaks) collapsed to one space when stored (`add_term`, `update_term`) | `test_person_fields_one_line` |
+
+### Rejected (considered, not done)
+
+- GPT 5 (`--out` with `..` through a not-yet-existing projects subdirectory), GPT 6 (the before
+  checkout unpacked inside the projects directory), GPT 7 (argparse echoing a mistyped
+  argument): not realistic for hand-run scripts.
+- GPT 11 (stored keys with surrounding spaces): entries are stripped on the way in.
+- GPT 14 (the separator counted twice at the exact 8000 boundary): at most one extra call in a
+  boundary case.
+
+### Mutation testing
+
+`scripts/verify/mutation.sh main`, parallel.
+
+| Run | Mutants | Killed | Survived | Timeout |
+|---|---|---|---|---|
+| round 2, first | 1319 | 1309 | 10 | 0 |
+| round 2, final | 1319 | 1313 | 6 | 0 |
+
+First → final: a fenced list over several lines (kills the joiner and `split(None)` mutants),
+an imported frequency; `readable` no longer carries the unused third value of a unit (its
+mutant was equivalent). Remaining, each equivalent on any machine: the five of round 1
+(`translate_segment` 4, `_candidate_line` 2, extraction `run` 84, `main` 61 and 87, reasons as
+recorded there) and `import_json` 9 (`save=False` → `save=None`: `add_term` tests it for
+truth, so `None` saves as little as `False`).
+
+### Checks and tests
+
+- `python3 -m pytest tests/ -q -p no:cacheprovider`: three suites at once, 2539 passed each, no
+  failure. No existing test removed; changed: the tests whose fake extraction answered `[]`
+  (now one term, item G) and the `readable` expectations (item J: one line per top-level
+  block, so a `<br>` inside a paragraph no longer breaks the line).
+- The four older check scripts (phase 3 to 6, `--anonymize`): the same TOTAL lines; projects
+  fingerprint `a7197555c962562a530d6de80fa045af`. No real model call in this round.
+
+### Not verified
+
+- Items B (form), F and H of round 1 in a browser: only the rendered pages were checked.
