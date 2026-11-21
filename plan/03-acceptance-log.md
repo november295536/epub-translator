@@ -5885,8 +5885,9 @@ there; 15 equivalent):
   within about 1 s, twice). If a Copilot version kept it alive after its parent died, it would be
   left running; the cancel check above would show it.
 - The extension needs `EPUB_TRANSLATOR_SYSTEM_PROMPT`; without it the CLI fails the run (exit 1,
-  `ProtocolSystemMessageConfig`), which is classified as transient. `CopilotCLI` always sets it,
-  so only a hand-made call can hit this.
+  `ProtocolSystemMessageConfig`). `CopilotCLI` always sets it. (Corrected in review round 1:
+  that error now stops the run as backend-unavailable instead of being retried as transient, since
+  a Copilot update that changes the extension interface gives the same error.)
 - The check accepts any `agent_replacement` content; that it is our prompt is shown by the hash
   (the SHA-256 prefix of `SYSTEM_PROMPT`), which is not checked.
 - Copilot calls still each leave a session in the user's Copilot directory (as in Phase 7). The
@@ -5966,4 +5967,46 @@ intermittent warning on `main` than a thread.
 Cause of the intermittent warning (seen during Phase 7 and after the Phase 8 merge): that docstring, the only one of the repository's Python files that warns when compiled (`py_compile` under `-W error`); it is now a raw string (`__doc__` only; no behaviour change).
 Pinned by `tests/test_sources_compile.py`: every `.py` file under `src`, `scripts`, `tests` and `translate.py` is compiled in memory with warnings as errors (no bytecode written); it fails on the old docstring.
 
+The projects fingerprint is `a7197555c962562a530d6de80fa045af` after this round.
+
+## Phase 9 — review round 2
+
+Date: 2026-11-22. Opus approved, GPT and Gemini requested changes. Each accepted item checked
+first; all were real.
+
+B. The check on every model of `CopilotCLI.MODELS` (one call each, the engine's prompt around
+an invented paragraph; `python3 scripts/verify/phase9_copilot_overhead.py --only replaced
+--repetitions 1 --model <m> --raw`, all exit 0). Every family reports exactly one
+`agent_replacement` segment, so the check stays as it is:
+
+| model | result | wall | input tokens | output tokens | system segments |
+|---|---|---|---|---|---|
+| `claude-sonnet-5.5` (default) | pass | 5.11 s | 1723 | 68 | 1 (14 tokens) |
+| `gpt-6.2-sol` | pass | 6.81 s | 1366 | 57 | 1 (11 tokens) |
+| `gemini-4-carbon` | pass | 24.05 s | 1142 | 1033 | 1 (11 tokens) |
+| `claude-haiku-4.5` | pass (Phase 9 run, median of 3) | 11.79 s | 1670 | 673 | 1 (14 tokens) |
+
+(The segment's token count is the vendor's tokenizer on the same one-line prompt.)
+
+| Item | Finding | Fix | Test |
+|---|---|---|---|
+| A | `tests/test_sources_compile.py` walked a literal `src`, which the mutation runner renames, so its clean run failed; `plan/experiments/` was not compiled | the package is found through `import src.llm` (rewritten by the runner like every package reference); the test walks the repository root and the package, skipping hidden folders, `__pycache__` and virtualenvs (70 files here, the same as `git ls-files '*.py'`); it asserts known files (`translate.py`, itself, `scripts/verify/mutation.py`, the package's `llm/copilot_cli.py` and `glossary/glossary_manager.py`, and `plan/experiments/migrate_dryrun.py` where `plan/` exists, which it does not in the runner's copy) | `test_known_sources_found` |
+| C | plain stdout was collected only for a non-zero exit, so an exit-0 run without a reply and with a rate-limit or login line on stdout was neither classified nor quoted | collected whenever there is no error event and either a non-zero exit or no reply | `TestRound2` |
+| D | the script showed only the exit code for a call without a usage checkpoint | it names the class `classify_error` gives the result (`no error` when none): `no usage in the output (exit 0, BackendUnavailableError)` | `test_failed_calls` |
+| E | three sentences were wrong: the Phase 9 limitation still called the rejected system message transient; the comment said it was observed with an empty variable (it was removed); the module docstring's "So does a run …" followed "does not depend on the prompt's length" | corrected | — |
+
+Rejected (recorded, not done): GPT 1 (a truncated second checkpoint line after a valid one on an
+exit-0 run): not a realistic output.
+
+Real calls this round: 3 (B). Phase total: 33.
+
+Mutation (`scripts/verify/mutation.sh main`, parallel): the first run of this round had a clean
+baseline (the compile test now finds the renamed package) and 425 mutants, 409 killed, 16
+survived; two were new in `classify_error` (`returncode == 0` and `!= 1` in the plain-stdout
+condition) and are killed by `test_plain_stdout_of_a_failed_run_with_a_reply_is_quoted` (exit 1
+and 2). Final: 425 mutants, 411 killed, 14 survived, 0 timeout: the 14 equivalent ones recorded in
+round 1, none in `src/llm/`.
+
+Tests: 2685 passed, alone and three suites at once, with `-rfw`: no failure and no warning in any
+of the four runs. No test removed; changed: `test_failed_calls` (D) and the compile test (A).
 The projects fingerprint is `a7197555c962562a530d6de80fa045af` after this round.
