@@ -725,9 +725,12 @@ class TestRound1Consolidation:
                             '{"rejected": [{"term": "Orrin", "translation": "歐倫"}]}'])
         terms = TermExtractor(backend=fake).extract_from_segments(_segments(3))
         assert terms == [{'term': 'Orrin', 'translation': '奧林', 'category': 'person'}]
-        # the same rule for an extraction reply
+    def test_extraction_reply_that_is_not_a_list(self, caplog):
+        caplog.set_level(logging.WARNING, logger='src.glossary.term_extractor')
         assert TermExtractor(backend=FakeBackend(
             ['{"terms": [{"term": "A", "translation": "甲"}]}'])).extract_from_text('x') == []
+        assert [r.getMessage() for r in caplog.records] == [
+            'Could not parse term extraction response']
 
     def test_reply_that_cannot_be_parsed_is_unusable(self, small_batches, caplog):
         caplog.set_level(logging.WARNING, logger='src.glossary.term_extractor')

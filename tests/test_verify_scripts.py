@@ -4974,6 +4974,7 @@ class TestPhase8Round1Scripts:
                 del sys.modules[k]
             sys.modules.update(saved)
         assert result == 0, capsys.readouterr().out
+        assert os.listdir(tmp_path / 'out') == ['terms-before.json']  # the exact name
         written = json.loads((tmp_path / 'out' / 'terms-before.json').read_text('utf-8'))
         assert written['terms'][0]['translation'] == '丙'
 
@@ -5069,3 +5070,56 @@ class TestPhase8Round1Scripts:
                      [{'term': 'Orrin', 'translation': '歐林'}],
                      [{'term': 'Orrin', 'translation': '歐林'}]]
         assert extraction.conflicts(proposals) == {'Orrin': {'奧林': 1, '歐林': 2}}
+
+
+class TestPhase8Round1Survivors:
+
+    def test_checkout_without_the_extractor_in_process(self, tmp_path, capsys, monkeypatch):
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=1)
+        code = _stub_checkout(tmp_path / 'code', '丁')
+        shutil.rmtree(os.path.join(code, _package(), 'glossary'))
+        package = _package()
+        saved = {k: v for k, v in sys.modules.items() if k == package or k.startswith(package + '.')}
+        monkeypatch.setattr(sys, 'path', [ROOT] + sys.path)
+        try:
+            for k in saved:
+                del sys.modules[k]
+            result = extraction.main(['--code', code, '--projects-dir', str(projects),
+                                      '--project-index', '1', '--out', str(tmp_path / 'out')])
+        finally:
+            for k in [k for k in sys.modules if k == package or k.startswith(package + '.')]:
+                del sys.modules[k]
+            sys.modules.update(saved)
+        assert result == 2
+        assert capsys.readouterr().out == \
+            'ERROR --code has no term extractor (ModuleNotFoundError)\n'
+
+    def test_conflicts_read_on_after_an_unusable_proposal(self):
+        proposals = [[{'term': 5, 'translation': '五'}, {'term': 'Orrin', 'translation': '奧林'}],
+                     [{'term': 'Orrin', 'translation': None}, {'term': 'Orrin', 'translation': '歐林'}]]
+        assert extraction.conflicts(proposals) == {'Orrin': {'奧林': 1, '歐林': 1}}
+
+    def test_brief_sample_fails_when_a_translation_without_the_brief_failed(
+            self, tmp_path, capsys):
+        from src.llm import LLMError
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        projects = tmp_path / 'projects'
+        _phase8_projects(str(projects), n=10)
+
+        def respond(request):
+            prompt = request.messages[0].content
+            if '>Line3 ' in prompt and not prompt.startswith('本書簡介'):
+                raise LLMError('bad request')
+            return like(request, '譯')
+
+        brief = tmp_path / 'brief.txt'
+        brief.write_text('A brief.', encoding='utf-8')
+        with use_fake_backend(FakeBackend(responder=respond)):
+            code = brief_sample.main(['--projects-dir', str(projects), '--project-index', '2',
+                                      '--brief-file', str(brief), '--out', str(tmp_path / 'o'),
+                                      '--anonymize'])
+        assert code == 1
+        assert capsys.readouterr().out.splitlines()[-1] == \
+            'FAIL project-2: not every sampled segment has both translations'
