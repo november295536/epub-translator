@@ -26,14 +26,20 @@ from src.llm import (  # noqa: F401  (RateLimitError, AuthError re-exported)
 logger = logging.getLogger(__name__)
 
 
-def available_models() -> list[dict]:
-    """The models of the backend in use, as dicts (alias, label, description)."""
-    return [asdict(m) for m in llm.default_backend().list_models()]
+def available_models(backend: str | None = None) -> list[dict]:
+    """The models of the backend named `backend` (None: the default one), as
+    dicts (alias, label, description)."""
+    return [asdict(m) for m in llm.backend_for(backend).list_models()]
 
 
-def default_model() -> str:
-    """The model of the backend in use for a project that names none."""
-    return llm.default_backend().default_model
+def default_model(backend: str | None = None) -> str:
+    """The model used for a project of that backend that names none."""
+    return llm.backend_for(backend).default_model
+
+
+def available_backends() -> list[dict]:
+    """Every backend a project can use: name and models."""
+    return [{'name': name, 'models': available_models(name)} for name in llm.BACKENDS]
 
 _SHARED_RULES = """1. 使用台灣慣用的繁體中文用語
 2. 專業術語請保留原文並用括號標註，例如：機器學習（machine learning）
@@ -60,6 +66,11 @@ _RESTRUCTURE_TEXT = '- 不要逐句對譯，先理解整段語意，再用自然
 _RESTRUCTURE_HTML = ('- 不要逐句對譯，先理解整段語意，再用自然的中文重新表達；'
                      '可以在同一個區塊內合併、拆分句子或調整語序，但不可合併或拆分區塊')
 
+# Order kept in Phase 7 (plan/02-improvement-plan.md, Phase 7 part A): both
+# CLI backends send the prompt as one message, so moving text inside it is
+# not expected to help caching, and moving the per-segment sections down
+# would put the HTML right after the context, with nothing marking where
+# the source starts.
 _SHARED_PROHIBITIONS = """嚴格禁止：
 - 不要加任何說明、前綴或後綴（例如「以下是翻譯」「翻譯如下」等）
 - 不要使用 markdown 語法"""
@@ -265,6 +276,18 @@ ERROR_MESSAGE_CHARS = 2000
 # in a rate-limit or authentication error raise at once and are not counted.
 MAX_CALLS = 4
 
+# Seconds waited before the call that follows the n-th transient error of a
+# segment (the last value for any later one). Transient errors spend the
+# same per-segment budget (MAX_CALLS); a segment that runs out of it fails
+# (code `transient`) and is retried with --retry-failed.
+TRANSIENT_BACKOFF_SECONDS = (5, 15, 45)
+
+
+def wait_or_cancel(seconds: float, cancel: threading.Event) -> bool:
+    """Wait `seconds`; True when `cancel` was set meanwhile (the default
+    wait of TranslationEngine; tests inject their own)."""
+    return cancel.wait(seconds)
+
 
 class _Rejected(Exception):
     """A reply failed its check (the result's blocking issues)."""
@@ -283,6 +306,7 @@ class _Session:
         self.prompt = ''       # the first request, for the diagnostics
         self.attempts = []     # (message, raw output) of each failed call
         self.usage = None
+        self.transient = 0     # transient errors so far
 
     def call(self, messages: list, clean) -> str:
         """One reply to `messages`, passed through `clean`. A transient
@@ -303,6 +327,12 @@ class _Session:
                 logger.warning("Translation attempt %d/%d failed: %s", self.used,
                                engine.max_calls, str(e)[:ERROR_MESSAGE_CHARS])
                 self.attempts.append((str(e), e.raw))
+                self.transient += 1
+                if self.left > 0:
+                    backoff = TRANSIENT_BACKOFF_SECONDS
+                    delay = backoff[min(self.transient, len(backoff)) - 1]
+                    if (engine.wait or wait_or_cancel)(delay, self.cancel):
+                        raise CancelledError('cancelled')
                 continue
             except LLMError as e:
                 # A refusal or an error that a retry cannot fix
@@ -406,7 +436,12 @@ class TranslationEngine:
     """Translates text segments through an LLM backend."""
 
     def __init__(self, max_calls: int = MAX_CALLS, model: str | None = None,
-                 backend: llm.LLMBackend | None = None, timeout: float = 120):
+                 backend: llm.LLMBackend | None = None, timeout: float = 120,
+                 wait=None):
+        """`wait(seconds, cancel) -> bool` waits before a retry after a
+        transient error and returns True when cancelled; None:
+        wait_or_cancel."""
+        self.wait = wait
         self.max_calls = max_calls
         self.backend = backend if backend is not None else llm.default_backend()
         self.model = model if model is not None else self.backend.default_model

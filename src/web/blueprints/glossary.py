@@ -7,6 +7,7 @@ import threading
 from dataclasses import asdict
 from flask import Blueprint, request, jsonify, current_app
 
+import src.llm as llm
 from src.core.project import ProjectManager
 from src.core.segmenter import SegmentType
 from src.glossary.glossary_manager import GlossaryManager
@@ -116,7 +117,7 @@ def extract_terms(project_name: str):
     # All text segments; TermExtractor splits them into bounded batches
     segments = [{'text': s.text} for s in pm.data.segments
                 if s.segment_type != SegmentType.CODE]
-    model = pm.data.model
+    model, backend = pm.data.model, pm.data.backend
 
     _extraction_tasks[project_name] = {
         'running': True,
@@ -131,7 +132,7 @@ def extract_terms(project_name: str):
 
     def run_extraction():
         try:
-            extractor = TermExtractor(model=model)
+            extractor = TermExtractor(model=model, backend=llm.backend_for(backend))
             stopped = None
             try:
                 terms = extractor.extract_from_segments(segments)
