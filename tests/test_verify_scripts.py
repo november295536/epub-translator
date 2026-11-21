@@ -5338,7 +5338,16 @@ class TestPhase9CopilotOverheadScript:
         monkeypatch.setattr(copilot_overhead, 'run_process',
                             lambda cmd, **kw: ProcessResult(3, 'no', ''))
         call = copilot_overhead.one_call('replaced', True, 'p', 'm', 5)
-        assert call['ok'] is False and call['error'] == 'no usage in the output (exit 3)'
+        assert call['ok'] is False and call['error'] == 'no usage in the output (exit 3, TransientError)'
+        # review round 2, D: the class of the result is named (not its text)
+        replaced_only = json.dumps({'type': 'session.usage_checkpoint', 'data': {
+            'promptCacheBreakState': [{'models': {'m': {'system_segments': [
+                {'segment': 'agent_replacement'}]}}}]}})
+        for result, found in ((ProcessResult(0, '', ''), 'BackendUnavailableError'),
+                              (ProcessResult(0, replaced_only, ''), 'no error')):
+            monkeypatch.setattr(copilot_overhead, 'run_process', lambda cmd, r=result, **kw: r)
+            call = copilot_overhead.one_call('replaced', True, 'p', 'm', 5)
+            assert call == {'ok': False, 'error': f'no usage in the output (exit 0, {found})'}
         # a rate limit beside the usage: neither replaced nor detected
         limit = json.dumps({'type': 'session.error', 'data': {'message': 'rate limit'}})
         run = _copilot_run(_segments_as_copilot, [])
