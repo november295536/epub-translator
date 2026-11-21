@@ -80,8 +80,8 @@ def _usage(events: list) -> Optional[Usage]:
     checkpoints = [e for e in events if e.get('type') == 'session.usage_checkpoint']
     if not checkpoints:
         return None
-    metrics = _data(checkpoints[-1]).get('accountingSnapshot', {}).get('modelMetrics', {})
     try:
+        metrics = _data(checkpoints[-1])['accountingSnapshot']['modelMetrics']
         usages = [m['usage'] for m in metrics.values()]
         return Usage(sum(int(u['inputTokens']) for u in usages),
                      sum(int(u['outputTokens']) for u in usages)) if usages else None
