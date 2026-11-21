@@ -77,6 +77,17 @@ class GlossaryEntry:
     note: str = ''
 
 
+def _check_entries(raw) -> None:
+    """ValueError unless `raw` is a list of entries whose text fields
+    (TEXT_FIELDS) are strings where present."""
+    if not isinstance(raw, list):
+        raise ValueError('the glossary is not a list')
+    for item in raw:
+        if not isinstance(item, dict) or not isinstance(item.get('term'), str) \
+                or any(not isinstance(item[k], str) for k in TEXT_FIELDS if k in item):
+            raise ValueError('a glossary entry is not an object with text fields')
+
+
 def entry_dict(entry: GlossaryEntry) -> dict:
     """The stored form of an entry: OPTIONAL_FIELDS only when not empty."""
     raw = asdict(entry)
@@ -105,13 +116,9 @@ class GlossaryManager:
             return
         with open(self.glossary_path, 'r', encoding='utf-8') as f:
             raw = json.load(f)
-        if not isinstance(raw, list):
-            raise ValueError('the glossary is not a list')
+        _check_entries(raw)
         entries = {}
         for item in raw:
-            if not isinstance(item, dict) or not isinstance(item.get('term'), str) \
-                    or any(not isinstance(item[k], str) for k in TEXT_FIELDS if k in item):
-                raise ValueError('a glossary entry is not an object with text fields')
             entries[item['term'].lower()] = GlossaryEntry(**item)
         self.entries = entries
 
@@ -153,7 +160,7 @@ class GlossaryManager:
         key = term.lower()
         entry = GlossaryEntry(
             term=term, translation=translation,
-            category=category, frequency=frequency, gender=gender, note=note,
+            category=category, frequency=frequency, gender=gender.strip(), note=note.strip(),
         )
         self.entries[key] = entry
         self.save()
@@ -182,9 +189,9 @@ class GlossaryManager:
         if category is not None:
             entry.category = category
         if gender is not None:
-            entry.gender = gender
+            entry.gender = gender.strip()
         if note is not None:
-            entry.note = note
+            entry.note = note.strip()
         self.save()
         return entry
 
@@ -233,9 +240,12 @@ class GlossaryManager:
         return '\n'.join(lines)
 
     def import_json(self, json_path: str) -> int:
-        """Import entries from a JSON file. Returns number of entries imported."""
+        """Import entries from a JSON file. Returns number of entries
+        imported. Raises ValueError, before anything is written, when the
+        file is not a glossary that load() would accept."""
         with open(json_path, 'r', encoding='utf-8') as f:
             raw = json.load(f)
+        _check_entries(raw)
         count = 0
         for item in raw:
             term = item.get('term', '')

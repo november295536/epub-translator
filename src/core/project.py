@@ -49,6 +49,11 @@ def check_rules(value) -> int:
     return value
 
 
+# Upper bound of a book's brief: it goes into every text prompt, which the
+# CLI backends pass as one command-line argument
+MAX_BRIEF_CHARS = 2000
+
+
 def check_backend(value) -> str:
     """`value` when it names a backend (src.llm.BACKENDS); raises ValueError
     otherwise."""
@@ -338,11 +343,15 @@ class ProjectManager:
 
     def set_brief(self, text: str) -> None:
         """Set the book's brief (in-memory only; call save() to persist).
-        Surrounding whitespace is dropped; an empty brief removes it."""
+        Surrounding whitespace is dropped; an empty brief removes it. One
+        longer than MAX_BRIEF_CHARS raises ValueError and changes nothing."""
         if not self.data:
             raise RuntimeError("No project loaded.")
+        text = text.strip()
+        if len(text) > MAX_BRIEF_CHARS:
+            raise ValueError(f'書籍簡介最多 {MAX_BRIEF_CHARS} 字（目前 {len(text)} 字）')
         with self.mutex:
-            self.data.brief = text.strip() or None
+            self.data.brief = text or None
 
     def mark_translated(self, segment_id: str, translated_text: str) -> None:
         """Mark a segment as translated (in-memory only; call save() to persist)."""

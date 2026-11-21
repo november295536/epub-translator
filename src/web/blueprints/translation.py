@@ -239,7 +239,9 @@ def get_brief(project_name: str):
         pm = _get_task_manager().get_or_load_pm(project_name, current_app.config['PROJECTS_DIR'])
     except Exception as e:
         return jsonify({'error': str(e)}), 404
-    return jsonify({'brief': pm.data.brief or ''})
+    with pm.mutex:  # a PUT in progress may still restore the previous one
+        brief = pm.data.brief or ''
+    return jsonify({'brief': brief})
 
 
 @translation_bp.route('/api/projects/<project_name>/brief', methods=['PUT'])
@@ -252,9 +254,18 @@ def set_brief(project_name: str):
     try:
         with _get_task_manager().transaction(project_name,
                                              current_app.config['PROJECTS_DIR']) as pm:
-            pm.set_brief(data['brief'])
-            pm.save()
-            brief = pm.data.brief or ''
+            with pm.mutex:  # a running task reads it under the mutex
+                previous = pm.data.brief
+                try:
+                    pm.set_brief(data['brief'])
+                except ValueError as e:  # too long: nothing changed
+                    return jsonify({'error': str(e)}), 400
+                try:
+                    pm.save()
+                except BaseException:
+                    pm.data.brief = previous  # not saved: the workers keep the old one
+                    raise
+                brief = pm.data.brief or ''
     except (FileNotFoundError, ValueError) as e:
         return jsonify({'error': str(e)}), 404
     return jsonify({'status': 'ok', 'brief': brief})

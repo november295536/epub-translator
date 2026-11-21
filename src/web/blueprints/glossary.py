@@ -54,8 +54,8 @@ def list_terms(project_name: str):
 @glossary_bp.route('/api/projects/<project_name>/glossary', methods=['POST'])
 def add_term(project_name: str):
     """Add a new glossary term."""
-    data = request.get_json()
-    if not data or 'term' not in data or 'translation' not in data:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or 'term' not in data or 'translation' not in data:
         return jsonify({'error': '請提供 term 和 translation'}), 400
     if _bad_person_fields(data):
         return jsonify({'error': 'gender 和 note 必須是文字'}), 400
@@ -75,8 +75,8 @@ def add_term(project_name: str):
 @glossary_bp.route('/api/projects/<project_name>/glossary/<term>', methods=['PUT'])
 def update_term(project_name: str, term: str):
     """Update a glossary term."""
-    data = request.get_json()
-    if not data:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not data:
         return jsonify({'error': '請提供更新資料'}), 400
     if _bad_person_fields(data):
         return jsonify({'error': 'gender 和 note 必須是文字'}), 400
