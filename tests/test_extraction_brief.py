@@ -1080,3 +1080,18 @@ class TestRound2:
         # Alpine 3 calls init() itself; x-init="init()" ran it a second time
         assert '<div x-data="translationController()">' in page
         assert 'x-init="init()"' not in page
+
+
+class TestRound2Survivors:
+
+    def test_fenced_list_over_several_lines(self):
+        reply = '```json\n[\n  {"term": "Mira Vale", "translation": "米拉 維爾"}\n]\n```'
+        assert te._top_level_list(reply) == [{'term': 'Mira Vale', 'translation': '米拉 維爾'}]
+
+    def test_import_keeps_the_frequency(self, tmp_path):
+        source = tmp_path / 'in.json'
+        source.write_text(json.dumps([{'term': 'A', 'translation': '甲', 'frequency': 3}]),
+                          encoding='utf-8')
+        gm = GlossaryManager(str(tmp_path / 'g.json'))
+        gm.import_json(str(source))
+        assert gm.get_term('A').frequency == 3
