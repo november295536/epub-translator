@@ -2172,14 +2172,19 @@ class TestCoordinatorFailure:
                                                         PROJECT_NAME))
 
     def test_save_failure_wakes_paused_worker(self, project_with_translations):
-        paused = threading.Event()
+        paused, in_flight = threading.Event(), threading.Event()
 
         def respond(request):
             prompt = request.messages[-1].content
             if '>Chapter 2<' in prompt:
+                # Pre-merge: only once the other call is in flight. A pause
+                # before it starts means no call and no result, so nothing
+                # to save and no failure: the run stays paused (correctly)
+                assert in_flight.wait(30)
                 raise RateLimitError('limit')
             if '>Second paragraph.<' in prompt:
-                assert paused.wait(10)
+                in_flight.set()
+                assert paused.wait(30)
             return like(request, '譯')
 
         TaskManager._instance = None
