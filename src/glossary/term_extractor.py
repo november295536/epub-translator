@@ -87,7 +87,7 @@ def _batches(segments: list[dict]) -> list[str]:
 
 def _most_common(counter: Counter) -> str:
     """The most frequent key; the first counted on a tie."""
-    return counter.most_common(1)[0][0]
+    return max(counter, key=counter.get)  # max keeps the first of equal ones
 
 
 def _candidate_line(group: dict) -> str:
@@ -99,7 +99,6 @@ def _consolidation_batches(groups: list[dict]) -> list[list[dict]]:
     """`groups` in order, cut so that each part's candidate lines stay
     within MAX_CHARS_PER_CONSOLIDATION (a longer single line is a part)."""
     parts: list[list[dict]] = []
-    size = 0
     for group in groups:
         length = len(_candidate_line(group)) + 1
         if parts and size + length <= MAX_CHARS_PER_CONSOLIDATION:

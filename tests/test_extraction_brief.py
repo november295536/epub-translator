@@ -277,8 +277,11 @@ class TestBriefPrompt:
 
         engine = TranslationEngine(backend=FakeBackend())
         monkeypatch.setattr(engine, 'translate_reply', broken)
-        outcome = translate_segment(engine, seg, pm.data.segments, brief=BRIEF)
+        gm = GlossaryManager(os.path.join(path, 'glossary.json'))
+        gm.add_term('Orrin', '奧林')
+        outcome = translate_segment(engine, seg, pm.data.segments, gm, brief=BRIEF)
         assert outcome.failure.prompt.startswith(BRIEF_SECTION.format(brief=BRIEF))
+        assert 'Orrin → 奧林\n' in outcome.failure.prompt  # the glossary too
 
 
 # --- The brief in the project file -------------------------------------------------
@@ -317,8 +320,9 @@ class TestBriefInProject:
             assert 'brief' not in json.loads(pm.to_json())
 
     def test_set_without_project(self, tmp_path):
-        with pytest.raises(RuntimeError, match='No project loaded.'):
+        with pytest.raises(RuntimeError) as info:
             ProjectManager(str(tmp_path)).set_brief('x')
+        assert str(info.value) == 'No project loaded.'
 
     @pytest.mark.parametrize('value', [5, None, ['x']])
     def test_brief_that_is_not_text_refused(self, tmp_path, value):
@@ -329,8 +333,9 @@ class TestBriefInProject:
         raw['brief'] = value
         with open(file, 'w', encoding='utf-8') as f:
             json.dump(raw, f)
-        with pytest.raises(ValueError, match='the brief is not text'):
+        with pytest.raises(ValueError) as info:
             ProjectManager(path).load()
+        assert str(info.value) == 'the brief is not text'
 
 
 # --- Person notes in the glossary ---------------------------------------------------
@@ -363,6 +368,9 @@ class TestPersonNotes:
         translate_segment(TranslationEngine(backend=fake), pm.data.segments[0],
                           pm.data.segments, gm)
         assert 'MARK1 → 標記 [人名]（性別：female；備註：the narrator）\n' in fake.prompts[0]
+
+    def test_add_defaults(self, gm):
+        assert gm.add_term('Orrin', '奧林') == GlossaryEntry('Orrin', '奧林', '', 0, '', '')
 
     def test_absent_notes_keep_the_file_format(self, gm):
         gm.add_term('Orrin', '奧林', category='person')
@@ -402,6 +410,7 @@ class TestPersonNotes:
             {'term': 'Orrin', 'translation': '奧林'}]), encoding='utf-8')
         assert gm.import_json(str(source)) == 2
         assert gm.get_term('Tess').note == 'the baker'
+        assert gm.get_term('Orrin') == GlossaryEntry('Orrin', '奧林')
         out = tmp_path / 'out.json'
         gm.export_json(str(out))
         assert json.loads(out.read_text(encoding='utf-8')) == [
@@ -464,12 +473,14 @@ class TestCliBrief:
         assert len(fake.prompts) == 2
         assert all(p.startswith(BRIEF_SECTION.format(brief=BRIEF)) for p in fake.prompts)
 
-    def test_start_without_brief_sends_todays_prompt(self, runner, tmp_path):
-        path = _project(tmp_path, n=1)
+    @pytest.mark.parametrize('workers', ['1', '2'])
+    def test_start_without_brief_sends_todays_prompt(self, runner, tmp_path, workers):
+        path = _project(tmp_path)
         fake = FakeBackend(responder=lambda r: like(r, '譯'))
         with use_fake_backend(fake):
-            runner.invoke(_cli(), ['start', '-p', path])
-        assert fake.prompts[0].startswith('你是一位專業的英文翻譯')
+            runner.invoke(_cli(), ['start', '-p', path, '--workers', workers])
+        assert len(fake.prompts) == 2
+        assert all(p.startswith('你是一位專業的英文翻譯') for p in fake.prompts)
 
 
 class TestCliPersonNotes:
@@ -586,8 +597,8 @@ class TestWebBrief:
             release.set()
             task = TaskManager().get_task('book')
             _wait(lambda: not task.threads_alive() and task.state == 'completed')
-        assert [p.startswith(BRIEF_SECTION.format(brief=BRIEF)) for p in fake.prompts] == \
-            [False, True]
+        assert fake.prompts[0].startswith('你是一位專業的英文翻譯')  # none yet: today's prompt
+        assert fake.prompts[1].startswith(BRIEF_SECTION.format(brief=BRIEF))
         assert ProjectManager(str(tmp_path / 'book')).load().brief == BRIEF
 
     def test_retranslate_sends_the_brief(self, web):
@@ -640,3 +651,54 @@ class TestWebPersonNotes:
         page = client.get('/project/book/glossary').get_data(as_text=True)
         assert 'x-model="newTerm.gender"' in page and 'x-model="newTerm.note"' in page
         assert 'x-model="editData.gender"' in page and 'x-model="editData.note"' in page
+
+
+class TestMutationSurvivors:
+    """Mutants of the first mutation run."""
+
+    def test_translate_reply_without_brief(self):
+        fake = FakeBackend(['譯文'])
+        TranslationEngine(backend=fake).translate_reply('Hi.', SegmentType.TEXT, '', '', '', '')
+        assert fake.prompts[0].startswith('你是一位專業的英文翻譯')
+
+    def test_second_batch_filled_exactly_is_one_call(self, small_batches):
+        assert te._batches([{'text': 'a' * 20}, {'text': 'b' * 9}, {'text': 'c' * 9}]) == \
+            ['a' * 20, 'b' * 9 + '\n\n' + 'c' * 9]
+
+    def test_consolidation_batch_boundary(self, monkeypatch):
+        groups = [{'term': 'a', 'translations': Counter({'x': 1, 'y': 1}),
+                   'categories': Counter({'': 2})} for _ in range(2)]
+        size = len(te._candidate_line(groups[0])) + 1
+        monkeypatch.setattr(te, 'MAX_CHARS_PER_CONSOLIDATION', 2 * size - 1)
+        assert [len(p) for p in te._consolidation_batches(groups)] == [1, 1]
+        monkeypatch.setattr(te, 'MAX_CHARS_PER_CONSOLIDATION', 2 * size)
+        assert [len(p) for p in te._consolidation_batches(groups)] == [2]
+
+    def test_sorted_case_insensitively(self):
+        groups = {k: {'term': k, 'translations': Counter({'x': 1}), 'categories': Counter({'': 1})}
+                  for k in ('aB', 'a_b', 'Ac')}
+        # by lowercase: '_' (95) sorts before 'b' (98); uppercase would put 'AB' first
+        assert [t['term'] for t in te._final(groups, {})] == ['a_b', 'aB', 'Ac']
+
+    def test_most_common(self):
+        assert te._most_common(Counter({'x': 1, 'y': 2, 'z': 2})) == 'y'
+        assert te._most_common(Counter({'b': 1, 'a': 1})) == 'b'
+
+    def test_call_passes_an_event(self):
+        import threading
+        from src.llm import LLMResponse
+        seen = []
+
+        class Backend(FakeBackend):
+            def complete(self, request, cancel):
+                seen.append(cancel)
+                return LLMResponse(text='[]', stop_reason='complete', usage=None, model='m')
+
+        TermExtractor(backend=Backend()).extract_from_text('x')
+        assert len(seen) == 1 and isinstance(seen[0], threading.Event) and not seen[0].is_set()
+
+    def test_later_items_read_after_an_unusable_one(self, small_batches):
+        fake = FakeBackend([_reply(('Orrin', '歐林', 'person')), _reply(('Orrin', '奧林', 'person')),
+                            _reply(('Someone', '某人', 'person'), ('Orrin', '歐倫', 'person'))])
+        terms = TermExtractor(backend=fake).extract_from_segments(_segments(2))
+        assert terms == [{'term': 'Orrin', 'translation': '歐倫', 'category': 'person'}]
