@@ -247,11 +247,8 @@ def _report_unsaved(saver):
 
 
 class _RunStopped(Exception):
-    """A run-level stop inside the sequential loop, reported after the save."""
-
-    def __init__(self, error):
-        super().__init__(str(error))
-        self.error = error
+    """A run-level stop inside the sequential loop, reported after the save
+    (args[0]: the error)."""
 
 
 def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
@@ -289,7 +286,7 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
             if stop:
                 raise _RunStopped(stop)
     except _RunStopped as s:
-        stopped = s.error  # reported once the save below succeeded
+        stopped = s.args[0]  # reported once the save below succeeded
     finally:
         # Also on Ctrl-C (the call in flight was killed, its segment stays
         # pending; one applied between apply_outcome and add is saved too:
@@ -318,7 +315,7 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
     cancel = threading.Event()       # Ctrl-C: the calls in flight are killed
     gate = threading.Event()         # cleared while a rate limit pauses the run
     gate.set()
-    pause = {'until': None, 'error': None, 'shown': False}
+    pause = {}  # until, error, shown: set when the gate closes, read only while closed
     pause_lock = threading.Lock()
     stop_errors = []
     total = progress['total']

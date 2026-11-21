@@ -1283,7 +1283,8 @@ class TestRound1ParallelCliGate:
         assert len(calls) == 5
         assert (f'  ✗ limit reached\n  使用量已達上限：{wait:.0f} 秒後自動繼續（Ctrl-C 停止）\n'
                 in result.output)
-        assert '  繼續翻譯' in result.output
+        assert '\n  繼續翻譯\n' in result.output
+        assert result.output.count('使用量已達上限') == 1  # announced once (round 4)
         assert _statuses(path) == [SegmentStatus.TRANSLATED] * 4
 
 
@@ -2605,3 +2606,153 @@ class TestRound4:
             assert saver.flush() is True
         assert saver.pending == [] and saver.saves == 1
         assert '儲存後寫入失敗紀錄時出錯' in caplog.messages
+
+
+class TestRound4Survivors:
+    """Mutants that earlier runs counted as killed only because a test that
+    runs the CLI (the throughput script's) failed under mutmut's load."""
+
+    def test_second_pause_is_announced_again(self, tmp_path, monkeypatch):
+        clock = _CountingClock()
+        monkeypatch.setattr(translate, '_clock', clock)
+        path = _make_project(tmp_path, n=2)
+        announced = []
+        real_message = translate._rate_limit_message
+        monkeypatch.setattr(translate, '_rate_limit_message',
+                            lambda e, d: (announced.append(d), real_message(e, d))[1])
+        limited = []
+
+        def respond(request):
+            if '>Line 1.<' in request.messages[0].content and len(limited) < 2:
+                limited.append(1)
+                raise RateLimitError('limit', retry_after=7)
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            thread, holder = _run_cli_in_thread(['start', '--project', path, '--workers', '2'])
+            _wait(lambda: len(announced) == 1)
+            clock.now += 7
+            _wait(lambda: len(announced) == 2)  # a new pause: announced again
+            clock.now += 7
+            thread.join(timeout=30)
+        assert holder['result'].exit_code == 0, holder['result'].output
+        assert holder['result'].output.count('  繼續翻譯\n') == 2
+        assert _statuses(path) == [SegmentStatus.TRANSLATED] * 2
+
+    def test_parallel_uses_the_project_backend(self, tmp_path, monkeypatch):
+        path = _make_project(tmp_path, n=2)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.set_model('gpt-6.2-sol', backend='copilot-cli')
+        pm.save()
+        chosen = FakeBackend(responder=lambda r: like(r, '譯'))
+        other = FakeBackend(responder=lambda r: like(r, '譯'))
+        monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: chosen)
+        with use_fake_backend(other):
+            result = CliRunner().invoke(translate.cli, ['start', '--project', path,
+                                                        '--workers', '2'])
+        assert result.exit_code == 0, result.output
+        assert len(chosen.requests) == 2 and other.requests == []
+        assert '使用模型：gpt-6.2-sol（copilot-cli）\n' in result.output
+
+    def test_model_line_without_a_backend(self, tmp_path):
+        path = _make_project(tmp_path, n=1)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '譯'))):
+            result = CliRunner().invoke(translate.cli, ['start', '--project', path])
+        assert '使用模型：sonnet\n' in result.output
+
+    def test_interrupt_saves_the_queued_results(self, tmp_path, monkeypatch):
+        """Ctrl-C in the main loop: results already queued are applied and
+        saved, with their diagnostics."""
+        import queue
+        path = _make_project(tmp_path, n=2)
+        made = []
+
+        class Counted(queue.Queue):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.puts = 0
+                made.append(self)
+
+            def put(self, *a, **kw):
+                super().put(*a, **kw)
+                self.puts += 1
+
+        monkeypatch.setattr(queue, 'Queue', Counted)
+        real_apply = ProjectManager.apply_outcome
+        interrupted = []
+
+        def apply(self, *a, **kw):
+            if not interrupted:
+                interrupted.append(1)
+                _wait(lambda: made[1].puts == 2)  # both results queued
+                raise KeyboardInterrupt
+            return real_apply(self, *a, **kw)
+
+        monkeypatch.setattr(ProjectManager, 'apply_outcome', apply)
+
+        def respond(request):
+            raise LLMError('bad request')  # failures: their diagnostics are written
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            result = CliRunner().invoke(translate.cli, ['start', '--project', path,
+                                                        '--workers', '2'])
+        assert result.exit_code == 1
+        assert sorted(_statuses(path)) == sorted([SegmentStatus.PENDING, SegmentStatus.FAILED])
+        assert len(os.listdir(os.path.join(path, 'log', 'failed'))) == 1
+
+    def test_sequential_window_uses_the_injected_clock(self, tmp_path, monkeypatch, clock):
+        path = _make_project(tmp_path, n=2)
+        writes = _count_saves(monkeypatch)
+
+        def respond(request):
+            if '>Line 2.<' in request.messages[0].content:
+                clock.now += SAVE_INTERVAL_SECONDS  # the window is over
+            return like(request, '譯')
+
+        with use_fake_backend(FakeBackend(responder=respond)):
+            result = CliRunner().invoke(translate.cli, ['start', '--project', path])
+        assert result.exit_code == 0, result.output
+        assert len(writes) == 2  # the window after result 2, the final flush
+
+    def test_cancelled_messages(self, tmp_path):
+        fake = FakeBackend(['<p k="1">譯</p>'])
+        engine = TranslationEngine(model='m', backend=fake, interrupted=lambda: True)
+        with pytest.raises(CancelledError) as info:
+            engine.translate_reply('Line.', SegmentType.TEXT, '', '', '', '<p>Line.</p>')
+        assert str(info.value) == 'cancelled'
+        FakeBackend.overcalls.clear()
+        path = _make_project(tmp_path, n=1)
+        pm = ProjectManager(path)
+        pm.load()
+        cancel = threading.Event()
+        cancel.set()
+        engine = TranslationEngine(model='m', backend=FakeBackend(responder=lambda r: 'bad'))
+        with pytest.raises(CancelledError) as info:
+            translate_segment(engine, pm.data.segments[0], pm.data.segments, None, cancel=cancel)
+        assert str(info.value) == 'cancelled'
+        FakeBackend.overcalls.clear()
+
+    def test_backoff_wait_gets_interrupted(self):
+        seen = []
+
+        def wait(seconds, cancel, interrupted):
+            seen.append(interrupted)
+            return True
+
+        check = lambda: False  # noqa: E731
+        engine = TranslationEngine(model='m', backend=FakeBackend([TransientError('t')]),
+                                   wait=wait, interrupted=check)
+        with pytest.raises(CancelledError) as info:
+            engine.translate_reply('Line.', SegmentType.TEXT, '', '', '', '<p>Line.</p>')
+        assert seen == [check] and str(info.value) == 'cancelled'
+
+    def test_saves_are_counted(self, tmp_path):
+        path = _make_project(tmp_path, n=1)
+        pm = ProjectManager(path)
+        pm.load()
+        saver = DebouncedSaver(pm, clock=FakeClock())
+        for item in ('a', 'b'):
+            saver.add(item)
+            assert saver.flush()
+        assert saver.saves == 2
