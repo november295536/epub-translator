@@ -33,9 +33,9 @@ prompt segments sent with each model call (`promptCacheBreakState[].models.
 segment named REPLACED_SEGMENT (the built-in prompt is 18 segments). A run
 without that report, or with any other segment, raises
 BackendUnavailableError: the run stops instead of paying for the full prompt
-on every call. The report does not depend on the prompt's length. So does a
-run in which Copilot rejected the extension's system message
-(`ProtocolSystemMessageConfig`).
+on every call. The report does not depend on the prompt's length. A run in
+which Copilot rejected the extension's system message
+(`ProtocolSystemMessageConfig`) raises the same error.
 """
 
 from __future__ import annotations
@@ -82,8 +82,9 @@ NOT_REPLACED_MESSAGE = (
     '無法確認 Copilot CLI 已套用翻譯用的系統提示，為免每次呼叫都送出完整的內建提示，已停止。'
     f'可能原因：外掛沒有載入（請確認 copilot 支援 --experimental 與 --plugin-dir，且 {PLUGIN_LOCATION} '
     '資料夾存在），或 Copilot 更新後改變了擴充功能的介面或 system_segments 的回報。')
-# Copilot refused the system message the extension passed (observed with an
-# empty one, exit 1): the mechanism itself is broken, every call would fail
+# Copilot refused the system message the extension passed (observed with the
+# extension's environment variable removed, exit 1): the mechanism itself is
+# broken, every call would fail
 _EXTENSION_REJECTED_PATTERN = re.compile(r'ProtocolSystemMessageConfig')
 
 # Every documented message says "rate limit" ("Rate limited." too)
@@ -211,8 +212,8 @@ class CopilotCLI(CLIBackend):
         stderr = _text(result.stderr).strip()
         texts = [redact(f"{_text(d.get('errorType'))} {_text(d.get('message'))}".strip())
                  for d in errors] + ([redact(stderr)] if stderr else [])
-        if not errors and result.returncode != 0:
-            # No error event: a plain-text message on stdout is the error
+        if not errors and (result.returncode != 0 or not _reply(events)):
+            # No error event and no reply: a plain-text message on stdout is the error
             plain = ' '.join(line.strip() for line in _text(result.stdout).splitlines()
                              if line.strip() and not _is_json(line))
             if plain:
