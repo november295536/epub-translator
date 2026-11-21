@@ -19,9 +19,11 @@ follow it. Round 4's mutation run left no killable survivor.
 The cleanup after Phase 9 moved the entries whose code Phases 2-7 rewrote
 to the new text (core58, core62, core63, web171-176, cli8, cli75, cli78,
 cli82) and dropped web142 (break instead of continue after a skipped
-segment): since Phase 7 the coordinator starts workers again while a
-segment is still queued (_workers_done), so the mutant changes no outcome
-(only fewer workers run until the others end).
+segment): since Phase 7 the coordinator starts workers again once all
+have ended with a segment still queued (_workers_done), so the queue is
+still completed when those replacement workers start (fewer workers run
+meanwhile, and a replacement that cannot start fails the task, which the
+original continue never needs).
 
 Usage:
     python3 scripts/verify/phase1_survivor_kills.py [name ...]

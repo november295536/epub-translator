@@ -2155,8 +2155,6 @@ class TestCoordinatorFailure:
 
         def respond(request):
             threads.append(threading.current_thread())
-            if '>Chapter 2<' in request.messages[-1].content:
-                _time.sleep(1)  # still in flight when the save fails
             return like(request, '譯')
 
         TaskManager._instance = None
@@ -2181,6 +2179,27 @@ class TestCoordinatorFailure:
             return real_join(thread, *args, **kwargs)
 
         monkeypatch.setattr(threading.Thread, 'join', join)
+        waiting = []  # (thread, event) of every Event.wait in progress
+        real_wait = threading.Event.wait
+
+        def wait(event, timeout=None):
+            entry = (threading.current_thread(), event)
+            waiting.append(entry)
+            try:
+                return real_wait(event, timeout)
+            finally:
+                waiting.remove(entry)
+
+        monkeypatch.setattr(threading.Event, 'wait', wait)
+        box = {}
+
+        def save(pm):
+            # The first save fails only once a worker is parked at the pause
+            # gate: the worker the failing coordinator has to wake
+            if not box.get('failed'):
+                box['failed'] = True
+                _wait(lambda: any(e is box['task'].pause_event for _, e in list(waiting)))
+            raise OSError('disk full')
 
         def respond(request):
             prompt = request.messages[-1].content
@@ -2196,17 +2215,17 @@ class TestCoordinatorFailure:
             return like(request, '譯')
 
         TaskManager._instance = None
-        with patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
+        with patch.object(ProjectManager, 'save', save):
             task, patcher = _start(project_with_translations, respond,
                                    segment_ids=['ch1_seg0003', 'ch2_seg0001'],
                                    num_workers=2)
+            box['task'] = task
             _wait(lambda: task.state == 'paused')
             paused.set()
             _finish(task, patcher)
-        assert task.state == 'failed'
+        assert task.state == 'failed' and 'disk full' in task.error
         assert not any(t.is_alive() for t in task._threads)
         # Joined by the failing coordinator itself, not just ended by now
-        # (cleanup after Phase 9: the save fails at the pause, workers alive)
         assert task._threads and all(t in joined for t in task._threads)
 
 
@@ -2228,7 +2247,8 @@ class TestStopThenLateRunError:
         release.set()
         _finish(task, patcher, timeout=10)
         assert task.state == 'stopped'
-        # Not paused again: a worker of the ending task would block on it
+        # Not paused again (this worker exits at the stop check either way;
+        # a cleared gate could strand another one already past that check)
         assert task.pause_event.is_set()
         assert lock_free_for_other_process(os.path.join(project_with_translations,
                                                         PROJECT_NAME))
@@ -2961,6 +2981,7 @@ class TestRound2UnsavedReport:
         outcome = TranslationOutcome(text='x', status=SegmentStatus.TRANSLATED, issues=[],
                                      model='m', usage=None)
         task.result_queue.put(TranslationResult('ch1_seg0003', outcome, 0))
+        task.result_queue.put(TranslationResult('ch2_seg0001', outcome, 5))  # stale: edited since
         from src.core.runcontrol import DebouncedSaver
         TaskManager()._fail_task(task, RuntimeError('boom'), DebouncedSaver(task.pm))
         assert task.error == 'boom（1 個段落的結果未儲存：ch1_seg0003）'

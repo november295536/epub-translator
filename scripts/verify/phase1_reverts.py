@@ -313,11 +313,11 @@ r('R2-19 lock descriptor leaked when the holder cannot be read',
   [(P, "                    try:\n                        holder = os.read(fd, 32).decode(errors='replace').strip()\n                    finally:\n                        os.close(fd)\n",
     '                    holder = os.read(fd, 32).decode().strip()\n                    os.close(fd)\n')],
   ['tests/test_project.py::TestRound2DescriptorLeaks'])
+# Since Phase 7 the saved part of the report is DebouncedSaver.pending, which
+# only accepted results enter; the queue drain is where the old report survives
 r('R2-20 stale and skipped results reported as unsaved',
-  [(T, '                        if self._apply_result(task, pm, res):\n',
-    '                        if self._apply_result(task, pm, res) or True:\n'),
-   (T, '                if (res.outcome is not None\n                        and task.pm._find(res.segment_id).revision == res.revision):\n', '                if True:\n')],
-  ['tests/test_web.py::TestRound2UnsavedReport'])
+  [(T, '                if (res.outcome is not None\n                        and task.pm._find(res.segment_id).revision == res.revision):\n', '                if True:\n')],
+  ['tests/test_web.py::TestRound2UnsavedReport::test_skipped_result_in_queue_not_reported'])
 r('R2-21 rate-limit message cut from long stdout',
   [(CL, '            source = stderr if _RATE_LIMIT_PATTERN.search(stderr) else stdout\n            return RateLimitError(source.strip()[:ERROR_CHARS])',
     '            return RateLimitError(searched.strip()[:ERROR_CHARS])')],
