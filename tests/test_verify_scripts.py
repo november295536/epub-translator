@@ -3574,7 +3574,9 @@ class TestThroughputScript:
         projects = tmp_path / 'projects'
         _invented_projects(str(projects))
         args = ['--projects-dir', str(projects), '--project-index', '1']
-        monkeypatch.setattr(throughput.tempfile, 'gettempdir', lambda: ROOT)
+        tree = tmp_path / 'tree'
+        (tree / '.git').mkdir(parents=True)  # a work tree (the test may run in a copy)
+        monkeypatch.setattr(throughput.tempfile, 'gettempdir', lambda: str(tree))
         assert throughput.main(args) == 2
         assert 'inside a git work tree' in capsys.readouterr().out
         monkeypatch.setattr(throughput.tempfile, 'gettempdir', lambda: str(projects))
