@@ -27,7 +27,7 @@ FULL_GLOSSARY_MAX_TERMS = 150
 
 
 def term_pattern(term: str) -> str:
-    """Regex for a glossary term: it starts at a word boundary, with any
+    r"""Regex for a glossary term: it starts at a word boundary, with any
     continuation, case-insensitive.
 
     (?<!\w) is used instead of \b so that terms starting with a non-word
