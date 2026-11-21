@@ -2171,8 +2171,16 @@ class TestCoordinatorFailure:
         assert lock_free_for_other_process(os.path.join(project_with_translations,
                                                         PROJECT_NAME))
 
-    def test_save_failure_wakes_paused_worker(self, project_with_translations):
+    def test_save_failure_wakes_paused_worker(self, project_with_translations, monkeypatch):
         paused, in_flight = threading.Event(), threading.Event()
+        joined = []
+        real_join = threading.Thread.join
+
+        def join(thread, *args, **kwargs):
+            joined.append(thread)
+            return real_join(thread, *args, **kwargs)
+
+        monkeypatch.setattr(threading.Thread, 'join', join)
 
         def respond(request):
             prompt = request.messages[-1].content
@@ -2197,6 +2205,9 @@ class TestCoordinatorFailure:
             _finish(task, patcher)
         assert task.state == 'failed'
         assert not any(t.is_alive() for t in task._threads)
+        # Joined by the failing coordinator itself, not just ended by now
+        # (cleanup after Phase 9: the save fails at the pause, workers alive)
+        assert task._threads and all(t in joined for t in task._threads)
 
 
 class TestStopThenLateRunError:
@@ -2217,6 +2228,8 @@ class TestStopThenLateRunError:
         release.set()
         _finish(task, patcher, timeout=10)
         assert task.state == 'stopped'
+        # Not paused again: a worker of the ending task would block on it
+        assert task.pause_event.is_set()
         assert lock_free_for_other_process(os.path.join(project_with_translations,
                                                         PROJECT_NAME))
 

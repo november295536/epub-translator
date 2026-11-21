@@ -614,9 +614,17 @@ class TestCLISupervisorFailure:
     """Item 6: the parallel supervisor joins its workers before the lock goes."""
 
     @pytest.mark.parametrize('error', [OSError('disk full'), KeyboardInterrupt()])
-    def test_save_failure(self, runner, tmp_path, error):
+    def test_save_failure(self, runner, tmp_path, error, monkeypatch):
         path = _make_project(str(tmp_path / 'p'), n=4)
         threads = []
+        joined = []
+        real_join = threading.Thread.join
+
+        def join(thread, *args, **kwargs):
+            joined.append(thread)
+            return real_join(thread, *args, **kwargs)
+
+        monkeypatch.setattr(threading.Thread, 'join', join)
 
         def respond(request):
             threads.append(threading.current_thread())
@@ -630,6 +638,9 @@ class TestCLISupervisorFailure:
             result = runner.invoke(cli, ['start', '--project', path, '--workers', '3'])
         assert result.exit_code != 0
         assert threads and not any(t.is_alive() for t in threads)
+        # Joined by the failing supervisor (Phase 7: its first save is the
+        # last one, so the workers have ended by then; the join is still made)
+        assert all(t in joined for t in threads)
         assert '未儲存的結果' in result.output
         assert lock_free_for_other_process(path)
         # Nothing was saved: every segment is still pending
