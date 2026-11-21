@@ -42,6 +42,16 @@ def start_export(project_name: str):
     if progress['translated'] + progress['reviewed'] - progress['passthrough'] == 0:
         return jsonify({'error': '尚未翻譯任何段落，請先翻譯再匯出'}), 400
 
+    # The export reads project.json: a running task's results waiting for
+    # their save (the window) are written first
+    tm = TaskManager()
+    running = tm.get_task(project_name)
+    if running is not None and running.saver is not None and tm.get_project_manager(project_name):
+        try:
+            running.saver.flush()
+        except Exception as e:  # noqa: BLE001 - reported, the export is not started
+            return jsonify({'error': f'無法儲存專案：{type(e).__name__}: {e}'}), 500
+
     # Check if already exporting
     with _export_lock:
         existing = _export_tasks.get(project_name)

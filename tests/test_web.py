@@ -966,7 +966,7 @@ class TestDynamicWorkers:
             with patch.object(tm, 'resume_translation', return_value=True) as mock_resume:
                 response = client.post(
                     f'/api/projects/{PROJECT_NAME}/translate/pause',
-                    data=json.dumps({'workers': 4}),
+                    data=json.dumps({'action': 'resume', 'workers': 4}),  # Phase 7 round 1
                     content_type='application/json',
                 )
                 assert response.status_code == 200
@@ -2172,14 +2172,19 @@ class TestCoordinatorFailure:
                                                         PROJECT_NAME))
 
     def test_save_failure_wakes_paused_worker(self, project_with_translations):
-        paused = threading.Event()
+        paused, in_flight = threading.Event(), threading.Event()
 
         def respond(request):
             prompt = request.messages[-1].content
             if '>Chapter 2<' in prompt:
+                # Pre-merge: only once the other call is in flight. A pause
+                # before it starts means no call and no result, so nothing
+                # to save and no failure: the run stays paused (correctly)
+                assert in_flight.wait(30)
                 raise RateLimitError('limit')
             if '>Second paragraph.<' in prompt:
-                assert paused.wait(10)
+                in_flight.set()
+                assert paused.wait(30)
             return like(request, '譯')
 
         TaskManager._instance = None
@@ -2438,7 +2443,8 @@ class TestTemplatesHandleErrors:
 
     def test_model_select_reverts_on_error(self, client):
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
-        assert 'this.model = previous;' in html
+        # Phase 7: the select shows the stored backend/model again
+        assert "document.getElementById('model-select').value = previous;" in html
         assert "this.error = data.error || '模型設定失敗'" in html
 
     def test_retry_button_reactive(self, client):
@@ -2929,9 +2935,10 @@ class TestRound2UnsavedReport:
         with patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
             release.set()
             _finish(task, patcher)
-        assert task.state == 'failed'
-        error = [e for e in task.progress.get_all() if e['event'] == 'error'][0]
-        assert error['data'] == {'error': 'disk full', 'unsaved': []}
+        # Phase 7 (debounced saves): the stale result is dropped, nothing is
+        # waiting, so no save is made and none fails; nothing is reported
+        assert task.state == 'completed'
+        assert not [e for e in task.progress.get_all() if e['event'] == 'error']
 
     def test_skipped_result_in_queue_not_reported(self, project_with_translations):
         task = TranslationTask(task_id='t', project_name=PROJECT_NAME,
@@ -2941,7 +2948,8 @@ class TestRound2UnsavedReport:
         outcome = TranslationOutcome(text='x', status=SegmentStatus.TRANSLATED, issues=[],
                                      model='m', usage=None)
         task.result_queue.put(TranslationResult('ch1_seg0003', outcome, 0))
-        TaskManager()._fail_task(task, RuntimeError('boom'), [])
+        from src.core.runcontrol import DebouncedSaver
+        TaskManager()._fail_task(task, RuntimeError('boom'), DebouncedSaver(task.pm))
         assert task.error == 'boom（1 個段落的結果未儲存：ch1_seg0003）'
 
 
@@ -2986,9 +2994,11 @@ class TestRound2StoredModelOption:
 
     def test_unlisted_stored_model_shown(self, client):
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
-        assert ("if (!this.availableModels.some(m => m.alias === this.model))" in html)
-        assert "{ alias: this.model, label: this.model, description: '目前設定，後端未列出' }" \
-            in html
+        # Phase 7: options are backend/model keys
+        assert ("if (!this.availableModels.some(m => m.key === this.modelKey()))" in html)
+        assert ("{ alias: this.model, label: this.model, description: '目前設定，後端未列出',\n"
+                "                                              backend: this.backend, "
+                "key: this.modelKey() }") in html
 
     def test_model_unchanged_by_reading(self, client, project_with_translations):
         TaskManager._instance = None
@@ -3037,7 +3047,7 @@ class TestRound2StartChecks:
 
 # --- Review round 3 ---------------------------------------------------------------
 
-from src.core.translator import MAX_CONSECUTIVE_UNEXPECTED
+from src.core.translator import MAX_CONSECUTIVE_UNEXPECTED, UnexpectedStreak
 
 
 def _dir_snapshot(path):
@@ -3233,7 +3243,7 @@ class TestRound3InitialStatusError:
         first = next(iter(response.response)).decode('utf-8')
         response.close()
         assert first == ('event: status\ndata: {"state": "paused", "completed": 0, '
-                         '"total": 3, "error": "找不到程式"}\n\n')
+                         '"total": 3, "error": "找不到程式", "resume_in": null}\n\n')  # round 2
         TaskManager._instance = None
 
     def test_event_after_snapshot_delivered(self, client, project_with_translations):
@@ -3265,16 +3275,22 @@ class TestRound3StaleResultInFailureDrain:
         def respond(request):
             if '>Chapter 2<' in request.messages[-1].content:
                 in_flight.set()
-                assert release.wait(10)
+                assert release.wait(60)
+            else:  # pre-merge: the failing save waits until this call is in flight
+                assert in_flight.wait(60)
             return like(request, '譯')
 
         TaskManager._instance = None
-        with patch.object(ProjectManager, 'save', side_effect=OSError('disk full')):
+        import functools
+        from src.core.runcontrol import DebouncedSaver
+        # Phase 7: a window of one result, so the first result's save fails
+        with patch.object(ProjectManager, 'save', side_effect=OSError('disk full')), \
+                patch('src.web.tasks.DebouncedSaver', functools.partial(DebouncedSaver, every=1)):
             task, patcher = _start(project_with_translations, respond,
                                    segment_ids=['ch1_seg0003', 'ch2_seg0001'],
                                    num_workers=2)
-            assert in_flight.wait(10)
-            _wait(lambda: task.state == 'failed')  # the drain waits for this call
+            assert in_flight.wait(60)
+            _wait(lambda: task.state == 'failed', timeout=60)  # the drain waits for this call
             task.pm.update_translation('ch2_seg0001', '人工')  # edited while in flight
             release.set()
             _finish(task, patcher)
@@ -3294,9 +3310,10 @@ class TestRound3UnexpectedStreakWeb:
             Segment(id=f'ch1_seg{i:04d}', html=f'<p>Line {i}.</p>', text=f'Line {i}.',
                     word_count=2, segment_type=SegmentType.TEXT) for i in range(1, n + 1)])
 
-    def test_run_stops_after_five(self, project_with_translations):
+    def test_run_stops_after_five(self, project_with_translations, monkeypatch):
         self._project(project_with_translations, 8)
         holder, calls = {}, []
+        _stop_once_the_sixth_call_runs(monkeypatch, calls)
 
         def respond(request):
             calls.append(1)
@@ -3487,9 +3504,10 @@ class TestRound4StreakKeepsInFlightResults:
     """Item 3: after five unexpected failures in a row the calls in flight
     are awaited and their results saved, then the task fails."""
 
-    def test_good_result_after_streak_saved(self, project_with_translations):
+    def test_good_result_after_streak_saved(self, project_with_translations, monkeypatch):
         TestRound3UnexpectedStreakWeb()._project(project_with_translations, 8)
         holder, calls = {}, []
+        _stop_once_the_sixth_call_runs(monkeypatch, calls)
 
         def respond(request):
             calls.append(1)
@@ -3622,7 +3640,7 @@ class TestRound4StreamAfterEnd:
         body = b''.join(response.response).decode('utf-8')
         response.close()
         assert body == (f'event: status\ndata: {{"state": "{state}", "completed": 0, '
-                        '"total": 3, "error": null}\n\n')
+                        '"total": 3, "error": null, "resume_in": null}\n\n')  # round 2
         TaskManager._instance = None
 
     def test_page_closes_stream_on_ended_first_status(self, client):
@@ -3838,7 +3856,7 @@ class TestPhase4HeaderProgress:
     def test_header_bar_refreshed_when_a_run_ends(self, client):
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
         start = html.index('async refreshFailedCount()')
-        body = html[start:html.index('async fetchStatus()')]
+        body = html[start:html.index('async fetchStatus(connect = true)')]  # Phase 7 round 4
         assert "document.querySelector('.project-header .progress-bar')" in body
         assert "header.querySelector('.progress-fill').style.width = data.percent + '%';" in body
         assert ('`${data.translated + data.reviewed}/${data.total} (${data.percent}%)`'
@@ -4320,3 +4338,18 @@ class TestReviewPageGlossaryNotice(TestReviewPageScript):
     def test_notice_in_the_page(self, client):
         html = client.get(f'/project/{PROJECT_NAME}/review/chapter/ch1').get_data(as_text=True)
         assert html.count('<p class="glossary-notice" hidden>術語表無法讀取，這次未檢查術語。</p>') == 3
+
+
+def _stop_once_the_sixth_call_runs(monkeypatch, calls):
+    """The coordinator stops the run after the fifth failure only once the
+    worker's sixth call has started (Phase 7 round 4: a worker makes no call
+    once the run is stopping, so without this the sixth call raced the stop)."""
+    real = UnexpectedStreak.add
+
+    def add(self, outcome):
+        stop = real(self, outcome)
+        if stop:
+            _wait(lambda: len(calls) > MAX_CONSECUTIVE_UNEXPECTED)
+        return stop
+
+    monkeypatch.setattr(UnexpectedStreak, 'add', add)

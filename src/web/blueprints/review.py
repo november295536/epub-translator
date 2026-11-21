@@ -9,6 +9,7 @@ from flask import Blueprint, render_template, request, jsonify, current_app
 
 from dataclasses import asdict
 
+import src.llm as llm
 from src.core.project import ProjectManager, SegmentStatus
 from src.core.validation import check_segment
 from src.core.translator import (
@@ -210,7 +211,7 @@ def retranslate_segment(project_name: str, segment_id: str):
         source = (seg.html, seg.text)  # a replaced project has other text
         if seg.passthrough:
             return _passthrough_refused()
-        model = pm.data.model
+        model, backend = pm.data.model, pm.data.backend
         translations = pm.data.segmentation == 2
         segments = copy.deepcopy(pm.data.segments)
         seg = next(s for s in segments if s.segment_id == segment_id)
@@ -220,7 +221,7 @@ def retranslate_segment(project_name: str, segment_id: str):
 
     handler = setup_project_logging(project_dir)
     try:
-        engine = TranslationEngine(model=model)
+        engine = TranslationEngine(model=model, backend=llm.backend_for(backend))
         logger.info("重新翻譯段落: %s (模型: %s)", segment_id, engine.model)
         outcome = translate_segment(engine, seg, segments, gm, translations=translations)
         with transaction(project_name) as pm:
