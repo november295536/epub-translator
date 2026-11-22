@@ -57,10 +57,11 @@ def test_entry_points_stop_first(entry, requested):
     assert [n for n in started if n.split('.')[0] == PACKAGE] == requested
 
 
-@pytest.mark.parametrize('path', ['translate.py', os.path.join('src', '__init__.py')])
+@pytest.mark.parametrize('path', [os.path.join(ROOT, 'translate.py'),
+                                  sys.modules[PACKAGE].__file__])  # src/__init__.py
 def test_readable_by_an_old_interpreter(path):
     # the message can only appear if an old interpreter can compile these
-    with open(os.path.join(ROOT, path), encoding='utf-8') as f:
+    with open(path, encoding='utf-8') as f:
         ast.parse(f.read(), path, feature_version=(3, 9))
 
 
