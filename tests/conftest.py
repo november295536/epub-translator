@@ -350,6 +350,32 @@ def no_fake_backend_overcalls():
     assert not overcalls, f'FakeBackend called {len(overcalls)} time(s) beyond its script'
 
 
+# The programs of the model backends, as the backends start them (by name)
+MODEL_PROGRAMS = ('claude', 'copilot')
+# Exit status of the stand-ins below
+STAND_IN_EXIT = 97
+
+
+@pytest.fixture(scope='session', autouse=True)
+def model_programs_replaced(tmp_path_factory):
+    """For the whole session `claude` and `copilot` on PATH are stand-ins
+    that only fail (exit STAND_IN_EXIT, a message on stderr), and so they
+    are for every child process the tests start (scripts, CLI runs, lock
+    holders): code that reaches a model program by any route, including a
+    `run_process` a script imported before the guard below was installed,
+    cannot start the real one."""
+    bin_dir = tmp_path_factory.mktemp('model-programs')
+    for name in MODEL_PROGRAMS:
+        path = bin_dir / name
+        path.write_text('#!/bin/sh\necho "tests do not run the real %s" >&2\nexit %d\n'
+                        % (name, STAND_IN_EXIT))
+        path.chmod(0o755)
+    previous = os.environ.get('PATH', '')
+    os.environ['PATH'] = str(bin_dir) + os.pathsep + previous
+    yield str(bin_dir)
+    os.environ['PATH'] = previous
+
+
 @pytest.fixture(autouse=True)
 def no_real_model_calls(monkeypatch):
     """No test starts the real `claude` program: a call that reaches the

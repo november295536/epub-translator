@@ -39,12 +39,38 @@
                             :disabled="modelLoading"
                             @change="setModel($event.target.value)"
                             style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
-                        <template x-for="m in availableModels" :key="m.key">
-                            <option :value="m.key" :selected="m.key === modelKey()"
-                                    x-text="m.backend + '：' + m.label + ' — ' + m.description"></option>
+                        <template x-for="g in modelGroups()" :key="g.label">
+                            <optgroup :label="g.label">
+                                <template x-for="m in g.models" :key="m.key">
+                                    <option :value="m.key" :selected="m.key === modelKey()"
+                                            x-text="m.label + ' — ' + m.description"></option>
+                                </template>
+                            </optgroup>
                         </template>
                     </select>
                     <span x-show="modelLoading" class="spinner" style="margin-left: 0.5rem;"></span>
+                </div>
+                <div>
+                    <label for="effort-select" style="font-weight: 600; margin-right: 0.5rem;">推理強度</label>
+                    <select id="effort-select"
+                            :disabled="modelLoading || currentEfforts().length === 0"
+                            @change="saveEffort($event.target.value)"
+                            style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
+                        <template x-if="currentEfforts().length === 0">
+                            <option value="" selected>此模型不可設定</option>
+                        </template>
+                        <template x-for="level in currentEfforts()" :key="level">
+                            <option :value="level" :selected="level === effort" x-text="level"></option>
+                        </template>
+                    </select>
+                </div>
+                <div>
+                    <label for="timeout-input" style="font-weight: 600; margin-right: 0.5rem;">呼叫逾時（秒）</label>
+                    <input id="timeout-input" type="number" step="1"
+                           :min="timeoutMin" :max="timeoutMax" :value="timeout"
+                           :disabled="modelLoading"
+                           @change="saveTimeout($event.target.value)"
+                           style="width: 6rem; padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
                 </div>
                 <div>
                     <label for="workers-select" style="font-weight: 600; margin-right: 0.5rem;">並行 Workers</label>
@@ -66,6 +92,11 @@
                           style="margin-left: 0.5rem;"
                           x-text="activeWorkers + ' 個活躍中'"></span>
                 </div>
+            </div>
+
+            <div x-show="settingsNote || settingsError" style="margin-bottom: 1rem;">
+                <span class="text-muted" x-show="settingsNote" x-text="settingsNote"></span>
+                <span class="text-error" x-show="settingsError" x-text="settingsError"></span>
             </div>
 
             <!-- Book brief -->
@@ -159,7 +190,14 @@ function translationController() {
         backend: '',
         failedCount: {{ progress.failed }},
         availableModels: [],
-        modelLoading: false,
+        modelLoading: false,  // a settings save is pending (start, retry and resume wait for it)
+        _settingsSave: null,  // the pending settings save (null: none)
+        effort: null,      // the level the calls use; null: the model takes none
+        timeout: 180,      // seconds per model call
+        timeoutMin: 30,
+        timeoutMax: 3600,
+        settingsNote: '',  // e.g. a stored level the new model does not take
+        settingsError: '',  // the settings' own: a later save clears it, the task error stays
         workers: 1,
         activeWorkers: 0,
         _pauseInFlight: false,
@@ -195,7 +233,11 @@ function translationController() {
                 const data = await res.json();
                 this.model = data.current;
                 this.backend = data.backend;
-                // Every backend's models; the project's backend first
+                this.effort = data.effort;
+                this.timeout = data.timeout;
+                this.timeoutMin = data.timeout_min;
+                this.timeoutMax = data.timeout_max;
+                // Every backend's models (each with its effort levels); the project's backend first
                 const lists = (data.backends || []).filter(b => b.name !== data.backend);
                 lists.unshift({ name: data.backend, models: data.available });
                 this.availableModels = lists.flatMap(b => b.models.map(m => ({
@@ -204,7 +246,7 @@ function translationController() {
                 // changed only when another one is picked
                 if (!this.availableModels.some(m => m.key === this.modelKey())) {
                     this.availableModels = [{ alias: this.model, label: this.model, description: '目前設定，後端未列出',
-                                              backend: this.backend, key: this.modelKey() },
+                                              efforts: data.efforts, backend: this.backend, key: this.modelKey() },
                                             ...this.availableModels];
                 }
             } catch (e) {
@@ -253,34 +295,100 @@ function translationController() {
             return this.backend + '/' + this.model;
         },
 
-        async setModel(key) {
-            const previous = this.modelKey();
-            const chosen = this.availableModels.find(m => m.key === key);
-            if (!chosen) return;
-            const alias = chosen.alias;
+        // The models in groups of backend and family (the alias up to its
+        // first '-'), in list order: many models stay findable in one select
+        modelGroups() {
+            const groups = [];
+            for (const m of this.availableModels) {
+                const dash = m.alias.indexOf('-');
+                const label = dash > 0 ? m.backend + '：' + m.alias.slice(0, dash) : m.backend;
+                let group = groups.find(g => g.label === label);
+                if (!group) groups.push(group = { label, models: [] });
+                group.models.push(m);
+            }
+            return groups;
+        },
+
+        // The effort levels of the selected model ([]: not configurable)
+        currentEfforts() {
+            const current = this.availableModels.find(m => m.key === this.modelKey());
+            return current ? current.efforts : [];
+        },
+
+        // PUT only the settings in `body` (what the user changed; the server
+        // keeps the others as stored); applies the stored ones on success and
+        // resolves to whether it succeeded. One save at a time: the settings
+        // controls are disabled while it is pending (modelLoading), and a run
+        // action waits for it through settingsSaved().
+        putSettings(body) {
+            const save = this._putSettings(body);
+            this._settingsSave = save;
             this.modelLoading = true;
-            let data = {};
+            save.finally(() => {
+                this._settingsSave = null;
+                this.modelLoading = false;
+            });
+            return save;
+        },
+
+        async _putSettings(body) {
+            let data = null;
             let ok = false;
             try {
                 const res = await fetch('/api/projects/{{ project_name }}/model', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model: alias, backend: chosen.backend }),
+                    body: JSON.stringify(body),
                 });
                 data = await res.json();
-                ok = res.ok && data.status === 'ok';
+                ok = res.ok && !!data && data.status === 'ok';
             } catch (e) {
                 data = { error: '模型設定失敗: ' + e.message };
+            } finally {
+                if (ok) {
+                    this.model = data.model;
+                    this.backend = data.backend;
+                    this.effort = data.effort;
+                    this.timeout = data.timeout;
+                    this.settingsNote = data.note;
+                    this.settingsError = '';
+                } else {
+                    this.settingsError = (data && data.error) || '模型設定失敗';
+                }
             }
-            if (ok) {
-                this.model = data.model;
-                this.backend = data.backend;
-            } else {
+            return ok;
+        },
+
+        // Waits for the pending settings save; true when there is none or it
+        // succeeded (a refused or failed one shows its error)
+        async settingsSaved() {
+            return this._settingsSave ? await this._settingsSave : true;
+        },
+
+        async setModel(key) {
+            const previous = this.modelKey();
+            const chosen = this.availableModels.find(m => m.key === key);
+            if (!chosen) return;
+            if (!await this.putSettings({ model: chosen.alias, backend: chosen.backend })) {
                 // Not saved: show the stored model again
                 document.getElementById('model-select').value = previous;
-                this.error = data.error || '模型設定失敗';
             }
-            this.modelLoading = false;
+        },
+
+        async saveEffort(level) {
+            const previous = this.effort;
+            if (!await this.putSettings({ effort: level })) {
+                document.getElementById('effort-select').value = previous;  // the stored one
+            }
+        },
+
+        async saveTimeout(value) {
+            const previous = this.timeout;
+            // sent as typed (a number when it is one): the server checks it
+            const seconds = /^\d+$/.test(value.trim()) ? parseInt(value, 10) : value;
+            if (!await this.putSettings({ timeout: seconds })) {
+                document.getElementById('timeout-input').value = previous;  // the stored one
+            }
         },
 
         async refreshFailedCount() {
@@ -327,7 +435,14 @@ function translationController() {
         },
 
         async startTranslation(retryFailed = false) {
+            if (this.starting) return;
             this.starting = true;
+            // the click that ended a settings edit (blur) waits for its save;
+            // a refused or failed save starts nothing (its error is shown)
+            if (!await this.settingsSaved()) {
+                this.starting = false;
+                return;
+            }
             this.error = null;
             this.autoResume = false;  // a new run: no wait
             this.logs = [];
@@ -366,6 +481,8 @@ function translationController() {
             if (this._pauseInFlight) return;
             this._pauseInFlight = true;
             try {
+                // as for start: a resume waits for pending settings saves (pause does not)
+                if (action === 'resume' && !await this.settingsSaved()) return;
                 const body = { action: action };
                 if (action === 'resume') body.workers = parseInt(this.workers);
                 const res = await fetch('/api/projects/{{ project_name }}/translate/pause', {

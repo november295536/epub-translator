@@ -10,7 +10,6 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
-import src.llm as llm
 from src.core.project import ProjectLock, ProjectManager, SegmentStatus, project_mutex
 from src.core.runcontrol import DebouncedSaver, resume_delay
 from src.core.translator import (
@@ -730,7 +729,7 @@ class TaskManager:
         tag = f"W{worker_id}"
         pm = task.pm
         gm = task._gm
-        engine, current = None, None  # made for the project's (backend, model)
+        engine, current = None, None  # made for the project's call settings
 
         def interrupted() -> bool:
             # A retry's backoff wait ends, and no call is made, once the
@@ -772,19 +771,17 @@ class TaskManager:
                     task.segment_queue.put(seg)
                     continue
 
-                # The project's backend and model, read again for every
-                # segment (as one, under the mutex): a switch during the
-                # run applies to the next one
+                # The project's backend, model, effort and timeout, read
+                # again for every segment (as one, under the mutex): a
+                # switch during the run applies to the next one
                 with pm.mutex:
-                    wanted = (pm.data.backend, pm.data.model)
+                    wanted = pm.call_settings()
                     brief = pm.data.brief or ''  # an edit applies to the next segment
                 if wanted != current:
-                    if current is not None:
-                        logger.info("[%s] 模型切換: %s → %s", tag, current[1], wanted[1])
+                    if current is not None and wanted.model != current.model:
+                        logger.info("[%s] 模型切換: %s → %s", tag, current.model, wanted.model)
                     current = wanted
-                    engine = TranslationEngine(model=current[1],
-                                               backend=llm.backend_for(current[0]),
-                                               interrupted=interrupted)
+                    engine = TranslationEngine(**current.call_args(), interrupted=interrupted)
 
                 revision, queued_status = task.queued.get(
                     seg.segment_id, (seg.revision, seg.status))

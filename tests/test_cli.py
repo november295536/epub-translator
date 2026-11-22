@@ -724,7 +724,8 @@ class TestCLIModelCommand:
         path = _make_project(str(tmp_path / 'p'), n=1)
         result = runner.invoke(cli, ['model', 'show', '-p', path])
         assert (result.exit_code, result.output) == (
-            0, '後端：claude-cli\n模型：sonnet\n可用模型：sonnet, opus, haiku\n')
+            0, '後端：claude-cli\n模型：sonnet\n可用模型：sonnet, opus, haiku\n'
+               '推理強度：low\n可用推理強度：low, medium, high, xhigh, max\n呼叫逾時：180 秒\n')
 
     def test_set_backend_then_extract_uses_it(self, runner, tmp_path, monkeypatch):
         import src.llm as llm
@@ -732,11 +733,13 @@ class TestCLIModelCommand:
         fake = FakeBackend(['[{"term": "MARK1", "translation": "標記", "category": "term"}]'])
         monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: fake)
         result = runner.invoke(cli, ['model', 'set', '-b', 'copilot-cli', '-p', path])
-        assert (result.exit_code, result.output) == (0, '已設定模型：fake-model（copilot-cli）\n')
+        assert (result.exit_code, result.output) == (
+            0, '已設定模型：fake-model（copilot-cli）\n推理強度：此模型不可設定，呼叫逾時：180 秒\n')
         raw = json.loads(self._bytes(path))
         assert (raw['backend'], raw['model']) == ('copilot-cli', 'fake-model')
         result = runner.invoke(cli, ['model', 'show', '--project', path])
-        assert result.output == '後端：copilot-cli\n模型：fake-model\n可用模型：fake-model\n'
+        assert result.output == ('後端：copilot-cli\n模型：fake-model\n可用模型：fake-model\n'
+                                 '推理強度：此模型不可設定\n可用推理強度：無\n呼叫逾時：180 秒\n')
         # the default backend (claude-cli) would refuse: conftest blocks real processes
         result = runner.invoke(cli, ['glossary', 'extract', '--project', path])
         assert result.exit_code == 0, result.output
@@ -745,7 +748,7 @@ class TestCLIModelCommand:
     def test_set_model_of_the_project_backend(self, runner, tmp_path):
         path = _make_project(str(tmp_path / 'p'), n=1)
         result = runner.invoke(cli, ['model', 'set', '-m', 'opus', '-p', path])
-        assert (result.exit_code, result.output) == (0, '已設定模型：opus（claude-cli）\n')
+        assert (result.exit_code, result.output) == (0, '已設定模型：opus（claude-cli）\n推理強度：low，呼叫逾時：180 秒\n')
         raw = json.loads(self._bytes(path))
         assert raw['model'] == 'opus' and 'backend' not in raw
 
@@ -774,7 +777,7 @@ class TestCLIModelCommand:
         before = self._bytes(path)
         with patch.object(ProjectManager, 'save') as save:
             result = runner.invoke(cli, ['model', 'set', '-b', 'claude-cli', '-p', path])
-        assert (result.exit_code, result.output) == (0, '已設定模型：opus（claude-cli）\n')
+        assert (result.exit_code, result.output) == (0, '已設定模型：opus（claude-cli）\n推理強度：low，呼叫逾時：180 秒\n')
         assert save.call_count == 0
         assert self._bytes(path) == before
         assert ProjectManager(path).load().model == 'opus'
@@ -785,7 +788,7 @@ class TestCLIModelCommand:
         (['-b', 'copilot-cli', '-m', 'sonnet'],
          "Invalid value for '--model' / '-m': 無效的模型：sonnet，可用模型：fake-model"),
         (['-b', 'nope'], "Invalid value for '--backend' / '-b': 'nope' is not one of"),
-        ([], 'Error: 請指定 --backend/-b 或 --model/-m（或兩者）'),
+        ([], 'Error: 請指定 --backend/-b、--model/-m、--effort/-e 或 --timeout/-t（可合併）'),
     ])
     def test_refused_values_change_nothing(self, runner, tmp_path, monkeypatch, args, message):
         import src.llm as llm

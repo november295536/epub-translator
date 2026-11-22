@@ -282,17 +282,18 @@ class TestInterfaceDetails:
         assert RateLimitError('limit').raw == ''
 
     def test_claude_cli_identity(self):
-        from src.llm import Capabilities, ModelInfo
+        from src.llm import EFFORT_LEVELS, Capabilities, ModelInfo
         backend = ClaudeCLI()
         assert backend.name == 'claude-cli'
         assert backend.capabilities == Capabilities(
             separate_system=False, multi_turn=False, reports_usage=False,
             sampling_params=False, suggested_concurrency=1)
         assert backend.list_models() == [
-            ModelInfo('sonnet', 'Sonnet', '快速且高品質，適合大多數翻譯'),
-            ModelInfo('opus', 'Opus', '最高品質，費用較高'),
-            ModelInfo('haiku', 'Haiku', '最快速度，適合簡單內容'),
+            ModelInfo('sonnet', 'Sonnet', '快速且高品質，適合大多數翻譯', EFFORT_LEVELS),
+            ModelInfo('opus', 'Opus', '最高品質，費用較高', EFFORT_LEVELS),
+            ModelInfo('haiku', 'Haiku', '最快速度，適合簡單內容', EFFORT_LEVELS),
         ]
+        assert EFFORT_LEVELS == ('low', 'medium', 'high', 'xhigh', 'max')
 
     def test_auth_message(self):
         error = ClaudeCLI().classify_error(_result(1, '', 'OAuth token has expired'))
