@@ -64,10 +64,11 @@ from src.llm.copilot_cli import (
     _UNAVAILABLE_PATTERN, AUTH_HINT, EFFORT_REJECTED_MESSAGE, MODELS, CopilotCLI, redact,
 )
 
-# How long an aborted session may take to go idle before it is deleted anyway
+# Bound on the abort and the wait for the session to go idle; it is then
+# deleted anyway
 ABORT_WAIT_SECONDS = 5
-# Bound on abort + delete, and on stopping the client at exit: a runtime that
-# no longer answers cannot hold them forever
+# Bound on the delete, on waiting for the turns at exit and on the graceful
+# stop: a runtime that no longer answers cannot hold them forever
 CLEANUP_SECONDS = 10
 
 # The built-in MCP servers of the coding-agent mode (as listed by the
@@ -193,7 +194,10 @@ class _Runtime:
 
     async def client(self):
         """The started client (on the loop): a new runtime when the last one
-        died; AuthError when it has no logged-in account."""
+        died; AuthError when it has no logged-in account. Refused once
+        closed, so a turn that was waiting cannot start a runtime after it."""
+        if self._closed:
+            raise CancelledError('shutting down')
         if self._client is None:
             self._client = _new_client()
         client = self._client
@@ -219,23 +223,46 @@ class _Runtime:
             if self._closed:
                 return
             self._closed = True
-            loop, client, turns = self._loop, self._client, dict(self._turns)
-        if client is None or loop.is_closed():  # a client exists only on a loop
+            loop, turns = self._loop, dict(self._turns)
+        if loop is None or loop.is_closed():
             return
         for stop in turns.values():
             self.stop_turn(stop)
         concurrent.futures.wait(turns, timeout=CLEANUP_SECONDS)
+        client = self._client  # read now: a first turn may just have made it
+        if client is None:
+            return
         try:
-            asyncio.run_coroutine_threadsafe(_stop(client), loop).result(CLEANUP_SECONDS)
+            asyncio.run_coroutine_threadsafe(_stop(client), loop).result(2 * CLEANUP_SECONDS)
         except BaseException:
             pass
 
 
 async def _stop(client) -> None:
+    """A graceful stop, bounded; else a forced one."""
     try:
-        await client.stop()
+        async with asyncio.timeout(CLEANUP_SECONDS):
+            await client.stop()
     except Exception:
         await client.force_stop()
+
+
+async def _until(aw, stop: asyncio.Event, cancel: threading.Event, timeout: float):
+    """The result of `aw`, unless the turn is stopped first (CancelledError)
+    or `timeout` seconds pass (TimeoutError); `aw` is then cancelled."""
+    task = asyncio.ensure_future(aw)
+    stopped = asyncio.ensure_future(stop.wait())
+    try:
+        await asyncio.wait((task, stopped), timeout=max(0.0, timeout),
+                           return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        stopped.cancel()
+    if not task.done():
+        task.cancel()
+        if stop.is_set() or cancel.is_set():
+            raise CancelledError('cancelled')
+        raise TimeoutError('the runtime did not answer in time')
+    return task.result()
 
 
 _runtime = _Runtime()
@@ -261,7 +288,7 @@ class CopilotSDK:
             raise CancelledError('cancelled')
         deadline = time.monotonic() + request.timeout
         stop = asyncio.Event()
-        future = _runtime.submit(self._turn(request, flatten_prompt(request), stop), stop)
+        future = _runtime.submit(self._turn(request, flatten_prompt(request), stop, cancel), stop)
         try:
             while True:
                 try:
@@ -285,9 +312,13 @@ class CopilotSDK:
             # loop, never interrupted); one that finished ignores this
             _runtime.stop_turn(stop)
 
-    async def _turn(self, request: LLMRequest, prompt: str, stop: asyncio.Event) -> LLMResponse:
+    async def _turn(self, request: LLMRequest, prompt: str, stop: asyncio.Event,
+                    cancel: threading.Event) -> LLMResponse:
         """One request in a fresh session, deleted afterwards (also when
-        `stop` is set: the turn is aborted first). Raises only LLMErrors."""
+        `stop` is set: the turn is aborted first). The caller's `cancel` is
+        checked too before each step (`stop` follows it only at the caller's
+        next poll). Every step is bounded by the request's timeout. Raises
+        only LLMErrors."""
         usages, messages = [], []
         idle = asyncio.Event()
 
@@ -300,34 +331,51 @@ class CopilotSDK:
             elif kind == 'session.idle':
                 idle.set()
 
-        client = await _runtime.client()
+        loop = asyncio.get_running_loop()
+        # A second later than the caller's: the caller times out first, this
+        # bound only ends a turn that nobody stops (e.g. a wedged runtime)
+        deadline = loop.time() + request.timeout + 1
+
+        def left() -> float:
+            return deadline - loop.time()
+
+        def check() -> None:
+            if stop.is_set() or cancel.is_set():
+                raise CancelledError('cancelled')
+
+        check()
+        try:
+            client = await _until(_runtime.client(), stop, cancel, left())
+        except LLMError:
+            raise
+        except Exception as e:
+            raise _error(e, messages)
         # The id is chosen here, so a session whose creation failed half-way
         # is deleted too
         session_id = str(uuid.uuid4())
         session = None
         running = False  # the prompt was sent and the turn has not ended
         try:
-            session = await client.create_session(session_id=session_id, **session_options(request))
+            check()
+            # Not raced against the stop: a creation given up half-way could
+            # leave a session behind; only a runtime that does not answer ends it
+            session = await asyncio.wait_for(client.create_session(
+                session_id=session_id, **session_options(request)), max(0.0, left()))
             session.on(record)
-            if stop.is_set():  # the caller gave up while the session was created
-                raise CancelledError('cancelled')
-            send = asyncio.ensure_future(session.send_and_wait(prompt, timeout=request.timeout))
+            check()  # the caller may have given up while the session was created
             running = True
-            stopped = asyncio.ensure_future(stop.wait())
-            await asyncio.wait((send, stopped), return_when=asyncio.FIRST_COMPLETED)
-            stopped.cancel()
-            if not send.done():
-                send.cancel()
-                raise CancelledError('cancelled')
-            reply = send.result()  # raised: aborted (a timeout leaves the turn running)
-            running = False
+            reply = await _until(session.send_and_wait(prompt, timeout=request.timeout),
+                                 stop, cancel, left())
+            running = False  # raised: aborted (a timeout leaves the turn running)
         except Exception as e:
             raise _error(e, messages)
         finally:
             await self._clean_up(client, session if running else None, session_id, idle)
-        if any(u.content_filter_triggered for u in usages):
-            raise RefusalError('copilot SDK: the reply was filtered (content filter)')
         text = getattr(getattr(reply, 'data', None), 'content', None) or ''
+        # Filtered: refused unless the final call was not and gave a reply
+        if any(u.content_filter_triggered for u in usages) and (
+                usages[-1].content_filter_triggered or not text):
+            raise RefusalError('copilot SDK: the reply was filtered (content filter)')
         truncated = bool(usages) and usages[-1].finish_reason == 'length'
         return LLMResponse(text=text, stop_reason='truncated' if truncated else 'complete',
                            usage=_usage(usages), model=request.model)
@@ -337,14 +385,15 @@ class CopilotSDK:
         """Abort the turn of `session` if one is given (waiting briefly for
         it to go idle), then delete the session. Failures are ignored: a
         runtime that died took its turns with it."""
+        if session is not None:
+            try:
+                async with asyncio.timeout(ABORT_WAIT_SECONDS):
+                    await session.abort()
+                    await idle.wait()
+            except Exception:
+                pass  # deleted all the same
         try:
             async with asyncio.timeout(CLEANUP_SECONDS):
-                if session is not None:
-                    await session.abort()
-                    try:
-                        await asyncio.wait_for(idle.wait(), ABORT_WAIT_SECONDS)
-                    except TimeoutError:
-                        pass
                 await client.delete_session(session_id)
         except Exception:
             pass
