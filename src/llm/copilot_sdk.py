@@ -67,8 +67,10 @@ from src.llm.copilot_cli import (
 # Bound on the abort and the wait for the session to go idle; it is then
 # deleted anyway
 ABORT_WAIT_SECONDS = 5
-# Bound on the delete, on waiting for the turns at exit and on the graceful
-# stop: a runtime that no longer answers cannot hold them forever
+# Bound on the delete, and at exit on the graceful stop and then on the
+# forced one: a runtime that no longer answers cannot hold them forever.
+# At exit the turns get ABORT_WAIT_SECONDS + CLEANUP_SECONDS (one cleanup),
+# so the whole shutdown takes at most ABORT_WAIT_SECONDS + 3 * CLEANUP_SECONDS
 CLEANUP_SECONDS = 10
 
 # The built-in MCP servers of the coding-agent mode (as listed by the
@@ -84,6 +86,7 @@ NOT_LOGGED_IN_MESSAGE = f'Copilot SDK 沒有已登入的帳號，{AUTH_HINT}'
 # The SDK logs failures it also raises (with tracebacks) and the runtime's
 # stderr as warnings; the errors this backend raises carry what matters
 logging.getLogger('copilot').setLevel(logging.ERROR)
+logger = logging.getLogger(__name__)
 
 
 def _new_client():
@@ -228,7 +231,7 @@ class _Runtime:
             return
         for stop in turns.values():
             self.stop_turn(stop)
-        concurrent.futures.wait(turns, timeout=CLEANUP_SECONDS)
+        concurrent.futures.wait(turns, timeout=ABORT_WAIT_SECONDS + CLEANUP_SECONDS)
         client = self._client  # read now: a first turn may just have made it
         if client is None:
             return
@@ -239,12 +242,13 @@ class _Runtime:
 
 
 async def _stop(client) -> None:
-    """A graceful stop, bounded; else a forced one."""
+    """A graceful stop, else a forced one; each bounded."""
     try:
         async with asyncio.timeout(CLEANUP_SECONDS):
             await client.stop()
     except Exception:
-        await client.force_stop()
+        async with asyncio.timeout(CLEANUP_SECONDS):
+            await client.force_stop()
 
 
 async def _until(aw, stop: asyncio.Event):
@@ -339,8 +343,8 @@ class CopilotSDK:
         session_id = str(uuid.uuid4())
         session = None
         running = False  # the prompt was sent and the turn has not ended
+        check()  # before the try: a session never created is not deleted
         try:
-            check()
             # Not raced against the stop (a creation given up half-way could
             # leave a session behind): bounded, for a runtime that does not answer
             session = await asyncio.wait_for(client.create_session(
@@ -353,7 +357,8 @@ class CopilotSDK:
         except Exception as e:
             raise _error(e, messages)
         finally:
-            await self._clean_up(client, session if running else None, session_id, idle)
+            await self._clean_up(client, session if running else None, session_id, idle,
+                                 created=session is not None)
         text = getattr(getattr(reply, 'data', None), 'content', None) or ''
         # Filtered: refused unless the final call was not and gave a reply
         if any(u.content_filter_triggered for u in usages) and (
@@ -364,10 +369,13 @@ class CopilotSDK:
                            usage=_usage(usages), model=request.model)
 
     @staticmethod
-    async def _clean_up(client, session, session_id: str, idle: asyncio.Event) -> None:
+    async def _clean_up(client, session, session_id: str, idle: asyncio.Event,
+                        created: bool) -> None:
         """Abort the turn of `session` if one is given (waiting briefly for
-        it to go idle), then delete the session. Failures are ignored: a
-        runtime that died took its turns with it."""
+        it to go idle), then delete the session. A failed abort is ignored.
+        A failed delete of a session that was `created` is logged (its
+        folder, prompt and reply included, stays: e.g. the runtime died);
+        one whose creation failed may not exist, so that is not logged."""
         if session is not None:
             try:
                 async with asyncio.timeout(ABORT_WAIT_SECONDS):
@@ -379,7 +387,9 @@ class CopilotSDK:
             async with asyncio.timeout(CLEANUP_SECONDS):
                 await client.delete_session(session_id)
         except Exception:
-            pass
+            if created:
+                logger.warning('copilot-sdk: session %s not deleted; its folder in '
+                               '~/.copilot/session-state/ is left', session_id)
 
 
 def _usage(usages: list) -> Optional[Usage]:
