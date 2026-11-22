@@ -6226,3 +6226,87 @@ Mutation: not run (no Python file under `src/` changed). Projects fingerprint un
 - A failed re-translation of a translated or reviewed segment is not selected by
   `--retry-failed`.
 - The CLI cannot set the backend without starting a translation.
+
+## Fix: export source path and `model` command
+
+Branch `fix/export-source-and-model-cmd`. Two changes; no new options.
+
+### 1. Export survives a moved or renamed project directory
+
+`source_epub_path(project_dir, epub_path)` (`src/core/project.py`, with `SOURCE_FILE`) is the one
+choice of the source EPUB: the project directory's `source.epub` when it is a file, else the
+stored `epub_path` (projects without a copy). Readers found (every use of `epub_path`,
+`EPUBExtractor(`, `open_archive(`, `Archive(`) and how each resolves now:
+
+| Reader | Before | Now |
+|---|---|---|
+| `exporter._export` (CLI and web export) | `data.epub_path` | `source_epub_path`; the hash check and the "output must not be the source" guard use the file opened; `epub_path` is not rewritten |
+| `migrate.migrate_project` | own inline choice | `source_epub_path` (same behaviour) |
+| `translate.py status` ("來源：" line) | `data.epub_path` | `source_epub_path` (display only) |
+| `phase2_roundtrip.source_path`, `phase6_segmentation_check.source_of` | own copies of the choice | `source_epub_path` |
+| `phase2_migrate_copies.placed_chapters`, `phase3_export_check.check_copy` | `data.epub_path` | `source_epub_path` |
+
+Not readers of the source: `validate` and re-translation (they use `project.json` only); `init`
+and web `POST /api/projects` write the copy (unchanged); `EPUBExtractor` in the web upload and
+metadata endpoints reads the uploaded file.
+
+### 2. `translate.py model show` / `model set [-b] [-m]`
+
+`ProjectManager.select_model(backend, model)` holds the rules once, used by `model set`,
+`start -b/-m` (through `translate._select_model`, which turns a refused model into a usage error
+of `-m`) and the web `PUT …/model`: the project's own backend is not stored again; a new backend
+without a model takes its default model; the model must be one of the models of the backend it
+will run with; an unknown backend or model raises `ValueError` and changes nothing; returns
+whether anything was set (nothing set: nothing saved). `translate._check_model` and the inline
+check of the web blueprint are gone. `model set` takes `project.lock` like `brief set` (locked:
+the lock message, exit 1); neither option, an unknown backend (`click.Choice`) or a refused model
+is a usage error (exit 2) with `project.json` byte-identical.
+
+Behaviour changes, deliberate: the refused-model message is now
+`無效的模型：<model>，可用模型：<a, b, …>` in the CLI too (was `'<model>' is not one of …`); four test
+assertions follow it. The web refuses `{"model": null}` with `未提供模型名稱` (before: `無效的模型：None…`),
+since `select_model` takes `None` as "keep".
+
+### Tests (32 added, 4 assertions changed)
+
+- `test_exporter.py::TestSourceOfAMovedProject` (7): a project made by `translate.py init`, then
+  renamed into another directory with its stored path gone: every format exports and equals the
+  unmoved export member by member (names and bytes), `epub_path` unchanged; CLI export of a
+  moved project; `source.epub` replaced by a different EPUB is refused (hash), no output; the
+  copy is preferred over an existing different file at the stored path; output onto the copy
+  of a moved project is refused; a project without a copy exports from the stored path (and
+  output onto it is refused); `source_epub_path` with a directory named `source.epub`.
+  Five of the seven fail with the old `data.epub_path` in `_export` (checked by editing it back).
+- `test_cli.py::TestCLIModelCommand` (12): `show` output; `set -b copilot-cli` then
+  `glossary extract` calls the newly stored backend (a fake under `copilot-cli`); `-m` alone;
+  both; own backend alone saves nothing; refused values (`-m nope`, a Claude model for Copilot,
+  `-b nope`, no option) exit 2 with `project.json` byte-identical; refused while another process
+  holds the lock (byte-identical, lock free afterwards); no project; help texts.
+- `test_project.py::TestSelectModel` (10), `test_web.py` (2: null model, exact refusal message,
+  both byte-identical), `test_verify_scripts.py` (1: `placed_chapters` reads the stored path
+  without a copy and the copy in a moved project).
+
+### Commands and results
+
+```
+$ source <repo>/venv/bin/activate                     # Python 3.9 suite; mutmut on its 3.12
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once
+2719 passed in 218.67s / 220.85s / 221.75s            (no failure, no warning in any)
+$ scripts/verify/mutation.sh main                      # run 1
+TOTAL mutants 104  killed 103  survived 1  timeout 0  suspicious 0  untested 0
+    survivor: phase2_migrate_copies.placed_chapters, epub_path -> None (no test without a copy)
+    killed by test_placed_chapters_source_resolved
+$ scripts/verify/mutation.sh main                      # run 2 (final)
+TOTAL mutants 104  killed 104  survived 0  timeout 0  suspicious 0  untested 0
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+`phase1_survivor_kills.py`: entries `cli7` and `cli8` mutated the old `--model` message in
+`translate.py`; they now mutate the same message in `ProjectManager.select_model` (the first run
+after the change reported `cli7` SURVIVED: its anchor matched the new `model show` line first).
+Click commands (`model show`, `model set`) are decorated, so mutmut does not mutate them; their
+lines are covered by `TestCLIModelCommand`. The scripts that read real projects were not run (no
+access to the projects directory on this branch). No real model calls.
