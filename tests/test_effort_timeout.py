@@ -326,6 +326,25 @@ class TestSelect:
         with pytest.raises(SettingError):
             pm.select_model('claude-cli', 'sonnet', effort='none')
 
+    def test_unlisted_stored_level_kept_without_a_model_change(self, pm):
+        """A level the current model does not list (hand-edited, or a list
+        that shrank) survives a timeout or effort-less change; calls use the
+        default meanwhile. A model change drops it."""
+        pm.select_model('copilot-cli', 'gemini-4-carbon')
+        pm.data.effort = 'max'  # as loaded from such a file
+        assert pm.select_model(None, None, timeout=400) is True
+        assert _state(pm) == ('copilot-cli', 'gemini-4-carbon', 'max', 400)
+        assert pm.call_settings().effort == 'low'
+        assert pm.select_model(None, 'gemini-4-carbon') is True  # the same model again
+        assert pm.data.effort == 'max'
+        assert pm.select_model('copilot-cli', 'gemini-4-carbon') is True  # its own backend
+        assert pm.data.effort == 'max'
+        pm.select_model(None, 'gemini-4-argon')  # another model (also without max)
+        assert pm.data.effort is None
+        pm.data.effort = 'max'
+        pm.select_model('claude-cli', None)  # another backend (its default takes max)
+        assert _state(pm)[1:3] == ('sonnet', 'max')
+
     def test_effort_with_the_model_change(self, pm):
         pm.select_model(None, None, effort='max')
         pm.select_model('copilot-cli', 'gemini-4-carbon', effort='medium')
@@ -776,3 +795,70 @@ class TestSmallMessages:
         # aliases without a family share one group of their own, in list order
         assert translate._model_lines(['sonnet', 'XXXX-a', 'opus', 'gpt-x', 'XXXX-b']) == (
             'sonnet, opus\n          XXXX-a, XXXX-b\n          gpt-x')
+
+
+class TestRunWaitsForSettings:
+    """Start, retry and resume wait for a pending settings save (pause does
+    not): a run must not start with the old settings, or after a refusal."""
+
+    def test_markup(self, client):
+        html = client.get(f'/project/{PROJECT}/translation').get_data(as_text=True)
+        assert '@click="startTranslation()" :disabled="starting || modelLoading"' in html
+        assert '@click="startTranslation(true)" :disabled="starting || modelLoading"' in html
+        assert '''@click="pauseTranslation('resume')" :disabled="modelLoading"''' in html
+        assert '''<button class="btn btn-secondary" @click="pauseTranslation('pause')">''' in html
+
+    # The page's controller in Node, fetch stubbed: the PUT of a settings
+    # save stays pending until the test releases it
+    HARNESS = r"""
+const fetched = [];
+let release;
+global.document = {getElementById: () => ({value: ''}), querySelector: () => null};
+global.fetch = async (url, options) => {
+    const method = (options && options.method) || 'GET';
+    fetched.push(method + ' ' + url.replace(/^.*\/api\/projects\/[^/]+/, ''));
+    if (method === 'PUT') {
+        await new Promise(r => { release = r; });
+        return {ok: true, json: async () => ({status: 'ok', model: 'sonnet', backend: 'claude-cli',
+                                              effort: 'low', efforts: [], timeout: 300, note: ''})};
+    }
+    return {ok: true, json: async () => ({state: 'running', total: 1})};
+};
+global.EventSource = class { addEventListener() {} close() {} };
+const page = require('fs').readFileSync(0, 'utf8');
+eval(page + '; global.translationController = translationController;');
+(async () => {
+    const ctrl = translationController();
+    const saving = ctrl.saveTimeout('300');
+    const during = ctrl.modelLoading;
+    await ctrl.startTranslation();
+    await ctrl.startTranslation(true);
+    await ctrl.pauseTranslation('resume');
+    await ctrl.pauseTranslation('pause');
+    const whilePending = fetched.slice();
+    release();
+    await saving;
+    await ctrl.startTranslation();
+    console.log(JSON.stringify({during, whilePending, after: fetched.slice(whilePending.length),
+                                loading: ctrl.modelLoading, timeout: ctrl.timeout}));
+})();
+"""
+
+    def test_run_actions_wait(self, client):
+        import shutil
+        import subprocess
+        node = shutil.which('node')
+        if node is None:
+            pytest.skip('node is not installed')
+        html = client.get(f'/project/{PROJECT}/translation').get_data(as_text=True)
+        start = html.index('<script>\nfunction translationController()') + len('<script>')
+        script = html[start:html.index('</script>', start)]
+        out = subprocess.run([node, '-e', self.HARNESS], input=script,
+                             capture_output=True, text=True, timeout=30)
+        assert out.returncode == 0, out.stderr
+        result = json.loads(out.stdout)
+        assert result['during'] is True
+        # only the save and the pause went out while the save was pending
+        assert result['whilePending'] == ['PUT /model', 'POST /translate/pause']
+        assert result['after'][0] == 'POST /translate/start'
+        assert (result['loading'], result['timeout']) == (False, 300)

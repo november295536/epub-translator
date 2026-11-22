@@ -5521,6 +5521,50 @@ class TestPhase9ScriptRound1:
 # --- Phase 10: reasoning effort script --------------------------------------------
 
 effort_check = _load('phase10_effort_check')
+# Imported at collection, before conftest's guard replaces it
+from src.llm.cli import run_process as real_run_process  # noqa: E402
+
+
+class UnexpectedProcess(BaseException):
+    """A measuring script started a process its test did not stub. A
+    BaseException, so the scripts' `except Exception` cannot count it as a
+    failed call and go on."""
+
+
+# The measuring scripts that import run_process by name: the suite's guard
+# (conftest.no_real_model_calls) replaces src.llm.cli.run_process, not
+# these copies
+MEASURING_SCRIPTS = (overhead, copilot_overhead, effort_check)
+
+
+@pytest.fixture(autouse=True)
+def no_unstubbed_script_process(monkeypatch):
+    """Every test here starts with the measuring scripts' run_process
+    failing; a test that expects calls installs its own stub over it."""
+    def unexpected(cmd, *args, **kwargs):
+        raise UnexpectedProcess(f'unexpected process in a test: {cmd[:1]}')
+    for module in MEASURING_SCRIPTS:
+        monkeypatch.setattr(module, 'run_process', unexpected)
+
+
+class TestNoRealModelProcess:
+
+    @pytest.mark.parametrize('module', MEASURING_SCRIPTS, ids=lambda m: m.__name__)
+    def test_scripts_process_stubbed(self, module):
+        with pytest.raises(UnexpectedProcess):
+            module.run_process(['copilot', '-p', 'x'], timeout=1, cwd='.', env={})
+
+    @pytest.mark.parametrize('program', ['claude', 'copilot'])
+    def test_model_programs_are_stand_ins(self, program, tmp_path):
+        """Even the real run_process (or a child process) reaches only the
+        session's stand-in (conftest.model_programs_replaced)."""
+        from tests.conftest import STAND_IN_EXIT
+        result = real_run_process([program, '-p', 'x'], timeout=30, cwd=str(tmp_path),
+                                  env=dict(os.environ))
+        assert result.returncode == STAND_IN_EXIT
+        assert f'tests do not run the real {program}' in result.stderr
+        child = subprocess.run([program, '--version'], capture_output=True, text=True)
+        assert child.returncode == STAND_IN_EXIT
 
 
 def _claude_json(thinking=7, error=False, reply='<p k="1">譯文</p>'):

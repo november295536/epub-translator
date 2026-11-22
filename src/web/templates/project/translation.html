@@ -8,14 +8,14 @@
             <h3 style="margin: 0; font-size: 1rem;">翻譯控制</h3>
             <div class="header-actions">
                 <template x-if="state === 'idle' || state === 'completed' || state === 'failed' || state === 'stopped'">
-                    <button class="btn btn-primary" @click="startTranslation()" :disabled="starting">
+                    <button class="btn btn-primary" @click="startTranslation()" :disabled="starting || modelLoading">
                         <template x-if="starting">
                             <span class="spinner"></span>
                         </template>
                         開始翻譯
                     </button>
                 </template>
-                <button class="btn btn-secondary" @click="startTranslation(true)" :disabled="starting"
+                <button class="btn btn-secondary" @click="startTranslation(true)" :disabled="starting || modelLoading"
                         x-show="failedCount > 0 && (state === 'idle' || state === 'completed' || state === 'failed' || state === 'stopped')"
                         x-text="'重試失敗段落（' + failedCount + '）'">重試失敗段落（{{ progress.failed }}）</button>
                 <template x-if="state === 'running' || (state === 'paused' && autoResume)">
@@ -24,7 +24,7 @@
                     </button>
                 </template>
                 <template x-if="state === 'paused'">
-                    <button class="btn btn-success" @click="pauseTranslation('resume')">
+                    <button class="btn btn-success" @click="pauseTranslation('resume')" :disabled="modelLoading">
                         ▶ 繼續翻譯
                     </button>
                 </template>
@@ -190,7 +190,7 @@ function translationController() {
         backend: '',
         failedCount: {{ progress.failed }},
         availableModels: [],
-        modelLoading: false,
+        modelLoading: false,  // a settings save is pending: start, retry and resume wait for it
         effort: null,      // the level the calls use; null: the model takes none
         timeout: 180,      // seconds per model call
         timeoutMin: 30,
@@ -416,6 +416,7 @@ function translationController() {
         },
 
         async startTranslation(retryFailed = false) {
+            if (this.modelLoading) return;  // a run would start with the old settings
             this.starting = true;
             this.error = null;
             this.autoResume = false;  // a new run: no wait
@@ -453,6 +454,7 @@ function translationController() {
 
         async pauseTranslation(action) {
             if (this._pauseInFlight) return;
+            if (action === 'resume' && this.modelLoading) return;  // as for start; pause stays
             this._pauseInFlight = true;
             try {
                 const body = { action: action };

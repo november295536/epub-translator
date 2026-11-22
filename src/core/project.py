@@ -460,9 +460,11 @@ class ProjectManager:
         leaves a setting as it is. The project's own backend is not stored
         again; a new backend without a model takes that backend's default
         model; the model must be one of the models of the backend it will be
-        used with, and the effort one of the levels of that model. A stored
-        effort the resulting model does not accept is dropped (None: the
-        default). A refused value raises SettingError (a ValueError) and
+        used with, and the effort one of the levels of that model. When the
+        backend or model changes, a stored effort the new model does not
+        accept is dropped (None: the default); a change of the effort or the
+        timeout alone keeps it (call_settings falls back while it is not
+        listed). A refused value raises SettingError (a ValueError) and
         changes nothing. True when something was set (False: nothing given,
         or only the project's own backend)."""
         if not self.data:
@@ -491,13 +493,15 @@ class ProjectManager:
             check_timeout(timeout)
         if model is None and effort is None and timeout is None:
             return False
+        # The model in use changes (a new backend always brings a model here)
+        switched = model is not None and (backend is not None or model != self.data.model)
         with self.mutex:
             if model is not None:
                 self.set_model(model, backend=backend)
             if effort is not None:
                 self.data.effort = effort
-            elif self.data.effort not in levels:
-                self.data.effort = None  # not taken by this model: the default
+            elif switched and self.data.effort not in levels:
+                self.data.effort = None  # not taken by the new model: the default
             if timeout is not None:
                 self.data.timeout = timeout
         return True
