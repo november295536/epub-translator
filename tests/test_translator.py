@@ -297,8 +297,8 @@ class TestSegmentTypePrompts:
             engine.translate('test', glossary_text=glossary)
 
         prompt = mock_run.call_args[0][0][2]
-        assert '術語表' in prompt
-        assert 'machine learning' in prompt
+        assert '術語表（' in prompt
+        assert 'machine learning → 機器學習' in prompt
 
     def test_context_included_in_prompt(self):
         engine = TranslationEngine()
@@ -316,6 +316,44 @@ class TestSegmentTypePrompts:
         assert 'previous text' in prompt
         assert '後文參考' in prompt
         assert 'next text' in prompt
+
+
+class TestPersonNameRule:
+    """Rule 5: a person in the glossary is written as the glossary gives it
+    (also when the text uses only part of a listed full name), any other
+    person name, or an unlisted part of one, stays in English; titles are
+    still translated. The old rule ("嚴格禁止翻譯") contradicted the
+    glossary's [人名] line."""
+
+    ENTRY = 'Quillon Marsh → 奎倫·馬許 [人名]'
+    CLAUSES = ('術語表有列出的人名，照術語表的寫法',          # listed
+               '給英文原文就保留英文原文',                         # listed as English
+               '文中只用其中的姓或名（含所有格、複數）時，也算有列出',   # part of a listed name
+               '用譯名中對應的部分',
+               '無法對應時保留英文，不猜譯、不補成全名',
+               '術語表沒有列出的人名（包括有通行譯名的知名人物），以及人名中術語表沒有列出的部分，'
+               '一律保留英文原文',                                  # unlisted
+               '稱謂、頭銜仍要翻譯',                               # titles
+               'Miss Ferrowind 寫成費洛溫小姐',
+               'Halvarth 勳爵')
+
+    @pytest.mark.parametrize('html', ['', '<p k="1">Miss Marsh smiled.</p>'])
+    @pytest.mark.parametrize('glossary', ['', ENTRY])
+    def test_text_prompts_carry_the_rule(self, html, glossary):
+        prompt = TranslationEngine()._build_prompt('Miss Marsh smiled.', SegmentType.TEXT,
+                                                   glossary_text=glossary, html=html)
+        rules = [line for line in prompt.splitlines() if line.startswith('5. 人名')]
+        assert len(rules) == 1
+        for clause in self.CLAUSES:
+            assert clause in rules[0]
+        assert '嚴格禁止翻譯' not in prompt and '人名保持英文' not in prompt
+        assert (self.ENTRY in prompt) == bool(glossary)
+        assert ('- [人名]：人物名稱，依照術語表翻譯' in prompt) == bool(glossary)
+
+    def test_code_prompt_has_no_name_rule(self):
+        prompt = TranslationEngine()._build_prompt('# Miss Marsh\nx = 1', SegmentType.CODE,
+                                                   glossary_text=self.ENTRY)
+        assert '人名' not in prompt
 
 
 class TestHTMLMode:
@@ -390,8 +428,8 @@ class TestHTMLMode:
                            segment_type=SegmentType.TEXT, html=html, glossary_text=glossary)
 
         prompt = mock_run.call_args[0][0][2]
-        assert '術語表' in prompt
-        assert 'machine learning' in prompt
+        assert '術語表（' in prompt
+        assert 'machine learning → 機器學習' in prompt
         assert 'HTML 標籤結構' in prompt
 
 
@@ -1093,7 +1131,9 @@ class TestRequestAndMessages:
         fake = FakeBackend(['<p k="1">譯文</p>'])
         seg = _seg()
         translate_segment(_engine(fake), seg, [seg])
-        assert '術語表' not in fake.prompts[0]
+        # rule 5 names the glossary itself; the section is what must be absent
+        assert '術語表（' not in fake.prompts[0]
+        assert '術語類別說明' not in fake.prompts[0]
 
 
 class TestFailureLogFormat:
