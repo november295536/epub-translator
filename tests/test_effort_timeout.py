@@ -771,3 +771,8 @@ class TestSmallMessages:
     def test_call_settings_without_load(self, tmp_path):
         with pytest.raises(RuntimeError, match='^No project loaded.$'):
             ProjectManager(str(tmp_path)).call_settings()
+
+    def test_model_lines(self):
+        # aliases without a family share one group of their own, in list order
+        assert translate._model_lines(['sonnet', 'XXXX-a', 'opus', 'gpt-x', 'XXXX-b']) == (
+            'sonnet, opus\n          XXXX-a, XXXX-b\n          gpt-x')
