@@ -17,3 +17,9 @@
 **影響**：用 `copilot-cli` 後端時，Copilot CLI 會把每次呼叫的提示與回覆（也就是書的原文與譯文）寫進 `~/.copilot/session-store.db`，供 Copilot 搜尋與列出過去的工作階段；工作階段資料夾 `~/.copilot/session-state/<id>/` 也留著。Copilot CLI 1.0.114 沒有能逐次呼叫關閉它的旗標、環境變數或設定：`copilot --help`、`copilot help config`、`copilot help environment` 都沒有；執行環境有 `enableSessionStore` 這個工作階段選項，但只有 SDK 建立工作階段時能傳，`-p` 不行，擴充功能在加入工作階段時傳 `state: { enableCrossSessionStore: false }` 也無效（實測一次呼叫，資料庫仍多了一筆）。這兩個位置都是本機上的檔案，不會因此上傳。
 
 **暫時做法**：翻譯真正的書時用 `copilot-sdk` 後端，它不寫入這個資料庫，且每次呼叫後刪除工作階段資料夾。已經用 `copilot-cli` 翻譯過的，可在 Copilot CLI 裡用 `/session delete` 或 `/session prune` 刪除那些工作階段（是否一併移除資料庫中的紀錄未驗證）。
+
+## 術語表超過 150 筆時，只用姓或名稱呼的人物不會帶到該段的提示
+
+**影響**：術語表不超過 150 筆時，每段提示都附上整份術語表；超過時只附上該段原文中出現的術語，而「出現」是指整個術語（`term_pattern`：從詞首開始、全部字詞都在）。人物通常以全名列入術語表（`Sabel Tarrowmere`），文中卻常只寫姓或名（`Miss Tarrowmere`、`Sabel's`）；這樣的段落找不到該條目，提示裡就沒有這個人，依規則 5 名字保留英文原文，於是同一人在別段是中文、在這段是英文。品質檢查的「術語未套用」也一樣只看整個術語，不會提醒。
+
+**暫時做法**：常只用姓或名出現的人物，另外把姓或名也加成術語（例如 `Tarrowmere → 塔洛米爾`、`Sabel → 薩貝爾`，類別 person）；或在審閱頁搜尋該姓名，修改仍是英文的段落。
