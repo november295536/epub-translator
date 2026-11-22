@@ -62,6 +62,19 @@ def check_backend(value) -> str:
     return value
 
 
+# The project's own copy of the book, written at creation (and by migrate)
+SOURCE_FILE = 'source.epub'
+
+
+def source_epub_path(project_dir: str, epub_path: str) -> str:
+    """The source EPUB of the project in `project_dir`: its own copy
+    SOURCE_FILE when it exists (so a moved or renamed project directory
+    still finds it), else `epub_path`, the path stored at creation (older
+    projects without a copy)."""
+    own = os.path.join(project_dir, SOURCE_FILE)
+    return own if os.path.isfile(own) else epub_path
+
+
 def sha256_file(path: str) -> str:
     """SHA-256 of a file, hex."""
     digest = hashlib.sha256()
@@ -340,6 +353,31 @@ class ProjectManager:
             if backend is not None:
                 self.data.backend = backend
             self.data.model = model
+
+    def select_model(self, backend: str | None, model: str | None) -> bool:
+        """Set the backend and/or the model as the CLI and the web choose
+        them (in-memory only; call save() to persist). The project's own
+        backend is not stored again; a new backend without a model takes
+        that backend's default model; the model must be one of the models
+        of the backend it will be used with. An unknown backend or model
+        raises ValueError and changes nothing. True when something was set
+        (False: neither given, or only the project's own backend)."""
+        if not self.data:
+            raise RuntimeError("No project loaded.")
+        if backend is not None:
+            check_backend(backend)
+            if backend == (self.data.backend or llm.default_backend().name):
+                backend = None  # the project's backend already: nothing to store
+        if model is None:
+            if backend is None:
+                return False
+            model = llm.backend_for(backend).default_model
+        chosen = backend if backend is not None else self.data.backend
+        aliases = [m.alias for m in llm.backend_for(chosen).list_models()]
+        if model not in aliases:
+            raise ValueError(f'無效的模型：{model}，可用模型：{", ".join(aliases)}')
+        self.set_model(model, backend=backend)
+        return True
 
     def set_brief(self, text: str) -> None:
         """Set the book's brief (in-memory only; call save() to persist).

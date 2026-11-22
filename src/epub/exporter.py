@@ -37,6 +37,7 @@ from lxml import etree
 
 from src.core.project import (
     ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus, sha256_file,
+    source_epub_path,
 )
 from src.core.segmenter import SegmentType, _code_text
 import src.core.validation as validation
@@ -191,16 +192,17 @@ def _export(project_dir: str, output_path: str, fmt: str) -> ExportReport:
     data = ProjectManager(project_dir).load()
     if data.schema != 2:
         raise ExportError(SCHEMA_1_MESSAGE)
+    source = source_epub_path(project_dir, data.epub_path)
     try:
-        digest = sha256_file(data.epub_path)
+        digest = sha256_file(source)
     except OSError as e:
         raise ExportError(f'無法讀取來源 EPUB：{e}') from e
     if not data.source_sha256 or digest != data.source_sha256:
         raise ExportError('來源 EPUB 與專案記錄的雜湊值不符，無法匯出')
-    if os.path.exists(output_path) and os.path.samefile(output_path, data.epub_path):
+    if os.path.exists(output_path) and os.path.samefile(output_path, source):
         raise ExportError('輸出檔不能是來源 EPUB 本身')
     try:
-        zf = open_archive(data.epub_path)
+        zf = open_archive(source)
         opf_path = package_path(zf)
         opf, manifest, spine = read_package(zf)
         opf_subset = has_internal_subset(opf, read_member(zf, opf_path))

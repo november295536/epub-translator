@@ -60,6 +60,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 # At index 0, ahead of everything (see phase2_roundtrip.py)
 sys.path.insert(0, ROOT)
 
+from src.core.project import source_epub_path  # noqa: E402
 from src.core.segmenter import HEADING_TAGS, Segmenter  # noqa: E402
 from src.epub.blocks import walk_blocks  # noqa: E402
 from src.epub.extractor import (  # noqa: E402
@@ -67,7 +68,6 @@ from src.epub.extractor import (  # noqa: E402
 )
 
 PROJECT_FILE = 'project.json'
-SOURCE_FILE = 'source.epub'
 COUNTS = ('old_segments', 'new_segments', 'old_calls', 'new_calls', 'passthrough',
           'merged', 'headings')
 
@@ -86,11 +86,8 @@ def snapshot(project_dir: str) -> list:
 
 def source_of(project_dir: str) -> str:
     """The project's source EPUB: its own copy, else the stored path."""
-    own = os.path.join(project_dir, SOURCE_FILE)
-    if os.path.isfile(own):
-        return own
     with open(os.path.join(project_dir, PROJECT_FILE), encoding='utf-8') as f:
-        return json.load(f)['epub_path']
+        return source_epub_path(project_dir, json.load(f)['epub_path'])
 
 
 def covers(blocks: list, segments: list) -> bool:

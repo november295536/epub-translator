@@ -870,7 +870,7 @@ class TestBackendSelection:
         result = runner.invoke(translate.cli, ['start', '--project', path, '--backend',
                                                'copilot-cli', '--model', 'sonnet'])
         assert result.exit_code == 2
-        assert "Invalid value for '--model' / '-m': 'sonnet' is not one of fake-model" \
+        assert "Invalid value for '--model' / '-m': 無效的模型：sonnet，可用模型：fake-model" \
             in result.output
         result = runner.invoke(translate.cli, ['start', '--project', path,
                                                '--backend', 'copilot-cli'])
@@ -882,7 +882,7 @@ class TestBackendSelection:
         assert (pm.data.backend, pm.data.model) == ('copilot-cli', 'fake-model')
         # a later --model is checked against the stored backend
         result = runner.invoke(translate.cli, ['start', '--project', path, '--model', 'opus'])
-        assert result.exit_code == 2 and "'opus' is not one of fake-model" in result.output
+        assert result.exit_code == 2 and '無效的模型：opus，可用模型：fake-model' in result.output
 
     def test_cli_backend_choices(self):
         result = CliRunner().invoke(translate.cli, ['start', '--backend', 'nope'])

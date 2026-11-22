@@ -48,10 +48,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 from lxml import etree  # noqa: E402
 
+from src.core.project import source_epub_path  # noqa: E402
 from src.epub.extractor import XHTML_MEDIA_TYPE, parse_xml, read_package  # noqa: E402
 
 PROJECT_FILE = 'project.json'
-SOURCE_FILE = 'source.epub'
 
 
 def snapshot(project_dir: str) -> list:
@@ -67,11 +67,8 @@ def snapshot(project_dir: str) -> list:
 
 
 def source_path(project_dir: str) -> str:
-    own = os.path.join(project_dir, SOURCE_FILE)
-    if os.path.isfile(own):
-        return own
     with open(os.path.join(project_dir, PROJECT_FILE), encoding='utf-8') as f:
-        return json.load(f)['epub_path']
+        return source_epub_path(project_dir, json.load(f)['epub_path'])
 
 
 def canonical(data: bytes) -> str:

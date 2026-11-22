@@ -17,6 +17,7 @@ from src.epub.extractor import EPUBError, EPUBExtractor
 from src.core.segmenter import Segmenter, SegmentType
 from src.core.project import (
     ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus, sha256_file,
+    source_epub_path,
 )
 from src.core.runcontrol import DebouncedSaver, resume_delay
 from src.core.translator import (
@@ -120,12 +121,12 @@ def init(epub_file):
     click.echo("使用 'python translate.py start' 開始翻譯")
 
 
-def _check_model(model, backend):
-    """--model must be one of the models of the backend the run will use."""
-    aliases = [m['alias'] for m in available_models(backend)]
-    if model not in aliases:
-        raise click.BadParameter(f"'{model}' is not one of {', '.join(aliases)}",
-                                 param_hint="'--model' / '-m'")
+def _select_model(pm, backend, model) -> bool:
+    """pm.select_model, an unknown model being a usage error of -m."""
+    try:
+        return pm.select_model(backend, model)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="'--model' / '-m'") from e
 
 
 @cli.command()
@@ -161,17 +162,7 @@ def start(project, backend, model, workers, retry_failed):
 def _start(project_dir, backend, model, workers, retry_failed):
     pm = ProjectManager(project_dir)
     pm.load()  # under the lock: the backend and model are checked against this
-    if backend is not None or model is not None:
-        current = pm.data.backend or llm.default_backend().name
-        if backend == current:
-            backend = None  # the project's backend already: nothing to store
-        if backend is not None and model is None:
-            model = llm.backend_for(backend).default_model  # a model of the new backend
-        if model is not None:
-            _check_model(model, backend if backend is not None else pm.data.backend)
-
-    if model:
-        pm.set_model(model, backend=backend)
+    if _select_model(pm, backend, model):
         pm.save()
 
     pending = pm.get_pending_segments(include_failed=retry_failed)
@@ -483,7 +474,7 @@ def status(project):
     progress = pm.get_progress()
     click.echo(f"書名：{pm.data.title}")
     click.echo(f"作者：{pm.data.author}")
-    click.echo(f"來源：{pm.data.epub_path}")
+    click.echo(f"來源：{source_epub_path(project_dir, pm.data.epub_path)}")
     click.echo()
     click.echo(f"總段落數：{progress['total']}")
     click.echo(f"已翻譯：  {progress['translated']}")
@@ -838,6 +829,55 @@ def brief_set(text, project):
         click.echo(str(e))
         sys.exit(1)
     click.echo("已設定書籍簡介。" if pm.data.brief else "已移除書籍簡介。")
+
+
+# --- Backend and model ---
+
+@cli.group()
+def model():
+    """Show or set the project's backend and model (without translating)."""
+
+
+@model.command('show')
+@click.option('--project', '-p', default=None, help='Project directory path')
+def model_show(project):
+    """Show the project's backend and model."""
+    project_dir = _find_project(project)
+    if not project_dir:
+        click.echo("找不到專案。")
+        sys.exit(1)
+    pm = ProjectManager(project_dir)
+    pm.load()
+    click.echo(f"後端：{pm.data.backend or llm.default_backend().name}")
+    click.echo(f"模型：{pm.data.model}")
+    aliases = [m['alias'] for m in available_models(pm.data.backend)]
+    click.echo(f"可用模型：{', '.join(aliases)}")
+
+
+@model.command('set')
+@click.option('--backend', '-b', default=None, type=click.Choice(sorted(llm.BACKENDS)),
+              help="Backend (without --model: that backend's default model)")
+@click.option('--model', '-m', 'model_name', default=None,
+              help="Model: one of the backend's models")
+@click.option('--project', '-p', default=None, help='Project directory path')
+def model_set(backend, model_name, project):
+    """Set the backend and/or the model used by later runs and glossary extract."""
+    if backend is None and model_name is None:
+        raise click.UsageError("請指定 --backend/-b 或 --model/-m（或兩者）")
+    project_dir = _find_project(project)
+    if not project_dir:
+        click.echo("找不到專案。")
+        sys.exit(1)
+    try:
+        with ProjectLock(project_dir):
+            pm = ProjectManager(project_dir)
+            pm.load()
+            if _select_model(pm, backend, model_name):
+                pm.save()
+    except ProjectLockedError as e:
+        click.echo(str(e))
+        sys.exit(1)
+    click.echo(f"已設定模型：{pm.data.model}（{pm.data.backend or llm.default_backend().name}）")
 
 
 def _find_project(project_dir: str | None) -> str | None:

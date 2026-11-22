@@ -30,7 +30,8 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 from lxml import etree
 
 from src.core.project import (
-    ProjectLock, ProjectManager, SegmentState, SegmentStatus, sha256_file,
+    SOURCE_FILE, ProjectLock, ProjectManager, SegmentState, SegmentStatus, sha256_file,
+    source_epub_path,
 )
 from src.core.segmenter import SegmentType, segment_from_blocks
 from src.epub.blocks import normalize, walk_blocks
@@ -39,7 +40,6 @@ from src.epub.extractor import (
     read_package, unresolved_entities,
 )
 
-SOURCE_FILE = 'source.epub'
 BACKUP_FILE = 'project.schema1.json'
 
 # Lowest first: a merged segment takes the lowest status of its group
@@ -242,7 +242,7 @@ def migrate_project(project_dir: str, dry_run: bool = False) -> MigrationReport:
         own = os.path.join(project_dir, SOURCE_FILE)
         try:  # a malformed file (wrong JSON shape included) is a message
             pm.load()
-            source = own if os.path.isfile(own) else pm.data.epub_path
+            source = source_epub_path(project_dir, pm.data.epub_path)
             found = os.path.isfile(source)
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
             raise MigrationError(f'無法讀取 project.json：{e}') from e
