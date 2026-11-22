@@ -514,14 +514,16 @@ class TestModelAPI:
         assert response.status_code == 400
 
     def test_set_model_null_is_refused(self, client, project_with_translations):
-        """A null model is no model (select_model would take it as 'keep'):
-        refused, project.json unchanged."""
+        """A null setting is no setting (select_model takes it as 'keep'): a
+        body with none is refused, project.json unchanged (Phase 10: the
+        model is optional, so a null model beside a backend is a switch)."""
         project_file = os.path.join(project_with_translations, PROJECT_NAME, 'project.json')
         before = open(project_file, 'rb').read()
-        for body in ({'model': None}, {'model': None, 'backend': 'copilot-cli'}):
+        for body in ({'model': None}, {}, {'model': None, 'backend': None, 'effort': None,
+                                           'timeout': None}, {'other': 'opus'}):
             response = client.put(f'/api/projects/{PROJECT_NAME}/model', json=body)
             assert response.status_code == 400
-            assert response.get_json()['error'] == '未提供模型名稱'
+            assert response.get_json()['error'] == '未提供要設定的項目（model、backend、effort 或 timeout）'
         assert open(project_file, 'rb').read() == before
 
     @pytest.mark.parametrize('body', ['"opus"', '["opus"]', '1', 'null'])
@@ -531,7 +533,7 @@ class TestModelAPI:
         response = client.put(f'/api/projects/{PROJECT_NAME}/model', data=body,
                               content_type='application/json')
         assert response.status_code == 400
-        assert response.get_json()['error'] == '未提供模型名稱'
+        assert response.get_json()['error'] == '未提供要設定的項目（model、backend、effort 或 timeout）'
         assert open(project_file, 'rb').read() == before
 
     @pytest.mark.parametrize('body, saved', [
@@ -2484,7 +2486,7 @@ class TestBackendModels:
         with use_fake_backend(fake):
             data = client.get(f'/api/projects/{PROJECT_NAME}/model').get_json()
             assert data['available'] == [{'alias': 'fake-model', 'label': 'Fake',
-                                          'description': ''}]
+                                          'description': '', 'efforts': []}]
             assert client.put(f'/api/projects/{PROJECT_NAME}/model',
                               json={'model': 'sonnet'}).status_code == 400
             assert client.put(f'/api/projects/{PROJECT_NAME}/model',
@@ -2535,7 +2537,7 @@ class TestTemplatesHandleErrors:
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
         # Phase 7: the select shows the stored backend/model again
         assert "document.getElementById('model-select').value = previous;" in html
-        assert "this.error = data.error || '模型設定失敗'" in html
+        assert "this.settingsError = (data && data.error) || '模型設定失敗'" in html
 
     def test_retry_button_reactive(self, client):
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
@@ -3088,8 +3090,8 @@ class TestRound2StoredModelOption:
         # Phase 7: options are backend/model keys
         assert ("if (!this.availableModels.some(m => m.key === this.modelKey()))" in html)
         assert ("{ alias: this.model, label: this.model, description: '目前設定，後端未列出',\n"
-                "                                              backend: this.backend, "
-                "key: this.modelKey() }") in html
+                "                                              efforts: data.efforts, "
+                "backend: this.backend, key: this.modelKey() }") in html
 
     def test_model_unchanged_by_reading(self, client, project_with_translations):
         TaskManager._instance = None

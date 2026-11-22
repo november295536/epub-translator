@@ -6320,7 +6320,9 @@ Two approvals, one "changes requested". Fixed:
 
 - `PUT …/model` (`src/web/blueprints/translation.py`, `set_model`): a JSON body that is not an
   object (`"opus"`, `["opus"]`, `1`) raised `AttributeError` (500) after the first round; `main`
-  answered 400. It is 400 (`未提供模型名稱`) again (`isinstance(data, dict)`).
+  answered 400 for `"opus"`/`["opus"]` and 500 for `1`/`true`. It is 400 (`未提供模型名稱`) for
+  all of them now (`isinstance(data, dict)`). (Corrected in Phase 10 review round 1: this
+  said `main` answered 400 for every such body.)
 - Same route: the change and the save now run under `pm.mutex`, and a failed save puts the
   previous backend and model back on the manager, as the brief route does, so a running task's
   workers keep the saved values. `main` had the same gap (`set_model` then `save()` with no
@@ -6366,3 +6368,441 @@ exit 0                      (not killed 0; 81 KILLED)
 
 The route fixes are in a decorated Flask view, which mutmut 3.8.1 does not mutate (the mutant
 count is unchanged); the new web tests cover them. No real model calls.
+
+## Phase 10 — Reasoning effort and call timeout
+
+Branch `feat/reasoning-effort-and-timeout`. Two per-project settings, chosen like backend and
+model (plan, Phase 10). Installed CLIs: Claude Code 2.1.330 (`claude --help`: `--effort <level>
+(low, medium, high, xhigh, max)`), Copilot CLI 1.0.114 (`copilot --help`: `--reasoning-effort
+<level>`, "supported levels depend on the model").
+
+### Design
+
+- Levels per model: `ModelInfo.efforts` (`src/llm/base.py`, `EFFORT_LEVELS` = the five values),
+  declared in `MODELS` of `claude_cli.py` and `copilot_cli.py`; `effort_levels(backend, model)`
+  (`src/core/project.py`) reads them; a model the backend does not list has none.
+- Project fields `effort` and `timeout` (`ProjectData`), None when the file has no key, never
+  written while None (like `backend`/`brief`), so old files round-trip. `call_settings(data)` →
+  `CallSettings(backend, model, effort, timeout)`: effort = stored or `DEFAULT_EFFORT` (`low`) for a
+  model with levels, None otherwise; timeout = stored or `DEFAULT_TIMEOUT` (180).
+  `CallSettings.call_args()` gives the keyword arguments of `TranslationEngine` and `TermExtractor`
+  (both take `effort` and `timeout`; the engine puts the effort on `LLMRequest.effort`). Load
+  refuses an `effort` outside `EFFORT_LEVELS` and a `timeout` outside 30–3600 (as it refuses an
+  unknown backend). A stored level the model does not take (only by hand editing, or a CLI
+  catalog change) is passed as it is: Copilot then refuses it and the run stops with its message.
+  (Corrected in review rounds 1 and 2: load checks `KNOWN_LEVELS`, which adds Copilot's `none`;
+  a stored level the model does not list is not passed, `call_settings` gives the default.)
+- `ProjectManager.select_model(backend, model, effort=None, timeout=None)`: every refusal is a
+  `SettingError` (a `ValueError` with `setting`) raised before anything changes; a stored level
+  the resulting model does not take becomes None (the default) (corrected in review round 2:
+  only when the backend or model changes); `effort_reset_note` builds the
+  message (`原推理強度 X 不適用於 M，已改回預設：low|此模型不可設定`).
+- Callers: web worker (`tasks.py`, re-reads `pm.call_settings()` per segment and rebuilds the
+  engine when any of the four changes), CLI sequential and parallel runs, `glossary extract`
+  (CLI and web), web re-translation.
+- Claude: `--effort LEVEL` after `--model`; `CLAUDE_CODE_EFFORT_LEVEL` removed from the child
+  environment. Copilot: `--reasoning-effort LEVEL` after `--model`, nothing for
+  `claude-haiku-4.5`; its two refusal texts → `BackendUnavailableError`
+  (`EFFORT_REJECTED_MESSAGE` + the CLI text); `classify_error`'s pattern table now maps each
+  pattern to a function building its error (same messages as before for the others).
+- CLI: `model set -e/--effort`, `-t/--timeout` (click `INT`; range from `select_model`), each
+  refusal a usage error of its own option; `model show` adds 推理強度, 可用推理強度, 呼叫逾時;
+  `start` prints the effort/timeout line after 使用模型.
+- Web: `GET …/model` adds `effort`, `efforts`, `timeout`, `timeout_min`, `timeout_max`, and every
+  model in `available`/`backends` carries `efforts` (so the page shows the right levels as soon
+  as another model is picked). `PUT` takes `effort`, `timeout` beside `model` (still required;
+  corrected in review round 1: every setting is optional, at least one required),
+  answers the stored settings and `note`, restores all four on a failed save. Page: effort
+  `<select>` (`:selected` + `@change`, no `x-model`; disabled "此模型不可設定" when the model has
+  no levels), timeout number field; on a refusal the control shows the stored value again.
+  Checked in Chrome against a server on an invented project: xhigh saved; switching to Gemini
+  showed `low, medium, high`, selected `low`, and the reset note; Haiku 4.5 showed the disabled
+  "此模型不可設定"; timeout 10 refused with the message and the field back at 180; 240 saved.
+
+### Tests (115 added, 11 assertions changed)
+
+- `tests/test_effort_timeout.py` (93): per-model levels; exact Claude and Copilot command lines
+  with and without a level; Claude environment without `CLAUDE_CODE_EFFORT_LEVEL` (Copilot's
+  unchanged); seven backend/model/level combinations from stored settings to the program's
+  argv, timeout and environment through the engine; the three Copilot refusal texts (stderr and
+  error event) → `BackendUnavailableError`, a reply quoting them is no error; a CLI run exits 1
+  and a web task pauses (`backend_error`) after one call with every segment still pending and no
+  failure log; `select_model` (defaults, effort/timeout alone, kept or reset on a model change,
+  unconfigurable model, 12 refusals changing nothing); project files (old file loads as the
+  defaults and saves without the keys, set values written, bad stored values refused, a stored
+  level passed as it is (corrected in review round 1: the default is used), an unlisted model
+  gets none); CLI show/set/reset note/7 refusals
+  byte-identical/start line/effort and timeout reach `start` (1 and 2 workers) and `glossary
+  extract`/help; web GET/PUT/reset note/12 refused bodies byte-identical/failed save restores
+  all four/extraction and re-translation get both/page markup; a mid-run switch of effort and
+  timeout reaches the second segment's request.
+- `tests/test_verify_scripts.py::TestPhase10EffortScript` (20).
+- Changed: the 180 s default (2 in `test_translator.py`), `ModelInfo` with levels
+  (`test_llm.py`, `test_web.py` ×2), `model show`/`set` output and the usage error
+  (`test_cli.py` ×5), the PUT answer (`test_runtime.py` ×2).
+
+### Real calls (`scripts/verify/phase10_effort_check.py`, invented paragraph)
+
+13 calls, one per cell, no repeats, no rate limit. `reported` is the level Copilot's
+`session.start` names (Claude reports none). Tokens: Claude input = input + cache creation +
+cache read; output includes the reasoning tokens.
+
+```
+$ python3 scripts/verify/phase10_effort_check.py --backend claude-cli --model haiku --levels low high
+claude-cli   haiku              low     reported -       wall    3.82 s  in   2200  out    290  reasoning      0  ok
+claude-cli   haiku              high    reported -       wall    9.53 s  in   2200  out   1662  reasoning   1342  ok
+$ … --backend claude-cli --model sonnet --levels low high
+claude-cli   sonnet             low     reported -       wall    4.91 s  in   2179  out    337  reasoning      0  ok
+claude-cli   sonnet             high    reported -       wall    4.57 s  in   2179  out    336  reasoning      0  ok
+$ … --backend claude-cli --model sonnet --levels max
+claude-cli   sonnet             max     reported -       wall   82.27 s  in   2179  out  11601  reasoning  11270  ok
+$ … --backend claude-cli --model opus --levels low high
+claude-cli   opus               low     reported -       wall    6.25 s  in   2175  out    321  reasoning      0  ok
+claude-cli   opus               high    reported -       wall    7.74 s  in   2175  out    426  reasoning    114  ok
+$ … --backend copilot-cli --model claude-sonnet-5.5 --levels low high
+copilot-cli  claude-sonnet-5.5  low     reported low     wall   11.66 s  in   1651  out    327  reasoning      0  ok
+copilot-cli  claude-sonnet-5.5  high    reported high    wall    7.84 s  in   1651  out    324  reasoning      0  ok
+$ … --backend copilot-cli --model gpt-6.2-sol --levels low high
+copilot-cli  gpt-6.2-sol        low     reported low     wall    7.38 s  in   1273  out    250  reasoning      0  ok
+copilot-cli  gpt-6.2-sol        high    reported high    wall   10.16 s  in   1273  out    565  reasoning    310  ok
+$ … --backend copilot-cli --model gemini-4-carbon --levels low medium
+copilot-cli  gemini-4-carbon    low     reported low     wall    9.08 s  in   1086  out    215  reasoning      0  ok
+copilot-cli  gemini-4-carbon    medium  reported medium  wall   11.52 s  in   1086  out    421  reasoning    209  ok
+```
+
+Every call exited 0. Evidence that the flag reaches the CLI: Copilot names the level passed in
+every call; Claude's reasoning tokens change with the level (haiku 0 → 1342, opus 0 → 114,
+sonnet 0 at low and high but 11270 at max). Sonnet thought nothing at `high` on this paragraph,
+so a third Sonnet call at `max` was made (13 calls in all). Gemini was measured at `low` and
+`medium`, not `high`: in the research `high` did not finish a comparable paragraph in 300 s,
+beyond the 180 s default. `claude-haiku-4.5` on Copilot takes no level and was not called.
+Single samples: adaptive reasoning varies from call to call.
+
+### Commands and results
+
+```
+$ source <repo>/venv/bin/activate                     # Python 3.9 suite; mutmut on its 3.12
+$ scripts/verify/mutation.sh main                      # run 1
+TOTAL mutants 642  killed 581  survived 61  timeout 0  suspicious 0  untested 0
+$ scripts/verify/mutation.sh main                      # run 2, after tests for the survivors
+TOTAL mutants 642  killed 634  survived 8  timeout 0  suspicious 0  untested 0
+$ scripts/verify/mutation.sh main                      # run 3 (final)
+TOTAL mutants 642  killed 638  survived 4  timeout 0  suspicious 0  untested 0
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once
+2840 passed in 218.43s / 225.69s / 220.93s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+Run 1 survivors were killed by tests (in the commits after the feature): exact messages of
+`check_effort` and of `call_settings` without a loaded project; and in the script: the request
+handed to `build_command`, every argparse option (required, choices, help, metavar, the
+description's first line only), the refusal message with and without levels, flushing each line,
+the wall time of a failed call, the prompt passed to `classify_error`, an empty Claude reply, a
+Copilot run without `session.start`. Run 2 left `--model` required and the description; killed.
+
+The 4 survivors of run 3 are equivalent on any machine; all are in `prompt_text` of the script,
+which builds the engine's real text prompt: `TranslationEngine(backend=None)` (the default
+backend instead of a fake; `_build_prompt` never uses the backend), and the first two arguments
+of `_build_prompt` as `None`/`'XXXX'` text and `None` segment type (with `html` given the text is
+not used, and any type other than CODE takes the same text path).
+
+No phase 1 guard entry had to be re-anchored. Decorated functions (click commands, Flask views)
+are not mutated by mutmut 3.8.1; their lines are covered by `TestCLI` and `TestWeb`. The scripts
+that read real projects were not run (no access to the projects directory on this branch).
+
+## Phase 10 — review round 1
+
+One approval, two "changes requested". Fixed:
+
+- `PUT …/model` (`src/web/blueprints/translation.py`, `set_model`): every setting is optional;
+  a body with none of `model`, `backend`, `effort`, `timeout` (or only nulls) is 400
+  (`未提供要設定的項目…`). The page sends only the setting the user changed (`putSettings(body)`),
+  so a stale tab that changes the timeout no longer switches a running task's model back, and a
+  project whose stored model is not listed can change its timeout. Two message assertions in
+  `test_web.py` follow; `{"model": null, "backend": "copilot-cli"}` is now a backend switch.
+- `call_settings` (`src/core/project.py`): a stored level the model does not list (a hand-edited
+  file, or a list that shrank) gives the default; the route's settings come from it, so the page
+  shows what the call uses. The file keeps the level until a set changes it.
+- Page: settings errors go to `settingsError`, shown beside the note and cleared by a successful
+  settings save; the task's `error` banner is no longer touched by settings.
+- `GET …/model`: `available` comes from the same `call_settings()` reading as the rest.
+- Tests:
+  - `TestWeb::test_web_extraction_passes_effort_and_timeout` waited on a `running` key the
+    status answer does not have (`{'status': 'running'}`), so the wait returned at once. Failing
+    interleaving: the request thread returns from `POST …/extract` and reaches `call, =
+    rec.calls` before the extraction thread has called `run_process`: zero calls, the unpacking
+    fails (or, with a slower check, a test would look at calls of an unfinished extraction). It
+    now waits for `status == 'completed'`.
+  - `TestCopilotRefusal::test_web_task_pauses_with_nothing_stored` waited for `state ==
+    'paused'`. `TaskManager._pause_for` sets `task.state = 'paused'` and only then puts the
+    `backend_error` event: a test thread scheduled between the two reads no event and fails
+    `len(events) == 1`. It now waits for the event itself (and then checks the state).
+  - `test_failed_save_restores_effort_and_timeout` started at `high`, which Gemini takes, so it
+    passed without the effort rollback. It starts at `xhigh` now: the attempted save sees the
+    level reset (None) and the rollback restores `xhigh`.
+  - Added: only what is sent changes (stale-tab case), an unlisted stored model changes its
+    timeout (an effort for it is still refused), GET shows the fallback level, the fallback
+    reaches the command line, page markup (only the changed setting sent, own error field,
+    optgroups).
+- `scripts/verify/phase10_effort_check.py`: the reported level is printed only when it is one of
+  `KNOWN_LEVELS`, else `-` (Haiku 4.5 reports null).
+- `src/web/tasks.py`: the engine comment names the call settings.
+- The round-1 section of "Fix: export source path and `model` command" said `main` answered 400
+  for every non-object body; corrected (400 for `"opus"`/`["opus"]`, 500 for `1`/`true`, checked
+  in `main`'s code: `'model' in 1` raises `TypeError`).
+
+Declined:
+
+- An explicit `null` for `effort`/`timeout` in the PUT body means "not given" (as for `model`
+  and `backend`); there is no "reset to default" through the API.
+- `updated_at` changes on a load and save without edits: older than this branch.
+- The invented first names in the script's invented paragraph are not personal data.
+- The script fails when Copilot omits token accounting: a measurement without tokens is not one.
+
+### Addition: the full Copilot model list
+
+`copilot_cli.MODELS` lists the 20 chat models the owner named (no `auto`, coding-specific or
+internal models), descriptions with the premium-request multiplier the account shows; default
+still `claude-sonnet-5.5`.
+
+Levels, found without model calls (the research's method): for each model the product's
+`CopilotCLI.build_command` (its environment and working directory) was started with each of
+`none, minimal, low, medium, high, xhigh, max` and with no value; the CLI validates the level
+before any model call, and the process group was killed at the first of `user.message`,
+`assistant.turn_start`, `model.call_start` or an error. A level counts as accepted when the run
+reached that point without a `session.model_change` discarding it. 160 starts, 0 model calls.
+Script kept outside the repository (it starts the CLI; it is a one-off probe).
+
+Then one real call per model through the product's path (`TranslationEngine(max_calls=1)` with
+`CopilotCLI`, which runs the `agent_replacement` check in `classify_error`), an invented
+sentence, at the model's lowest level, timeout 180 s. 20 calls, no retries, no rate limit.
+
+| model | multiplier | accepted levels | default (none passed) | lowest-level call | replacement check | reply | wall s |
+|---|---|---|---|---|---|---|---|
+| claude-sonnet-5.5 | 1x | low…max | medium | low | passed | translation | 5.21 |
+| claude-sonnet-5 | 1x | low…max | medium | low | passed | translation | 4.94 |
+| claude-opus-5.5 | 15x | low…max | medium | low | passed | translation | 5.05 |
+| claude-haiku-5.5 | 1x | low…max | medium | low | passed | translation | 5.18 |
+| claude-haiku-4.5 | 0.33x | none (only `none`, discarded) | null | (none passed) | passed | translation | 9.15 |
+| gpt-6.2-sol | 1x | low…max | medium | low | passed | translation | 5.61 |
+| gpt-6.2-astra | 1x | low…max | medium | low | passed | translation | 5.90 |
+| gpt-6.1-sol | 1x | low…max | medium | low | passed | translation | 5.54 |
+| gpt-6.1-terra | 1x | low…max | medium | low | passed | translation | 5.92 |
+| gpt-6-sol | 1x | none, low…max | medium | none | passed | translation | 5.25 |
+| gpt-6-luna | 1x | none, low…max | medium | none | passed | translation | 6.07 |
+| gpt-6-astra | 1x | low…max | medium | low | passed | translation | 6.20 |
+| gpt-5.6-sol | 1x | none, low…max | medium | none | passed | translation | 4.75 |
+| gpt-5.6-luna | 1x | none, low…max | medium | none | passed | translation | 5.22 |
+| gemini-4-carbon | 1x | low, medium, high | medium | low | passed | translation | 7.10 |
+| gemini-4-argon | 1x | low, medium, high | medium | low | passed | translation | 7.20 |
+| gemini-4-hydrogen | 1x | low, medium, high | medium | low | passed | translation | 7.38 |
+| gemini-3.8-flash | 14x | low, medium, high | medium | low | passed | translation | 6.32 |
+| grok-4.7 | 1x | low, medium, high, xhigh | high | low | passed | translation | 7.68 |
+| grok-4.6 | 1x | low, medium, high, xhigh | medium | low | passed | translation | 6.48 |
+
+`low…max` = `low, medium, high, xhigh, max`. `minimal` was refused by every model. For
+`gpt-5.6-sol`/`-luna`, `none` is reported through a `session.model_change` from null to `none`
+(not a discard), and the `none` call answered normally. No model was left out.
+
+Consequences in the code: `KNOWN_LEVELS = ('none',) + EFFORT_LEVELS` (`src/llm/base.py`) is
+what load accepts and what the script prints; the four GPT models declare `none`; Claude Code
+models never do (its CLI knows no `none`). The web model selector groups options with
+`<optgroup>` by backend and alias family (`claude`, `gpt`, `gemini`, `grok`; generic, from the
+alias up to its first `-`); `model show` prints the aliases one line per family (one line for
+the Claude backend, as before). Checked in Chrome on an invented project: 5 groups; a timeout
+saved from a tab whose model selection was stale left the newer model stored; `gpt-6-sol`
+offered `none` and saved it; a refused timeout appeared in the settings error, the task banner
+stayed empty, and the next good save cleared it.
+
+### Commands and results (review round 1)
+
+```
+$ scripts/verify/mutation.sh main                      # first run after the fixes
+TOTAL mutants 670  killed 665  survived 5  timeout 0  suspicious 0  untested 0
+    new survivor: translate._model_lines, the group key of aliases without a family '' -> 'XXXX'
+    killed by TestSmallMessages::test_model_lines
+$ scripts/verify/mutation.sh main                      # final
+TOTAL mutants 670  killed 666  survived 4  timeout 0  suspicious 0  untested 0
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once
+2850 passed in 228.19s / 231.24s / 224.06s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+The 4 survivors are the equivalent `prompt_text` mutants justified above. Real model calls in
+this round: the 20 listed in the table (one per model) and none else; level probes made no
+model call.
+
+## Phase 10 — review round 2
+
+Opus approved, GPT requested changes, Gemini ran out of turns before the web and test parts.
+Fixed:
+
+- No test can start a real model program.
+  - `tests/conftest.py::model_programs_replaced` (session, autouse): `claude` and `copilot` on
+    `PATH` are stand-ins that print a message and exit 97, for the whole session and every child
+    process the tests start. The backends start the programs by name, so any route reaches only
+    the stand-in.
+  - `tests/test_verify_scripts.py::no_unstubbed_script_process` (autouse): `run_process` of the
+    measuring scripts that import it by name raises `UnexpectedProcess` (a `BaseException`, so
+    the scripts' `except Exception` cannot swallow it) unless the test installs its own stub.
+    `TestNoRealModelProcess` checks both.
+  - Found in the other measuring scripts' tests: `phase7_cli_overhead` and
+    `phase9_copilot_overhead` had the same hole (both `from src.llm.cli import run_process`, so
+    conftest's patch of `src.llm.cli.run_process` did not reach them). Every existing test of
+    theirs installs its own stub before calling `main`/`one_call`, so none started a process,
+    but a mutant or a new test could have. `phase7_throughput`, `phase8_brief_sample` and
+    `phase8_extraction_compare` call backends through `src.llm.cli.run_process` (guarded). The
+    phase 8 tests that run `phase8_extraction_compare.py` in a fresh interpreter, outside the
+    in-process guard, use a stub checkout and make no backend call; they are now also covered
+    by the stand-ins on `PATH`.
+- `select_model` (`src/core/project.py`) clears a stored level the model does not list only when
+  the backend or model changes (also not for the same model selected again); an effort- or
+  timeout-only change keeps it, and `call_settings` falls back meanwhile. Test:
+  `TestSelect::test_unlisted_stored_level_kept_without_a_model_change`.
+- Page: Start, Retry and Resume are disabled while a settings save is pending
+  (`modelLoading`), and `startTranslation` / `pauseTranslation('resume')` return at once while
+  it is; Pause stays available. Tests: the bindings (`TestRunWaitsForSettings::test_markup`) and
+  the controller in Node with a pending PUT (`test_run_actions_wait`: only the PUT and the pause
+  go out; start goes out after the save). Removing the guard in `startTranslation` makes the
+  Node test fail (checked by editing it out). Checked in Chrome on an invented project with the
+  PUT held: Start disabled while it was pending, a click sent nothing, enabled after; the timeout
+  was stored.
+- README and CLAUDE.md: a known level the model does not list falls back (the file keeps it
+  until a model change); an unknown value such as `"bogus"` makes the project fail to load and
+  must be corrected or removed.
+- Phase 10 Design/Tests above: the three stale statements are marked corrected in place.
+
+Declined:
+
+- The script classifying Claude's JSON envelope instead of the plain reply: the classification
+  the script needs is call failed or not; the envelope's `is_error` is checked as well.
+- A stale tab keeping its old effort shown after a refusal: the refusal message says what the
+  model takes; a reload shows the stored state.
+- Settings controls editable before the first GET returns: a save then sends only that setting,
+  which the server checks against the stored model.
+- Reading `session.model_change` for the reported level: `session.start` reports the level for
+  every configurable model measured.
+- Catching Ctrl-C in the script: an interrupted measurement is not a result; run_process kills
+  the process group.
+- Comparing the old-file round-trip against fixed fixture bytes: the test compares with the file
+  as written by the same code before the change, which is what round-trip means here.
+
+```
+$ scripts/verify/mutation.sh main
+TOTAL mutants 677  killed 673  survived 4  timeout 0  suspicious 0  untested 0
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once
+2858 passed in 237.70s / 232.63s / 231.56s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+The 4 survivors are the equivalent `prompt_text` mutants justified in the Phase 10 entry. No
+real model calls in this round.
+
+## Phase 10 — review round 3
+
+Opus and Gemini approved, GPT requested changes. Fixed:
+
+- Page (`translation.html`): round 2 disabled Start/Retry/Resume while a settings save was
+  pending, which swallowed the click that ended the edit (mousedown blurs the field, `change`
+  starts the save, the button is disabled before mouseup, no click arrives). The buttons are no
+  longer disabled by a save. `putSettings` chains the saves (`_settingsSave`: each PUT goes out
+  after the earlier one; the chain resolves to true only when every save in it succeeded) and
+  resolves to its own save's result; `settingsSaved()` waits for the chain, also for saves added
+  meanwhile. `startTranslation` and `pauseTranslation('resume')` await it and start nothing when
+  a save was refused or failed (its error is already shown); Pause does not wait. A non-2xx
+  answer whose JSON is `null` or has no `error` no longer throws (`(data && data.error)`), the
+  settings state is applied in `finally`, and the pending state is cleared when the last save of
+  the chain settles.
+- Tests (`TestRunWaitsForSettings`, controller in Node with held PUTs): start waits for the held
+  PUT and goes out after it; a refused PUT sends neither start nor resume; two overlapping saves
+  (the second PUT after the first, start after both); overlapping saves with the first refused
+  start nothing; a `null` error body gives `模型設定失敗` with nothing pending. Without the wait
+  in `startTranslation`, 5 of the 6 tests fail (checked on a scratch copy of the template).
+- Browser, invented project, scratch server whose process layer only records and echoes (no
+  real CLI): typed 420 in the timeout field and clicked 開始翻譯 without leaving the field first.
+  The server log shows one `PUT …/model` then one `POST …/translate/start`; both segments were
+  called with `--model gpt-6.2-sol --reasoning-effort low` and timeout 420; `project.json` has
+  `"timeout": 420`.
+- CLAUDE.md names the two test guards of round 2 (the `claude`/`copilot` stand-ins on `PATH`,
+  and `MEASURING_SCRIPTS` for a new measuring script that imports `run_process` by name).
+
+Declined:
+
+- Stand-ins skipped when pytest's temp directory is mounted `noexec`: not a supported setup;
+  the in-process guards still apply there.
+- The measuring script treating an empty metrics map as zeros: it reports what the CLI reported.
+- A hand-edited `"model": null` on the page: load fills the backend's default model.
+- The CLI printing the reset note before the save: a failed save raises and the message is
+  followed by the error, never by a confirmation.
+
+```
+$ scripts/verify/mutation.sh main
+TOTAL mutants 677  killed 673  survived 4  timeout 0  suspicious 0  untested 0
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once
+2862 passed in 236.30s / 230.29s / 233.34s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+The 4 survivors are the equivalent `prompt_text` mutants justified in the Phase 10 entry. The
+template's JavaScript is not mutated by mutmut; the Node tests cover it. No real model calls.
+
+## Phase 10 — review round 4
+
+Opus and Gemini approved, GPT requested changes. Simplified:
+
+- The save chain of round 3 is gone. Checked first that the page cannot issue a second settings
+  save while one is pending: only three handlers save (`setModel`, `saveEffort`,
+  `saveTimeout`, from the `@change` of the model select, the effort select and the timeout
+  field; there is no separate backend control, Enter in the field fires the same `change`), and
+  all three controls are `:disabled="modelLoading"`. `putSettings` sets `modelLoading`
+  synchronously in the `change` handler; Alpine applies the binding in the microtasks after that
+  event, before any further user event can be dispatched. So the chain only added a path where a
+  refused save A, a successful save B clearing the error, and a silent no-op Start could combine.
+  `_settingsSave` is now the one pending save, cleared when it settles; `settingsSaved()`
+  resolves true when there is none or it succeeded. The two overlap Node tests are removed; the
+  remaining ones (Start waits for a held PUT, refused PUT starts neither start nor resume, `null`
+  error body, bindings) pass, and 3 of the 4 fail without the wait in `startTranslation`
+  (checked on a scratch copy).
+- Browser, invented project, scratch server with a recording process layer (no real CLI): typed
+  360 in the timeout field and clicked 開始翻譯 without leaving the field. Server log: one `PUT
+  …/model`, then one `POST …/translate/start`; both segments called with `--model gpt-6.2-sol
+  --reasoning-effort low`, timeout 360; `project.json` has `"timeout": 360`.
+
+Accepted behaviour, not a defect: when a refused save has already returned before the click on
+Start arrives (the usual order on a local server), the run starts with the stored settings; the
+refusal is shown in the settings error and the field shows the stored value again, so what is
+shown is what is used.
+
+Declined:
+
+- Pause pressed while Resume is waiting on a save: the pause goes out at once; the waiting
+  resume then follows the save's result as before.
+- The web route saving on a no-op backend-only PUT: an atomic rewrite of the same content.
+- The measuring script's wording for an unconfigurable model ("does not take …; it takes:
+  none"): accurate as it is.
+
+```
+$ scripts/verify/mutation.sh main
+TOTAL mutants 677  killed 673  survived 4  timeout 0  suspicious 0  untested 0
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once
+2860 passed in 227.96s / 228.00s / 226.35s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+The 4 survivors are the equivalent `prompt_text` mutants justified in the Phase 10 entry. No
+real model calls.

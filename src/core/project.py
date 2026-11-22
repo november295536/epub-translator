@@ -62,6 +62,79 @@ def check_backend(value) -> str:
     return value
 
 
+class SettingError(ValueError):
+    """A backend, model, effort or timeout refused by select_model;
+    `setting` names which ('backend', 'model', 'effort' or 'timeout')."""
+
+    def __init__(self, setting: str, message: str):
+        super().__init__(message)
+        self.setting = setting
+
+
+# The reasoning effort of a model that accepts levels, when the project names
+# none (also after a model change dropped a level the new model does not take)
+DEFAULT_EFFORT = 'low'
+# Seconds one model call may take (translation and term extraction), when the
+# project names none, and the range a project may set
+DEFAULT_TIMEOUT = 180
+MIN_TIMEOUT, MAX_TIMEOUT = 30, 3600
+
+
+def effort_levels(backend: str | None, model: str) -> tuple:
+    """The effort levels `model` of the backend named `backend` (None: the
+    default one) accepts; () when it accepts none or the backend does not
+    list it."""
+    for info in llm.backend_for(backend).list_models():
+        if info.alias == model:
+            return tuple(info.efforts)
+    return ()
+
+
+def check_effort(value) -> str:
+    """`value` when it is one of src.llm.KNOWN_LEVELS; raises ValueError
+    otherwise."""
+    if type(value) is not str or value not in llm.KNOWN_LEVELS:
+        raise ValueError(f'unknown effort: {value!r}')
+    return value
+
+
+def check_timeout(value) -> int:
+    """`value` when it is an integer (not a bool) from MIN_TIMEOUT to
+    MAX_TIMEOUT; raises SettingError otherwise."""
+    if type(value) is not int or not MIN_TIMEOUT <= value <= MAX_TIMEOUT:
+        raise SettingError('timeout', f'無效的逾時：{value!r}，須為 {MIN_TIMEOUT}–{MAX_TIMEOUT} 的整數秒數')
+    return value
+
+
+@dataclass(frozen=True)
+class CallSettings:
+    """What a model call of the project uses: backend name (None: the
+    default), model, effort (None: pass none) and timeout in seconds."""
+    backend: str | None
+    model: str
+    effort: str | None
+    timeout: int
+
+    def call_args(self) -> dict:
+        """Keyword arguments of TranslationEngine and TermExtractor for them."""
+        return {'model': self.model, 'backend': llm.backend_for(self.backend),
+                'effort': self.effort, 'timeout': self.timeout}
+
+
+def effort_label(effort: str | None) -> str:
+    """A call effort as shown to the user."""
+    return effort if effort is not None else '此模型不可設定'
+
+
+def effort_reset_note(previous: str | None, data: ProjectData) -> str:
+    """The note for a stored level that select_model dropped ('' when it
+    kept it): `previous` is the stored level before the call."""
+    if previous is None or data.effort is not None:
+        return ''
+    after = effort_label(call_settings(data).effort)
+    return f'原推理強度 {previous} 不適用於 {data.model}，已改回預設：{after}'
+
+
 # The project's own copy of the book, written at creation (and by migrate)
 SOURCE_FILE = 'source.epub'
 
@@ -166,7 +239,28 @@ class ProjectData:
     # translation prompt; None: the file has no such key, which is never
     # written, so existing files round-trip unchanged
     brief: str | None = None
+    # The reasoning effort (one of the model's levels); None: the file has no
+    # such key, which means DEFAULT_EFFORT for a model that takes levels
+    # (none for one that does not) and is never written, so existing files
+    # round-trip unchanged. See call_settings
+    effort: str | None = None
+    # Seconds per model call; None: no such key, DEFAULT_TIMEOUT, never written
+    timeout: int | None = None
     segments: list[SegmentState] = field(default_factory=list)
+
+
+def call_settings(data: ProjectData) -> CallSettings:
+    """The settings the project's model calls use. The effort is the stored
+    level when the model takes it, else DEFAULT_EFFORT (none stored, or a
+    level the model does not list: a hand-edited file or a shorter list);
+    a model that takes no levels, or that its backend does not list, gets
+    none."""
+    levels = effort_levels(data.backend, data.model)
+    if not levels:
+        effort = None
+    else:
+        effort = data.effort if data.effort in levels else DEFAULT_EFFORT
+    return CallSettings(data.backend, data.model, effort, data.timeout or DEFAULT_TIMEOUT)
 
 
 # One mutex per project directory, shared by every ProjectManager of this
@@ -284,6 +378,10 @@ class ProjectManager:
             check_rules(raw['segmentation'])
         if not isinstance(raw.get('brief', ''), str):
             raise ValueError('the brief is not text')
+        if 'effort' in raw:  # absent: the default (None)
+            check_effort(raw['effort'])
+        if 'timeout' in raw:  # absent: the default (None)
+            check_timeout(raw['timeout'])
         self.data = ProjectData(**raw, segments=segments)
         return self.data
 
@@ -305,8 +403,9 @@ class ProjectManager:
             del raw['segmentation']  # the file had none: saved as before
         if raw['backend'] is None:
             del raw['backend']  # the default backend: saved as before
-        if raw['brief'] is None:
-            del raw['brief']  # no brief: saved as before
+        for key in ('brief', 'effort', 'timeout'):
+            if raw[key] is None:
+                del raw[key]  # not set: saved as before
         for seg in raw['segments']:
             for key, default in _SEGMENT_DEFAULTS.items():
                 if seg[key] == default:
@@ -354,30 +453,65 @@ class ProjectManager:
                 self.data.backend = backend
             self.data.model = model
 
-    def select_model(self, backend: str | None, model: str | None) -> bool:
-        """Set the backend and/or the model as the CLI and the web choose
-        them (in-memory only; call save() to persist). The project's own
-        backend is not stored again; a new backend without a model takes
-        that backend's default model; the model must be one of the models
-        of the backend it will be used with. An unknown backend or model
-        raises ValueError and changes nothing. True when something was set
-        (False: neither given, or only the project's own backend)."""
+    def select_model(self, backend: str | None, model: str | None,
+                     effort: str | None = None, timeout: int | None = None) -> bool:
+        """Set the backend, model, effort and/or timeout as the CLI and the
+        web choose them (in-memory only; call save() to persist). None
+        leaves a setting as it is. The project's own backend is not stored
+        again; a new backend without a model takes that backend's default
+        model; the model must be one of the models of the backend it will be
+        used with, and the effort one of the levels of that model. When the
+        backend or model changes, a stored effort the new model does not
+        accept is dropped (None: the default); a change of the effort or the
+        timeout alone keeps it (call_settings falls back while it is not
+        listed). A refused value raises SettingError (a ValueError) and
+        changes nothing. True when something was set (False: nothing given,
+        or only the project's own backend)."""
         if not self.data:
             raise RuntimeError("No project loaded.")
         if backend is not None:
-            check_backend(backend)
+            try:
+                check_backend(backend)
+            except ValueError as e:
+                raise SettingError('backend', str(e)) from None
             if backend == (self.data.backend or llm.default_backend().name):
                 backend = None  # the project's backend already: nothing to store
-        if model is None:
-            if backend is None:
-                return False
+        if model is None and backend is not None:
             model = llm.backend_for(backend).default_model
         chosen = backend if backend is not None else self.data.backend
-        aliases = [m.alias for m in llm.backend_for(chosen).list_models()]
-        if model not in aliases:
-            raise ValueError(f'無效的模型：{model}，可用模型：{", ".join(aliases)}')
-        self.set_model(model, backend=backend)
+        if model is not None:
+            aliases = [m.alias for m in llm.backend_for(chosen).list_models()]
+            if model not in aliases:
+                raise SettingError('model', f'無效的模型：{model}，可用模型：{", ".join(aliases)}')
+        target = model if model is not None else self.data.model
+        levels = effort_levels(chosen, target)
+        if effort is not None and effort not in levels:
+            raise SettingError('effort', (
+                f'無效的推理強度：{effort}，{target} 可用：{", ".join(levels)}' if levels
+                else f'模型 {target} 不可設定推理強度'))
+        if timeout is not None:
+            check_timeout(timeout)
+        if model is None and effort is None and timeout is None:
+            return False
+        # The model in use changes (a new backend always brings a model here)
+        switched = model is not None and (backend is not None or model != self.data.model)
+        with self.mutex:
+            if model is not None:
+                self.set_model(model, backend=backend)
+            if effort is not None:
+                self.data.effort = effort
+            elif switched and self.data.effort not in levels:
+                self.data.effort = None  # not taken by the new model: the default
+            if timeout is not None:
+                self.data.timeout = timeout
         return True
+
+    def call_settings(self) -> CallSettings:
+        """call_settings(self.data), read under the mutex."""
+        if not self.data:
+            raise RuntimeError("No project loaded.")
+        with self.mutex:
+            return call_settings(self.data)
 
     def set_brief(self, text: str) -> None:
         """Set the book's brief (in-memory only; call save() to persist).

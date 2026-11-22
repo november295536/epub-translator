@@ -16,7 +16,7 @@ import src.llm as llm
 from lxml import etree
 
 import src.core.validation as validation
-from src.core.project import Issue, SegmentStatus
+from src.core.project import DEFAULT_TIMEOUT, Issue, SegmentStatus
 from src.core.segmenter import SegmentType
 from src.llm import (  # noqa: F401  (RateLimitError, AuthError re-exported)
     AuthError, BackendUnavailableError, CancelledError, LLMError, LLMRequest,
@@ -335,7 +335,7 @@ class _Session:
             self.prompt = messages[0].content
         engine = self.engine
         request = LLMRequest(system='', messages=list(messages), model=engine.model,
-                             timeout=engine.timeout)
+                             timeout=engine.timeout, effort=engine.effort)
         while self.left > 0:
             if engine.interrupted is not None and engine.interrupted():
                 # Paused or stopped (also before a feedback or split call):
@@ -459,9 +459,11 @@ class TranslationEngine:
     """Translates text segments through an LLM backend."""
 
     def __init__(self, max_calls: int = MAX_CALLS, model: str | None = None,
-                 backend: llm.LLMBackend | None = None, timeout: float = 120,
-                 wait=None, interrupted=None):
-        """`wait(seconds, cancel, interrupted) -> bool` waits before a retry
+                 backend: llm.LLMBackend | None = None, timeout: float = DEFAULT_TIMEOUT,
+                 wait=None, interrupted=None, effort: str | None = None):
+        """`timeout`: seconds per call; `effort`: the reasoning effort
+        passed with every call (None: none).
+        `wait(seconds, cancel, interrupted) -> bool` waits before a retry
         after a transient error and returns True when cancelled or
         interrupted; None: wait_or_cancel. `interrupted() -> bool`: the run
         stopped or paused (no retry is made then); None: never."""
@@ -471,6 +473,7 @@ class TranslationEngine:
         self.backend = backend if backend is not None else llm.default_backend()
         self.model = model if model is not None else self.backend.default_model
         self.timeout = timeout
+        self.effort = effort
 
     def translate(self, text: str, segment_type: SegmentType = SegmentType.TEXT,
                   glossary_text: str = '',

@@ -752,7 +752,11 @@ class TestCopilotCLI:
             separate_system=False, multi_turn=False, reports_usage=True,
             sampling_params=False, suggested_concurrency=1)
         assert [m.alias for m in backend.list_models()] == [
-            'claude-sonnet-5.5', 'gpt-6.2-sol', 'gemini-4-carbon', 'claude-haiku-4.5']
+            'claude-sonnet-5.5', 'claude-sonnet-5', 'claude-opus-5.5', 'claude-haiku-5.5',
+            'claude-haiku-4.5', 'gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6.1-sol', 'gpt-6.1-terra',
+            'gpt-6-sol', 'gpt-6-luna', 'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-luna',
+            'gemini-4-carbon', 'gemini-4-argon', 'gemini-4-hydrogen', 'gemini-3.8-flash',
+            'grok-4.7', 'grok-4.6']
         assert backend.auth_hint == '請在終端執行 copilot login 重新登入'
 
     def test_parse_last_message_and_usage(self):
@@ -900,7 +904,9 @@ class TestBackendSelection:
                             json={'model': 'gpt-6.2-sol', 'backend': 'copilot-cli'})
         assert answer.status_code == 200
         assert answer.get_json() == {'status': 'ok', 'model': 'gpt-6.2-sol',
-                                     'backend': 'copilot-cli'}
+                                     'backend': 'copilot-cli', 'effort': 'low',
+                                     'efforts': ['low', 'medium', 'high', 'xhigh', 'max'], 'timeout': 180,
+                                     'note': ''}
         stored = ProjectManager(os.path.join(str(tmp_path), PROJECT))
         stored.load()
         assert (stored.data.backend, stored.data.model) == ('copilot-cli', 'gpt-6.2-sol')
@@ -1594,7 +1600,9 @@ class TestRound1BackendKey:
         client = create_app(projects_dir=str(tmp_path)).test_client()
         answer = client.put(f'/api/projects/{PROJECT}/model',
                             json={'model': 'opus', 'backend': 'claude-cli'})
-        assert answer.get_json() == {'status': 'ok', 'model': 'opus', 'backend': 'claude-cli'}
+        assert answer.get_json() == {'status': 'ok', 'model': 'opus', 'backend': 'claude-cli',
+                                     'effort': 'low', 'efforts': ['low', 'medium', 'high', 'xhigh', 'max'],
+                                     'timeout': 180, 'note': ''}
         with open(os.path.join(path, 'project.json'), encoding='utf-8') as f:
             raw = json.load(f)
         assert raw['model'] == 'opus' and 'backend' not in raw

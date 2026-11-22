@@ -5516,3 +5516,263 @@ class TestPhase9ScriptRound1:
         doc = ' '.join(copilot_overhead.__doc__.split())
         assert 'each call is saved as a session in the user\'s Copilot directory' in doc
         assert '`plugin-data/_direct/`' in doc
+
+
+# --- Phase 10: reasoning effort script --------------------------------------------
+
+effort_check = _load('phase10_effort_check')
+# Imported at collection, before conftest's guard replaces it
+from src.llm.cli import run_process as real_run_process  # noqa: E402
+
+
+class UnexpectedProcess(BaseException):
+    """A measuring script started a process its test did not stub. A
+    BaseException, so the scripts' `except Exception` cannot count it as a
+    failed call and go on."""
+
+
+# The measuring scripts that import run_process by name: the suite's guard
+# (conftest.no_real_model_calls) replaces src.llm.cli.run_process, not
+# these copies
+MEASURING_SCRIPTS = (overhead, copilot_overhead, effort_check)
+
+
+@pytest.fixture(autouse=True)
+def no_unstubbed_script_process(monkeypatch):
+    """Every test here starts with the measuring scripts' run_process
+    failing; a test that expects calls installs its own stub over it."""
+    def unexpected(cmd, *args, **kwargs):
+        raise UnexpectedProcess(f'unexpected process in a test: {cmd[:1]}')
+    for module in MEASURING_SCRIPTS:
+        monkeypatch.setattr(module, 'run_process', unexpected)
+
+
+class TestNoRealModelProcess:
+
+    @pytest.mark.parametrize('module', MEASURING_SCRIPTS, ids=lambda m: m.__name__)
+    def test_scripts_process_stubbed(self, module):
+        with pytest.raises(UnexpectedProcess):
+            module.run_process(['copilot', '-p', 'x'], timeout=1, cwd='.', env={})
+
+    @pytest.mark.parametrize('program', ['claude', 'copilot'])
+    def test_model_programs_are_stand_ins(self, program, tmp_path):
+        """Even the real run_process (or a child process) reaches only the
+        session's stand-in (conftest.model_programs_replaced)."""
+        from tests.conftest import STAND_IN_EXIT
+        result = real_run_process([program, '-p', 'x'], timeout=30, cwd=str(tmp_path),
+                                  env=dict(os.environ))
+        assert result.returncode == STAND_IN_EXIT
+        assert f'tests do not run the real {program}' in result.stderr
+        child = subprocess.run([program, '--version'], capture_output=True, text=True)
+        assert child.returncode == STAND_IN_EXIT
+
+
+def _claude_json(thinking=7, error=False, reply='<p k="1">譯文</p>'):
+    return json.dumps({'type': 'result', 'is_error': error, 'result': reply, 'usage': {
+        'input_tokens': 10, 'cache_creation_input_tokens': 200, 'cache_read_input_tokens': 3000,
+        'output_tokens': 50, 'output_tokens_details': {'thinking_tokens': thinking}}})
+
+
+def _copilot_json(level='high', reasoning=30, reply='<p k="1">譯文</p>'):
+    events = [{'type': 'session.start', 'data': {'reasoningEffort': level}},
+              {'type': 'assistant.message', 'data': {'content': reply}},
+              {'type': 'session.usage_checkpoint', 'data': {
+                  'accountingSnapshot': {'modelMetrics': {
+                      'a': {'usage': {'inputTokens': 100, 'outputTokens': 40,
+                                      'reasoningTokens': reasoning}},
+                      'b': {'usage': {'inputTokens': 1, 'outputTokens': 2}}}},
+                  'promptCacheBreakState': [{'models': {'a': {'system_segments': [
+                      {'segment': 'agent_replacement'}]}}}]}}]
+    return '\n'.join(json.dumps(e) for e in events)
+
+
+class TestPhase10EffortScript:
+
+    def _run(self, monkeypatch, answer):
+        from src.llm.cli import ProcessResult
+        seen = []
+
+        def run(cmd, **kwargs):
+            seen.append((cmd, kwargs))
+            return ProcessResult(0, answer(cmd), '')
+        monkeypatch.setattr(effort_check, 'run_process', run)
+        return seen
+
+    def test_claude(self, monkeypatch, capsys):
+        from src.llm.claude_cli import ClaudeCLI, LEAN_FLAGS
+        monkeypatch.setenv('CLAUDE_CODE_EFFORT_LEVEL', 'max')
+        seen = self._run(monkeypatch, lambda cmd: _claude_json())
+        assert effort_check.main(['--backend', 'claude-cli', '--model', 'opus']) == 0
+        assert [c[c.index('--effort') + 1] for c, _ in seen] == ['low', 'high']
+        cmd, kwargs = seen[1]
+        assert cmd == ['claude', '-p', cmd[2], '--model', 'opus', '--effort', 'high',
+                       *LEAN_FLAGS, '--output-format', 'json']
+        assert 'Priya' in cmd[2] and '<p k="1">' in cmd[2]
+        assert kwargs['timeout'] == 180 and kwargs['cwd'] == ClaudeCLI().working_directory()
+        assert 'CLAUDE_CODE_EFFORT_LEVEL' not in kwargs['env']
+        out = capsys.readouterr().out.splitlines()
+        assert out[0] == (f'claude-cli opus  levels low high  timeout 180 s  prompt {len(cmd[2])} '
+                          'characters (invented paragraph)')
+        assert out[2].startswith('claude-cli   opus               high    reported -       wall ')
+        assert out[2].endswith('s  in   3210  out     50  reasoning      7  ok')
+
+    def test_copilot(self, monkeypatch, capsys):
+        from src.llm.copilot_cli import SYSTEM_PROMPT_ENV
+        seen = self._run(monkeypatch, lambda cmd: _copilot_json(cmd[cmd.index('--reasoning-effort') + 1]))
+        assert effort_check.main(['--backend', 'copilot-cli', '--model', 'gemini-4-carbon',
+                                  '--levels', 'medium', '--timeout', '33']) == 0
+        (cmd, kwargs), = seen
+        assert cmd[3:7] == ['--model', 'gemini-4-carbon', '--reasoning-effort', 'medium']
+        assert '--output-format' in cmd and cmd.count('--output-format') == 1
+        assert kwargs['timeout'] == 33 and kwargs['env'][SYSTEM_PROMPT_ENV]
+        out = capsys.readouterr().out.splitlines()
+        assert out[1].startswith('copilot-cli  gemini-4-carbon    medium  reported medium  wall ')
+        assert out[1].endswith('s  in    101  out     42  reasoning     30  ok')
+
+    @pytest.mark.parametrize('args', [
+        ['--backend', 'copilot-cli', '--model', 'gemini-4-carbon', '--levels', 'low', 'max'],
+        ['--backend', 'copilot-cli', '--model', 'claude-haiku-4.5', '--levels', 'low'],
+        ['--backend', 'claude-cli', '--model', 'opus', '--levels', 'none'],
+    ])
+    def test_refused_level_makes_no_call(self, monkeypatch, capsys, args):
+        seen = self._run(monkeypatch, lambda cmd: _claude_json())
+        with pytest.raises(SystemExit) as e:
+            effort_check.main(args)
+        assert e.value.code == 2 and seen == []
+        assert 'does not take' in capsys.readouterr().err
+
+    @pytest.mark.parametrize('answer, error', [
+        (lambda cmd: _claude_json(error=True), 'FAIL error result'),
+        (lambda cmd: _claude_json(reply='  '), 'FAIL empty reply'),
+        (lambda cmd: 'not json at all, ' + 'x' * 400, 'FAIL unreadable output'),
+    ])
+    def test_failed_claude_calls(self, monkeypatch, capsys, answer, error):
+        self._run(monkeypatch, answer)
+        assert effort_check.main(['--backend', 'claude-cli', '--model', 'haiku',
+                                  '--levels', 'low']) == 1
+        assert error in capsys.readouterr().out
+
+    def test_classified_error_and_exception(self, monkeypatch, capsys):
+        from src.llm.cli import ProcessResult
+        monkeypatch.setattr(effort_check, 'run_process',
+                            lambda cmd, **kw: ProcessResult(1, '', "You've hit your limit"))
+        assert effort_check.main(['--backend', 'claude-cli', '--model', 'haiku',
+                                  '--levels', 'low']) == 1
+        assert 'low     FAIL RateLimitError after ' in capsys.readouterr().out
+
+        def broken(cmd, **kw):
+            raise OSError('x')
+        monkeypatch.setattr(effort_check, 'run_process', broken)
+        call = effort_check.one_call(effort_check.llm.backend_for('claude-cli'), 'p', 'haiku',
+                                     'low', 5)
+        assert (call['ok'], call['error'], call['level']) == (False, 'OSError', 'low')
+
+    def test_copilot_values_without_reasoning(self):
+        values = effort_check.copilot_values(_copilot_json(level=None, reasoning=0))
+        assert (values['in'], values['out'], values['reasoning'], values['reported']) == (
+            101, 42, 0, '-')  # null (a model without levels): not a level
+        for reported, shown in (('max', 'max'), ('none', 'none'), ('minimal', '-'), ('bogus', '-'), (5, '-')):
+            assert effort_check.copilot_values(_copilot_json(level=reported))['reported'] == shown
+        values = effort_check.claude_values(json.dumps({'result': 'r', 'usage': {
+            'input_tokens': 1, 'output_tokens': 2}}))
+        assert (values['in'], values['reasoning'], values['error']) == (1, 0, None)
+
+    def test_call_values(self, monkeypatch):
+        ticks = iter([10.0, 12.5])
+        monkeypatch.setattr(effort_check, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
+        self._run(monkeypatch, lambda cmd: _claude_json())
+        call = effort_check.one_call(effort_check.llm.backend_for('claude-cli'), 'p', 'haiku',
+                                     'max', 5)
+        assert call == {'level': 'max', 'ok': True, 'wall': 2.5, 'reply': '<p k="1">譯文</p>',
+                        'in': 3210, 'out': 50, 'reasoning': 7, 'reported': '-', 'error': ''}
+
+    def test_help(self, tmp_path):
+        result = _run_script('phase10_effort_check', ['--help'], str(tmp_path))
+        assert result.returncode == 0 and '--levels' in result.stdout
+
+    def test_request_handed_to_the_product_command(self, monkeypatch):
+        from src.llm import LLMRequest, Message
+        backend = effort_check.llm.backend_for('copilot-cli')
+        seen = []
+        monkeypatch.setattr(backend, 'build_command', lambda p, r: seen.append(r) or ['x'])
+        assert effort_check.command(backend, 'PROMPT', 'gpt-6.2-sol', 'xhigh') == ['x']
+        assert seen == [LLMRequest(system='', messages=[Message('user', 'PROMPT')],
+                                   model='gpt-6.2-sol', timeout=0, effort='xhigh')]
+
+    def test_options(self, capsys):
+        with pytest.raises(SystemExit) as e:
+            effort_check.main(['--help'])
+        assert e.value.code == 0
+        out = ' '.join(capsys.readouterr().out.split())
+        assert out.startswith('usage: ') and '--backend {claude-cli,copilot-cli} --model MODEL' in out
+        assert '[--levels LEVEL [LEVEL ...]]' in out
+        assert 'Phase 10 measurement: does the project\'s reasoning effort reach the CLI?' in out
+        assert "--model MODEL One of the backend's models" in out
+        assert '--levels LEVEL [LEVEL ...] Levels to call with, in order (default: low high)' in out
+        assert '--timeout TIMEOUT Seconds per call (default 180, the product default)' in out
+        assert 'Makes REAL calls' not in out  # the first line only
+        for args, message in ((['--model', 'opus'], 'required: --backend'),
+                              (['--backend', 'claude-cli'], 'required: --model'),
+                              (['--backend', 'nope', '--model', 'opus'], "invalid choice: 'nope'")):
+            with pytest.raises(SystemExit) as e:
+                effort_check.main(args)
+            assert e.value.code == 2
+            assert message in capsys.readouterr().err
+
+    @pytest.mark.parametrize('args, message', [
+        (['--backend', 'copilot-cli', '--model', 'gemini-4-carbon', '--levels', 'xhigh', 'max'],
+         'gemini-4-carbon (copilot-cli) does not take xhigh, max; it takes: low, medium, high'),
+        (['--backend', 'copilot-cli', '--model', 'claude-haiku-4.5', '--levels', 'low'],
+         'claude-haiku-4.5 (copilot-cli) does not take low; it takes: none'),
+    ])
+    def test_refusal_message(self, capsys, args, message):
+        with pytest.raises(SystemExit):
+            effort_check.main(args)
+        assert capsys.readouterr().err.splitlines()[-1].endswith(f'error: {message}')
+
+    def test_lines_flushed(self, monkeypatch):
+        import io
+        self._run(monkeypatch, lambda cmd: _claude_json())
+
+        class Observed(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.flushed_at = []
+
+            def flush(self):
+                self.flushed_at.append(self.getvalue().count('\n'))
+                super().flush()
+
+        stream = Observed()
+        monkeypatch.setattr(sys, 'stdout', stream)
+        effort_check.main(['--backend', 'claude-cli', '--model', 'haiku'])
+        assert 2 in stream.flushed_at and 3 in stream.flushed_at
+
+    def test_failed_call_wall(self, monkeypatch):
+        ticks = iter([10.0, 14.0])
+        monkeypatch.setattr(effort_check, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
+
+        def broken(cmd, **kw):
+            raise OSError('x')
+        monkeypatch.setattr(effort_check, 'run_process', broken)
+        call = effort_check.one_call(effort_check.llm.backend_for('claude-cli'), 'p', 'haiku',
+                                     'low', 5)
+        assert call == {'level': 'low', 'ok': False, 'error': 'OSError', 'wall': 4.0}
+
+    def test_echoed_phrase_is_no_error(self, monkeypatch):
+        """The prompt goes to the backend's classification: a short reply that
+        repeats a phrase of the request is not taken for an error."""
+        reply = json.dumps({'result': 'authentication_error', 'usage': {
+            'input_tokens': 1, 'output_tokens': 1}})
+        self._run(monkeypatch, lambda cmd: reply)
+        call = effort_check.one_call(effort_check.llm.backend_for('claude-cli'),
+                                     'translate: authentication_error', 'haiku', 'low', 5)
+        assert call['ok'] is True
+
+    def test_missing_reply_and_level(self):
+        values = effort_check.claude_values(json.dumps({'result': None, 'usage': {
+            'input_tokens': 1, 'output_tokens': 2}}))
+        assert values['reply'] == ''
+        events = [json.loads(line) for line in _copilot_json().splitlines()][1:]
+        values = effort_check.copilot_values('\n'.join(json.dumps(e) for e in events))
+        assert values['reported'] == '-'
