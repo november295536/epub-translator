@@ -7908,3 +7908,57 @@ exit 0                      (not killed 0; 81 KILLED)
 
 Both ran on the code commit of this round (the log commit after it changes no code). No anchor
 in the prompt text.
+
+## Fix: person names follow the glossary — review round 2
+
+Gemini approved; GPT and Opus asked for wording changes. Fixed:
+
+1. "同一人" dropped: a surname or given name of a listed full name, used alone, counts as listed
+   whoever bears it (a family plural names several people; a father shares the surname). The
+   example now shows the plural (`the Tarrowmeres` → `塔洛米爾一家`), and the unlisted clause reads
+   `以及人名中術語表沒有列出的部分`.
+2. Fallback when the rendering cannot be divided: `無法對應時保留英文，不猜譯、不補成全名`.
+3. Rule 7 (established translations of proper nouns) could cover a well-known person: rule 5's
+   unlisted clause now says `術語表沒有列出的人名（包括有通行譯名的知名人物）`. Rule 7 unchanged.
+4. Tests: the asserted clauses include `給英文原文就保留英文原文`, the fallback and the well-known
+   person clause.
+5. `known-issues.md`: the full glossary goes into text-segment prompts only, "1 至 150 筆".
+6. README and CLAUDE.md sentences updated (fallback; well-known people; whoever bears the name).
+
+Rule 5 now:
+
+```text
+5. 人名：術語表有列出的人名，照術語表的寫法（術語表給中文譯名就用中文譯名，給英文原文就保留英文原文）；術語表列全名、文中只用其中的姓或名（含所有格、複數）時，也算有列出，對應明確時用譯名中對應的部分，無法對應時保留英文，不猜譯、不補成全名，例如術語表有 Sabel Tarrowmere → 薩貝爾·塔洛米爾 時，Tarrowmere、the Tarrowmeres 寫成塔洛米爾、塔洛米爾一家；術語表沒有列出的人名（包括有通行譯名的知名人物），以及人名中術語表沒有列出的部分，一律保留英文原文，不要自行翻譯，例如：Orla Vintermark、Tobin Quayle。稱謂、頭銜仍要翻譯，例如：術語表有 Ferrowind → 費洛溫 時，Miss Ferrowind 寫成費洛溫小姐；沒有列出時，Miss Dunmere、Lord Halvarth 寫成 Dunmere 小姐、Halvarth 勳爵。
+```
+
+### Real recheck (invented text; REAL calls: 6)
+
+Case P of round 1 with one added sentence using the family plural (`The <Surname>s had owned the
+house for a century.`); default effort `low`. Each reply read in full; not tuned afterwards.
+
+| Backend, model | Runs | `Dr. <Surname>` | `<Given>` | `<Given>'s` | `the <Surname>s` | `Miss <Other>` |
+|---|---|---|---|---|---|---|
+| `claude-cli` `sonnet` | 3 | 3× `<S>` + 醫師 | 3× full rendering `<G>·<S>` | 3× became 他 | 3× `<S>`一家 | 3× English + 小姐 |
+| `copilot-sdk` `gpt-6.2-sol` | 3 | 3× `<S>` + 博士 | 3× `<G>` | 3× became 他 | 2× `<S>`家, 1× `<S>`一家 | 3× English + 小姐 |
+
+The plural follows the glossary on both backends. Claude Sonnet still expands the given name
+alone to the full rendering (3/3), against the new `不補成全名`; reported as found, not tuned
+further. No English left for a listed name, nothing invented, the unlisted person stays in
+English. Copilot SDK: no new session folder, no `copilot --headless` left.
+
+### Commands and results (code commit of this round)
+
+Hand mutations on `git archive HEAD` copies (selection: `TestPersonNameRule` and
+`test_no_glossary_section_without_glossary`, 6 tests): old rule put back → 4 fail; the
+partial-name clause removed → 4; the fallback removed → 4; the well-known-person clause removed
+→ 4; `，給英文原文就保留英文原文` removed → 4; the `[人名]` line removed from the glossary
+section → 2.
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once
+2982 passed in 265.47s / 267.98s / 274.11s           (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
