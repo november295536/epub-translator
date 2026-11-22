@@ -48,7 +48,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, ROOT)
 
 from src.core.migrate import migrate_project  # noqa: E402
-from src.core.project import ProjectManager  # noqa: E402
+from src.core.project import ProjectManager, source_epub_path  # noqa: E402
 from src.epub.exporter import _matches, chapter_items, load_chapter  # noqa: E402
 from src.epub.extractor import open_archive, read_package  # noqa: E402
 from src.web.server import create_app  # noqa: E402
@@ -80,7 +80,7 @@ def placed_chapters(project_dir: str) -> tuple[int, int]:
     """(chapters with segments, chapters the exporter accepts: a chapter
     entry of the spine that loads and whose blocks match its segments)."""
     data = ProjectManager(project_dir).load()
-    zf = open_archive(data.epub_path)
+    zf = open_archive(source_epub_path(project_dir, data.epub_path))
     _, _, spine = read_package(zf)
     items = chapter_items(spine)
     by_chapter: dict = {}

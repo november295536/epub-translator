@@ -1099,3 +1099,55 @@ class TestPhase4MarkFailed:
         assert pm.data.segments[1].issues == [warning]
         pm.update_translation('ch1_seg0002', '<p>y</p>')
         assert pm.data.segments[1].issues == []
+
+
+class TestSelectModel:
+    """ProjectManager.select_model: the one place where the CLI (`model set`,
+    `start -b/-m`) and the web (`PUT …/model`) choose backend and model."""
+
+    @staticmethod
+    def _state(pm):
+        return (pm.data.backend, pm.data.model)
+
+    def test_nothing_given(self, pm):
+        assert pm.select_model(None, None) is False
+        assert self._state(pm) == (None, 'sonnet')
+
+    def test_own_backend_alone_is_nothing(self, pm):
+        assert pm.select_model('claude-cli', None) is False
+        assert self._state(pm) == (None, 'sonnet')
+
+    def test_own_backend_with_a_model_is_not_stored(self, pm):
+        assert pm.select_model('claude-cli', 'haiku') is True
+        assert self._state(pm) == (None, 'haiku')
+
+    def test_new_backend_takes_its_default_model(self, pm):
+        import src.llm as llm
+        copilot = llm.backend_for('copilot-cli')
+        assert pm.select_model('copilot-cli', None) is True
+        assert self._state(pm) == ('copilot-cli', copilot.default_model)
+        # its own backend now: a model is checked against its models
+        with pytest.raises(ValueError):
+            pm.select_model(None, 'sonnet')
+        assert pm.select_model(None, copilot.list_models()[-1].alias) is True
+        assert self._state(pm) == ('copilot-cli', copilot.list_models()[-1].alias)
+
+    @pytest.mark.parametrize('backend, model, message', [
+        (None, 'nope', '無效的模型：nope，可用模型：sonnet, opus, haiku'),
+        ('copilot-cli', 'sonnet', None),
+        ('nope', None, "unknown backend: 'nope'"),
+        ('nope', 'sonnet', "unknown backend: 'nope'"),
+        (1, 'sonnet', 'unknown backend: 1'),
+    ])
+    def test_refused_changes_nothing(self, pm, backend, model, message):
+        with pytest.raises(ValueError) as e:
+            pm.select_model(backend, model)
+        if message:
+            assert str(e.value) == message
+        else:
+            assert str(e.value).startswith('無效的模型：sonnet，可用模型：')
+        assert self._state(pm) == (None, 'sonnet')
+
+    def test_without_load(self, project_dir):
+        with pytest.raises(RuntimeError, match='^No project loaded.$'):
+            ProjectManager(project_dir).select_model(None, 'opus')

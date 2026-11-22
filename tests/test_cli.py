@@ -705,10 +705,122 @@ class TestCLIBackendModels:
         with use_fake_backend(fake):
             result = runner.invoke(cli, ['start', '--project', path, '--model', 'sonnet'])
             assert result.exit_code == 2
-            assert "'sonnet' is not one of fake-model" in result.output
+            assert '無效的模型：sonnet，可用模型：fake-model' in result.output
             result = runner.invoke(cli, ['start', '--project', path, '--model', 'fake-model'])
         assert result.exit_code == 0, result.output
         assert [r.model for r in fake.requests] == ['fake-model']
+
+
+class TestCLIModelCommand:
+    """`model show` / `model set`: the backend and model without translating,
+    with the rules of start -b/-m and the web (ProjectManager.select_model)."""
+
+    @staticmethod
+    def _bytes(path):
+        with open(os.path.join(path, 'project.json'), 'rb') as f:
+            return f.read()
+
+    def test_show(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        result = runner.invoke(cli, ['model', 'show', '-p', path])
+        assert (result.exit_code, result.output) == (
+            0, '後端：claude-cli\n模型：sonnet\n可用模型：sonnet, opus, haiku\n')
+
+    def test_set_backend_then_extract_uses_it(self, runner, tmp_path, monkeypatch):
+        import src.llm as llm
+        path = _make_project(str(tmp_path / 'p'), n=2)
+        fake = FakeBackend(['[{"term": "MARK1", "translation": "標記", "category": "term"}]'])
+        monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: fake)
+        result = runner.invoke(cli, ['model', 'set', '-b', 'copilot-cli', '-p', path])
+        assert (result.exit_code, result.output) == (0, '已設定模型：fake-model（copilot-cli）\n')
+        raw = json.loads(self._bytes(path))
+        assert (raw['backend'], raw['model']) == ('copilot-cli', 'fake-model')
+        result = runner.invoke(cli, ['model', 'show', '--project', path])
+        assert result.output == '後端：copilot-cli\n模型：fake-model\n可用模型：fake-model\n'
+        # the default backend (claude-cli) would refuse: conftest blocks real processes
+        result = runner.invoke(cli, ['glossary', 'extract', '--project', path])
+        assert result.exit_code == 0, result.output
+        assert [r.model for r in fake.requests] == ['fake-model']
+
+    def test_set_model_of_the_project_backend(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        result = runner.invoke(cli, ['model', 'set', '-m', 'opus', '-p', path])
+        assert (result.exit_code, result.output) == (0, '已設定模型：opus（claude-cli）\n')
+        raw = json.loads(self._bytes(path))
+        assert raw['model'] == 'opus' and 'backend' not in raw
+
+    def test_set_both(self, runner, tmp_path, monkeypatch):
+        import src.llm as llm
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: FakeBackend([]))
+        result = runner.invoke(cli, ['model', 'set', '-b', 'copilot-cli', '-m', 'fake-model',
+                                     '-p', path])
+        assert result.exit_code == 0, result.output
+        # the project's own backend again, with one of its models
+        result = runner.invoke(cli, ['model', 'set', '-b', 'copilot-cli', '-m', 'fake-model',
+                                     '-p', path])
+        assert result.exit_code == 0, result.output
+        raw = json.loads(self._bytes(path))
+        assert (raw['backend'], raw['model']) == ('copilot-cli', 'fake-model')
+
+    def test_own_backend_alone_changes_nothing(self, runner, tmp_path):
+        """The project's own backend without -m keeps a non-default model
+        and saves nothing (no reset to the default, no needless save)."""
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.set_model('opus')
+        pm.save()
+        before = self._bytes(path)
+        with patch.object(ProjectManager, 'save') as save:
+            result = runner.invoke(cli, ['model', 'set', '-b', 'claude-cli', '-p', path])
+        assert (result.exit_code, result.output) == (0, '已設定模型：opus（claude-cli）\n')
+        assert save.call_count == 0
+        assert self._bytes(path) == before
+        assert ProjectManager(path).load().model == 'opus'
+
+    @pytest.mark.parametrize('args, message', [
+        (['-m', 'nope'],
+         "Invalid value for '--model' / '-m': 無效的模型：nope，可用模型：sonnet, opus, haiku"),
+        (['-b', 'copilot-cli', '-m', 'sonnet'],
+         "Invalid value for '--model' / '-m': 無效的模型：sonnet，可用模型：fake-model"),
+        (['-b', 'nope'], "Invalid value for '--backend' / '-b': 'nope' is not one of"),
+        ([], 'Error: 請指定 --backend/-b 或 --model/-m（或兩者）'),
+    ])
+    def test_refused_values_change_nothing(self, runner, tmp_path, monkeypatch, args, message):
+        import src.llm as llm
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: FakeBackend([]))
+        before = self._bytes(path)
+        result = runner.invoke(cli, ['model', 'set', '-p', path] + args)
+        assert result.exit_code == 2
+        assert message in result.output
+        assert self._bytes(path) == before
+
+    def test_set_refused_while_another_process_runs(self, runner, tmp_path):
+        path = _make_project(str(tmp_path / 'p'), n=1)
+        before = self._bytes(path)
+        child = hold_lock_in_child(path)
+        try:
+            result = runner.invoke(cli, ['model', 'set', '-m', 'opus', '-p', path])
+        finally:
+            child.stdin.close()
+            child.wait(timeout=10)
+        assert result.exit_code == 1
+        assert '專案正由另一個程序使用' in result.output
+        assert self._bytes(path) == before
+        assert lock_free_for_other_process(path)
+
+    def test_no_project(self, runner, tmp_path):
+        for args in (['model', 'show'], ['model', 'set', '-m', 'opus']):
+            result = runner.invoke(cli, args + ['-p', str(tmp_path / 'none')])
+            assert (result.exit_code, result.output) == (1, '找不到專案。\n')
+
+    def test_help(self, runner):
+        output = ' '.join(runner.invoke(cli, ['model', 'set', '--help']).output.split())
+        assert "--model TEXT Model: one of the backend's models" in output
+        assert ("Backend; when it differs from the project's and --model is not given, "
+                "that backend's default model is taken") in output
 
 
 class TestCLIBackendUnavailable:
@@ -753,7 +865,7 @@ class TestCLIRound1Exact:
         path = _make_project(str(tmp_path / 'p'), n=1)
         result = runner.invoke(cli, ['start', '--project', path, '--model', 'nope'])
         assert result.exit_code == 2
-        assert "Invalid value for '--model' / '-m': 'nope' is not one of sonnet, opus, haiku" \
+        assert "Invalid value for '--model' / '-m': 無效的模型：nope，可用模型：sonnet, opus, haiku" \
             in result.output
 
     def test_model_help(self, runner):

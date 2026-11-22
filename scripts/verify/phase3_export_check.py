@@ -75,7 +75,7 @@ sys.path.insert(0, ROOT)
 from lxml import etree  # noqa: E402
 
 from src.core.migrate import migrate_project  # noqa: E402
-from src.core.project import ProjectManager  # noqa: E402
+from src.core.project import ProjectManager, source_epub_path  # noqa: E402
 from src.epub.blocks import localname, serialize  # noqa: E402
 from src.epub.exporter import (  # noqa: E402
     EPUB_TYPE, FORMATS, NCX_MEDIA_TYPE, _without_zip64, export_project,
@@ -385,9 +385,10 @@ def check_copy(copy_dir: str, out_dir: str) -> tuple[dict, list[str]]:
         if migration.unmatched:
             return {}, [f'{len(migration.unmatched)} chapters unmatched by the migration']
         pm.load()
-    source = Archive(pm.data.epub_path)
+    source_file = source_epub_path(copy_dir, pm.data.epub_path)
+    source = Archive(source_file)
     src_labels = toc_labels(source)
-    source_errors = epubcheck_errors(pm.data.epub_path)
+    source_errors = epubcheck_errors(source_file)
     result = {'exports': len(FORMATS), 'entries': len(src_labels), 'epubcheck': {},
               'source_errors': source_errors}
     for fmt in FORMATS:  # chinese-only first: its counts are the project's
