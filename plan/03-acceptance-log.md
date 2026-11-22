@@ -7729,3 +7729,102 @@ exit 0                      (reverts not detected: 0; 105 OK)
 $ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
 exit 0                      (not killed 0; 81 KILLED)
 ```
+
+## Fix: person names follow the glossary
+
+Branch `fix/person-name-rule`. A wording change of the text prompts (`_SHARED_RULES` rule 5 in
+`src/core/translator.py`, used by both the plain-text and the HTML prompt); nothing else changes
+(extraction prompt, glossary format, validation and code prompts untouched).
+
+The old rule 5 said person names stay in English and must never be translated, while the
+glossary section says a `[人名]` entry is translated as the glossary says: with a person in the
+glossary the two contradicted each other. The owner's rule: a person's name is translated only
+when the glossary provides it, otherwise the original stays.
+
+Before:
+
+```text
+5. 人名保持英文原文，嚴格禁止翻譯，例如：Orla Vintermark、Tobin Quayle, Miss Ferrowind, Lord Halvarth, Miss Dunmere 等。應該被翻譯成 Ferrowind 小姐、Halvarth 男爵、Dunmere 小姐等。
+```
+
+After:
+
+```text
+5. 人名：術語表有列出的人名，照術語表的寫法（術語表給中文譯名就用中文譯名，給英文原文就保留英文原文）；術語表沒有列出的人名，一律保留英文原文，不要自行翻譯，例如：Orla Vintermark、Tobin Quayle。人名前後的稱謂、頭銜仍要翻譯，例如：Miss Ferrowind、Lord Halvarth、Miss Dunmere 應翻譯成 Ferrowind 小姐、Halvarth 男爵、Dunmere 小姐。
+```
+
+Without a glossary in the prompt (the section is omitted), no name is listed, so every name
+stays in English. The glossary section's `- [人名]：人物名稱，依照術語表翻譯` is unchanged: it
+now agrees with rule 5.
+
+### Tests
+
+- `test_translator.py::TestPersonNameRule` (5): the plain-text and the HTML prompt, each with and
+  without a glossary, contain the new rule exactly once and not "嚴格禁止翻譯"; the `[人名]` line
+  is there only with a glossary; the code prompt has no name rule.
+- Changed: rule 5 now names "術語表" itself, so four assertions that used the bare word as the
+  sign of the glossary section now look for the section's heading `術語表（`
+  (`test_no_glossary_section_without_glossary` also checks `術語類別說明` is absent; it failed
+  with the bare word, the others would have passed without a glossary):
+  `test_translator.py` (3), `test_verify_scripts.py` (2).
+
+### Real check (invented text; REAL calls: 24)
+
+An invented paragraph with two invented people, each with a title (`Miss <A>`, `Dr. <B>`, each
+twice), translated through `TranslationEngine.translate_reply` (HTML path, the product's prompt
+builder and backend), the glossary text from `GlossaryManager.format_for_prompt`, default effort
+(`low`). Cases: (a) glossary lists A as a person with a Chinese name; (b) no glossary; (c) the
+glossary lists A with the English name itself as its translation. "Old" puts the old rule 5 back
+in the prompt (the prompt was checked to contain "嚴格禁止翻譯"). Counted per reply: A's glossary
+Chinese name, A and B in English, `Miss`/`Dr.` left untranslated, `小姐` and 醫生/醫師/博士.
+Claude Code 2.1.330, Copilot CLI 1.0.114.
+
+| Backend, model | Prompt | Case | Runs | A as glossary Chinese | A in English | B in English | titles translated |
+|---|---|---|---|---|---|---|---|
+| `claude-cli` `sonnet` | new | a | 3 | 3/3 | 0/3 | 3/3 | 3/3 |
+| `claude-cli` `sonnet` | new | b | 3 | 0/3 | 3/3 | 3/3 | 3/3 |
+| `claude-cli` `sonnet` | new | c | 3 | 0/3 | 3/3 | 3/3 | 3/3 |
+| `claude-cli` `sonnet` | old | a | 3 | 3/3 | 0/3 | 3/3 | 3/3 |
+| `copilot-sdk` `gpt-6.2-sol` | new | a | 3 | 3/3 | 0/3 | 3/3 | 3/3 |
+| `copilot-sdk` `gpt-6.2-sol` | new | b | 3 | 0/3 | 3/3 | 3/3 | 3/3 |
+| `copilot-sdk` `gpt-6.2-sol` | new | c | 3 | 0/3 | 3/3 | 3/3 | 3/3 |
+| `copilot-sdk` `gpt-6.2-sol` | old | a | 3 | 3/3 | 0/3 | 3/3 | 3/3 |
+
+"A as glossary Chinese" means every occurrence (2 of 2) used the glossary name; "in English"
+likewise; no reply mixed both, none kept `Miss` or `Dr.`, and no other Chinese name was
+invented for either person. The new rule does what was asked on both backends. The old prompt
+gave the same result for case (a) in all 6 runs: with this short paragraph and an explicit
+glossary entry both models let the glossary win, so the contradiction did not show here; the
+change removes it from the prompt rather than fixing an observed failure. Copilot SDK session
+folders: no new folder under `~/.copilot/session-state/` after the 12 SDK calls (listing
+compared by name before and after), no `copilot --headless` left.
+
+### Commands and results
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once, final commit
+2982 passed in 266.19s / 270.51s / 261.98s           (no failure, no warning in any)
+$ scripts/verify/mutation.sh main
+mutating the changed lines of src/core/translator.py
+ERROR mutmut failed   (exit 2: "could not find any test case for any mutant")
+```
+
+The only changed source line is part of a module-level string constant (`_SHARED_RULES`), which
+mutmut does not mutate, so there are no mutants. In its place, on `git archive HEAD` copies:
+the old rule put back → 4 of the 6 rule tests fail; one phrase of the new rule altered → 4
+fail; the `[人名]` line removed from the glossary section → 2 fail.
+
+```
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+Neither script has an anchor in the changed prompt text. Noticed and left: rule 8
+(`翻譯名稱時不要出現什麼乖乖等錯誤翻譯的字眼`) is vague but does not contradict rule 5; the example
+`Lord Halvarth → Halvarth 男爵` (kept from the old rule) maps "Lord" to one specific rank; rule 2
+(keep technical terms in English with a note) and the glossary's `[術語]` line
+(`依照術語表翻譯`) have the same kind of overlap rule 5 had, for terms instead of people.
+Not verified: longer passages, names the glossary lists only by surname or full name while the
+text uses the other form, and other models.
