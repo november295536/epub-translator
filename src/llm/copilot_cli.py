@@ -53,16 +53,37 @@ from src.llm.cli import (
     ERROR_CHARS, SYSTEM_PROMPT, UNKNOWN_OPTION_PATTERN, CLIBackend, ProcessResult, _text,
 )
 
-# From the account's model catalog when this backend was written; the
-# multiplier is what Copilot counts per request. Effort levels: the ones the
-# CLI (1.0.114) accepted for `--reasoning-effort` with each model (no command
-# lists them; they can change with the CLI); Claude Haiku 4.5 accepts none.
+# The models Copilot offers for chat (not `auto`, coding-specific or
+# internal ones), ids as the CLI spells them; the multiplier is the premium
+# requests Copilot counts per request on the account when they were listed.
+# Effort levels: the ones the CLI (1.0.114) accepted for `--reasoning-effort`
+# with each model, probed without a model call (plan/03-acceptance-log.md,
+# Phase 10, review round 1); no command lists them and they can change with
+# the CLI. Claude Haiku 4.5 takes none.
+_GEMINI_LEVELS = ('low', 'medium', 'high')
+_GROK_LEVELS = ('low', 'medium', 'high', 'xhigh')
+_WITH_NONE = ('none',) + EFFORT_LEVELS
 MODELS = [
     ModelInfo('claude-sonnet-5.5', 'Claude Sonnet 5.5', '品質與速度兼顧（1x）', EFFORT_LEVELS),
-    ModelInfo('gpt-6.2-sol', 'GPT-6.2 Sol', 'OpenAI 模型（1x）', EFFORT_LEVELS),
-    ModelInfo('gemini-4-carbon', 'Gemini 4 Carbon', 'Google 模型，較慢（1x）',
-              ('low', 'medium', 'high')),
+    ModelInfo('claude-sonnet-5', 'Claude Sonnet 5', '前一代 Sonnet（1x）', EFFORT_LEVELS),
+    ModelInfo('claude-opus-5.5', 'Claude Opus 5.5', '最高品質，費用高（15x）', EFFORT_LEVELS),
+    ModelInfo('claude-haiku-5.5', 'Claude Haiku 5.5', '快速（1x）', EFFORT_LEVELS),
     ModelInfo('claude-haiku-4.5', 'Claude Haiku 4.5', '最便宜，適合簡單內容（0.33x）'),
+    ModelInfo('gpt-6.2-sol', 'GPT-6.2 Sol', 'OpenAI 模型（1x）', EFFORT_LEVELS),
+    ModelInfo('gpt-6.2-astra', 'GPT-6.2 Astra', 'OpenAI 模型（1x）', EFFORT_LEVELS),
+    ModelInfo('gpt-6.1-sol', 'GPT-6.1 Sol', 'OpenAI 模型（1x）', EFFORT_LEVELS),
+    ModelInfo('gpt-6.1-terra', 'GPT-6.1 Terra', 'OpenAI 模型（1x）', EFFORT_LEVELS),
+    ModelInfo('gpt-6-sol', 'GPT-6 Sol', 'OpenAI 模型（1x）', _WITH_NONE),
+    ModelInfo('gpt-6-luna', 'GPT-6 Luna', 'OpenAI 模型（1x）', _WITH_NONE),
+    ModelInfo('gpt-6-astra', 'GPT-6 Astra', 'OpenAI 模型（1x）', EFFORT_LEVELS),
+    ModelInfo('gpt-5.6-sol', 'GPT-5.6 Sol', 'OpenAI 模型（1x）', _WITH_NONE),
+    ModelInfo('gpt-5.6-luna', 'GPT-5.6 Luna', 'OpenAI 模型（1x）', _WITH_NONE),
+    ModelInfo('gemini-4-carbon', 'Gemini 4 Carbon', 'Google 模型，較慢（1x）', _GEMINI_LEVELS),
+    ModelInfo('gemini-4-argon', 'Gemini 4 Argon', 'Google 模型（1x）', _GEMINI_LEVELS),
+    ModelInfo('gemini-4-hydrogen', 'Gemini 4 Hydrogen', 'Google 模型（1x）', _GEMINI_LEVELS),
+    ModelInfo('gemini-3.8-flash', 'Gemini 3.8 Flash', 'Google 模型（14x）', _GEMINI_LEVELS),
+    ModelInfo('grok-4.7', 'Grok 4.7', 'xAI 模型（1x）', _GROK_LEVELS),
+    ModelInfo('grok-4.6', 'Grok 4.6', 'xAI 模型（1x）', _GROK_LEVELS),
 ]
 
 AUTH_HINT = '請在終端執行 copilot login 重新登入'

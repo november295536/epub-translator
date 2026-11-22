@@ -17,7 +17,8 @@ text); Copilot's command is the product's as it is (it already asks for
 JSON). Per call it prints: level, wall time (seconds, the whole process),
 input tokens (Claude: input + cache creation + cache read), output tokens,
 the reasoning tokens inside them, and for Copilot the level the CLI says
-the session used (`session.start` `reasoningEffort`; Claude reports none,
+the session used (`session.start` `reasoningEffort`, shown only when it is
+one of the known levels; otherwise, and for Claude, which reports none,
 "-"). Nothing else of the output is printed (no reply text, no account
 data); the script writes no file (the CLIs keep their own session logs).
 
@@ -103,7 +104,8 @@ def copilot_values(stdout: str) -> dict:
     reported = '-'
     for event in events:
         if event.get('type') == 'session.start':
-            reported = str(copilot_cli._data(event).get('reasoningEffort'))
+            level = copilot_cli._data(event).get('reasoningEffort')
+            reported = level if level in llm.KNOWN_LEVELS else '-'  # e.g. null: none
     checkpoints = [e for e in events if e.get('type') == 'session.usage_checkpoint']
     usages = [m['usage'] for m in copilot_cli._data(checkpoints[-1])['accountingSnapshot']
               ['modelMetrics'].values()]

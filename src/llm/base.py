@@ -10,9 +10,12 @@ import threading
 from dataclasses import dataclass
 from typing import List, Optional, Protocol, Tuple
 
-# Every reasoning effort level a backend's models may accept, lowest first
-# (the values both CLIs know; each model declares its own in ModelInfo.efforts)
+# The reasoning effort levels both CLIs know, lowest first (each model
+# declares the ones it takes in ModelInfo.efforts)
 EFFORT_LEVELS = ('low', 'medium', 'high', 'xhigh', 'max')
+# Every level a model may declare: also Copilot's `none`, which some of its
+# models take (Claude Code knows no such value)
+KNOWN_LEVELS = ('none',) + EFFORT_LEVELS
 
 
 @dataclass
@@ -60,7 +63,7 @@ class ModelInfo:
     alias: str
     label: str
     description: str
-    # The reasoning effort levels the model accepts (of EFFORT_LEVELS);
+    # The reasoning effort levels the model accepts (of KNOWN_LEVELS);
     # empty: it cannot be configured, and no level is passed
     efforts: Tuple[str, ...] = ()
 

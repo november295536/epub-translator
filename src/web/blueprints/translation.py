@@ -193,42 +193,46 @@ def get_model(project_name: str):
     except Exception as e:
         return jsonify({'error': str(e)}), 404
 
+    with pm.mutex:  # one reading: a switch in between cannot mix two states
+        settings = pm.call_settings()
     return jsonify({
-        **_settings(pm),
-        'available': available_models(pm.data.backend),  # of the project's backend
+        **_settings(settings),
+        'available': available_models(settings.backend),  # of the project's backend
         'backends': available_backends(),  # each model with its effort levels
         'timeout_min': MIN_TIMEOUT,
         'timeout_max': MAX_TIMEOUT,
     })
 
 
-def _settings(pm) -> dict:
-    """The project's backend, model, the effort and timeout its calls use,
-    and the effort levels of its model ([]: not configurable)."""
-    with pm.mutex:
-        settings = pm.call_settings()
-        return {
-            'current': settings.model,
-            'backend': settings.backend or llm.default_backend().name,
-            'effort': settings.effort,  # None: the model takes no level
-            'efforts': list(effort_levels(settings.backend, settings.model)),
-            'timeout': settings.timeout,
-        }
+def _settings(settings) -> dict:
+    """The project's backend, model, the effort and timeout its calls use
+    (CallSettings), and the effort levels of its model ([]: not
+    configurable)."""
+    return {
+        'current': settings.model,
+        'backend': settings.backend or llm.default_backend().name,
+        'effort': settings.effort,  # None: the model takes no level
+        'efforts': list(effort_levels(settings.backend, settings.model)),
+        'timeout': settings.timeout,
+    }
+
+
+# The settings a PUT of the model route may carry; None (or left out): kept
+_SETTING_KEYS = ('model', 'backend', 'effort', 'timeout')
 
 
 @translation_bp.route('/api/projects/<project_name>/model', methods=['PUT'])
 def set_model(project_name: str):
-    """Set the translation model (and its backend), the reasoning effort and
-    the call timeout of a project. `model` is required (the current one to
-    change only the others); `backend`, `effort`, `timeout` may be left out."""
+    """Set any of the translation model, its backend, the reasoning effort
+    and the call timeout of a project: what the body leaves out (or gives as
+    null) stays as stored, so a page sends only what the user changed. A body
+    with none of them is refused (400)."""
     projects_dir = current_app.config['PROJECTS_DIR']
 
-    data = request.get_json()
-    # an object with a model (select_model would take None as 'keep')
-    if not isinstance(data, dict) or data.get('model') is None:
-        return jsonify({'error': '未提供模型名稱'}), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or all(data.get(key) is None for key in _SETTING_KEYS):
+        return jsonify({'error': '未提供要設定的項目（model、backend、effort 或 timeout）'}), 400
 
-    model = data['model']
     backend = data.get('backend')  # None: the project's backend stays
     if backend is not None and (not isinstance(backend, str) or backend not in llm.BACKENDS):
         return jsonify({'error': f'無效的後端：{backend}'}), 400
@@ -239,7 +243,7 @@ def set_model(project_name: str):
             with pm.mutex:  # a running task reads them under the mutex
                 previous = (pm.data.backend, pm.data.model, pm.data.effort, pm.data.timeout)
                 try:
-                    pm.select_model(backend, model, effort=data.get('effort'),
+                    pm.select_model(backend, data.get('model'), effort=data.get('effort'),
                                     timeout=data.get('timeout'))
                 except ValueError as e:  # nothing changed
                     return jsonify({'error': str(e)}), 400
@@ -250,7 +254,7 @@ def set_model(project_name: str):
                     (pm.data.backend, pm.data.model, pm.data.effort,
                      pm.data.timeout) = previous
                     raise
-                answer = _settings(pm)
+                answer = _settings(pm.call_settings())
                 note = effort_reset_note(previous[2], pm.data)
     except (FileNotFoundError, ValueError) as e:
         return jsonify({'error': str(e)}), 404

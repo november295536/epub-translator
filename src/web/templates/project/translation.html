@@ -39,9 +39,13 @@
                             :disabled="modelLoading"
                             @change="setModel($event.target.value)"
                             style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
-                        <template x-for="m in availableModels" :key="m.key">
-                            <option :value="m.key" :selected="m.key === modelKey()"
-                                    x-text="m.backend + '：' + m.label + ' — ' + m.description"></option>
+                        <template x-for="g in modelGroups()" :key="g.label">
+                            <optgroup :label="g.label">
+                                <template x-for="m in g.models" :key="m.key">
+                                    <option :value="m.key" :selected="m.key === modelKey()"
+                                            x-text="m.label + ' — ' + m.description"></option>
+                                </template>
+                            </optgroup>
                         </template>
                     </select>
                     <span x-show="modelLoading" class="spinner" style="margin-left: 0.5rem;"></span>
@@ -90,7 +94,10 @@
                 </div>
             </div>
 
-            <div x-show="settingsNote" class="text-muted" style="margin-bottom: 1rem;" x-text="settingsNote"></div>
+            <div x-show="settingsNote || settingsError" style="margin-bottom: 1rem;">
+                <span class="text-muted" x-show="settingsNote" x-text="settingsNote"></span>
+                <span class="text-error" x-show="settingsError" x-text="settingsError"></span>
+            </div>
 
             <!-- Book brief -->
             <div style="margin-bottom: 1rem;">
@@ -189,6 +196,7 @@ function translationController() {
         timeoutMin: 30,
         timeoutMax: 3600,
         settingsNote: '',  // e.g. a stored level the new model does not take
+        settingsError: '',  // the settings' own: a later save clears it, the task error stays
         workers: 1,
         activeWorkers: 0,
         _pauseInFlight: false,
@@ -286,14 +294,29 @@ function translationController() {
             return this.backend + '/' + this.model;
         },
 
+        // The models in groups of backend and family (the alias up to its
+        // first '-'), in list order: many models stay findable in one select
+        modelGroups() {
+            const groups = [];
+            for (const m of this.availableModels) {
+                const dash = m.alias.indexOf('-');
+                const label = dash > 0 ? m.backend + '：' + m.alias.slice(0, dash) : m.backend;
+                let group = groups.find(g => g.label === label);
+                if (!group) groups.push(group = { label, models: [] });
+                group.models.push(m);
+            }
+            return groups;
+        },
+
         // The effort levels of the selected model ([]: not configurable)
         currentEfforts() {
             const current = this.availableModels.find(m => m.key === this.modelKey());
             return current ? current.efforts : [];
         },
 
-        // PUT the settings (the current model unless another is given);
-        // applies the stored ones on success, returns whether it succeeded
+        // PUT only the settings in `body` (what the user changed; the server
+        // keeps the others as stored); applies the stored ones on success,
+        // returns whether it succeeded
         async putSettings(body) {
             this.modelLoading = true;
             let data = {};
@@ -302,7 +325,7 @@ function translationController() {
                 const res = await fetch('/api/projects/{{ project_name }}/model', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model: this.model, backend: this.backend, ...body }),
+                    body: JSON.stringify(body),
                 });
                 data = await res.json();
                 ok = res.ok && data.status === 'ok';
@@ -315,8 +338,9 @@ function translationController() {
                 this.effort = data.effort;
                 this.timeout = data.timeout;
                 this.settingsNote = data.note;
+                this.settingsError = '';
             } else {
-                this.error = data.error || '模型設定失敗';
+                this.settingsError = data.error || '模型設定失敗';
             }
             this.modelLoading = false;
             return ok;

@@ -5626,7 +5626,9 @@ class TestPhase10EffortScript:
     def test_copilot_values_without_reasoning(self):
         values = effort_check.copilot_values(_copilot_json(level=None, reasoning=0))
         assert (values['in'], values['out'], values['reasoning'], values['reported']) == (
-            101, 42, 0, 'None')
+            101, 42, 0, '-')  # null (a model without levels): not a level
+        for reported, shown in (('max', 'max'), ('none', 'none'), ('minimal', '-'), ('bogus', '-'), (5, '-')):
+            assert effort_check.copilot_values(_copilot_json(level=reported))['reported'] == shown
         values = effort_check.claude_values(json.dumps({'result': 'r', 'usage': {
             'input_tokens': 1, 'output_tokens': 2}}))
         assert (values['in'], values['reasoning'], values['error']) == (1, 0, None)

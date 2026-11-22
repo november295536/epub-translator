@@ -752,7 +752,11 @@ class TestCopilotCLI:
             separate_system=False, multi_turn=False, reports_usage=True,
             sampling_params=False, suggested_concurrency=1)
         assert [m.alias for m in backend.list_models()] == [
-            'claude-sonnet-5.5', 'gpt-6.2-sol', 'gemini-4-carbon', 'claude-haiku-4.5']
+            'claude-sonnet-5.5', 'claude-sonnet-5', 'claude-opus-5.5', 'claude-haiku-5.5',
+            'claude-haiku-4.5', 'gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6.1-sol', 'gpt-6.1-terra',
+            'gpt-6-sol', 'gpt-6-luna', 'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-luna',
+            'gemini-4-carbon', 'gemini-4-argon', 'gemini-4-hydrogen', 'gemini-3.8-flash',
+            'grok-4.7', 'grok-4.6']
         assert backend.auth_hint == '請在終端執行 copilot login 重新登入'
 
     def test_parse_last_message_and_usage(self):
