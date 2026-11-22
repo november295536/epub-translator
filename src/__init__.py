@@ -14,7 +14,7 @@ def require_python(version=None) -> None:
     """Exit with one message when `version` (default: the running
     interpreter's) is older than MIN_PYTHON."""
     version = tuple(sys.version_info if version is None else version)
-    if version[:2] < MIN_PYTHON:
+    if version < MIN_PYTHON:  # (3, 12, 0, ...) > (3, 12)
         need = '.'.join(map(str, MIN_PYTHON))
         found = '.'.join(map(str, version[:3]))
         raise SystemExit(f'需要 Python {need} 以上版本（目前是 {found}）；'
@@ -24,5 +24,5 @@ def require_python(version=None) -> None:
 # Called only when it will stop: an unconditional call would run mutmut's
 # trampoline on every import, so in its forced-fail run every child process
 # importing src would fail (and a test could leave that child unreaped)
-if sys.version_info[:2] < MIN_PYTHON:
+if sys.version_info < MIN_PYTHON:
     require_python()

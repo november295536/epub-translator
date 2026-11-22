@@ -21,7 +21,7 @@ def test_older_interpreter_stops_with_the_message(version):
     assert e.value.code == MESSAGE
 
 
-@pytest.mark.parametrize('version', [(3, 12, 0), (3, 14, 7), (4, 0, 0)])
+@pytest.mark.parametrize('version', [(3, 12), (3, 12, 0), (3, 14, 7), (4, 0, 0)])
 def test_supported_interpreter_passes(version):
     assert require_python(version) is None
 
