@@ -9,15 +9,20 @@
 # copy in a temporary directory, removed at the end.
 #
 # Exit code: 0 when every mutant was killed, 1 when some survived, timed out,
-# are suspicious or untested, 2 when mutmut failed or generated no mutants.
+# are suspicious or untested, 2 when the interpreter is too old, mutmut is
+# missing or failed, or no mutants were generated.
 
 set -euo pipefail
 
+cd "$(git rev-parse --show-toplevel)"
+# The project's own version check first: it prints why this interpreter cannot run it
+if ! python3 -c 'import src'; then
+    exit 2
+fi
 if ! python3 -c 'import mutmut, pytest' 2>/dev/null; then
     echo "mutmut not found: pip install -r requirements.txt -r requirements-dev.txt" >&2
     echo "in the project environment, and activate it" >&2
     exit 2
 fi
 
-cd "$(git rev-parse --show-toplevel)"
 exec python3 scripts/verify/mutation.py "${1:-main}"

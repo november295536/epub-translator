@@ -9,7 +9,7 @@ EPUB 智能翻譯系統 - Translates English EPUB books to Traditional Chinese t
 ## Development Commands
 
 ```bash
-python3.12 -m venv venv                  # once (3.12 or newer); an older venv is deleted and rebuilt
+python3.12 -m venv venv                  # fresh checkout only (3.12 or newer); an existing older venv: README rebuild steps
 source venv/bin/activate                 # required before all commands
 pip install -r requirements.txt -r requirements-dev.txt   # dev: test fixtures (ebooklib), mutmut
 
@@ -99,7 +99,7 @@ API (`/api/...`):
 
 - To stop a run: the web pause button (saved at the next tick), or Ctrl-C in the CLI's terminal (kills the calls in flight, then saves). Killing the web server loses results not yet saved.
 - A call left behind: pause / Ctrl-C first; then `pgrep -fl 'claude -p'` (or `copilot -p`), check that it is this project's, `kill <PID>`. Not `pkill -f`: it also hits other sessions. Process arguments contain book text: do not paste them anywhere public.
-- Translation and extraction calls time out after the project's timeout (default 180 s; `model set -t` or the translation page); a high effort on a slow model can need more. A timeout is a transient error, retried within the segment's budget: a retry that succeeds leaves nothing behind. Only when the budget is used up does a pending segment become `failed` (`log/failed/`; retry with `start --retry-failed` or the retry button); a translated/reviewed one keeps its text and status and only gets issues (retranslate it from review/search). Term extraction does not retry: a timed-out batch is logged and proposes nothing, a timed-out consolidation call leaves its terms at the most frequent proposal. Stored translations that fail the check: `validate --mark-failed`, then `start --retry-failed`.
+- Translation and extraction calls time out after the project's timeout (default 180 s; `model set -t` or the translation page); a high effort on a slow model can need more. A timeout is a transient error, retried within the segment's budget: a retry that succeeds leaves no segment failure and no failure file (the web run log keeps a warning). Only when the budget is used up does a pending segment become `failed` (`log/failed/`; retry with `start --retry-failed` or the retry button); a translated/reviewed one keeps its text and status and only gets issues (retranslate it from review/search). Term extraction does not retry: a timed-out batch is logged and proposes nothing, a timed-out consolidation call leaves its terms at the most frequent proposal. Stored translations that fail the check: `validate --mark-failed`, then `start --retry-failed`.
 - "project locked" (409 / CLI message): another process (a CLI run, the web task, an export, a migration) holds `project.lock`.
 - Export or validate refuses a schema 1 project: run `migrate` first.
 - Export cannot read the source EPUB ("無法讀取來源 EPUB"): the project's `source.epub` is missing (removed or renamed) and the recorded `epub_path` does not lead to the book either; put the book back as `source.epub` in the project directory. A hash mismatch means that file is not the book whose digest was recorded at creation or migration.
