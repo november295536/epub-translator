@@ -844,8 +844,8 @@ As built:
   `copilot login`. At interpreter exit `close` refuses later calls (and `client()` refuses
   once closed), stops the turns submitted or running and waits (15 s at most, one cleanup: review round 3)
   until they deleted their sessions, reads the client only then (a first turn may just have made
-  it: review round 2), and stops it (`stop()` bounded to 10 s, else `force_stop()` bounded to
-  10 s: at most about 35 s in all). It is registered with `threading`'s exit hooks
+  it: review round 2), and stops it (`stop()` bounded to 10 s, else `force_stop()`; the two
+  together bounded to 20 s: at most about 35 s in all). It is registered with `threading`'s exit hooks
   (`threading._register_atexit`, private but the one `concurrent.futures` itself uses), which run
   before `concurrent.futures` shuts its executors down: from a plain `atexit` hook the SDK's
   `stop()` failed (`cannot schedule new futures after shutdown`, it runs blocking steps on the
