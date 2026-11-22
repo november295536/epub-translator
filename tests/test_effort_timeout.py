@@ -737,7 +737,7 @@ class TestWeb:
         assert 'body: JSON.stringify(body),' in html
         assert 'this.putSettings({ effort: level })' in html
         assert 'this.putSettings({ timeout: seconds })' in html
-        assert "this.settingsError = data.error || '模型設定失敗';" in html
+        assert "this.settingsError = (data && data.error) || '模型設定失敗';" in html
         assert "this.settingsError = '';" in html
         assert 'x-text="settingsError"' in html
         # models grouped by backend and alias family; no x-model on the select
@@ -745,7 +745,7 @@ class TestWeb:
         model_select = model_select[:model_select.index('</select>')]
         assert '<optgroup :label="g.label">' in model_select and 'x-model' not in model_select
         assert "m.backend + '：' + m.alias.slice(0, dash) : m.backend" in html
-        start = html.index('async putSettings(body)')
+        start = html.index('        putSettings(body) {')
         assert 'this.error' not in html[start:html.index('async setModel(key)')]
 
 
@@ -798,53 +798,91 @@ class TestSmallMessages:
 
 
 class TestRunWaitsForSettings:
-    """Start, retry and resume wait for a pending settings save (pause does
-    not): a run must not start with the old settings, or after a refusal."""
+    """Start, retry and resume wait for the pending settings saves (pause
+    does not) and start nothing when one of them was refused or failed. The
+    buttons stay enabled: the click that ends a settings edit (its blur
+    fires the save) must not be lost."""
 
     def test_markup(self, client):
         html = client.get(f'/project/{PROJECT}/translation').get_data(as_text=True)
-        assert '@click="startTranslation()" :disabled="starting || modelLoading"' in html
-        assert '@click="startTranslation(true)" :disabled="starting || modelLoading"' in html
-        assert '''@click="pauseTranslation('resume')" :disabled="modelLoading"''' in html
-        assert '''<button class="btn btn-secondary" @click="pauseTranslation('pause')">''' in html
+        assert '@click="startTranslation()" :disabled="starting"' in html
+        assert '@click="startTranslation(true)" :disabled="starting"' in html
+        assert """<button class="btn btn-success" @click="pauseTranslation('resume')">""" in html
+        assert """<button class="btn btn-secondary" @click="pauseTranslation('pause')">""" in html
 
-    # The page's controller in Node, fetch stubbed: the PUT of a settings
-    # save stays pending until the test releases it
+    # The page's controller in Node, fetch stubbed: every PUT waits until the
+    # test answers it with the next reply of the scenario
     HARNESS = r"""
+const scenario = process.argv[1];
 const fetched = [];
-let release;
+const held = [];
+const tick = () => new Promise(r => setTimeout(r, 5));
 global.document = {getElementById: () => ({value: ''}), querySelector: () => null};
+const ok = {status: 'ok', model: 'sonnet', backend: 'claude-cli', effort: 'low', efforts: [],
+            timeout: 300, note: ''};
 global.fetch = async (url, options) => {
     const method = (options && options.method) || 'GET';
     fetched.push(method + ' ' + url.replace(/^.*\/api\/projects\/[^/]+/, ''));
     if (method === 'PUT') {
-        await new Promise(r => { release = r; });
-        return {ok: true, json: async () => ({status: 'ok', model: 'sonnet', backend: 'claude-cli',
-                                              effort: 'low', efforts: [], timeout: 300, note: ''})};
+        const reply = await new Promise(r => held.push(r));
+        return {ok: reply.status === 200, json: async () => reply.body};
     }
     return {ok: true, json: async () => ({state: 'running', total: 1})};
 };
 global.EventSource = class { addEventListener() {} close() {} };
 const page = require('fs').readFileSync(0, 'utf8');
 eval(page + '; global.translationController = translationController;');
+const answer = async (status, body) => { while (!held.length) await tick(); held.shift()({status, body}); await tick(); };
 (async () => {
-    const ctrl = translationController();
-    const saving = ctrl.saveTimeout('300');
-    const during = ctrl.modelLoading;
-    await ctrl.startTranslation();
-    await ctrl.startTranslation(true);
-    await ctrl.pauseTranslation('resume');
-    await ctrl.pauseTranslation('pause');
-    const whilePending = fetched.slice();
-    release();
-    await saving;
-    await ctrl.startTranslation();
-    console.log(JSON.stringify({during, whilePending, after: fetched.slice(whilePending.length),
-                                loading: ctrl.modelLoading, timeout: ctrl.timeout}));
+    const c = translationController();
+    const out = {};
+    if (scenario === 'held') {
+        c.saveTimeout('300');
+        const start = c.startTranslation();
+        await c.pauseTranslation('pause');
+        await tick();
+        out.whilePending = fetched.slice();
+        await answer(200, ok);
+        await start;
+    } else if (scenario === 'refused') {
+        c.saveTimeout('5');
+        const start = c.startTranslation();
+        const resume = c.pauseTranslation('resume');
+        await answer(400, {error: 'refused'});
+        await start; await resume;
+    } else if (scenario === 'overlap') {
+        c.saveTimeout('300');
+        c.saveEffort('high');
+        const start = c.startTranslation();
+        await answer(200, ok);
+        out.afterFirst = fetched.slice();
+        await answer(200, ok);
+        await start;
+    } else if (scenario === 'overlap-refused') {
+        c.saveTimeout('5');
+        c.saveEffort('high');
+        const start = c.startTranslation();
+        await answer(400, {error: 'refused'});
+        await answer(200, ok);
+        await start;
+    } else if (scenario === 'null') {
+        const saved = c.putSettings({timeout: 300});
+        const start = c.startTranslation();
+        await answer(500, null);
+        out.saved = await saved;
+        await start;
+    }
+    out.fetched = fetched;
+    out.loading = c.modelLoading;
+    out.pending = c._settingsSave;
+    out.starting = c.starting;
+    out.settingsError = c.settingsError;
+    out.timeout = c.timeout;
+    console.log(JSON.stringify(out));
 })();
 """
 
-    def test_run_actions_wait(self, client):
+    def _run(self, client, scenario):
         import shutil
         import subprocess
         node = shutil.which('node')
@@ -853,12 +891,39 @@ eval(page + '; global.translationController = translationController;');
         html = client.get(f'/project/{PROJECT}/translation').get_data(as_text=True)
         start = html.index('<script>\nfunction translationController()') + len('<script>')
         script = html[start:html.index('</script>', start)]
-        out = subprocess.run([node, '-e', self.HARNESS], input=script,
+        out = subprocess.run([node, '-e', self.HARNESS, scenario], input=script,
                              capture_output=True, text=True, timeout=30)
         assert out.returncode == 0, out.stderr
-        result = json.loads(out.stdout)
-        assert result['during'] is True
-        # only the save and the pause went out while the save was pending
-        assert result['whilePending'] == ['PUT /model', 'POST /translate/pause']
-        assert result['after'][0] == 'POST /translate/start'
-        assert (result['loading'], result['timeout']) == (False, 300)
+        return json.loads(out.stdout)
+
+    def test_start_waits_for_the_save(self, client):
+        result = self._run(client, 'held')
+        # while the save was held only it and the pause went out
+        assert sorted(result['whilePending']) == ['POST /translate/pause', 'PUT /model']
+        assert result['fetched'][2:] == ['POST /translate/start']
+        assert (result['loading'], result['pending'], result['timeout']) == (False, None, 300)
+
+    def test_refused_save_starts_nothing(self, client):
+        result = self._run(client, 'refused')
+        assert result['fetched'] == ['PUT /model']  # neither start nor resume
+        assert (result['settingsError'], result['starting'], result['loading']) == (
+            'refused', False, False)
+
+    def test_overlapping_saves(self, client):
+        result = self._run(client, 'overlap')
+        # the second save goes out after the first; start after both
+        assert result['afterFirst'] == ['PUT /model', 'PUT /model']
+        assert result['fetched'] == ['PUT /model', 'PUT /model', 'POST /translate/start']
+        assert (result['loading'], result['pending']) == (False, None)
+
+    def test_overlapping_saves_one_refused(self, client):
+        result = self._run(client, 'overlap-refused')
+        assert result['fetched'] == ['PUT /model', 'PUT /model']
+        assert result['starting'] is False
+
+    def test_null_error_body(self, client):
+        result = self._run(client, 'null')
+        assert result['saved'] is False
+        assert result['fetched'] == ['PUT /model']
+        assert (result['settingsError'], result['loading'], result['pending']) == (
+            '模型設定失敗', False, None)

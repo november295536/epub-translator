@@ -2537,7 +2537,7 @@ class TestTemplatesHandleErrors:
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
         # Phase 7: the select shows the stored backend/model again
         assert "document.getElementById('model-select').value = previous;" in html
-        assert "this.settingsError = data.error || '模型設定失敗'" in html
+        assert "this.settingsError = (data && data.error) || '模型設定失敗'" in html
 
     def test_retry_button_reactive(self, client):
         html = client.get(f'/project/{PROJECT_NAME}/translation').get_data(as_text=True)
