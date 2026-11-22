@@ -372,8 +372,15 @@ def model_programs_replaced(tmp_path_factory):
         path.chmod(0o755)
     previous = os.environ.get('PATH', '')
     os.environ['PATH'] = str(bin_dir) + os.pathsep + previous
+    # Nor does the Copilot SDK download its own runtime (it would without a path)
+    previous_skip = os.environ.get('COPILOT_SKIP_CLI_DOWNLOAD')
+    os.environ['COPILOT_SKIP_CLI_DOWNLOAD'] = '1'
     yield str(bin_dir)
     os.environ['PATH'] = previous
+    if previous_skip is None:
+        del os.environ['COPILOT_SKIP_CLI_DOWNLOAD']
+    else:
+        os.environ['COPILOT_SKIP_CLI_DOWNLOAD'] = previous_skip
 
 
 @pytest.fixture(autouse=True)

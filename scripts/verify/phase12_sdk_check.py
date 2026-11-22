@@ -79,7 +79,9 @@ RUNTIME_LOGS = os.path.expanduser('~/.copilot/logs/process-*.log')
 HAN = re.compile(r'[一-鿿]')
 # Seconds to wait for the runtime's cleanup of an aborted call
 SETTLE_SECONDS = 15
-# Every wait of the script (tests replace it)
+# Timeout of the call that is cancelled (it must not end by itself first)
+CANCELLED_TIMEOUT = 120
+# Every fixed wait of the script (tests replace it)
 _pause = time.sleep
 
 
@@ -124,7 +126,7 @@ class Watch:
 
     def record(self, session_id, event):
         with self.changed:
-            self.events[session_id].append((time.monotonic(), copilot_sdk._event_type(event),
+            self.events[session_id].append((time.monotonic(), event.type.value,
                                             event.data))
             self.changed.notify_all()
 
@@ -314,7 +316,8 @@ def main(argv=None) -> int:
                  f'{levels}')
 
     print('5. cancel and timeout mid-turn')
-    aborted_turn(watch, checks, backend, 'cancelled', args.model, timeout=120, cancel_after=1)
+    aborted_turn(watch, checks, backend, 'cancelled', args.model, timeout=CANCELLED_TIMEOUT,
+                 cancel_after=1)
     aborted_turn(watch, checks, backend, 'timed out', args.model, timeout=args.timeout_s)
 
     print('6. session files')
