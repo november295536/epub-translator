@@ -7356,3 +7356,14 @@ Each one not killed, and why:
 The one mutant of the first run that survived although its test fails when it is applied by hand
 (`asyncio.timeout(None)` in `_clean_up`: `test_cleanup_bounded` fails after 14 s) was killed in
 the later runs by a test that runs the cleanup on the test's own thread.
+
+### Suite and guards (final commit)
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once, 3.12.7
+2946 passed in 239.04s / 244.26s / 249.58s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
