@@ -326,11 +326,14 @@ class TestPersonNameRule:
     glossary's [人名] line."""
 
     ENTRY = 'Quillon Marsh → 奎倫·馬許 [人名]'
-    CLAUSES = ('術語表有列出的人名，照術語表的寫法',         # listed
-               '文中只用姓或名（含所有格、複數）稱呼同一人時，也算有列出',  # partly used
+    CLAUSES = ('術語表有列出的人名，照術語表的寫法',          # listed
+               '給英文原文就保留英文原文',                         # listed as English
+               '文中只用其中的姓或名（含所有格、複數）時，也算有列出',   # part of a listed name
                '用譯名中對應的部分',
-               '術語表沒有列出的人名，以及術語表只列姓或名時全名中沒有列出的部分，一律保留英文原文',
-               '稱謂、頭銜仍要翻譯',                             # titles
+               '無法對應時保留英文，不猜譯、不補成全名',
+               '術語表沒有列出的人名（包括有通行譯名的知名人物），以及人名中術語表沒有列出的部分，'
+               '一律保留英文原文',                                  # unlisted
+               '稱謂、頭銜仍要翻譯',                               # titles
                'Miss Ferrowind 寫成費洛溫小姐',
                'Halvarth 勳爵')
 
