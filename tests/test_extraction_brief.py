@@ -732,15 +732,24 @@ class TestRound1Consolidation:
         assert [r.getMessage() for r in caplog.records] == [
             'Could not parse term extraction response']
 
-    def test_reply_that_cannot_be_parsed_is_unusable(self, small_batches, caplog):
+    def test_reply_that_cannot_be_parsed_is_unusable(self, small_batches, caplog, monkeypatch):
         caplog.set_level(logging.WARNING, logger='src.glossary.term_extractor')
-        deep = '[' * 100000 + ']' * 100000  # the decoder raises RecursionError
+        # e.g. a deeply nested reply (at what depth the decoder gives up
+        # depends on the interpreter): the consolidation decoder raises
+        decoded = []
+
+        def too_deep(reply):
+            decoded.append(reply)
+            raise RecursionError('maximum recursion depth exceeded')
+        monkeypatch.setattr(te, '_top_level_list', too_deep)
+        deep = '[' * 1000 + ']' * 1000
         fake = FakeBackend([_reply(('Orrin', '歐林', 'person')), _reply(('Orrin', '奧林', 'person')),
                             _reply(('Orrin', '奧林', 'person')), deep])
         terms = TermExtractor(backend=fake).extract_from_segments(_segments(3))
         assert terms == [{'term': 'Orrin', 'translation': '奧林', 'category': 'person'}]
         assert [r.getMessage() for r in caplog.records][-2:] == [
             'Term consolidation error: RecursionError', 'Term consolidation decided 0 of 1 terms']
+        assert decoded == [deep]
 
     def test_contradicting_rows_leave_the_term_undecided(self, small_batches):
         fake = FakeBackend([

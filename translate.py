@@ -1,4 +1,5 @@
 """CLI entry point for the EPUB translator."""
+# Keep this file parseable by Python 3.9, so an old interpreter reaches the version message.
 
 from __future__ import annotations
 
@@ -8,11 +9,12 @@ import sys
 import time
 from collections import Counter
 
+from src import __version__  # first: stops an unsupported Python (src/__init__.py)
+
 import click
 
 import src.llm as llm
 
-from src import __version__
 from src.epub.extractor import EPUBError, EPUBExtractor
 from src.core.segmenter import Segmenter, SegmentType
 from src.core.project import (

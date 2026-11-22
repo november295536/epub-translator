@@ -4,13 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-EPUB 智能翻譯系統 - Translates English EPUB books to Traditional Chinese through a command-line model backend (`claude-cli` or `copilot-cli`). Glossary with automatic extraction, per-book brief, structural validation with retry, three output formats, Web review interface and CLI. `plan/02-improvement-plan.md` is the design record, `plan/03-acceptance-log.md` the evidence per phase. POSIX only (macOS/Linux: `fcntl` locks, process groups).
+EPUB 智能翻譯系統 - Translates English EPUB books to Traditional Chinese through a command-line model backend (`claude-cli` or `copilot-cli`). Glossary with automatic extraction, per-book brief, structural validation with retry, three output formats, Web review interface and CLI. `plan/02-improvement-plan.md` is the design record, `plan/03-acceptance-log.md` the evidence per phase. Python 3.12+ (`src/__init__.py` `require_python` stops older interpreters on import of `src`, so before any other module of `translate.py` or the app factory); POSIX only (macOS/Linux: `fcntl` locks, process groups).
 
 ## Development Commands
 
 ```bash
+python3.12 -m venv venv                  # fresh checkout only (3.12 or newer); an existing older venv: README rebuild steps
 source venv/bin/activate                 # required before all commands
-pip install -r requirements.txt -r requirements-dev.txt   # dev: test fixtures (ebooklib), mutmut on 3.10+
+pip install -r requirements.txt -r requirements-dev.txt   # dev: test fixtures (ebooklib), mutmut
 
 python3 -m flask --app src.web.server:create_app run --port 3000   # web UI
 python3 -m pytest tests/ -q -p no:cacheprovider -rfw               # tests
@@ -88,7 +89,7 @@ API (`/api/...`):
 ## Testing and verification
 
 - `python3 -m pytest tests/ -q -p no:cacheprovider -rfw` — must pass with no warnings, also when several suites run at once. New tests wait on conditions (`_wait`, events), not on sleeps (a few older timing tests still sleep). No test makes a real model call: besides the two guards above, a measuring script that imports `run_process` by name must be added to `MEASURING_SCRIPTS` in `tests/test_verify_scripts.py`, whose autouse fixture makes that copy fail unless a test stubs it.
-- `scripts/verify/mutation.sh [BASE]` — mutmut 3.8.1 over the lines changed vs `BASE` in the files listed in `mutation.py`, on a copy of the tree. Needs a Python 3.10+ environment with both `requirements.txt` and `requirements-dev.txt` (`MUTATION_VENV=<venv>` to point at one); the project venv may be 3.9. Exits 2 when mutmut is missing or no eligible line changed.
+- `scripts/verify/mutation.sh [BASE]` — mutmut 3.8.1 over the lines changed vs `BASE` in the files listed in `mutation.py`, on a copy of the tree. Runs on the active environment's `python3` (the project venv with both requirements files). Exits 2 when mutmut is missing or no eligible line changed.
 - `scripts/verify/` — one script per phase claim, each with a docstring:
   - read-only checks of real projects (`--projects-dir`, never written): `phase0_code_segments`, `phase1_load_projects`, `phase2_roundtrip` read in place; `phase2_migrate_copies`, `phase3_export_check`, `phase4_validate_check`, `phase5_glossary_check`, `phase6_segmentation_check` work on a temp copy. `--anonymize` covers stdout only: a file written with `--sample-out` (phase5) or `--out` (phase8) holds real book text and must never be published or committed;
   - guards of the test suite itself: `phase1_reverts` (old behaviours put back one by one; each must fail a test) and `phase1_survivor_kills` (recorded mutants must be killed); both work on `git archive HEAD`, so commit first;
@@ -98,7 +99,7 @@ API (`/api/...`):
 
 - To stop a run: the web pause button (saved at the next tick), or Ctrl-C in the CLI's terminal (kills the calls in flight, then saves). Killing the web server loses results not yet saved.
 - A call left behind: pause / Ctrl-C first; then `pgrep -fl 'claude -p'` (or `copilot -p`), check that it is this project's, `kill <PID>`. Not `pkill -f`: it also hits other sessions. Process arguments contain book text: do not paste them anywhere public.
-- Translation and extraction calls time out after the project's timeout (default 180 s; `model set -t` or the translation page); a high effort on a slow model can need more. Transient errors are retried within the segment's budget. A pending segment then becomes `failed` (`log/failed/`; retry with `start --retry-failed` or the retry button); a translated/reviewed one keeps its text and only gets issues (retranslate it from review/search). Stored translations that fail the check: `validate --mark-failed`, then `start --retry-failed`.
+- Translation and extraction calls time out after the project's timeout (default 180 s; `model set -t` or the translation page); a high effort on a slow model can need more. A timeout is a transient error, retried within the segment's budget: a retry that succeeds leaves no segment failure and no failure file (the web run log keeps a warning). Only when the budget is used up does a pending segment become `failed` (`log/failed/`; retry with `start --retry-failed` or the retry button); a translated/reviewed one keeps its text and status and only gets issues (retranslate it from review/search). Term extraction does not retry: a timed-out batch is logged and proposes nothing, a timed-out consolidation call leaves its terms at the most frequent proposal. Stored translations that fail the check: `validate --mark-failed`, then `start --retry-failed`.
 - "project locked" (409 / CLI message): another process (a CLI run, the web task, an export, a migration) holds `project.lock`.
 - Export or validate refuses a schema 1 project: run `migrate` first.
 - Export cannot read the source EPUB ("無法讀取來源 EPUB"): the project's `source.epub` is missing (removed or renamed) and the recorded `epub_path` does not lead to the book either; put the book back as `source.epub` in the project directory. A hash mismatch means that file is not the book whose digest was recorded at creation or migration.
