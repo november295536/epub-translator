@@ -7667,3 +7667,65 @@ Session folders in `~/.copilot/session-state/` and rows of `~/.copilot/session-s
 
 Real calls this round: 1 completed `copilot-cli` call (the store check), and the check script
 twice (10 completed, 4 aborted, 4.64 premium requests reported in all).
+
+## Phase 12 — review round 3
+
+Opus and Gemini approved; GPT requested changes (edge cases). No real calls this round: each fix
+is in shutdown or cleanup paths that a real call cannot provoke cheaply.
+
+1. **Exit wait shorter than one cleanup.** `close()` waited `CLEANUP_SECONDS` (10 s) for the turns,
+   but one cleanup may take abort and idle (5 s) plus delete (10 s). It now waits
+   `ABORT_WAIT_SECONDS + CLEANUP_SECONDS` (15 s). The reviewer was right that the
+   `3 * CLEANUP_SECONDS` mutant was not equivalent: `force_stop()` had no bound inside `_stop`,
+   so the outer `.result(2 * CLEANUP_SECONDS)` is its only bound (giving it a second bound inside
+   `_stop` was tried: mutation showed the two redundant, so it stays outer only). The whole
+   shutdown is at most about 35 s (15 for the turns, 20 for stop and force-stop); docs give that
+   figure. `3 * CLEANUP_SECONDS` survives mutation: not equivalent (it lengthens the bound on a
+   hanging `force_stop()` by 10 s), but only a timing assertion would tell them apart; `None`
+   and `2 / CLEANUP_SECONDS` are killed by the test where both stops hang.
+   Test: abort and delete each take 0.7 s with both bounds at 1 s; the delete comes before the
+   stop (failed on the round 2 code: the stop came first).
+2. **Failed delete swallowed.** A failed delete of a session that was created is now logged
+   through the module logger (`logger.warning`, the session id and the folder's location only).
+   The project's loggers reach stderr in the CLI (Python's last-resort handler) and the server
+   output and `log/translation_*.log` on the web. A delete after a failed creation is not logged
+   (the folder may not exist). Tests: the warning holds the session id and no prompt text (failed
+   on the round 2 code); no warning after a failed creation.
+3. **Stop before creation.** `check()` now runs before the `try`, so a stop there deletes nothing.
+   Test: the cancel arrives while the client starts, before the caller's next poll; no create, no
+   delete (failed on the round 2 code: a delete of a session never created).
+4. The duplicated `test_close_bounded_when_force_stop_hangs_too` is removed: a round 2 edit
+   anchored on a string that occurred twice.
+5. **Docs.** README, CLAUDE.md and the plan: a runtime that dies or is killed while calls run
+   leaves their session folders (also next to the `kill <PID>` advice); the `_clean_up`
+   docstring no longer says otherwise. After a web pause, wait about 15 s before stopping the
+   server: `paused` is reported once the cancel is set, before abort and delete end. The plan
+   says the turn is aborted only once the prompt was sent, and an error during creation leads to
+   the delete only.
+
+Declined in this round (by the coordinator):
+
+- checking the stop inside the send task itself (a continuation queued ahead of the stop can
+  still send; the turn is then aborted and deleted);
+- skipping the idle wait when the send itself raised;
+- the check script pairing results when a concurrent call fails before creating a session.
+
+Mutation testing (final code):
+
+```
+$ scripts/verify/mutation.sh main
+TOTAL mutants 1167  killed 1126  survived 41  timeout 0  suspicious 0  untested 0
+```
+
+Not killed: in `copilot_sdk.py` (18) the round 2 list less `session = ""` (now killed through
+the pre-`try` check), plus `result(3 * CLEANUP_SECONDS)` (item 1); in `phase12_sdk_check.py`
+the same 23 as in round 2.
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once, 3.12.7
+2977 passed in 267.91s / 271.14s / 270.08s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
