@@ -8,14 +8,14 @@
             <h3 style="margin: 0; font-size: 1rem;">翻譯控制</h3>
             <div class="header-actions">
                 <template x-if="state === 'idle' || state === 'completed' || state === 'failed' || state === 'stopped'">
-                    <button class="btn btn-primary" @click="startTranslation()" :disabled="starting || modelLoading">
+                    <button class="btn btn-primary" @click="startTranslation()" :disabled="starting">
                         <template x-if="starting">
                             <span class="spinner"></span>
                         </template>
                         開始翻譯
                     </button>
                 </template>
-                <button class="btn btn-secondary" @click="startTranslation(true)" :disabled="starting || modelLoading"
+                <button class="btn btn-secondary" @click="startTranslation(true)" :disabled="starting"
                         x-show="failedCount > 0 && (state === 'idle' || state === 'completed' || state === 'failed' || state === 'stopped')"
                         x-text="'重試失敗段落（' + failedCount + '）'">重試失敗段落（{{ progress.failed }}）</button>
                 <template x-if="state === 'running' || (state === 'paused' && autoResume)">
@@ -24,7 +24,7 @@
                     </button>
                 </template>
                 <template x-if="state === 'paused'">
-                    <button class="btn btn-success" @click="pauseTranslation('resume')" :disabled="modelLoading">
+                    <button class="btn btn-success" @click="pauseTranslation('resume')">
                         ▶ 繼續翻譯
                     </button>
                 </template>
@@ -190,7 +190,8 @@ function translationController() {
         backend: '',
         failedCount: {{ progress.failed }},
         availableModels: [],
-        modelLoading: false,  // a settings save is pending: start, retry and resume wait for it
+        modelLoading: false,  // a settings save is pending (start, retry and resume wait for it)
+        _settingsSave: null,  // the pending settings saves, chained (null: none)
         effort: null,      // the level the calls use; null: the model takes none
         timeout: 180,      // seconds per model call
         timeoutMin: 30,
@@ -315,11 +316,27 @@ function translationController() {
         },
 
         // PUT only the settings in `body` (what the user changed; the server
-        // keeps the others as stored); applies the stored ones on success,
-        // returns whether it succeeded
-        async putSettings(body) {
+        // keeps the others as stored); applies the stored ones on success and
+        // resolves to whether it succeeded. Saves run one after another; a
+        // run action waits for them through settingsSaved().
+        putSettings(body) {
+            const before = this._settingsSave || Promise.resolve(true);
+            const own = before.then(() => this._putSettings(body));  // after the earlier ones
+            // true only when this save and every earlier one still pending succeeded
+            const save = Promise.all([before, own]).then(([earlier, ok]) => earlier && ok);
+            this._settingsSave = save;
             this.modelLoading = true;
-            let data = {};
+            save.finally(() => {
+                if (this._settingsSave === save) {  // the latest: nothing pending any more
+                    this._settingsSave = null;
+                    this.modelLoading = false;
+                }
+            });
+            return own;
+        },
+
+        async _putSettings(body) {
+            let data = null;
             let ok = false;
             try {
                 const res = await fetch('/api/projects/{{ project_name }}/model', {
@@ -328,21 +345,33 @@ function translationController() {
                     body: JSON.stringify(body),
                 });
                 data = await res.json();
-                ok = res.ok && data.status === 'ok';
+                ok = res.ok && !!data && data.status === 'ok';
             } catch (e) {
                 data = { error: '模型設定失敗: ' + e.message };
+            } finally {
+                if (ok) {
+                    this.model = data.model;
+                    this.backend = data.backend;
+                    this.effort = data.effort;
+                    this.timeout = data.timeout;
+                    this.settingsNote = data.note;
+                    this.settingsError = '';
+                } else {
+                    this.settingsError = (data && data.error) || '模型設定失敗';
+                }
             }
-            if (ok) {
-                this.model = data.model;
-                this.backend = data.backend;
-                this.effort = data.effort;
-                this.timeout = data.timeout;
-                this.settingsNote = data.note;
-                this.settingsError = '';
-            } else {
-                this.settingsError = data.error || '模型設定失敗';
+            return ok;
+        },
+
+        // Waits for the settings saves still pending (also ones started
+        // meanwhile); false when one of them was refused or failed
+        async settingsSaved() {
+            let ok = true;
+            while (this._settingsSave) {
+                const pending = this._settingsSave;
+                ok = (await pending) && ok;
+                if (this._settingsSave === pending) break;
             }
-            this.modelLoading = false;
             return ok;
         },
 
@@ -416,8 +445,14 @@ function translationController() {
         },
 
         async startTranslation(retryFailed = false) {
-            if (this.modelLoading) return;  // a run would start with the old settings
+            if (this.starting) return;
             this.starting = true;
+            // the click that ended a settings edit (blur) waits for its save;
+            // a refused or failed save starts nothing (its error is shown)
+            if (!await this.settingsSaved()) {
+                this.starting = false;
+                return;
+            }
             this.error = null;
             this.autoResume = false;  // a new run: no wait
             this.logs = [];
@@ -454,9 +489,10 @@ function translationController() {
 
         async pauseTranslation(action) {
             if (this._pauseInFlight) return;
-            if (action === 'resume' && this.modelLoading) return;  // as for start; pause stays
             this._pauseInFlight = true;
             try {
+                // as for start: a resume waits for pending settings saves (pause does not)
+                if (action === 'resume' && !await this.settingsSaved()) return;
                 const body = { action: action };
                 if (action === 'resume') body.workers = parseInt(this.workers);
                 const res = await fetch('/api/projects/{{ project_name }}/translate/pause', {
