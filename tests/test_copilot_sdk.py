@@ -775,6 +775,20 @@ class TestRoundTwo:
         copilot_sdk._runtime.close()
         assert client.log[-1] == ('force_stop',)
 
+    def test_close_bounded_when_force_stop_hangs_too(self, client, monkeypatch):
+        monkeypatch.setattr(copilot_sdk, 'CLEANUP_SECONDS', 0.1)
+
+        async def hangs():
+            await asyncio.Event().wait()
+
+        CopilotSDK().complete(_req(), threading.Event())
+        monkeypatch.setattr(client, 'stop', hangs)
+        monkeypatch.setattr(client, 'force_stop', hangs)
+        closer = threading.Thread(target=copilot_sdk._runtime.close)
+        closer.start()
+        closer.join(WAIT / 2)
+        assert not closer.is_alive()
+
     @pytest.mark.parametrize('filtered, text, refused', [
         ([True, False], 'reply', False), ([False, True], 'reply', True),
         ([True, False], '', True), ([False, False], '', False)])
@@ -959,6 +973,20 @@ class TestShutdown:
         monkeypatch.setattr(client, 'stop', failing_stop)
         copilot_sdk._runtime.close()
         assert client.log[-1] == ('force_stop',)
+
+    def test_close_bounded_when_force_stop_hangs_too(self, client, monkeypatch):
+        monkeypatch.setattr(copilot_sdk, 'CLEANUP_SECONDS', 0.1)
+
+        async def hangs():
+            await asyncio.Event().wait()
+
+        CopilotSDK().complete(_req(), threading.Event())
+        monkeypatch.setattr(client, 'stop', hangs)
+        monkeypatch.setattr(client, 'force_stop', hangs)
+        closer = threading.Thread(target=copilot_sdk._runtime.close)
+        closer.start()
+        closer.join(WAIT / 2)
+        assert not closer.is_alive()
 
     def test_close_without_client(self):
         runtime = copilot_sdk._Runtime()
