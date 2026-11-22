@@ -7367,3 +7367,134 @@ exit 0                      (reverts not detected: 0; 105 OK)
 $ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
 exit 0                      (not killed 0; 81 KILLED)
 ```
+
+## Phase 12 — review round 1
+
+All three reviewers requested changes; the main defect (a session folder, holding the prompt,
+left behind outside the recorded Ctrl-C case) was confirmed for real and fixed. Real calls in
+this round: invented text only, Claude Haiku 4.5 (and Haiku 5.5 for the check's effort call).
+
+1. **Cleanup was cut short.** `complete`'s `future.cancel()` injected `CancelledError` into the
+   turn while it was aborting or deleting (`except Exception` does not catch it), so the delete was
+   skipped: when the loop's own `send_and_wait` timeout fired first and the poll noticed up to
+   0.1 s later, when a pause arrived while a finished call was deleting its session, or when
+   several workers were cancelled mid-cleanup. Reproduced with fakes whose `abort` and
+   `delete_session` really yield and whose send honours a timeout: `test_loop_timeout_first`,
+   `test_pause_while_deleting` fail on the previous code (`client.deleted` never set), as does
+   `test_close_waits_for_cleanups` (no abort at close). Now the turn is never cancelled from
+   outside: `complete` sets the turn's stop event; the turn waits for the reply or the stop
+   (`asyncio.wait`, first completed), and on stop or any error aborts, waits for idle and deletes.
+   A stop during session creation sends no prompt (`test_cancel_while_creating_sends_nothing`:
+   create, delete, no send, no abort).
+2. **`close()` did not drain, and ran too late.** Reproduced for real (one call each, then exit;
+   the hook's outcome printed by a wrapper around `_stop`):
+
+   ```
+   previous code    timeout: call TransientError, exit hook: stop() failed: RuntimeError cannot
+                    schedule new futures after shutdown; session folders 419 -> 420
+                    cancel:  call CancelledError, same failure;      session folders 420 -> 421
+   fixed code       timeout: call TransientError, exit hook: stop() ok; folders 422 -> 422
+                    cancel:  call CancelledError, exit hook: stop() ok; folders 422 -> 422
+   ```
+
+   The claim holds: `concurrent.futures` shuts its executors down from `threading`'s exit hooks,
+   which run before `atexit` hooks, and the SDK's `stop()` runs blocking steps through
+   `asyncio.to_thread`. `close()` now stops the turns still running, waits for them (10 s at most)
+   and only then stops the client; it is registered with `threading._register_atexit` when the
+   loop starts (`atexit` stays as a fallback; `close` runs once). That hook list runs in reverse,
+   so `concurrent.futures.thread` is imported first: without that import (its hook then registered
+   after ours, on the SDK's first `to_thread`) the same failure was seen once more with the hook in
+   place. This is the smallest thing that runs early enough; a private function, but the one
+   `concurrent.futures` itself uses. Kept out of the check script (it needs its own process); the
+   one-off evidence is above. Of the 5 folders the failing runs left, the last 3 were removed with
+   `client.delete_session`, the first 2 by hand (see 5).
+3. **Deadline.** The poll waits at most the remaining time, and a reply that arrives after the
+   deadline is refused (`TransientError`), as `run_process` does (two tests, one with a fake clock).
+4. **Classification before truncation.** Patterns are matched on the whole redacted text (now
+   with the `session.error` type before its message, as the CLI backend does); only the message is
+   cut to 500 characters (test: a rate limit after 2000 characters).
+5. **Cross-session store: the reviewer was right.** SDK 2.0.1 leaves
+   `state.enable_cross_session_store` unset in mode `coding-agent`, and the runtime then indexes
+   the prompt and reply in `~/.copilot/session-store.db`. One completed, deleted call with an
+   invented marker, files under `~/.copilot` outside `session-state/` and `logs/` compared before
+   and after: previous code `config.json`, `session-store.db`, `-shm`, `-wal` changed, the
+   database and its WAL held the marker (the session's rows were gone after the delete, the bytes
+   were still in the file); with `enable_cross_session_store: False` only `config.json` and the
+   `-shm` file changed and no file under `~/.copilot`, logs included, held the marker. Also seen:
+   the store keeps the rows of sessions whose folders were removed by hand or left by Ctrl-C, and
+   `delete_session` refuses those ids ("Session file not found"), so the earlier test sessions of
+   this phase that were cleaned up by hand left invented text in the store (no book text).
+6. **Truncated and filtered replies.** The SDK's `assistant.usage` has `finish_reason` and
+   `content_filter_triggered`: a last `length` gives `stop_reason='truncated'`, a filter
+   `RefusalError`. The translator does not read `stop_reason` (a cut reply fails its check and is
+   retried or split, as before), so this changes nothing there. Every real call reported `stop`
+   and `false`; neither case was observed.
+7. **Tests.** The conftest session fixture also clears `COPILOT_CLI_PATH` and points
+   `COPILOT_CLI_EXTRACT_DIR` at a temporary directory. The fake `abort()` returns before the idle
+   event is delivered, and the timeout test checks the order create, abort, idle, delete.
+8. **Check script.** An aborted call's checks wait (to a deadline) for its session folder to
+   disappear instead of sleeping 3 s; once it is gone the session can report nothing more. The
+   fake runtime now creates and removes the folders.
+9. **Docs.** README: "內建的後端都不提供"; what was observed for the two mid-turn aborts (no usage
+   event) instead of "zero usage and cost"; the store; when folders can still be left. Plan and
+   `CLAUDE.md` describe the stop event, the exit hook and the store.
+
+Declined:
+
+- Disabling OpenTelemetry exporters inherited from the owner's environment: the CLI backend
+  inherits them too, and the environment is the owner's.
+- Sharing the first authentication check among workers that start together: a few extra
+  `getStatus` calls at the first start only.
+- The check script's model-start and overlap instrumentation.
+
+Check script once more, on the fixed backend (folders 419 -> 419, no runtime left):
+
+```
+$ python3 scripts/verify/phase12_sdk_check.py; echo "exit $?"
+1. refusals before any model call
+  ok   unknown model/effort: BackendUnavailableError  BackendUnavailableError
+  ok   unknown: no model call
+  ok   effort model/effort: BackendUnavailableError  BackendUnavailableError
+  ok   effort: no model call
+2. three concurrent calls
+  concurrent 0 reply                    wall   3.81 s  in    96  out   282  cost [0.33]  effort [None]
+  concurrent 1 reply                    wall   4.51 s  in    97  out   358  cost [0.33]  effort [None]
+  concurrent 2 reply                    wall   4.35 s  in    93  out   300  cost [0.33]  effort [None]
+  ok   all three answered in Chinese
+  ok   the three calls overlapped in time
+  ok   one runtime process  1
+3. runtime killed, then a translation with the product prompt
+  ok   the runtime is gone
+  translation  reply                    wall   7.89 s  in  1408  out   602  cost [0.33]  effort [None]
+  ok   translation reply in Chinese
+  ok   a new runtime process
+  ok   usage reported
+4. effort low on claude-haiku-5.5
+  effort       reply                    wall   0.83 s  in    83  out    20  cost [1.0]  effort ['low']
+  ok   the model call reports effort low  ['low']
+5. cancel and timeout mid-turn
+  cancelled    CancelledError           wall   1.19 s  in     0  out     0  cost []  effort []
+  ok   cancelled: CancelledError
+  ok   cancelled: the model call had started
+  ok   cancelled: returned within 1 s  0.08 s
+  ok   cancelled: session went idle as aborted  idle events 1
+  ok   cancelled: no assistant.usage (nothing reported billed)
+  ok   cancelled: session deleted
+  timed out    TransientError           wall   6.01 s  in     0  out     0  cost []  effort []
+  ok   timed out: TransientError
+  ok   timed out: the model call had started
+  ok   timed out: returned within 1 s  0.01 s
+  ok   timed out: session went idle as aborted  idle events 1
+  ok   timed out: no assistant.usage (nothing reported billed)
+  ok   timed out: session deleted
+6. session files
+  ok   no session directory left of the 9 sessions  0 left
+  ok   a delete asked for every session
+7. stop
+  ok   no runtime process left  0
+information
+  cost the SDK reported in total: 2.32 premium requests
+  runtime logs written during the run: 2; hold prompt text: no
+PASS
+exit 0
+```

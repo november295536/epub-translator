@@ -6105,8 +6105,10 @@ class TestPhase12SdkCheck:
         monkeypatch.setattr(sdk_check, '_pause', lambda seconds: None)
         monkeypatch.setattr(sdk_check, 'SETTLE_SECONDS', 0.1)
         assert sdk_check.main(['--timeout-s', '0.5']) == 1
+        # Whether three calls that fail at once overlap depends on scheduling: not asserted
         fails = [re.sub(r'  -?\d+\.\d\d s$', '', line)
-                 for line in capsys.readouterr().out.splitlines() if line.startswith('  FAIL ')]
+                 for line in capsys.readouterr().out.splitlines()
+                 if line.startswith('  FAIL ') and 'overlapped' not in line]
         assert fails == [
             '  FAIL all three answered in Chinese',
             '  FAIL one runtime process  0',
