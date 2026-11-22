@@ -370,6 +370,21 @@ class TestComplete:
 
         assert _wait(lambda: asyncio.run_coroutine_threadsafe(others(), loop).result(WAIT) == 0)
 
+    def test_cleanup_bounded_in_this_thread(self, client, monkeypatch):
+        """The same bound, with the cleanup run here (on this thread's own loop)."""
+        monkeypatch.setattr(copilot_sdk, 'CLEANUP_SECONDS', 0.1)
+
+        async def hang(session_id):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(client, 'delete_session', hang)
+
+        async def clean_up():
+            await asyncio.wait_for(
+                CopilotSDK._clean_up(client, None, 'id', True, asyncio.Event()), WAIT)
+
+        asyncio.run(clean_up())
+
     def test_reply_refused_after_cancel(self, client):
         cancel = threading.Event()
 

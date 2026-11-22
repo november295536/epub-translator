@@ -7198,6 +7198,8 @@ made from a scratch directory, with a scratch `projects/` for the end-to-end run
 
 ### Check script (REAL calls: 6 completed, 2 aborted; 2.32 premium requests reported)
 
+Final version of the script, on the final backend:
+
 ```
 $ python3 scripts/verify/phase12_sdk_check.py; echo "exit $?"
 1. refusals before any model call
@@ -7206,25 +7208,26 @@ $ python3 scripts/verify/phase12_sdk_check.py; echo "exit $?"
   ok   effort model/effort: BackendUnavailableError  BackendUnavailableError
   ok   effort: no model call
 2. three concurrent calls
-  concurrent 0 reply                    wall   3.78 s  in    96  out   253  cost [0.33]  effort [None]
-  concurrent 1 reply                    wall   4.75 s  in    97  out   276  cost [0.33]  effort [None]
-  concurrent 2 reply                    wall   5.74 s  in    93  out   463  cost [0.33]  effort [None]
+  concurrent 0 reply                    wall   3.51 s  in    96  out   266  cost [0.33]  effort [None]
+  concurrent 1 reply                    wall   4.91 s  in    97  out   402  cost [0.33]  effort [None]
+  concurrent 2 reply                    wall   4.05 s  in    93  out   305  cost [0.33]  effort [None]
   ok   all three answered in Chinese
   ok   the three calls overlapped in time
   ok   one runtime process  1
 3. runtime killed, then a translation with the product prompt
-  translation  reply                    wall  10.82 s  in  1408  out   795  cost [0.33]  effort [None]
+  ok   the runtime is gone
+  translation  reply                    wall   7.64 s  in  1408  out   551  cost [0.33]  effort [None]
   ok   translation reply in Chinese
   ok   a new runtime process
   ok   usage reported
 4. effort low on claude-haiku-5.5
-  effort       reply                    wall   1.31 s  in    83  out    20  cost [1.0]  effort ['low']
+  effort       reply                    wall   0.87 s  in    83  out    18  cost [1.0]  effort ['low']
   ok   the model call reports effort low  ['low']
 5. cancel and timeout mid-turn
-  cancelled    CancelledError           wall   1.18 s  in     0  out     0  cost []  effort []
+  cancelled    CancelledError           wall   2.05 s  in     0  out     0  cost []  effort []
   ok   cancelled: CancelledError
   ok   cancelled: the model call had started
-  ok   cancelled: returned within 1 s  0.03 s
+  ok   cancelled: returned within 1 s  0.10 s
   ok   cancelled: session went idle as aborted  idle events 1
   ok   cancelled: no assistant.usage (nothing reported billed)
   ok   cancelled: session deleted
@@ -7250,9 +7253,12 @@ exit 0
 What this shows and what it does not: the effort line is the runtime's own record of the model
 call (`assistant.usage` `reasoningEffort`), not a measurement of how much the model reasoned.
 "Nothing reported billed" means the SDK reported no usage for the aborted turn; the account's
-own count could not confirm it (above). An earlier run of the same script (before the deletion
-was recorded when asked rather than after it returned) passed every other check, 2.32 premium
-requests as well.
+own count could not confirm it (above). Two earlier runs of the script while it was being
+written (same steps, 2.32 premium requests each) passed the same checks, except that the first
+recorded a deletion only after `delete_session` returned and so failed "every session deleted"
+for the two sessions whose creation had failed (their folders were gone all the same). The
+session folder count in `~/.copilot/session-state/` was the same before and after each run, and
+no `copilot --headless` process was left.
 
 ### End to end, CLI (invented two-chapter book, 4 segments; REAL calls, Claude Haiku 4.5)
 

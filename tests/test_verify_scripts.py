@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -5893,6 +5894,7 @@ class FakeSDKRuntime:
                 return Session(options)
 
             async def delete_session(self, session_id):
+                await asyncio.sleep(0.05)  # the runtime takes a moment
                 runtime.deleted.append(session_id)
 
             async def stop(self):
@@ -5990,7 +5992,15 @@ class TestPhase12SdkCheck:
              'Translate to Traditional Chinese: The clock in the hall stopped at noon.'),
             ('claude-haiku-4.5', None, sdk_check.LONG),
             ('claude-haiku-4.5', None, sdk_check.LONG)]
-        assert f'<p k="1">{sdk_check.PARAGRAPH}</p>' in prompt
+        from src.core.segmenter import SegmentType
+        from src.core.translator import TranslationEngine
+        from src.llm.fake import FakeBackend
+        assert prompt == TranslationEngine(backend=FakeBackend())._build_prompt(
+            '', SegmentType.TEXT, html=f'<p k="1">{sdk_check.PARAGRAPH}</p>')
+        done = threading.Event()  # the last delete may still be finishing on the loop
+        for _ in range(500):
+            if len(fake.deleted) == 9 or done.wait(0.01):
+                break
         assert len(fake.deleted) == 9 and len(set(fake.deleted)) == 9
         # The cancel came 1 s (pause) into the model call; it returned at once
         cancelled = re.search(r'cancelled +CancelledError +wall +(\d+\.\d\d) s', out)
