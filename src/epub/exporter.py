@@ -315,11 +315,13 @@ def _serialize(root) -> bytes:
 
 class _ZipInfo(zipfile.ZipInfo):
     """A ZipInfo that writes the member name as the given raw bytes, with
-    the source's UTF-8 flag (zipfile resets flag_bits when writing)."""
+    the source's UTF-8 flag (zipfile resets flag_bits when writing; from
+    Python 3.14 it resets them to the UTF-8 flag alone, so that bit is
+    replaced, not added to)."""
     __slots__ = ('raw_name', 'name_flag')
 
     def _encodeFilenameFlags(self):
-        return self.raw_name, self.flag_bits | self.name_flag
+        return self.raw_name, (self.flag_bits & ~0x800) | self.name_flag
 
 
 class _NoAttributes(int):

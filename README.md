@@ -4,7 +4,7 @@
 
 ## 系統需求
 
-- **Python 3.9+**，macOS 或 Linux（用到 `fcntl` 與 POSIX 程序群組，原生 Windows 無法執行）
+- **Python 3.12+**，macOS 或 Linux（用到 `fcntl` 與 POSIX 程序群組，原生 Windows 無法執行）
 - 至少一個模型後端（見下方「模型後端」）：
   - **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview)**（`claude`，預設後端），需登入
   - **GitHub Copilot CLI**（`copilot`），需登入（`copilot login`）
@@ -14,12 +14,24 @@
 ```bash
 git clone "$REPO_URL" epub-translator   # REPO_URL：本專案的 git 網址
 cd epub-translator
-python3 -m venv venv
+python3.12 -m venv venv               # 或更新的版本，例如 python3.14
 source venv/bin/activate
 pip install -r requirements.txt
-pip install -r requirements-dev.txt   # 執行測試需要（測試用 ebooklib 產生範例 EPUB）
+pip install -r requirements-dev.txt   # 執行測試與突變測試需要（ebooklib 產生範例 EPUB、mutmut）
 
 python3 -m pytest tests/ -q           # 確認安裝
+```
+
+用比 3.12 舊的 Python 執行 `translate.py` 或 Web 介面時，會直接顯示「需要 Python 3.12 以上版本」並結束。
+
+**重建既有的虛擬環境**（例如原本以 Python 3.9 建立）：虛擬環境綁定建立它的直譯器，無法就地升級，刪掉重建即可（`projects/` 不受影響）：
+
+```bash
+deactivate 2>/dev/null; rm -rf venv
+python3.12 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+python3 --version                     # 應為 3.12 以上
 ```
 
 ## 模型後端
@@ -33,7 +45,7 @@ python3 -m pytest tests/ -q           # 確認安裝
 - **推理強度與呼叫逾時**：也存在專案裡，與模型一樣設定（CLI `model set -e/--effort`、`-t/--timeout`，`model show` 顯示目前的值與模型可用的推理強度；Web「翻譯」頁模型選單旁的「推理強度」與「呼叫逾時（秒）」），翻譯中變更從下一段開始生效，翻譯與術語提取都使用。
   - 推理強度：Claude 後端的三個模型與 Copilot 的 Claude 5/5.5 系列、GPT 系列可選 `low`、`medium`、`high`、`xhigh`、`max`，其中 `gpt-6-sol`、`gpt-6-luna`、`gpt-5.6-sol`、`gpt-5.6-luna` 另有 `none`；Gemini 系列可選 `low`、`medium`、`high`；Grok 系列可選 `low`、`medium`、`high`、`xhigh`；`claude-haiku-4.5` 不可設定（不傳任何值）。`model show` 與翻譯頁列出目前模型可選的強度。預設 `low`。專案檔裡的強度是已知的強度（`none`、`low`、`medium`、`high`、`xhigh`、`max`）但不在目前模型的清單中（手動修改，或清單變短）時，呼叫與頁面都改用預設，檔案裡的值保留到換模型為止；不是已知強度的值（例如 `"bogus"`）會讓專案無法載入，請修正或刪除 `project.json` 的 `effort`。模型不接受的強度會被拒絕且不改動專案；換模型（或後端）時若原本的強度新模型不接受，會改回預設並在確認訊息中說明；只改逾時或強度不會清掉它。Claude 後端以 `--effort` 傳入（並忽略環境變數 `CLAUDE_CODE_EFFORT_LEVEL`），Copilot 後端以 `--reasoning-effort` 傳入；Copilot 拒絕強度時停下（Web 暫停、CLI 結束），不儲存結果。
   - 呼叫逾時：預設 180 秒，可設 30–3600 的整數秒。
-  - 風險：較高的強度在較慢的模型（Gemini）上可能超過逾時，請調高逾時或降低強度；Copilot 的模型清單、倍數與各模型可用的強度取自目前的帳號與 CLI 本身的檢查（Claude Code 2.1.330、Copilot CLI 1.0.114），CLI 或 Copilot 更新後可能改變（不接受的強度會讓翻譯停下並顯示 CLI 的訊息）。
+  - 風險：較高的強度在較慢的模型（Gemini）上可能超過逾時，請調高逾時或降低強度；Copilot 的模型清單、倍數與各模型可用的強度取自目前的帳號與 CLI 本身的檢查（Claude Code 2.1.330、Copilot CLI 1.0.114），CLI 或 Copilot 更新後可能改變：Copilot 不再接受某個強度時翻譯會停下並顯示 CLI 的訊息；Claude Code 若不再接受清單中的某個強度，只會警告並以它自己的預設強度繼續，翻譯不會停下。
 - **只有 Copilot 時**：建立專案後先執行 `python3 translate.py model set -b copilot-cli`（或在 Web「翻譯」頁選一個 Copilot 模型），再提取術語或翻譯。
 - 每次呼叫都以一句翻譯用的系統提示取代 CLI 內建的提示，並且不給模型任何工具；子程序在系統暫存目錄執行。
 - **Copilot 後端的需求與風險**：需要支援 `--experimental` 與 `--plugin-dir` 的 Copilot CLI（以 1.0.114 驗證）；系統提示由 `src/llm/copilot_plugin/` 的擴充功能替換，這依賴未公開的實驗性介面。每次呼叫結束後都會檢查替換是否生效，無法確認時不儲存結果並停下（Web 暫停、CLI 結束），不會改用約 2000 token 的內建提示繼續。Copilot 更新後可能需要調整後端；使用量上限的訊息取自 Copilot 文件，登入錯誤的判斷是推測的。
@@ -137,7 +149,7 @@ projects/<name>/              # 不進版控
 python3 -m pytest tests/ -q -p no:cacheprovider -rfw
 ```
 
-突變測試：`scripts/verify/mutation.sh main`，需要一個 Python 3.10+ 的環境，安裝 `requirements.txt` 與 `requirements-dev.txt`；與 `main` 相比沒有可突變的變更行時以 exit 2 結束。`scripts/verify/` 其他腳本見 [CLAUDE.md](CLAUDE.md)。
+突變測試：在專案的虛擬環境（已安裝 `requirements.txt` 與 `requirements-dev.txt`）執行 `scripts/verify/mutation.sh main`；與 `main` 相比沒有可突變的變更行時以 exit 2 結束。`scripts/verify/` 其他腳本見 [CLAUDE.md](CLAUDE.md)。
 
 ## 疑難排解
 
@@ -147,7 +159,7 @@ python3 -m pytest tests/ -q -p no:cacheprovider -rfw
 - 匯出或 `validate` 拒絕舊格式專案：先執行 `migrate`。
 - 匯出顯示「無法讀取來源 EPUB」：專案目錄裡的 `source.epub` 不見了（被刪除或改名），`project.json` 記錄的原書路徑也讀不到；把原書放回專案目錄並命名為 `source.epub`。雜湊值不符表示那個檔案不是建立專案或遷移時記錄的那本書。
 - Copilot 停在「無法確認 Copilot CLI 已套用翻譯用的系統提示」：外掛沒有載入或 CLI 改了介面；確認 `copilot --help` 有 `--experimental` 與 `--plugin-dir`。
-- 呼叫逾時（段落以 failed 結束、紀錄寫「timed out」）：用 `model set -t` 或翻譯頁調高逾時，或降低推理強度。
+- 呼叫逾時（紀錄寫「timed out」）：逾時的呼叫會在該段的呼叫次數內重試，重試成功就不會留下問題；用完次數時，待翻譯的段落以 failed 結束，已翻譯或已審閱的段落保留原譯文與狀態、只記下問題；術語提取的呼叫逾時則記錄警告、不重試：該批次不提出術語（裁決呼叫逾時則各術語保留最常見的譯法）。常逾時就用 `model set -t` 或翻譯頁調高逾時，或降低推理強度。
 - Copilot 停在「Copilot CLI 不接受此模型的推理強度設定」：改選這個模型可用的推理強度（`model show` 列出）或換模型。
 - Web 翻譯日誌：`projects/<name>/log/translation_*.log`。
 
