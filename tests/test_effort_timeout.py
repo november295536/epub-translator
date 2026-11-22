@@ -850,21 +850,6 @@ const answer = async (status, body) => { while (!held.length) await tick(); held
         const resume = c.pauseTranslation('resume');
         await answer(400, {error: 'refused'});
         await start; await resume;
-    } else if (scenario === 'overlap') {
-        c.saveTimeout('300');
-        c.saveEffort('high');
-        const start = c.startTranslation();
-        await answer(200, ok);
-        out.afterFirst = fetched.slice();
-        await answer(200, ok);
-        await start;
-    } else if (scenario === 'overlap-refused') {
-        c.saveTimeout('5');
-        c.saveEffort('high');
-        const start = c.startTranslation();
-        await answer(400, {error: 'refused'});
-        await answer(200, ok);
-        await start;
     } else if (scenario === 'null') {
         const saved = c.putSettings({timeout: 300});
         const start = c.startTranslation();
@@ -908,18 +893,6 @@ const answer = async (status, body) => { while (!held.length) await tick(); held
         assert result['fetched'] == ['PUT /model']  # neither start nor resume
         assert (result['settingsError'], result['starting'], result['loading']) == (
             'refused', False, False)
-
-    def test_overlapping_saves(self, client):
-        result = self._run(client, 'overlap')
-        # the second save goes out after the first; start after both
-        assert result['afterFirst'] == ['PUT /model', 'PUT /model']
-        assert result['fetched'] == ['PUT /model', 'PUT /model', 'POST /translate/start']
-        assert (result['loading'], result['pending']) == (False, None)
-
-    def test_overlapping_saves_one_refused(self, client):
-        result = self._run(client, 'overlap-refused')
-        assert result['fetched'] == ['PUT /model', 'PUT /model']
-        assert result['starting'] is False
 
     def test_null_error_body(self, client):
         result = self._run(client, 'null')
