@@ -7537,3 +7537,133 @@ exit 0                      (not killed 0; 81 KILLED)
 Real calls this round: 9 calls aborted mid-turn for the exit reproduction (2 on the previous
 code, 2 with the hook but without the import, 5 on the fixed code with and without a trace), 2 completed calls for the store comparison, the check script (5 completed, 2
 aborted, 2.32 premium requests reported).
+
+## Phase 12 — review round 2
+
+Small fixes, each with a test that fails on the round 1 code (`git show f0f4538:src/llm/copilot_sdk.py`
+in place, the new tests run: 7 of the new `TestRoundTwo` tests failed, the 4 filter cases and the
+"close during the first start" case passed: that case only took the 10 s wait there).
+
+1. **Delete skipped when the abort failed.** Abort and the wait for idle now have their own `try`
+   and bound (`ABORT_WAIT_SECONDS`, 5 s together); the delete is always attempted afterwards under
+   its own bound (`CLEANUP_SECONDS`, 10 s). Tests: a fake `abort` that raises (`session is
+   idle`) and one that hangs; the session is deleted in both. Fake-tested only: provoking a
+   failing abort on a real session would need an errored session mid-turn, which no cheap call
+   gives.
+2. **Cold-start `close()` race.** `close()` returned when no client existed yet, although a first
+   turn was already submitted. Now it stops and waits for every submitted turn whenever the loop
+   exists, reads the client only afterwards, and `client()` refuses once closed. Test: the loop
+   held busy by another coroutine, a first call submitted, `close()` called, then the loop
+   released: no client made, the call gets `CancelledError`, and `client()` refuses (failed on
+   the old code: one client made). The first version of this test held the loop only after the
+   call was submitted; under three concurrent suites the turn sometimes reached `client()`
+   first (3 of 3 runs failed): the hold now comes first.
+3. **Stop missed between steps.** The stop and the caller's cancel are checked on entry, after
+   the client is ready, and before the prompt is sent. Test: the cancel arrives while the session
+   is created, creation is released before the caller is joined and before its next poll
+   (`POLL_SECONDS` 2 s): nothing is sent, the session is deleted.
+4. **Setup without a bound.** Starting the client (start and auth) and the send race the stop
+   event, which the caller sets at its deadline at the latest; session creation is not raced
+   (given up half-way it could leave a session) and is bounded by the request's timeout
+   (`asyncio.wait_for`). Tests, one per step (`start`, `get_auth_status`, `create_session`)
+   stuck: the call times out, the turn ends, and a later call succeeds. A first version also gave
+   every step its own deadline inside the turn; mutation testing showed that bound and the
+   stop/timeout distinction were never reached (the caller always stops first), so they were
+   removed.
+5. **Reviewer's claim on `close()` holds.** `.result(CLEANUP_SECONDS)` timing out raised
+   `TimeoutError`, which `except BaseException: pass` swallowed: `force_stop()` was never called
+   when `stop()` hung. Now `_stop` bounds the graceful stop (10 s) inside the coroutine and then
+   calls `force_stop()`; `close()` waits for that at most 20 s. Tests: a hanging `stop()` ends in
+   `force_stop` (failed on the old code); `stop()` and `force_stop()` both hanging, `close()`
+   still returns.
+6. **Content filter.** `RefusalError` only when the last usage event is filtered or the reply is
+   empty; an earlier filtered call followed by a reply is accepted. Test: four cases.
+7. **Tests that could pass for the wrong reason.**
+   - `test_stopped_at_interpreter_exit`: the fake `delete_session` and `stop()` now use
+     `asyncio.to_thread` (as the SDK's stop does), a call is in flight when the main thread ends,
+     and the test asserts `EXIT`, `DELETED`, `STOPPED`. With `threading._register_atexit` removed:
+     `['EXIT', 'FORCED']` (fails); with the `concurrent.futures.thread` import removed: fails.
+     The child's call thread catches its exception: a traceback printed while the interpreter
+     finalizes aborted the child once under load (`_enter_buffered_busy`, exit -6).
+   - `test_reply_after_the_deadline_refused`: `POLL_SECONDS` is set to 10 s and the test asserts
+     it returned well within 5 s, and that the session was deleted without an abort: the reply
+     path ran, not the "still running" branch.
+8. **Docs.** README, CLAUDE.md and the plan: Ctrl-C in the terminal of a running web server during
+   a translation leaves the session folders too (pause first); the exit wait is about 20 s (10 s
+   for the turns, 10 s for the stop). The check run's completed calls: 3 concurrent, 1
+   translation, 1 effort = 5 (0.33 × 4 + 1.0 = 2.32), not 6; corrected in two places above.
+9. **`copilot-cli` and the cross-session store.** No per-call switch in Copilot CLI 1.0.114:
+   `copilot --help`, `copilot help config` and `copilot help environment` name none
+   (`session-store.db` is only listed under "Files and directories"; `--sync-session` is account
+   history sync, `memory` is agentic memory). The runtime's `enableSessionStore` session option
+   (the SDK's `enable_cross_session_store`, wire key `enableSessionStore`) is only set at session
+   creation; `copilot -p` creates the session itself. Tried: the plugin's extension passing
+   `state: { enableCrossSessionStore: false }` to `joinSession`, then ONE real call through
+   `CopilotCLI` (Claude Haiku 4.5, invented sentence with a marker): `sessions` rows 35 → 36, one
+   `turns` row holds the marker, session id `(id removed)` (left in place,
+   not deleted). The extension change was reverted. Documented in `known-issues.md`, README and
+   CLAUDE.md, with `copilot-sdk` recommended for real books and both backends' folders and the
+   store stated to be local files.
+
+Also found: the check script paired the three concurrent sessions with their results by
+creation order, which need not be the threads' order (the mutation stats run failed once on the
+golden output: 77 input tokens where 73 were expected). Each thread now starts once the
+previous one has its session; the fake makes a call that starts alone slower, so without the
+wait the golden output differs.
+
+Declined in this round (by the coordinator):
+
+- treating a `length` cutoff as a failure in the translator;
+- recording a reply's arrival separately from a slow deletion;
+- classifying a runtime exit during the first authentication call;
+- the check script's suggestions 10–13;
+- a note about workers looping during web server exit.
+
+Mutation testing (final code):
+
+```
+$ scripts/verify/mutation.sh main
+TOTAL mutants 1155  killed 1113  survived 42  timeout 0  suspicious 0  untested 0
+```
+
+Not killed, and why (equivalent unless said otherwise):
+
+- `copilot_sdk.py` (19): the messages of the `CancelledError`s raised inside a turn (`_until`,
+  `check`, `client()` once closed; 9: the caller has already raised its own, nobody reads the
+  turn's); `session = ""`, `running = None` (twice), `_thread = ""`, `_authenticated = None`,
+  `_closed = None` (only tested for truth or replaced before use); `_turns.pop(future, )` (the
+  future is always there); the two deadline comparisons `>=`/`>` (differ only at an exactly equal
+  clock reading); `result(3 * CLEANUP_SECONDS)` (a looser bound on a wait that is itself
+  bounded by `_stop`; `None` and `2 / …` are killed).
+- `phase12_sdk_check.py` (23): the 21 of round 1, and the new wait between concurrent calls
+  replaced by `lambda: None` or turned into `and` (each only waits the full bound and then goes
+  on; in the fake the three calls wait for each other, so the output is the same).
+
+Suite and guards (final commit):
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once, 3.12.7
+2974 passed in 265.84s / 266.90s / 261.65s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+The check script on the final backend (REAL calls: 5 completed, 2 aborted), run twice this
+round (after the first fixes, and again after the refactor of item 4 and the script fix): PASS
+both times, 2.32 premium requests reported each; concurrent lines of the second run:
+
+```
+  concurrent 0 reply                    wall   4.25 s  in    96  out   307  cost [0.33]  effort [None]
+  concurrent 1 reply                    wall   5.22 s  in    97  out   432  cost [0.33]  effort [None]
+  concurrent 2 reply                    wall   3.84 s  in    93  out   268  cost [0.33]  effort [None]
+  cancelled    CancelledError           wall   1.19 s  in     0  out     0  cost []  effort []
+  timed out    TransientError           wall   6.00 s  in     0  out     0  cost []  effort []
+```
+
+Session folders in `~/.copilot/session-state/` and rows of `~/.copilot/session-store.db`
+(read-only count) were the same before and after each run (420, 36).
+
+Real calls this round: 1 completed `copilot-cli` call (the store check), and the check script
+twice (10 completed, 4 aborted, 4.64 premium requests reported in all).
