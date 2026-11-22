@@ -6757,3 +6757,52 @@ exit 0                      (not killed 0; 81 KILLED)
 
 The 4 survivors are the equivalent `prompt_text` mutants justified in the Phase 10 entry. The
 template's JavaScript is not mutated by mutmut; the Node tests cover it. No real model calls.
+
+## Phase 10 — review round 4
+
+Opus and Gemini approved, GPT requested changes. Simplified:
+
+- The save chain of round 3 is gone. Checked first that the page cannot issue a second settings
+  save while one is pending: only three handlers save (`setModel`, `saveEffort`,
+  `saveTimeout`, from the `@change` of the model select, the effort select and the timeout
+  field; there is no separate backend control, Enter in the field fires the same `change`), and
+  all three controls are `:disabled="modelLoading"`. `putSettings` sets `modelLoading`
+  synchronously in the `change` handler; Alpine applies the binding in the microtasks after that
+  event, before any further user event can be dispatched. So the chain only added a path where a
+  refused save A, a successful save B clearing the error, and a silent no-op Start could combine.
+  `_settingsSave` is now the one pending save, cleared when it settles; `settingsSaved()`
+  resolves true when there is none or it succeeded. The two overlap Node tests are removed; the
+  remaining ones (Start waits for a held PUT, refused PUT starts neither start nor resume, `null`
+  error body, bindings) pass, and 3 of the 4 fail without the wait in `startTranslation`
+  (checked on a scratch copy).
+- Browser, invented project, scratch server with a recording process layer (no real CLI): typed
+  360 in the timeout field and clicked 開始翻譯 without leaving the field. Server log: one `PUT
+  …/model`, then one `POST …/translate/start`; both segments called with `--model gpt-6.2-sol
+  --reasoning-effort low`, timeout 360; `project.json` has `"timeout": 360`.
+
+Accepted behaviour, not a defect: when a refused save has already returned before the click on
+Start arrives (the usual order on a local server), the run starts with the stored settings; the
+refusal is shown in the settings error and the field shows the stored value again, so what is
+shown is what is used.
+
+Declined:
+
+- Pause pressed while Resume is waiting on a save: the pause goes out at once; the waiting
+  resume then follows the save's result as before.
+- The web route saving on a no-op backend-only PUT: an atomic rewrite of the same content.
+- The measuring script's wording for an unconfigurable model ("does not take …; it takes:
+  none"): accurate as it is.
+
+```
+$ scripts/verify/mutation.sh main
+TOTAL mutants 677  killed 673  survived 4  timeout 0  suspicious 0  untested 0
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once
+2860 passed in 227.96s / 228.00s / 226.35s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+The 4 survivors are the equivalent `prompt_text` mutants justified in the Phase 10 entry. No
+real model calls.
