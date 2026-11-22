@@ -6390,9 +6390,12 @@ model (plan, Phase 10). Installed CLIs: Claude Code 2.1.330 (`claude --help`: `-
   refuses an `effort` outside `EFFORT_LEVELS` and a `timeout` outside 30–3600 (as it refuses an
   unknown backend). A stored level the model does not take (only by hand editing, or a CLI
   catalog change) is passed as it is: Copilot then refuses it and the run stops with its message.
+  (Corrected in review rounds 1 and 2: load checks `KNOWN_LEVELS`, which adds Copilot's `none`;
+  a stored level the model does not list is not passed, `call_settings` gives the default.)
 - `ProjectManager.select_model(backend, model, effort=None, timeout=None)`: every refusal is a
   `SettingError` (a `ValueError` with `setting`) raised before anything changes; a stored level
-  the resulting model does not take becomes None (the default); `effort_reset_note` builds the
+  the resulting model does not take becomes None (the default) (corrected in review round 2:
+  only when the backend or model changes); `effort_reset_note` builds the
   message (`原推理強度 X 不適用於 M，已改回預設：low|此模型不可設定`).
 - Callers: web worker (`tasks.py`, re-reads `pm.call_settings()` per segment and rebuilds the
   engine when any of the four changes), CLI sequential and parallel runs, `glossary extract`
@@ -6407,7 +6410,8 @@ model (plan, Phase 10). Installed CLIs: Claude Code 2.1.330 (`claude --help`: `-
   `start` prints the effort/timeout line after 使用模型.
 - Web: `GET …/model` adds `effort`, `efforts`, `timeout`, `timeout_min`, `timeout_max`, and every
   model in `available`/`backends` carries `efforts` (so the page shows the right levels as soon
-  as another model is picked). `PUT` takes `effort`, `timeout` beside `model` (still required),
+  as another model is picked). `PUT` takes `effort`, `timeout` beside `model` (still required;
+  corrected in review round 1: every setting is optional, at least one required),
   answers the stored settings and `note`, restores all four on a failed save. Page: effort
   `<select>` (`:selected` + `@change`, no `x-model`; disabled "此模型不可設定" when the model has
   no levels), timeout number field; on a refusal the control shows the stored value again.
@@ -6426,7 +6430,8 @@ model (plan, Phase 10). Installed CLIs: Claude Code 2.1.330 (`claude --help`: `-
   failure log; `select_model` (defaults, effort/timeout alone, kept or reset on a model change,
   unconfigurable model, 12 refusals changing nothing); project files (old file loads as the
   defaults and saves without the keys, set values written, bad stored values refused, a stored
-  level passed as it is, an unlisted model gets none); CLI show/set/reset note/7 refusals
+  level passed as it is (corrected in review round 1: the default is used), an unlisted model
+  gets none); CLI show/set/reset note/7 refusals
   byte-identical/start line/effort and timeout reach `start` (1 and 2 workers) and `glossary
   extract`/help; web GET/PUT/reset note/12 refused bodies byte-identical/failed save restores
   all four/extraction and re-translation get both/page markup; a mid-run switch of effort and
