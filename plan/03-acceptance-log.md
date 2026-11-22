@@ -6706,3 +6706,54 @@ exit 0                      (not killed 0; 81 KILLED)
 
 The 4 survivors are the equivalent `prompt_text` mutants justified in the Phase 10 entry. No
 real model calls in this round.
+
+## Phase 10 — review round 3
+
+Opus and Gemini approved, GPT requested changes. Fixed:
+
+- Page (`translation.html`): round 2 disabled Start/Retry/Resume while a settings save was
+  pending, which swallowed the click that ended the edit (mousedown blurs the field, `change`
+  starts the save, the button is disabled before mouseup, no click arrives). The buttons are no
+  longer disabled by a save. `putSettings` chains the saves (`_settingsSave`: each PUT goes out
+  after the earlier one; the chain resolves to true only when every save in it succeeded) and
+  resolves to its own save's result; `settingsSaved()` waits for the chain, also for saves added
+  meanwhile. `startTranslation` and `pauseTranslation('resume')` await it and start nothing when
+  a save was refused or failed (its error is already shown); Pause does not wait. A non-2xx
+  answer whose JSON is `null` or has no `error` no longer throws (`(data && data.error)`), the
+  settings state is applied in `finally`, and the pending state is cleared when the last save of
+  the chain settles.
+- Tests (`TestRunWaitsForSettings`, controller in Node with held PUTs): start waits for the held
+  PUT and goes out after it; a refused PUT sends neither start nor resume; two overlapping saves
+  (the second PUT after the first, start after both); overlapping saves with the first refused
+  start nothing; a `null` error body gives `模型設定失敗` with nothing pending. Without the wait
+  in `startTranslation`, 5 of the 6 tests fail (checked on a scratch copy of the template).
+- Browser, invented project, scratch server whose process layer only records and echoes (no
+  real CLI): typed 420 in the timeout field and clicked 開始翻譯 without leaving the field first.
+  The server log shows one `PUT …/model` then one `POST …/translate/start`; both segments were
+  called with `--model gpt-6.2-sol --reasoning-effort low` and timeout 420; `project.json` has
+  `"timeout": 420`.
+- CLAUDE.md names the two test guards of round 2 (the `claude`/`copilot` stand-ins on `PATH`,
+  and `MEASURING_SCRIPTS` for a new measuring script that imports `run_process` by name).
+
+Declined:
+
+- Stand-ins skipped when pytest's temp directory is mounted `noexec`: not a supported setup;
+  the in-process guards still apply there.
+- The measuring script treating an empty metrics map as zeros: it reports what the CLI reported.
+- A hand-edited `"model": null` on the page: load fills the backend's default model.
+- The CLI printing the reset note before the save: a failed save raises and the message is
+  followed by the error, never by a confirmation.
+
+```
+$ scripts/verify/mutation.sh main
+TOTAL mutants 677  killed 673  survived 4  timeout 0  suspicious 0  untested 0
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once
+2862 passed in 236.30s / 230.29s / 233.34s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+The 4 survivors are the equivalent `prompt_text` mutants justified in the Phase 10 entry. The
+template's JavaScript is not mutated by mutmut; the Node tests cover it. No real model calls.
