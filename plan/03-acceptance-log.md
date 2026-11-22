@@ -7534,6 +7534,6 @@ $ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
 exit 0                      (not killed 0; 81 KILLED)
 ```
 
-Real calls this round: 2 aborted calls on the previous code and 2 on the fixed one (exit
-reproduction), 2 completed calls for the store comparison, the check script (6 completed, 2
+Real calls this round: 9 calls aborted mid-turn for the exit reproduction (2 on the previous
+code, 2 with the hook but without the import, 5 on the fixed code with and without a trace), 2 completed calls for the store comparison, the check script (6 completed, 2
 aborted, 2.32 premium requests reported).
