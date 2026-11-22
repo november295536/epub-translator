@@ -7022,3 +7022,98 @@ source venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 python3 --version
 ```
+
+## Phase 11 — review round 1
+
+Opus approved; GPT and Gemini requested changes.
+
+1. **Beautiful Soup in migration.** The entry above said `src/` does not import Beautiful Soup;
+   `src/core/migrate.py` does (`html.parser`, for the text of schema 1 segments, compared with
+   lxml's text of the chapter). Checked with an invented probe: `get_text()` of
+   `<TAG src="media.xhtml">A &amp; B</TAG>` with `html.parser`, against lxml's text:
+
+   ```
+   3.9.6, 3.12.7, 3.13.7: iframe, noembed, noframes, xmp, plaintext -> 'A & B' (same as lxml)
+   3.14.7:                iframe, noembed, noframes, xmp -> 'A &amp; B'; plaintext -> 'A &amp; B</plaintext>'
+   all versions:          script, style -> '' (bs4 leaves their text out; lxml 'A & B'); p, title,
+                          textarea, noscript -> 'A & B'
+   ```
+
+   End to end (`migrate_project` on a schema 1 project whose chapter is `<p>Before the
+   frame.</p><TAG src="media.xhtml">A &amp; B</TAG>`, both segments translated): on 3.12.7 every
+   chapter matched and was written; on 3.14.7 `iframe`, `noembed`, `noframes` and `xmp` gave
+   `unmatched [('c1', 'text differs')]`, nothing written (`p`: matched). CPython's
+   `Lib/html/parser.py` (`CDATA_CONTENT_ELEMENTS`, read per release tag with `gh api`): only
+   `("script", "style")` up to 3.12.12, 3.13.9 and 3.14.0; `xmp`, `iframe`, `noembed`,
+   `noframes` added from 3.12.13, 3.13.10 and 3.14.1. So it is not limited to 3.14: the 3.12.7
+   and 3.13.7 installed here are older patch releases. Not worked around: `known-issues.md`
+   entry (affected releases, migrate with a release before the change). The `script`/`style`
+   difference is the same on every version, 3.9 included, so it is not new.
+   `_consolidate` → `consolidate` in the entry above.
+2. **Which releases preset the UTF-8 bit.** Verified from CPython's `Lib/zipfile/__init__.py`
+   per tag (`gh api …/contents/…?ref=<tag>`): `zinfo.flag_bits = 0x00` in 3.12.12 and the 3.12
+   branch, 3.13.7–3.13.13, 3.14.0–3.14.5; `= _MASK_UTF_FILENAME` in 3.13.14–3.13.18,
+   3.14.6–3.14.10 and the 3.13 branch (gh-84353, "Preserve non-UTF-8 filenames when appending",
+   backported to 3.13 and 3.14 on 2026-05-27); on the 3.14 branch and `main`
+   `flag_bits &= _MASK_UTF_FILENAME`, then `|=` for a non-ASCII name (gh-152845, 2026-11-14).
+   From the review only: nothing; all of this was read from the source. The exporter's
+   `_encodeFilenameFlags` replaces bit 0x800 with the source's whatever `zipfile` left there, so
+   all three variants write the same flags. Comments in `src/epub/exporter.py`,
+   `tests/test_exporter.py` and the plan now say "some releases (3.13.14+, 3.14.6+) preset or
+   keep the UTF-8 bit"; code unchanged.
+3. **Import order.** The entry-point test now records every import started: before the first
+   project import only standard-library modules (`sys.stdlib_module_names`) are allowed. With
+   `import click` put back above the guard in `translate.py` (temporary edit, restored):
+   `AssertionError: assert ['click', …] == []`, 1 failed. New
+   `test_readable_by_an_old_interpreter`: `ast.parse(…, feature_version=(3, 9))` of
+   `translate.py` and `src/__init__.py`; one comment line in each says why.
+4. **Consolidation test.** Stubs `term_extractor._top_level_list` to raise `RecursionError`
+   (records the reply it got); same assertions (warning, decided 0 of 1, most frequent
+   translation kept).
+5. **`mutation.sh` on an old interpreter.** It now runs `python3 -c 'import src'` from the
+   repository root first and exits 2 with that message. Test with a `python3` on `PATH` that
+   reports 3.11.9 (message, exit 2, nothing on stdout) or 3.12.0 without mutmut (the mutmut
+   message, exit 2); skipped outside a git checkout. Real 3.9:
+
+   ```
+   $ PATH=<repo>/venv/bin:$PATH scripts/verify/mutation.sh main; echo "exit $?"
+   需要 Python 3.12 以上版本（目前是 3.9.6）；請以 python3.12 重建虛擬環境（見 README.md「安裝」）。
+   exit 2
+   ```
+6. **Docs.** `CLAUDE.md`: the venv command is for a fresh checkout, existing ones use the
+   README rebuild steps; a timeout followed by a successful retry leaves no segment failure and
+   no failure file (the web run log keeps a warning), same in the README. The lower-bounds
+   environment above is labelled as application and test fixtures (mutmut left out).
+
+Declined:
+
+- A bilingual export with `SOURCE_DATE_EPOCH=0` on 3.14: the added stylesheet's date is the
+  only field that may differ, already recorded; the exporter does not read that variable.
+- Secondary scripts (`phase2`/`3`/`7`/`8` verify scripts, `tests/conftest.py`) showing a missing
+  dependency or a generic stop instead of the version message on an old interpreter: the two
+  entry points and `mutation.sh` are covered; these run only in the project environment.
+
+The first mutation run of this round stopped at the stats step: the new parse test opened
+`src/__init__.py` by path, which the runner's copy renames; it now takes the path from the
+package. After that:
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once, 3.12.7
+2876 passed in 246.41s / 251.02s / 247.21s            (no failure, no warning in any)
+$ <venv314>/bin/python -m pytest tests/ -q -p no:cacheprovider -rfw
+2876 passed in 250.50s                                (no failure, no warning)
+$ scripts/verify/mutation.sh main
+TOTAL mutants 26  killed 26  survived 0  timeout 0  suspicious 0  untested 0
+```
+
+(The full suites ran on the commit before the path fix; `tests/test_python_version.py` was run
+again on both interpreters after it: 13 passed on each.)
+
+```
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+No real model calls.
