@@ -7762,7 +7762,7 @@ now agrees with rule 5.
 - `test_translator.py::TestPersonNameRule` (5): the plain-text and the HTML prompt, each with and
   without a glossary, contain the new rule exactly once and not "嚴格禁止翻譯"; the `[人名]` line
   is there only with a glossary; the code prompt has no name rule.
-- Changed: rule 5 now names "術語表" itself, so four assertions that used the bare word as the
+- Changed: rule 5 now names "術語表" itself, so five assertions that used the bare word as the
   sign of the glossary section now look for the section's heading `術語表（`
   (`test_no_glossary_section_without_glossary` also checks `術語類別說明` is absent; it failed
   with the bare word, the others would have passed without a glossary):
@@ -7811,8 +7811,10 @@ ERROR mutmut failed   (exit 2: "could not find any test case for any mutant")
 
 The only changed source line is part of a module-level string constant (`_SHARED_RULES`), which
 mutmut does not mutate, so there are no mutants. In its place, on `git archive HEAD` copies:
-the old rule put back → 4 of the 6 rule tests fail; one phrase of the new rule altered → 4
-fail; the `[人名]` line removed from the glossary section → 2 fail.
+the old rule put back → 4 of the 6 selected tests fail (the 4 parametrized cases of
+`test_text_prompts_carry_the_rule`; the code-prompt test and
+`test_no_glossary_section_without_glossary` pass); one phrase of the new rule altered → the
+same 4 fail; the `[人名]` line removed from the glossary section → 2 fail.
 
 ```
 $ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
@@ -7828,3 +7830,81 @@ Neither script has an anchor in the changed prompt text. Noticed and left: rule 
 (`依照術語表翻譯`) have the same kind of overlap rule 5 had, for terms instead of people.
 Not verified: longer passages, names the glossary lists only by surname or full name while the
 text uses the other form, and other models.
+
+## Fix: person names follow the glossary — review round 1
+
+Three reviewers; all requested changes. Fixed:
+
+1. **Partial names** (all three). A glossary usually lists a person once by full name, while
+   the text mostly uses the surname or given name; the first wording sent those to English, so
+   one person could be Chinese in one sentence and English in the next. Decision (coordinator,
+   as the reading of the owner's rule): part of a listed full name counts as listed and takes
+   the matching part of the glossary's rendering when the correspondence is clear (also with
+   possessives and plurals); when the glossary lists only a surname or a given name, the unlisted
+   part of a fuller name stays in English.
+2. **Title examples**: a listed case is added (`Ferrowind → 費洛溫` gives `費洛溫小姐`);
+   `Lord Halvarth` is now `Halvarth 勳爵` (no specific rank).
+3. **150-entry limit** (record only). Checked in the code: past `FULL_GLOSSARY_MAX_TERMS`=150,
+   `terms_for_prompt` keeps the entries `find_terms_in_text` finds, and `term_pattern` matches the
+   whole term (every word, from a word start; only suffixes are free), so a segment that says
+   only `Tarrowmere` does not get `Sabel Tarrowmere`, and the name stays in English there. Added
+   to `known-issues.md` (with the workaround: add the surname or given name as its own entry) and
+   one sentence to the README; CLAUDE.md's glossary line says it too.
+4. **Tests**: `TestPersonNameRule` no longer copies the rule; it asserts one line starting with
+   `5. 人名`, short clauses for listed / partly used / matching part / unlisted and unlisted part /
+   titles / the listed title example / `勳爵`, no `嚴格禁止翻譯` or `人名保持英文`, and the fixture's
+   entry line (`Quillon Marsh → 奎倫·馬許 [人名]`) only when a glossary is given. The two
+   heading assertions in `test_translator.py` now check the entry line `machine learning → 機器學習`
+   (the bare `machine learning` is in rule 2).
+5. **Log counts** in the entry above corrected (five assertions; which 4 of the 6 tests fail).
+
+Rule 5 now:
+
+```text
+5. 人名：術語表有列出的人名，照術語表的寫法（術語表給中文譯名就用中文譯名，給英文原文就保留英文原文）；術語表列全名、文中只用姓或名（含所有格、複數）稱呼同一人時，也算有列出，對應明確時用譯名中對應的部分，例如術語表有 Sabel Tarrowmere → 薩貝爾·塔洛米爾 時，Tarrowmere 寫成塔洛米爾；術語表沒有列出的人名，以及術語表只列姓或名時全名中沒有列出的部分，一律保留英文原文，不要自行翻譯，例如：Orla Vintermark、Tobin Quayle。稱謂、頭銜仍要翻譯，例如：術語表有 Ferrowind → 費洛溫 時，Miss Ferrowind 寫成費洛溫小姐；沒有列出時，Miss Dunmere、Lord Halvarth 寫成 Dunmere 小姐、Halvarth 勳爵。
+```
+
+### Real check, partial names (invented text, names not in the rule's examples; REAL calls: 12)
+
+Same harness as above (`translate_reply`, HTML path, default effort `low`). Case P: the glossary
+lists `<Given> <Surname>` (male) with a Chinese rendering `<G>·<S>`; the paragraph says
+`Dr. <Surname>`, `<Given>` alone, `<Given>'s`, and an unlisted `Miss <Other>`. Case S: the glossary
+lists only `<Surname>`; the paragraph says `<Given> <Surname>` once and `<Surname>` once. Each
+reply read in full; per reference: Chinese part used / English kept / other (reworded, pronoun).
+
+| Backend, model | Case | Runs | `Dr. <Surname>` | `<Given>` | `<Given>'s` | `Miss <Other>` | `<Given>` in `<Given> <Surname>` (S) | `<Surname>` (S) |
+|---|---|---|---|---|---|---|---|---|
+| `claude-cli` `sonnet` | P | 3 | 3 Chinese part + 醫師/醫生 | 3 full rendering `<G>·<S>` | 3 became 他 | 3 English + 小姐 | | |
+| `copilot-sdk` `gpt-6.2-sol` | P | 3 | 3 Chinese part + 博士 | 3 Chinese part `<G>` | 1 `<G>`的, 2 became 他 | 3 English + 小姐 | | |
+| `claude-cli` `sonnet` | S | 3 | | | | | 3 English | 3 Chinese (2 of 2 each) |
+| `copilot-sdk` `gpt-6.2-sol` | S | 3 | | | | | 3 English | 3 Chinese (2 of 2 each) |
+
+No reference stayed in English where the glossary covered it, no unlisted name or unlisted part
+was translated, and no Chinese rendering was invented. One deviation, reported as found and not
+tuned: Claude Sonnet wrote the given name alone as the full rendering `<G>·<S>` (3/3), not the
+matching part `<G>`; the person is still consistently Chinese. The possessive was mostly turned
+into a pronoun (allowed by the sentence-structure rules), so it was tested once in effect (Copilot
+run 2: `<G>`的). Copilot SDK: no new folder under `~/.copilot/session-state/`, no
+`copilot --headless` left.
+
+### Commands and results (final commit)
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once
+2982 passed in 264.46s / 263.67s / 265.41s           (no failure, no warning in any)
+```
+
+Hand mutations on `git archive HEAD` copies (mutmut does not mutate the string; the selection
+is `TestPersonNameRule` and `test_no_glossary_section_without_glossary`, 6 tests): old rule put
+back → 4 fail; the partial-name clause removed → 4 fail; the `[人名]` line removed from the
+glossary section → 2 fail.
+
+```
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+Both ran on the code commit of this round (the log commit after it changes no code). No anchor
+in the prompt text.
