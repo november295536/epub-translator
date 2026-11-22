@@ -900,7 +900,9 @@ class TestBackendSelection:
                             json={'model': 'gpt-6.2-sol', 'backend': 'copilot-cli'})
         assert answer.status_code == 200
         assert answer.get_json() == {'status': 'ok', 'model': 'gpt-6.2-sol',
-                                     'backend': 'copilot-cli'}
+                                     'backend': 'copilot-cli', 'effort': 'low',
+                                     'efforts': ['low', 'medium', 'high', 'xhigh', 'max'], 'timeout': 180,
+                                     'note': ''}
         stored = ProjectManager(os.path.join(str(tmp_path), PROJECT))
         stored.load()
         assert (stored.data.backend, stored.data.model) == ('copilot-cli', 'gpt-6.2-sol')
@@ -1594,7 +1596,9 @@ class TestRound1BackendKey:
         client = create_app(projects_dir=str(tmp_path)).test_client()
         answer = client.put(f'/api/projects/{PROJECT}/model',
                             json={'model': 'opus', 'backend': 'claude-cli'})
-        assert answer.get_json() == {'status': 'ok', 'model': 'opus', 'backend': 'claude-cli'}
+        assert answer.get_json() == {'status': 'ok', 'model': 'opus', 'backend': 'claude-cli',
+                                     'effort': 'low', 'efforts': ['low', 'medium', 'high', 'xhigh', 'max'],
+                                     'timeout': 180, 'note': ''}
         with open(os.path.join(path, 'project.json'), encoding='utf-8') as f:
             raw = json.load(f)
         assert raw['model'] == 'opus' and 'backend' not in raw

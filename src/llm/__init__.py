@@ -4,7 +4,7 @@ a project comes from backend_for(its backend name)."""
 from __future__ import annotations
 
 from src.llm.base import (  # noqa: F401
-    AuthError, BackendUnavailableError, CancelledError, Capabilities, LLMBackend, LLMError, LLMRequest,
+    EFFORT_LEVELS, AuthError, BackendUnavailableError, CancelledError, Capabilities, LLMBackend, LLMError, LLMRequest,
     LLMResponse, Message, ModelInfo, RateLimitError, RefusalError,
     TransientError, Usage,
 )

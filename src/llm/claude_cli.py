@@ -6,17 +6,20 @@ import re
 from typing import List, Optional
 
 from src.llm.base import (
-    AuthError, BackendUnavailableError, Capabilities, LLMError, LLMRequest, LLMResponse, ModelInfo,
-    RateLimitError, TransientError,
+    EFFORT_LEVELS, AuthError, BackendUnavailableError, Capabilities, LLMError, LLMRequest,
+    LLMResponse, ModelInfo, RateLimitError, TransientError,
 )
 from src.llm.cli import (
     ERROR_CHARS, SYSTEM_PROMPT, UNKNOWN_OPTION_PATTERN, CLIBackend, ProcessResult, _text,
 )
 
+# Effort levels: the values of `claude --help` (`--effort`, Claude Code
+# 2.1.330), which every model behind these aliases accepts. The CLI ignores
+# any other value with only a warning (exit 0), so only these are passed.
 MODELS = [
-    ModelInfo('sonnet', 'Sonnet', '快速且高品質，適合大多數翻譯'),
-    ModelInfo('opus', 'Opus', '最高品質，費用較高'),
-    ModelInfo('haiku', 'Haiku', '最快速度，適合簡單內容'),
+    ModelInfo('sonnet', 'Sonnet', '快速且高品質，適合大多數翻譯', EFFORT_LEVELS),
+    ModelInfo('opus', 'Opus', '最高品質，費用較高', EFFORT_LEVELS),
+    ModelInfo('haiku', 'Haiku', '最快速度，適合簡單內容', EFFORT_LEVELS),
 ]
 
 _RATE_LIMIT_PATTERN = re.compile(r"You've hit your limit", re.IGNORECASE)
@@ -55,8 +58,10 @@ class ClaudeCLI(CLIBackend):
     name = 'claude-cli'
     default_model = 'sonnet'
     auth_hint = AUTH_HINT
-    # Set inside a Claude Code session; the CLI refuses to start nested
-    env_remove = ('CLAUDECODE',)
+    # CLAUDECODE: set inside a Claude Code session; the CLI refuses to start
+    # nested. CLAUDE_CODE_EFFORT_LEVEL: takes precedence over --effort, so a
+    # value in the user's environment would replace the project's level
+    env_remove = ('CLAUDECODE', 'CLAUDE_CODE_EFFORT_LEVEL')
     # Plain-text output: no usage report, system prompt and turns flattened
     capabilities = Capabilities(
         separate_system=False, multi_turn=False, reports_usage=False,
@@ -70,6 +75,8 @@ class ClaudeCLI(CLIBackend):
         cmd = ['claude', '-p', prompt]
         if request.model:
             cmd += ['--model', request.model]
+        if request.effort:
+            cmd += ['--effort', request.effort]
         return cmd + list(LEAN_FLAGS)
 
     def parse_output(self, result: ProcessResult, request: LLMRequest) -> LLMResponse:

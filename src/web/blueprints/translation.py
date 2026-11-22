@@ -6,7 +6,10 @@ import json
 import os
 from flask import Blueprint, Response, jsonify, request, current_app
 
-from src.core.project import ProjectLockedError, ProjectManager
+from src.core.project import (
+    MAX_TIMEOUT, MIN_TIMEOUT, ProjectLockedError, ProjectManager, effort_levels,
+    effort_reset_note,
+)
 import src.llm as llm
 from src.core.translator import available_backends, available_models
 from src.web.tasks import TaskManager
@@ -190,18 +193,34 @@ def get_model(project_name: str):
     except Exception as e:
         return jsonify({'error': str(e)}), 404
 
-    backend = pm.data.backend or llm.default_backend().name
     return jsonify({
-        'current': pm.data.model,
+        **_settings(pm),
         'available': available_models(pm.data.backend),  # of the project's backend
-        'backend': backend,
-        'backends': available_backends(),
+        'backends': available_backends(),  # each model with its effort levels
+        'timeout_min': MIN_TIMEOUT,
+        'timeout_max': MAX_TIMEOUT,
     })
+
+
+def _settings(pm) -> dict:
+    """The project's backend, model, the effort and timeout its calls use,
+    and the effort levels of its model ([]: not configurable)."""
+    with pm.mutex:
+        settings = pm.call_settings()
+        return {
+            'current': settings.model,
+            'backend': settings.backend or llm.default_backend().name,
+            'effort': settings.effort,  # None: the model takes no level
+            'efforts': list(effort_levels(settings.backend, settings.model)),
+            'timeout': settings.timeout,
+        }
 
 
 @translation_bp.route('/api/projects/<project_name>/model', methods=['PUT'])
 def set_model(project_name: str):
-    """Set the translation model for a project."""
+    """Set the translation model (and its backend), the reasoning effort and
+    the call timeout of a project. `model` is required (the current one to
+    change only the others); `backend`, `effort`, `timeout` may be left out."""
     projects_dir = current_app.config['PROJECTS_DIR']
 
     data = request.get_json()
@@ -218,22 +237,25 @@ def set_model(project_name: str):
     try:
         with tm.transaction(project_name, projects_dir) as pm:
             with pm.mutex:  # a running task reads them under the mutex
-                previous = (pm.data.backend, pm.data.model)
+                previous = (pm.data.backend, pm.data.model, pm.data.effort, pm.data.timeout)
                 try:
-                    pm.select_model(backend, model)
+                    pm.select_model(backend, model, effort=data.get('effort'),
+                                    timeout=data.get('timeout'))
                 except ValueError as e:  # nothing changed
                     return jsonify({'error': str(e)}), 400
                 try:
                     pm.save()
                 except BaseException:
                     # not saved: the workers keep the old ones
-                    pm.data.backend, pm.data.model = previous
+                    (pm.data.backend, pm.data.model, pm.data.effort,
+                     pm.data.timeout) = previous
                     raise
-                chosen = pm.data.backend or llm.default_backend().name
+                answer = _settings(pm)
+                note = effort_reset_note(previous[2], pm.data)
     except (FileNotFoundError, ValueError) as e:
         return jsonify({'error': str(e)}), 404
 
-    return jsonify({'status': 'ok', 'model': model, 'backend': chosen})
+    return jsonify({'status': 'ok', 'model': answer.pop('current'), **answer, 'note': note})
 
 
 @translation_bp.route('/api/projects/<project_name>/brief')

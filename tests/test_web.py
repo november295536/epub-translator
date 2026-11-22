@@ -2484,7 +2484,7 @@ class TestBackendModels:
         with use_fake_backend(fake):
             data = client.get(f'/api/projects/{PROJECT_NAME}/model').get_json()
             assert data['available'] == [{'alias': 'fake-model', 'label': 'Fake',
-                                          'description': ''}]
+                                          'description': '', 'efforts': []}]
             assert client.put(f'/api/projects/{PROJECT_NAME}/model',
                               json={'model': 'sonnet'}).status_code == 400
             assert client.put(f'/api/projects/{PROJECT_NAME}/model',
@@ -3088,8 +3088,8 @@ class TestRound2StoredModelOption:
         # Phase 7: options are backend/model keys
         assert ("if (!this.availableModels.some(m => m.key === this.modelKey()))" in html)
         assert ("{ alias: this.model, label: this.model, description: '目前設定，後端未列出',\n"
-                "                                              backend: this.backend, "
-                "key: this.modelKey() }") in html
+                "                                              efforts: data.efforts, "
+                "backend: this.backend, key: this.modelKey() }") in html
 
     def test_model_unchanged_by_reading(self, client, project_with_translations):
         TaskManager._instance = None
