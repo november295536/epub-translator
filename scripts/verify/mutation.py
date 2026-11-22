@@ -1,7 +1,7 @@
 """Mutation testing over the lines changed on this branch (mutmut 3.8.1).
 
-Run through scripts/verify/mutation.sh, on an interpreter that has mutmut
-3.8.1 (Python 3.10 or later) and the requirements. argv: BASE.
+Run through scripts/verify/mutation.sh, in the project environment (both
+requirements files, mutmut 3.8.1). argv: BASE.
 
 Mutates only the lines added or changed versus the merge base with BASE in
 FILES, in a copy of the working tree under a temporary directory (the
