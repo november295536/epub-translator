@@ -579,6 +579,33 @@ class TestNothingCutShort:
         cancel.set()
         thread.join(WAIT)
 
+    def test_finished_turns_forgotten(self, client):
+        CopilotSDK().complete(_req(), threading.Event())
+        assert _wait(lambda: copilot_sdk._runtime._turns == {})
+
+    def test_close_bounded_by_a_stuck_turn(self, client, monkeypatch):
+        """A turn stuck where the stop event cannot reach it (a session
+        creation that never answers) does not hold the exit for ever."""
+        monkeypatch.setattr(copilot_sdk, 'CLEANUP_SECONDS', 0.2)
+        creating = threading.Event()
+
+        async def stuck(session_id, **options):
+            creating.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(client, 'create_session', stuck)
+        cancel = threading.Event()
+        thread = threading.Thread(target=lambda: _raises(
+            lambda: CopilotSDK().complete(_req(), cancel)), daemon=True)
+        thread.start()
+        assert creating.wait(WAIT)
+        done = threading.Event()
+        threading.Thread(target=lambda: (copilot_sdk._runtime.close(), done.set()),
+                         daemon=True).start()
+        assert done.wait(WAIT)
+        cancel.set()
+        thread.join(WAIT)
+
     def test_reply_after_the_deadline_refused(self, client, monkeypatch):
         clock = iter([0.0, 0.0])
         monkeypatch.setattr(copilot_sdk, 'time', SimpleNamespace(
@@ -665,8 +692,9 @@ class TestErrors:
             return _event('assistant.message', content='partial')
 
         client._respond = filtered
-        with pytest.raises(RefusalError, match='content filter'):
+        with pytest.raises(RefusalError) as e:
             CopilotSDK().complete(_req(), threading.Event())
+        assert str(e.value) == 'copilot SDK: the reply was filtered (content filter)'
 
     @pytest.mark.parametrize('reasons, stop_reason', [
         (['stop', 'length'], 'truncated'), (['length', 'stop'], 'complete'),
