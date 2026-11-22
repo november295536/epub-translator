@@ -6637,3 +6637,72 @@ exit 0                      (not killed 0; 81 KILLED)
 The 4 survivors are the equivalent `prompt_text` mutants justified above. Real model calls in
 this round: the 20 listed in the table (one per model) and none else; level probes made no
 model call.
+
+## Phase 10 — review round 2
+
+Opus approved, GPT requested changes, Gemini ran out of turns before the web and test parts.
+Fixed:
+
+- No test can start a real model program.
+  - `tests/conftest.py::model_programs_replaced` (session, autouse): `claude` and `copilot` on
+    `PATH` are stand-ins that print a message and exit 97, for the whole session and every child
+    process the tests start. The backends start the programs by name, so any route reaches only
+    the stand-in.
+  - `tests/test_verify_scripts.py::no_unstubbed_script_process` (autouse): `run_process` of the
+    measuring scripts that import it by name raises `UnexpectedProcess` (a `BaseException`, so
+    the scripts' `except Exception` cannot swallow it) unless the test installs its own stub.
+    `TestNoRealModelProcess` checks both.
+  - Found in the other measuring scripts' tests: `phase7_cli_overhead` and
+    `phase9_copilot_overhead` had the same hole (both `from src.llm.cli import run_process`, so
+    conftest's patch of `src.llm.cli.run_process` did not reach them). Every existing test of
+    theirs installs its own stub before calling `main`/`one_call`, so none started a process,
+    but a mutant or a new test could have. `phase7_throughput`, `phase8_brief_sample` and
+    `phase8_extraction_compare` call backends through `src.llm.cli.run_process` (guarded). The
+    phase 8 tests that run `phase8_extraction_compare.py` in a fresh interpreter, outside the
+    in-process guard, use a stub checkout and make no backend call; they are now also covered
+    by the stand-ins on `PATH`.
+- `select_model` (`src/core/project.py`) clears a stored level the model does not list only when
+  the backend or model changes (also not for the same model selected again); an effort- or
+  timeout-only change keeps it, and `call_settings` falls back meanwhile. Test:
+  `TestSelect::test_unlisted_stored_level_kept_without_a_model_change`.
+- Page: Start, Retry and Resume are disabled while a settings save is pending
+  (`modelLoading`), and `startTranslation` / `pauseTranslation('resume')` return at once while
+  it is; Pause stays available. Tests: the bindings (`TestRunWaitsForSettings::test_markup`) and
+  the controller in Node with a pending PUT (`test_run_actions_wait`: only the PUT and the pause
+  go out; start goes out after the save). Removing the guard in `startTranslation` makes the
+  Node test fail (checked by editing it out). Checked in Chrome on an invented project with the
+  PUT held: Start disabled while it was pending, a click sent nothing, enabled after; the timeout
+  was stored.
+- README and CLAUDE.md: a known level the model does not list falls back (the file keeps it
+  until a model change); an unknown value such as `"bogus"` makes the project fail to load and
+  must be corrected or removed.
+- Phase 10 Design/Tests above: the three stale statements are marked corrected in place.
+
+Declined:
+
+- The script classifying Claude's JSON envelope instead of the plain reply: the classification
+  the script needs is call failed or not; the envelope's `is_error` is checked as well.
+- A stale tab keeping its old effort shown after a refusal: the refusal message says what the
+  model takes; a reload shows the stored state.
+- Settings controls editable before the first GET returns: a save then sends only that setting,
+  which the server checks against the stored model.
+- Reading `session.model_change` for the reported level: `session.start` reports the level for
+  every configurable model measured.
+- Catching Ctrl-C in the script: an interrupted measurement is not a result; run_process kills
+  the process group.
+- Comparing the old-file round-trip against fixed fixture bytes: the test compares with the file
+  as written by the same code before the change, which is what round-trip means here.
+
+```
+$ scripts/verify/mutation.sh main
+TOTAL mutants 677  killed 673  survived 4  timeout 0  suspicious 0  untested 0
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once
+2858 passed in 237.70s / 232.63s / 231.56s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+The 4 survivors are the equivalent `prompt_text` mutants justified in the Phase 10 entry. No
+real model calls in this round.
