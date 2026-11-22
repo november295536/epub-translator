@@ -7600,8 +7600,8 @@ in place, the new tests run: 7 of the new `TestRoundTwo` tests failed, the 4 fil
    creation; `copilot -p` creates the session itself. Tried: the plugin's extension passing
    `state: { enableCrossSessionStore: false }` to `joinSession`, then ONE real call through
    `CopilotCLI` (Claude Haiku 4.5, invented sentence with a marker): `sessions` rows 35 → 36, one
-   `turns` row holds the marker, session id `(id removed)` (left in place,
-   not deleted). The extension change was reverted. Documented in `known-issues.md`, README and
+   `turns` row holds the marker (the row and its session folder were removed afterwards at the
+   owner's request). The extension change was reverted. Documented in `known-issues.md`, README and
    CLAUDE.md, with `copilot-sdk` recommended for real books and both backends' folders and the
    store stated to be local files.
 
