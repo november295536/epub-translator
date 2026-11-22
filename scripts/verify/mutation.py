@@ -62,7 +62,7 @@ FILES = [
     'src/core/migrate.py', 'src/core/validation.py', 'src/epub/blocks.py', 'src/epub/extractor.py', 'src/epub/exporter.py',
     'src/glossary/glossary_manager.py', 'src/glossary/term_extractor.py',
     'src/llm/__init__.py', 'src/llm/base.py', 'src/llm/cli.py', 'src/llm/claude_cli.py',
-    'src/llm/copilot_cli.py', 'src/llm/fake.py', 'src/web/tasks.py', 'src/web/server.py', 'src/web/blueprints/export.py', 'src/web/blueprints/home.py',
+    'src/llm/copilot_cli.py', 'src/llm/copilot_sdk.py', 'src/llm/fake.py', 'src/web/tasks.py', 'src/web/server.py', 'src/web/blueprints/export.py', 'src/web/blueprints/home.py',
     'src/web/blueprints/glossary.py', 'src/web/blueprints/projects.py',
     'src/web/blueprints/review.py', 'src/web/blueprints/search.py',
     'src/web/blueprints/translation.py', 'translate.py',
@@ -73,6 +73,7 @@ FILES = [
     'scripts/verify/phase7_cli_overhead.py', 'scripts/verify/phase7_throughput.py',
     'scripts/verify/phase8_extraction_compare.py', 'scripts/verify/phase8_brief_sample.py',
     'scripts/verify/phase9_copilot_overhead.py', 'scripts/verify/phase10_effort_check.py',
+    'scripts/verify/phase12_sdk_check.py',
 ]
 MODULE_REF = re.compile(r'\bsrc\.(core|epub|web|glossary|llm)\b')
 OK = ('killed',)  # any other status, known or not, fails the run

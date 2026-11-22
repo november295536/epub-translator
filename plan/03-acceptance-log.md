@@ -7160,3 +7160,572 @@ $ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # 3.12.7
 ```
 
 Only tests and documentation changed in this round. No real model calls.
+
+## Phase 12 — Copilot SDK backend
+
+`copilot-sdk` (`src/llm/copilot_sdk.py`) on `microsoft-copilot-sdk` 2.0.1 with Copilot CLI
+1.0.114 as its runtime, Python 3.12.7. Every real call used invented text only; the runs were
+made from a scratch directory, with a scratch `projects/` for the end-to-end runs.
+
+### Findings before building (no model call unless noted)
+
+- The wheel is pure Python (dependencies `httpx`, `pydantic`, `python-dateutil`): `pip install`
+  alone. With an explicit `path` the SDK uses that program (`_resolve_runtime_entrypoint`:
+  explicit > `COPILOT_CLI_PATH` > download); the download runs only without one.
+- `client.start()` on a client whose runtime was killed (SIGKILL between calls) started a new
+  runtime in 0.29 s (new pid), and `create_session` then worked: no new client is needed.
+- `delete_session` removes `~/.copilot/session-state/<id>/`. A session whose creation failed
+  (effort refused at `session.create`) left a folder with only `workspace.yaml`, which is why the
+  backend chooses the session id and deletes it in every case.
+- Error texts: unknown model `JSON-RPC Error -32603: Request session.create failed with message:
+  Model "no-such-model-xyz" is not available.`; effort on Claude Haiku 4.5 `… session
+  construction failed: Model 'claude-haiku-4.5' does not support reasoning effort
+  configuration. …`; `xhigh` on Gemini 4 Argon `Execution failed: Reasoning effort 'xhigh' is not
+  supported for model 'gemini-4-argon'.` (at send, `session.error` errorType `query`, no usage).
+  The CLI's effort pattern expected double quotes; it now takes either.
+- The runtime exits when its parent dies: product runtime started, then the Python process
+  killed with SIGKILL, SIGTERM, or SIGINT to its process group (a terminal's Ctrl-C): no runtime
+  left in each case.
+- No login: the product backend with `COPILOT_HOME` set to an empty scratch directory and no
+  GitHub CLI on PATH (and no token variables) → `AuthError Copilot SDK 沒有已登入的帳號，請在終端執行
+  copilot login 重新登入`. (This only simulates a missing login; the product never sets
+  `COPILOT_HOME`.)
+- Account premium request count (`account.getQuota`, `premium_interactions.usedRequests`): the
+  same value before and minutes after about 3.6 premium requests of completed calls, so it is not
+  usable as billing evidence; the check script reports the SDK's per-call `cost` instead.
+- The Copilot CLI backend keeps every call as a session (Phase 9, `phase9_copilot_overhead`
+  docstring); `copilot -p` has no option to avoid it, and that backend does not delete them.
+
+### Check script (REAL calls: 5 completed, 2 aborted; 2.32 premium requests reported)
+
+Final version of the script, on the final backend:
+
+```
+$ python3 scripts/verify/phase12_sdk_check.py; echo "exit $?"
+1. refusals before any model call
+  ok   unknown model/effort: BackendUnavailableError  BackendUnavailableError
+  ok   unknown: no model call
+  ok   effort model/effort: BackendUnavailableError  BackendUnavailableError
+  ok   effort: no model call
+2. three concurrent calls
+  concurrent 0 reply                    wall   3.51 s  in    96  out   266  cost [0.33]  effort [None]
+  concurrent 1 reply                    wall   4.91 s  in    97  out   402  cost [0.33]  effort [None]
+  concurrent 2 reply                    wall   4.05 s  in    93  out   305  cost [0.33]  effort [None]
+  ok   all three answered in Chinese
+  ok   the three calls overlapped in time
+  ok   one runtime process  1
+3. runtime killed, then a translation with the product prompt
+  ok   the runtime is gone
+  translation  reply                    wall   7.64 s  in  1408  out   551  cost [0.33]  effort [None]
+  ok   translation reply in Chinese
+  ok   a new runtime process
+  ok   usage reported
+4. effort low on claude-haiku-5.5
+  effort       reply                    wall   0.87 s  in    83  out    18  cost [1.0]  effort ['low']
+  ok   the model call reports effort low  ['low']
+5. cancel and timeout mid-turn
+  cancelled    CancelledError           wall   2.05 s  in     0  out     0  cost []  effort []
+  ok   cancelled: CancelledError
+  ok   cancelled: the model call had started
+  ok   cancelled: returned within 1 s  0.10 s
+  ok   cancelled: session went idle as aborted  idle events 1
+  ok   cancelled: no assistant.usage (nothing reported billed)
+  ok   cancelled: session deleted
+  timed out    TransientError           wall   6.00 s  in     0  out     0  cost []  effort []
+  ok   timed out: TransientError
+  ok   timed out: the model call had started
+  ok   timed out: returned within 1 s  0.00 s
+  ok   timed out: session went idle as aborted  idle events 1
+  ok   timed out: no assistant.usage (nothing reported billed)
+  ok   timed out: session deleted
+6. session files
+  ok   no session directory left of the 9 sessions  0 left
+  ok   a delete asked for every session
+7. stop
+  ok   no runtime process left  0
+information
+  cost the SDK reported in total: 2.32 premium requests
+  runtime logs written during the run: 2; hold prompt text: no
+PASS
+exit 0
+```
+
+What this shows and what it does not: the effort line is the runtime's own record of the model
+call (`assistant.usage` `reasoningEffort`), not a measurement of how much the model reasoned.
+"Nothing reported billed" means the SDK reported no usage for the aborted turn; the account's
+own count could not confirm it (above). Two earlier runs of the script while it was being
+written (same steps, 2.32 premium requests each) passed the same checks, except that the first
+recorded a deletion only after `delete_session` returned and so failed "every session deleted"
+for the two sessions whose creation had failed (their folders were gone all the same). The
+session folder count in `~/.copilot/session-state/` was the same before and after each run, and
+no `copilot --headless` process was left.
+
+### End to end, CLI (invented two-chapter book, 4 segments; REAL calls, Claude Haiku 4.5)
+
+```
+$ translate.py init harbour.epub            -> 提取了 2 個章節 / 分段完成：共 4 個段落
+$ translate.py model set -p projects/harbour -b copilot-sdk -m claude-haiku-4.5
+已設定模型：claude-haiku-4.5（copilot-sdk）
+推理強度：此模型不可設定，呼叫逾時：180 秒
+$ translate.py start -p projects/harbour -w 3
+  [W1] [1/4] ✓ chapter_0_seg0002（7 字）
+  [W2] [2/4] ✓ chapter_1_seg0001（35 字）
+  [W1] [3/4] ✓ chapter_1_seg0002（7 字）
+  [W0] [4/4] ✓ chapter_0_seg0001（62 字）
+全部翻譯完成！                               (exit 0, 14.0 s)
+$ translate.py status -p projects/harbour   -> 總段落數 4，已翻譯 4，失敗 0
+$ translate.py export -p projects/harbour
+已輸出：projects/harbour/output/harbour-bilingual-horizontal.epub
+以譯文匯出 2 段，保留原文 2 段（另有 0 段未翻譯或翻譯失敗，以原文匯出）
+  程式碼區塊含標記（code_markup）：2
+```
+
+The two code segments stay in English at export for `code_markup`, the exporter's existing rule
+for these `<pre><code>` blocks, not the backend. No runtime process was left after `start`, and
+the number of session folders was the same before and after.
+
+Ctrl-C: a second copy of the book, `start -w 3`, SIGINT to the CLI's process group 2.5 s after
+the runtime started → `翻譯中斷，正在停止進行中的段落……`, exit 1, nothing saved as translated, no
+runtime left; but 3 session folders (only `events.jsonl`, holding the prompt) were left: the
+runtime received the same SIGINT and exited before the backend could delete the sessions of the
+3 calls in flight. Recorded as a risk (plan); the folders, invented text, were removed by hand.
+
+### End to end, web (same project; REAL calls)
+
+App factory on the scratch `projects/`, model API, start with 3 workers, pause after 3 s, resume,
+server stopped with SIGINT to its process group:
+
+```
+backends ['claude-cli', 'copilot-cli', 'copilot-sdk'] current copilot-sdk claude-haiku-4.5
+start ok
+pause {'state': 'paused', 'status': 'ok'}
+after pause {'state': 'paused', 'completed': 0, 'total': 4, 'failed': None}
+runtime children while paused 1
+resume {'state': 'running', 'status': 'ok'}
+end {'state': 'completed', 'completed': 4, 'total': 4, 'failed': None}
+server exit 0
+runtime left []
+session dirs 419 -> 419
+```
+
+The pause cancelled the 3 calls in flight (nothing completed before it), their sessions were
+deleted; the run log holds only the task's and werkzeug's lines (the SDK's logger is at ERROR).
+
+### Mutation testing
+
+Four runs of `scripts/verify/mutation.sh main` (both new files added to `mutation.py`). The
+first (1135 mutants, 307 survived, 28 timeout, 4 suspicious) led to: simpler code where the
+survivors showed needless parts (the event type is always the SDK's enum; only
+`ProcessExitedError` skips the patterns, other disconnects fall through to transient anyway; a
+fixed poll interval; `close` guards on the client only; the script's waits on a condition
+instead of polling, one helper per repeated step); tests for messages, the cleanup and close
+bounds, the idle wait, the loop thread being a daemon, the working directory; and for the check
+script a stricter fake runtime (records each session's model, effort, prompt and deletion; a
+killed or stopped runtime still listed for one poll), its full expected output, one failing run
+per check, `--help`, flushing. The 4 suspicious mutants were the ones that dropped the runtime
+path: the SDK then tries to download its own runtime. The suite now sets
+`COPILOT_SKIP_CLI_DOWNLOAD=1` for the session (conftest), and a test shows a client without a
+path is refused.
+
+```
+$ scripts/verify/mutation.sh main          # final run, on the committed tree
+TOTAL mutants 1039  killed 1017  survived 19  timeout 3  suspicious 0  untested 0
+```
+
+Each one not killed, and why:
+
+- `src/llm/copilot_sdk.py`: `finished = None`, `_thread = ""`, `_authenticated = None`, `_closed
+  = None` (initial values only tested for truth, or replaced before use): equivalent.
+- `phase12_sdk_check.py`, `request()`: `system=None` and the message role `None`/`XXuserXX`/`USER`:
+  a one-message request with no system prompt is flattened to the message text alone
+  (`flatten_prompt`), so neither reaches the runtime: equivalent.
+- `'Say OK.'` changed (2): the prompt of the two refusals, which fail at session creation before
+  any message is sent: equivalent.
+- `TranslationEngine(backend=None)`, `_build_prompt(None, …)`, `_build_prompt('', None, …)`: the
+  text prompt does not depend on the engine's backend, an empty brief and `None` give the same
+  prompt, and a segment type other than code builds the text prompt: equivalent (the test
+  compares the whole prompt).
+- Boundaries `0 < latency`, `max(start) <= min(end)`, `getmtime(p) > run_start`: differ only for
+  exactly equal float clock readings.
+- `encoding=None` / `'UTF-8'` when reading the runtime logs: the same codec here (UTF-8 locale).
+- `watch.wait(lambda: None, …)` before the checks of an aborted call: with the fake runtime the
+  delete is already asked by then; the wait covers a real runtime's latency.
+- Timeout (3): the waits without a bound (`wait_for(…, None)`) hang when the condition never
+  holds, which the tests make happen: detected, as a hang rather than a failure.
+
+The one mutant of the first run that survived although its test fails when it is applied by hand
+(`asyncio.timeout(None)` in `_clean_up`: `test_cleanup_bounded` fails after 14 s) was killed in
+the later runs by a test that runs the cleanup on the test's own thread.
+
+### Suite and guards (final commit)
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once, 3.12.7
+2946 passed in 239.04s / 244.26s / 249.58s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+## Phase 12 — review round 1
+
+All three reviewers requested changes; the main defect (a session folder, holding the prompt,
+left behind outside the recorded Ctrl-C case) was confirmed for real and fixed. Real calls in
+this round: invented text only, Claude Haiku 4.5 (and Haiku 5.5 for the check's effort call).
+
+1. **Cleanup was cut short.** `complete`'s `future.cancel()` injected `CancelledError` into the
+   turn while it was aborting or deleting (`except Exception` does not catch it), so the delete was
+   skipped: when the loop's own `send_and_wait` timeout fired first and the poll noticed up to
+   0.1 s later, when a pause arrived while a finished call was deleting its session, or when
+   several workers were cancelled mid-cleanup. Reproduced with fakes whose `abort` and
+   `delete_session` really yield and whose send honours a timeout: `test_loop_timeout_first`,
+   `test_pause_while_deleting` fail on the previous code (`client.deleted` never set), as does
+   `test_close_waits_for_cleanups` (no abort at close). Now the turn is never cancelled from
+   outside: `complete` sets the turn's stop event; the turn waits for the reply or the stop
+   (`asyncio.wait`, first completed), and on stop or any error aborts, waits for idle and deletes.
+   A stop during session creation sends no prompt (`test_cancel_while_creating_sends_nothing`:
+   create, delete, no send, no abort).
+2. **`close()` did not drain, and ran too late.** Reproduced for real (one call each, then exit;
+   the hook's outcome printed by a wrapper around `_stop`):
+
+   ```
+   previous code    timeout: call TransientError, exit hook: stop() failed: RuntimeError cannot
+                    schedule new futures after shutdown; session folders 419 -> 420
+                    cancel:  call CancelledError, same failure;      session folders 420 -> 421
+   fixed code       timeout: call TransientError, exit hook: stop() ok; folders 422 -> 422
+                    cancel:  call CancelledError, exit hook: stop() ok; folders 422 -> 422
+   ```
+
+   The claim holds: `concurrent.futures` shuts its executors down from `threading`'s exit hooks,
+   which run before `atexit` hooks, and the SDK's `stop()` runs blocking steps through
+   `asyncio.to_thread`. `close()` now stops the turns still running, waits for them (10 s at most)
+   and only then stops the client; it is registered with `threading._register_atexit` when the
+   loop starts (`atexit` stays as a fallback; `close` runs once). That hook list runs in reverse,
+   so `concurrent.futures.thread` is imported first: without that import (its hook then registered
+   after ours, on the SDK's first `to_thread`) the same failure was seen once more with the hook in
+   place. This is the smallest thing that runs early enough; a private function, but the one
+   `concurrent.futures` itself uses. Kept out of the check script (it needs its own process); the
+   one-off evidence is above. Of the 5 folders the failing runs left, the last 3 were removed with
+   `client.delete_session`, the first 2 by hand (see 5).
+3. **Deadline.** The poll waits at most the remaining time, and a reply that arrives after the
+   deadline is refused (`TransientError`), as `run_process` does (two tests, one with a fake clock).
+4. **Classification before truncation.** Patterns are matched on the whole redacted text (now
+   with the `session.error` type before its message, as the CLI backend does); only the message is
+   cut to 500 characters (test: a rate limit after 2000 characters).
+5. **Cross-session store: the reviewer was right.** SDK 2.0.1 leaves
+   `state.enable_cross_session_store` unset in mode `coding-agent`, and the runtime then indexes
+   the prompt and reply in `~/.copilot/session-store.db`. One completed, deleted call with an
+   invented marker, files under `~/.copilot` outside `session-state/` and `logs/` compared before
+   and after: previous code `config.json`, `session-store.db`, `-shm`, `-wal` changed, the
+   database and its WAL held the marker (the session's rows were gone after the delete, the bytes
+   were still in the file); with `enable_cross_session_store: False` only `config.json` and the
+   `-shm` file changed and no file under `~/.copilot`, logs included, held the marker. Also seen:
+   the store keeps the rows of sessions whose folders were removed by hand or left by Ctrl-C, and
+   `delete_session` refuses those ids ("Session file not found"), so the earlier test sessions of
+   this phase that were cleaned up by hand left invented text in the store (no book text).
+6. **Truncated and filtered replies.** The SDK's `assistant.usage` has `finish_reason` and
+   `content_filter_triggered`: a last `length` gives `stop_reason='truncated'`, a filter
+   `RefusalError`. The translator does not read `stop_reason` (a cut reply fails its check and is
+   retried or split, as before), so this changes nothing there. Every real call reported `stop`
+   and `false`; neither case was observed.
+7. **Tests.** The conftest session fixture also clears `COPILOT_CLI_PATH` and points
+   `COPILOT_CLI_EXTRACT_DIR` at a temporary directory. The fake `abort()` returns before the idle
+   event is delivered, and the timeout test checks the order create, abort, idle, delete.
+8. **Check script.** An aborted call's checks wait (to a deadline) for its session folder to
+   disappear instead of sleeping 3 s; once it is gone the session can report nothing more. The
+   fake runtime now creates and removes the folders.
+9. **Docs.** README: "內建的後端都不提供"; what was observed for the two mid-turn aborts (no usage
+   event) instead of "zero usage and cost"; the store; when folders can still be left. Plan and
+   `CLAUDE.md` describe the stop event, the exit hook and the store.
+
+Declined:
+
+- Disabling OpenTelemetry exporters inherited from the owner's environment: the CLI backend
+  inherits them too, and the environment is the owner's.
+- Sharing the first authentication check among workers that start together: a few extra
+  `getStatus` calls at the first start only.
+- The check script's model-start and overlap instrumentation.
+
+Check script once more, on the fixed backend (folders 419 -> 419, no runtime left):
+
+```
+$ python3 scripts/verify/phase12_sdk_check.py; echo "exit $?"
+1. refusals before any model call
+  ok   unknown model/effort: BackendUnavailableError  BackendUnavailableError
+  ok   unknown: no model call
+  ok   effort model/effort: BackendUnavailableError  BackendUnavailableError
+  ok   effort: no model call
+2. three concurrent calls
+  concurrent 0 reply                    wall   3.81 s  in    96  out   282  cost [0.33]  effort [None]
+  concurrent 1 reply                    wall   4.51 s  in    97  out   358  cost [0.33]  effort [None]
+  concurrent 2 reply                    wall   4.35 s  in    93  out   300  cost [0.33]  effort [None]
+  ok   all three answered in Chinese
+  ok   the three calls overlapped in time
+  ok   one runtime process  1
+3. runtime killed, then a translation with the product prompt
+  ok   the runtime is gone
+  translation  reply                    wall   7.89 s  in  1408  out   602  cost [0.33]  effort [None]
+  ok   translation reply in Chinese
+  ok   a new runtime process
+  ok   usage reported
+4. effort low on claude-haiku-5.5
+  effort       reply                    wall   0.83 s  in    83  out    20  cost [1.0]  effort ['low']
+  ok   the model call reports effort low  ['low']
+5. cancel and timeout mid-turn
+  cancelled    CancelledError           wall   1.19 s  in     0  out     0  cost []  effort []
+  ok   cancelled: CancelledError
+  ok   cancelled: the model call had started
+  ok   cancelled: returned within 1 s  0.08 s
+  ok   cancelled: session went idle as aborted  idle events 1
+  ok   cancelled: no assistant.usage (nothing reported billed)
+  ok   cancelled: session deleted
+  timed out    TransientError           wall   6.01 s  in     0  out     0  cost []  effort []
+  ok   timed out: TransientError
+  ok   timed out: the model call had started
+  ok   timed out: returned within 1 s  0.01 s
+  ok   timed out: session went idle as aborted  idle events 1
+  ok   timed out: no assistant.usage (nothing reported billed)
+  ok   timed out: session deleted
+6. session files
+  ok   no session directory left of the 9 sessions  0 left
+  ok   a delete asked for every session
+7. stop
+  ok   no runtime process left  0
+information
+  cost the SDK reported in total: 2.32 premium requests
+  runtime logs written during the run: 2; hold prompt text: no
+PASS
+exit 0
+```
+
+Mutation testing after the fixes (three runs this round; the first stopped in mutmut's stats run
+on a test that asserted whether three calls failing at once overlap in time, which depends on
+scheduling: no longer asserted; the second led to tests for the finished-turn bookkeeping, a
+turn stuck where the stop cannot reach it at exit, and the filter message):
+
+```
+$ scripts/verify/mutation.sh main
+TOTAL mutants 1120  killed 1084  survived 36  timeout 0  suspicious 0  untested 0
+```
+
+Not killed, and why (equivalent unless said otherwise):
+
+- `copilot_sdk.py`: `session = ""`, `running = None` (twice), `_thread = ""`, `_authenticated =
+  None`, `_closed = None` (only tested for truth, or replaced before use); the message of the two
+  `CancelledError`s the turn raises when stopped (6: nobody reads that result, the caller has
+  already raised its own); `_turns.pop(future, )` (the future is always there); the two deadline
+  comparisons `>=`/`>` (differ only at an exactly equal clock reading).
+- `phase12_sdk_check.py`: the same as in the first round (`request()`'s system prompt and
+  message role, `'Say OK.'`, the engine's backend and `_build_prompt`'s first two arguments, now
+  4: the text argument is not used when the HTML is given; `getmtime >`, `0 < latency`,
+  `latency <= 1`, `max(start) <= min(end)`; the log codec, 3); `latency < 2` (a bound the fake
+  cannot reach: the backend returns within one 0.1 s poll); `until`'s poll count and
+  `children_gone`'s 6 s instead of 5 (how long a runtime is given to go).
+
+Suite and guards after the fixes:
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once, 3.12.7
+2959 passed in 248.81s / 255.69s / 251.78s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+Real calls this round: 9 calls aborted mid-turn for the exit reproduction (2 on the previous
+code, 2 with the hook but without the import, 5 on the fixed code with and without a trace), 2 completed calls for the store comparison, the check script (5 completed, 2
+aborted, 2.32 premium requests reported).
+
+## Phase 12 — review round 2
+
+Small fixes, each with a test that fails on the round 1 code (`git show f0f4538:src/llm/copilot_sdk.py`
+in place, the new tests run: 7 of the new `TestRoundTwo` tests failed, the 4 filter cases and the
+"close during the first start" case passed: that case only took the 10 s wait there).
+
+1. **Delete skipped when the abort failed.** Abort and the wait for idle now have their own `try`
+   and bound (`ABORT_WAIT_SECONDS`, 5 s together); the delete is always attempted afterwards under
+   its own bound (`CLEANUP_SECONDS`, 10 s). Tests: a fake `abort` that raises (`session is
+   idle`) and one that hangs; the session is deleted in both. Fake-tested only: provoking a
+   failing abort on a real session would need an errored session mid-turn, which no cheap call
+   gives.
+2. **Cold-start `close()` race.** `close()` returned when no client existed yet, although a first
+   turn was already submitted. Now it stops and waits for every submitted turn whenever the loop
+   exists, reads the client only afterwards, and `client()` refuses once closed. Test: the loop
+   held busy by another coroutine, a first call submitted, `close()` called, then the loop
+   released: no client made, the call gets `CancelledError`, and `client()` refuses (failed on
+   the old code: one client made). The first version of this test held the loop only after the
+   call was submitted; under three concurrent suites the turn sometimes reached `client()`
+   first (3 of 3 runs failed): the hold now comes first.
+3. **Stop missed between steps.** The stop and the caller's cancel are checked on entry, after
+   the client is ready, and before the prompt is sent. Test: the cancel arrives while the session
+   is created, creation is released before the caller is joined and before its next poll
+   (`POLL_SECONDS` 2 s): nothing is sent, the session is deleted.
+4. **Setup without a bound.** Starting the client (start and auth) and the send race the stop
+   event, which the caller sets at its deadline at the latest; session creation is not raced
+   (given up half-way it could leave a session) and is bounded by the request's timeout
+   (`asyncio.wait_for`). Tests, one per step (`start`, `get_auth_status`, `create_session`)
+   stuck: the call times out, the turn ends, and a later call succeeds. A first version also gave
+   every step its own deadline inside the turn; mutation testing showed that bound and the
+   stop/timeout distinction were never reached (the caller always stops first), so they were
+   removed.
+5. **Reviewer's claim on `close()` holds.** `.result(CLEANUP_SECONDS)` timing out raised
+   `TimeoutError`, which `except BaseException: pass` swallowed: `force_stop()` was never called
+   when `stop()` hung. Now `_stop` bounds the graceful stop (10 s) inside the coroutine and then
+   calls `force_stop()`; `close()` waits for that at most 20 s. Tests: a hanging `stop()` ends in
+   `force_stop` (failed on the old code); `stop()` and `force_stop()` both hanging, `close()`
+   still returns.
+6. **Content filter.** `RefusalError` only when the last usage event is filtered or the reply is
+   empty; an earlier filtered call followed by a reply is accepted. Test: four cases.
+7. **Tests that could pass for the wrong reason.**
+   - `test_stopped_at_interpreter_exit`: the fake `delete_session` and `stop()` now use
+     `asyncio.to_thread` (as the SDK's stop does), a call is in flight when the main thread ends,
+     and the test asserts `EXIT`, `DELETED`, `STOPPED`. With `threading._register_atexit` removed:
+     `['EXIT', 'FORCED']` (fails); with the `concurrent.futures.thread` import removed: fails.
+     The child's call thread catches its exception: a traceback printed while the interpreter
+     finalizes aborted the child once under load (`_enter_buffered_busy`, exit -6).
+   - `test_reply_after_the_deadline_refused`: `POLL_SECONDS` is set to 10 s and the test asserts
+     it returned well within 5 s, and that the session was deleted without an abort: the reply
+     path ran, not the "still running" branch.
+8. **Docs.** README, CLAUDE.md and the plan: Ctrl-C in the terminal of a running web server during
+   a translation leaves the session folders too (pause first); the exit wait is about 20 s (10 s
+   for the turns, 10 s for the stop). The check run's completed calls: 3 concurrent, 1
+   translation, 1 effort = 5 (0.33 × 4 + 1.0 = 2.32), not 6; corrected in two places above.
+9. **`copilot-cli` and the cross-session store.** No per-call switch in Copilot CLI 1.0.114:
+   `copilot --help`, `copilot help config` and `copilot help environment` name none
+   (`session-store.db` is only listed under "Files and directories"; `--sync-session` is account
+   history sync, `memory` is agentic memory). The runtime's `enableSessionStore` session option
+   (the SDK's `enable_cross_session_store`, wire key `enableSessionStore`) is only set at session
+   creation; `copilot -p` creates the session itself. Tried: the plugin's extension passing
+   `state: { enableCrossSessionStore: false }` to `joinSession`, then ONE real call through
+   `CopilotCLI` (Claude Haiku 4.5, invented sentence with a marker): `sessions` rows 35 → 36, one
+   `turns` row holds the marker (the row and its session folder were removed afterwards at the
+   owner's request). The extension change was reverted. Documented in `known-issues.md`, README and
+   CLAUDE.md, with `copilot-sdk` recommended for real books and both backends' folders and the
+   store stated to be local files.
+
+Also found: the check script paired the three concurrent sessions with their results by
+creation order, which need not be the threads' order (the mutation stats run failed once on the
+golden output: 77 input tokens where 73 were expected). Each thread now starts once the
+previous one has its session; the fake makes a call that starts alone slower, so without the
+wait the golden output differs.
+
+Declined in this round (by the coordinator):
+
+- treating a `length` cutoff as a failure in the translator;
+- recording a reply's arrival separately from a slow deletion;
+- classifying a runtime exit during the first authentication call;
+- the check script's suggestions 10–13;
+- a note about workers looping during web server exit.
+
+Mutation testing (final code):
+
+```
+$ scripts/verify/mutation.sh main
+TOTAL mutants 1155  killed 1113  survived 42  timeout 0  suspicious 0  untested 0
+```
+
+Not killed, and why (equivalent unless said otherwise):
+
+- `copilot_sdk.py` (19): the messages of the `CancelledError`s raised inside a turn (`_until`,
+  `check`, `client()` once closed; 9: the caller has already raised its own, nobody reads the
+  turn's); `session = ""`, `running = None` (twice), `_thread = ""`, `_authenticated = None`,
+  `_closed = None` (only tested for truth or replaced before use); `_turns.pop(future, )` (the
+  future is always there); the two deadline comparisons `>=`/`>` (differ only at an exactly equal
+  clock reading); `result(3 * CLEANUP_SECONDS)` (a looser bound on a wait that is itself
+  bounded by `_stop`; `None` and `2 / …` are killed).
+- `phase12_sdk_check.py` (23): the 21 of round 1, and the new wait between concurrent calls
+  replaced by `lambda: None` or turned into `and` (each only waits the full bound and then goes
+  on; in the fake the three calls wait for each other, so the output is the same).
+
+Suite and guards (final commit):
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once, 3.12.7
+2974 passed in 265.84s / 266.90s / 261.65s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+The check script on the final backend (REAL calls: 5 completed, 2 aborted), run twice this
+round (after the first fixes, and again after the refactor of item 4 and the script fix): PASS
+both times, 2.32 premium requests reported each; concurrent lines of the second run:
+
+```
+  concurrent 0 reply                    wall   4.25 s  in    96  out   307  cost [0.33]  effort [None]
+  concurrent 1 reply                    wall   5.22 s  in    97  out   432  cost [0.33]  effort [None]
+  concurrent 2 reply                    wall   3.84 s  in    93  out   268  cost [0.33]  effort [None]
+  cancelled    CancelledError           wall   1.19 s  in     0  out     0  cost []  effort []
+  timed out    TransientError           wall   6.00 s  in     0  out     0  cost []  effort []
+```
+
+Session folders in `~/.copilot/session-state/` and rows of `~/.copilot/session-store.db`
+(read-only count) were the same before and after each run (420, 36).
+
+Real calls this round: 1 completed `copilot-cli` call (the store check), and the check script
+twice (10 completed, 4 aborted, 4.64 premium requests reported in all).
+
+## Phase 12 — review round 3
+
+Opus and Gemini approved; GPT requested changes (edge cases). No real calls this round: each fix
+is in shutdown or cleanup paths that a real call cannot provoke cheaply.
+
+1. **Exit wait shorter than one cleanup.** `close()` waited `CLEANUP_SECONDS` (10 s) for the turns,
+   but one cleanup may take abort and idle (5 s) plus delete (10 s). It now waits
+   `ABORT_WAIT_SECONDS + CLEANUP_SECONDS` (15 s). The reviewer was right that the
+   `3 * CLEANUP_SECONDS` mutant was not equivalent: `force_stop()` had no bound inside `_stop`,
+   so the outer `.result(2 * CLEANUP_SECONDS)` is its only bound (giving it a second bound inside
+   `_stop` was tried: mutation showed the two redundant, so it stays outer only). The whole
+   shutdown is at most about 35 s (15 for the turns, 20 for stop and force-stop); docs give that
+   figure. `3 * CLEANUP_SECONDS` survives mutation: not equivalent (it lengthens the bound on a
+   hanging `force_stop()` by 10 s), but only a timing assertion would tell them apart; `None`
+   and `2 / CLEANUP_SECONDS` are killed by the test where both stops hang.
+   Test: abort and delete each take 0.7 s with both bounds at 1 s; the delete comes before the
+   stop (failed on the round 2 code: the stop came first).
+2. **Failed delete swallowed.** A failed delete of a session that was created is now logged
+   through the module logger (`logger.warning`, the session id and the folder's location only).
+   The project's loggers reach stderr in the CLI (Python's last-resort handler) and the server
+   output and `log/translation_*.log` on the web. A delete after a failed creation is not logged
+   (the folder may not exist). Tests: the warning holds the session id and no prompt text (failed
+   on the round 2 code); no warning after a failed creation.
+3. **Stop before creation.** `check()` now runs before the `try`, so a stop there deletes nothing.
+   Test: the cancel arrives while the client starts, before the caller's next poll; no create, no
+   delete (failed on the round 2 code: a delete of a session never created).
+4. The duplicated `test_close_bounded_when_force_stop_hangs_too` is removed: a round 2 edit
+   anchored on a string that occurred twice.
+5. **Docs.** README, CLAUDE.md and the plan: a runtime that dies or is killed while calls run
+   leaves their session folders (also next to the `kill <PID>` advice); the `_clean_up`
+   docstring no longer says otherwise. After a web pause, wait about 15 s before stopping the
+   server: `paused` is reported once the cancel is set, before abort and delete end. The plan
+   says the turn is aborted only once the prompt was sent, and an error during creation leads to
+   the delete only.
+
+Declined in this round (by the coordinator):
+
+- checking the stop inside the send task itself (a continuation queued ahead of the stop can
+  still send; the turn is then aborted and deleted);
+- skipping the idle wait when the send itself raised;
+- the check script pairing results when a concurrent call fails before creating a session.
+
+Mutation testing (final code):
+
+```
+$ scripts/verify/mutation.sh main
+TOTAL mutants 1167  killed 1126  survived 41  timeout 0  suspicious 0  untested 0
+```
+
+Not killed: in `copilot_sdk.py` (18) the round 2 list less `session = ""` (now killed through
+the pre-`try` check), plus `result(3 * CLEANUP_SECONDS)` (item 1); in `phase12_sdk_check.py`
+the same 23 as in round 2.
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once, 3.12.7
+2977 passed in 267.91s / 271.14s / 270.08s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
