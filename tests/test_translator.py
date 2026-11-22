@@ -297,7 +297,7 @@ class TestSegmentTypePrompts:
             engine.translate('test', glossary_text=glossary)
 
         prompt = mock_run.call_args[0][0][2]
-        assert '術語表' in prompt
+        assert '術語表（' in prompt
         assert 'machine learning' in prompt
 
     def test_context_included_in_prompt(self):
@@ -316,6 +316,32 @@ class TestSegmentTypePrompts:
         assert 'previous text' in prompt
         assert '後文參考' in prompt
         assert 'next text' in prompt
+
+
+class TestPersonNameRule:
+    """Rule 5: a person in the glossary is written as the glossary gives it,
+    any other person name stays in English; titles are still translated.
+    The old rule ("嚴格禁止翻譯") contradicted the glossary's [人名] line."""
+
+    RULE = ('5. 人名：術語表有列出的人名，照術語表的寫法（術語表給中文譯名就用中文譯名，'
+            '給英文原文就保留英文原文）；術語表沒有列出的人名，一律保留英文原文，不要自行翻譯，'
+            '例如：Orla Vintermark、Tobin Quayle。人名前後的稱謂、頭銜仍要翻譯，'
+            '例如：Miss Ferrowind、Lord Halvarth、Miss Dunmere 應翻譯成 '
+            'Ferrowind 小姐、Halvarth 男爵、Dunmere 小姐。\n')
+
+    @pytest.mark.parametrize('html', ['', '<p k="1">Miss Ferrowind smiled.</p>'])
+    @pytest.mark.parametrize('glossary', ['', 'Ferrowind → 費洛溫 [人名]'])
+    def test_text_prompts_carry_the_rule(self, html, glossary):
+        prompt = TranslationEngine()._build_prompt('Miss Ferrowind smiled.', SegmentType.TEXT,
+                                                   glossary_text=glossary, html=html)
+        assert prompt.count(self.RULE) == 1
+        assert '嚴格禁止翻譯' not in prompt
+        assert ('- [人名]：人物名稱，依照術語表翻譯' in prompt) == bool(glossary)
+
+    def test_code_prompt_has_no_name_rule(self):
+        prompt = TranslationEngine()._build_prompt('# Miss Ferrowind\nx = 1', SegmentType.CODE,
+                                                   glossary_text='Ferrowind → 費洛溫 [人名]')
+        assert '人名' not in prompt
 
 
 class TestHTMLMode:
@@ -390,7 +416,7 @@ class TestHTMLMode:
                            segment_type=SegmentType.TEXT, html=html, glossary_text=glossary)
 
         prompt = mock_run.call_args[0][0][2]
-        assert '術語表' in prompt
+        assert '術語表（' in prompt
         assert 'machine learning' in prompt
         assert 'HTML 標籤結構' in prompt
 
@@ -1093,7 +1119,9 @@ class TestRequestAndMessages:
         fake = FakeBackend(['<p k="1">譯文</p>'])
         seg = _seg()
         translate_segment(_engine(fake), seg, [seg])
-        assert '術語表' not in fake.prompts[0]
+        # rule 5 names the glossary itself; the section is what must be absent
+        assert '術語表（' not in fake.prompts[0]
+        assert '術語類別說明' not in fake.prompts[0]
 
 
 class TestFailureLogFormat:

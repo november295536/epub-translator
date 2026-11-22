@@ -72,7 +72,7 @@ Backend, model, reasoning effort and call timeout are stored in the project; fro
 - Also `glossary.json`, `source.epub`, `log/translation_*.log` (web runs), `log/failed/`, `output/*.epub`.
 
 ### Glossary (`src/glossary/`)
-- Entries: term, translation, category (`person`, `place`, `work`, `organization`, `term`, `expression`, `other`), and for people `gender` and `note`, which go into text prompts. All entries are in the prompt up to `FULL_GLOSSARY_MAX_TERMS`=150, else only those found in the segment.
+- Entries: term, translation, category (`person`, `place`, `work`, `organization`, `term`, `expression`, `other`), and for people `gender` and `note`, which go into text prompts. Prompt rule 5: a person name in the glossary is written as the glossary gives it (Chinese, or English when that is the translation), any other stays in English; titles are translated. All entries are in the prompt up to `FULL_GLOSSARY_MAX_TERMS`=150, else only those found in the segment.
 - `TermExtractor.extract_from_segments` (the project's timeout and effort per call): batches of ≤5000 chars propose terms; terms proposed with several translations are decided by consolidation calls; undecided ones keep the most frequent proposal. A rate limit, login error or unavailable backend stops it with the terms found so far (kept). The web adds only terms not yet in the glossary; `glossary extract` (CLI) also replaces the translation and category of existing ones but keeps their gender/note.
 
 ### Web (`src/web/`)
