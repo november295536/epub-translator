@@ -6342,6 +6342,12 @@ Considered and declined:
 
 - Phase 2/6 check scripts load `project.json` even when the copy exists: acceptable (one small
   read; the scripts' results do not depend on it).
+- "Hash then reopen" window with a project re-creation or deletion: considered, recorded as a
+  known issue (`known-issues.md`). Inside one web server it is not refused: `ProjectLock` is
+  shared by the threads of the holding process, the export thread holds only that lock, and
+  create/delete check `task_active` (translation tasks), not exports; across processes the
+  flock prevents it. `main` had the same window. Docs only; pytest after this change: 2725
+  passed, no warning.
 
 Tests: 6 added (`test_web.py`: 4 bodies that are not objects, a failed save with and without a
 backend switch), 2 changed (the no-op test, the help text). Reverting each fix makes its new
