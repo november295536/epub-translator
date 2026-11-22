@@ -3656,7 +3656,7 @@ class TestCliOverheadScript:
                                   '--no-session-persistence']
         assert 'CLAUDECODE' not in seen[0][1]['env']
         assert seen[0][1]['timeout'] == 120
-        assert 'robot' in base_cmd[2] and '術語表' in base_cmd[2]  # the engine's prompt
+        assert 'robot' in base_cmd[2] and '術語表（' in base_cmd[2]  # the engine's prompt
         assert 'in      330  cache_read      300  out    40  cost $0.00030' in out
         assert 'api   1.50 s' in out
         assert 'transcripts 2/2' in out.splitlines()[-2]
@@ -5315,7 +5315,7 @@ class TestPhase9CopilotOverheadScript:
         assert long[3:] == replaced[3:] and len(long[2]) > 4 * len(replaced[2])
         assert no_exp == replaced[:-3] + ['--no-experimental', '--plugin-dir', PLUGIN_DIR]
         assert wrong == replaced[:-1] + [PLUGIN_DIR + '-missing']
-        assert 'robot' in replaced[2] and '術語表' in replaced[2] and 'lantern-59' in long[2]
+        assert 'robot' in replaced[2] and '術語表（' in replaced[2] and 'lantern-59' in long[2]
         assert all(kw['env'][SYSTEM_PROMPT_ENV] for _, kw in seen)
         assert all(kw['timeout'] == 120 for _, kw in seen)
         from src.llm.copilot_cli import CopilotCLI
