@@ -7117,3 +7117,46 @@ exit 0                      (not killed 0; 81 KILLED)
 ```
 
 No real model calls.
+
+## Phase 11 — review round 2
+
+Opus and Gemini approved; GPT requested changes (minor).
+
+1. **Import order.** The allowance "any standard-library module before `src`" let modules that
+   3.9 lacks (`tomllib`, `zoneinfo`) through. Now `test_translate_imports_src_before_anything_else`
+   reads `translate.py` with `ast` and allows only `__future__`, `os`, `shutil`, `sys`, `time`,
+   `collections` before `from src import …` (what it imports today); the run-time test keeps the
+   message and `src`-last checks. Temporary `import tomllib`, then `import click`, above the
+   guard: each `1 failed, 13 passed`; restored.
+2. **`skipif` of the `mutation.sh` test:** `shutil.which('git')` and `ROOT/.git` existing (file
+   or directory) instead of running `git` at collection.
+3. **`feature_version=(3, 9)` is best effort.** Probe on 3.12.7, `ast.parse(src,
+   feature_version=(3, 9))`: `f"{"a"}"`, a backslash or a comment inside an f-string expression
+   accepted (3.9.6 rejects `f"{"a"}"`: `SyntaxError: f-string: expecting '}'`); `match`,
+   `except*`, `type X = int` rejected. One comment line in the test says so.
+4. **Child markup, not only entities.** Probe (`get_text()` with `html.parser` against lxml),
+   `<TAG>A <b>B</b></TAG>` and `<TAG>A<!--note-->B</TAG>`: 3.9.6 and 3.12.7 same as lxml for
+   every tag; 3.13.7 differs for `title` and `textarea` (`'A <b>B</b>'`, `'A<!--note-->B'`);
+   3.14.7 differs for `iframe`, `noembed`, `noframes`, `xmp`, `plaintext`, `title`, `textarea`
+   (`p` same everywhere). End to end with `migrate_project` (chapter `<p>…</p><TAG
+   src="media.xhtml">A <b>B</b></TAG>`): 3.12.7 matched for `iframe`, `xmp`, `textarea`, `p`;
+   3.14.7 `text differs` for the first three, `p` matched. Plan and `known-issues.md` now say
+   "an entity or child markup" and name `plaintext`.
+5. **Which releases predate which change** (`Lib/html/parser.py` per tag): `RCDATA_CONTENT_ELEMENTS
+   = ("textarea", "title")` from 3.12.12, 3.13.6 and 3.14.0; the wider raw-text list (`xmp`,
+   `iframe`, `noembed`, `noframes`, and `plaintext` handling) from 3.12.13, 3.13.10 and 3.14.1.
+   So the round 1 advice (3.12.12 or earlier, 3.13.9 or earlier) named affected releases; it now
+   says 3.12.11 or earlier or 3.13.5 or earlier, and that no 3.14 release predates both.
+6. Phase 10 text in the plan: Claude Code ignores an unknown `--effort` "with a warning".
+
+Declined: a `/bin/sh` shim for the fake `python3` shebang in the `mutation.sh` test
+(interpreter paths with spaces or over the shebang length limit are not a case here).
+
+```
+$ <venv314>/bin/python -m pytest tests/test_python_version.py -q -p no:cacheprovider -rfw
+14 passed in 1.50s
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # 3.12.7
+2877 passed in 242.12s                                (no failure, no warning)
+```
+
+Only tests and documentation changed in this round. No real model calls.

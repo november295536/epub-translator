@@ -3,6 +3,7 @@ any other project module is imported (the version is injected)."""
 
 import ast
 import os
+import shutil
 import subprocess
 import sys
 
@@ -41,32 +42,49 @@ def test_running_interpreter_passes():
 ])
 def test_entry_points_stop_first(entry, requested):
     # The version is replaced before the entry point runs; the message is
-    # all that is printed. Every import started is recorded (the audit event
-    # is raised when an import starts): before the first project import only
-    # the standard library (a third-party import there would fail first on an
-    # old interpreter), and `src` is the last project import: nothing after it runs
+    # all that is printed, and `src` is the last project import started (the
+    # audit event is raised when an import starts): nothing after it runs
     code = ("import sys; sys.version_info = (3, 11, 9, 'final', 0)\n"
             "sys.addaudithook(lambda event, args: event == 'import' and print(args[0]))\n" + entry)
     proc = subprocess.run([sys.executable, '-c', code], cwd=ROOT, capture_output=True,
                           text=True, timeout=60)
     assert proc.returncode == 1
     assert proc.stderr == MESSAGE + '\n'
-    started = proc.stdout.split()
-    first = next(i for i, name in enumerate(started) if name.split('.')[0] == PACKAGE)
-    assert [n for n in started[:first] if n.split('.')[0] not in sys.stdlib_module_names] == []
-    assert [n for n in started if n.split('.')[0] == PACKAGE] == requested
+    assert [n for n in proc.stdout.split() if n.split('.')[0] == PACKAGE] == requested
+
+
+# What translate.py may import before `src`: modules every old interpreter
+# has, so that the version message is what an old interpreter shows
+BEFORE_THE_CHECK = {'__future__', 'os', 'shutil', 'sys', 'time', 'collections'}
+
+
+def test_translate_imports_src_before_anything_else():
+    with open(os.path.join(ROOT, 'translate.py'), encoding='utf-8') as f:
+        tree = ast.parse(f.read())
+    before = []
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == PACKAGE:
+            break
+        if isinstance(node, ast.Import):
+            before += [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            before.append(node.module)
+    else:
+        pytest.fail('translate.py does not import src')
+    assert set(before) <= BEFORE_THE_CHECK, before
 
 
 @pytest.mark.parametrize('path', [os.path.join(ROOT, 'translate.py'),
                                   sys.modules[PACKAGE].__file__])  # src/__init__.py
 def test_readable_by_an_old_interpreter(path):
     # the message can only appear if an old interpreter can compile these
+    # (best effort: feature_version does not reject 3.12 f-string forms such as f"{"a"}")
     with open(path, encoding='utf-8') as f:
         ast.parse(f.read(), path, feature_version=(3, 9))
 
 
-@pytest.mark.skipif(subprocess.run(['git', '-C', ROOT, 'rev-parse'], capture_output=True).returncode != 0,
-                    reason='needs a git checkout (not in the mutation runner\'s copy)')
+@pytest.mark.skipif(shutil.which('git') is None or not os.path.exists(os.path.join(ROOT, '.git')),
+                    reason='needs git and a checkout (not in the mutation runner\'s copy)')
 @pytest.mark.parametrize('version, message', [
     ((3, 11, 9), MESSAGE),
     # a supported interpreter goes on to the next check (mutmut is hidden here)

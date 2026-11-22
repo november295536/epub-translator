@@ -727,7 +727,7 @@ on one paragraph). Two per-project settings, stored and chosen exactly like back
   model does not take, changing nothing; a model change drops a stored level the new model does
   not take back to the default and the CLI / web confirmation says so. Claude gets `--effort`
   (`CLAUDE_CODE_EFFORT_LEVEL` is removed from its environment: it overrides the flag; the CLI
-  ignores an unknown value silently, so only declared levels are passed); Copilot gets
+  ignores an unknown value with a warning, so only declared levels are passed); Copilot gets
   `--reasoning-effort`. Copilot's refusal of a level (`Reasoning effort "…" is not supported for
   model …`, `does not support reasoning effort configuration`) is a `BackendUnavailableError`:
   nothing stored, the web task pauses, the CLI exits 1.
@@ -806,10 +806,12 @@ Risks:
   are what catches it.
 - `scripts/verify/mutation.py` hooks into mutmut 3.8.1 internals; the pin stays.
 - An existing virtualenv is bound to the interpreter that made it: owners rebuild it (README).
-- Migration: newer patch releases (3.12.13+, 3.13.10+, 3.14.1+ by CPython's `html/parser.py`;
-  observed on 3.14.7, not on 3.12.7 or 3.13.7) keep the content of `<iframe>`, `<noembed>`,
-  `<noframes>`, `<xmp>` as raw text in `html.parser`, so `migrate` can refuse a chapter where
-  such an element holds an entity (`known-issues.md`). Not worked around.
+- Migration: newer patch releases keep the content of some elements as raw text in
+  `html.parser` (`title`, `textarea` from 3.12.12, 3.13.6, 3.14.0; `iframe`, `noembed`,
+  `noframes`, `xmp`, `plaintext` from 3.12.13, 3.13.10, 3.14.1, by CPython's
+  `html/parser.py`; observed: 3.12.7 none, 3.13.7 `title`/`textarea`, 3.14.7 all), so `migrate`
+  can refuse a chapter where such an element holds an entity or child markup
+  (`known-issues.md`). Not worked around.
 
 ### Phase 12 — Copilot SDK backend
 
