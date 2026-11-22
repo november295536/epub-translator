@@ -6507,3 +6507,128 @@ not used, and any type other than CODE takes the same text path).
 No phase 1 guard entry had to be re-anchored. Decorated functions (click commands, Flask views)
 are not mutated by mutmut 3.8.1; their lines are covered by `TestCLI` and `TestWeb`. The scripts
 that read real projects were not run (no access to the projects directory on this branch).
+
+## Phase 10 — review round 1
+
+One approval, two "changes requested". Fixed:
+
+- `PUT …/model` (`src/web/blueprints/translation.py`, `set_model`): every setting is optional;
+  a body with none of `model`, `backend`, `effort`, `timeout` (or only nulls) is 400
+  (`未提供要設定的項目…`). The page sends only the setting the user changed (`putSettings(body)`),
+  so a stale tab that changes the timeout no longer switches a running task's model back, and a
+  project whose stored model is not listed can change its timeout. Two message assertions in
+  `test_web.py` follow; `{"model": null, "backend": "copilot-cli"}` is now a backend switch.
+- `call_settings` (`src/core/project.py`): a stored level the model does not list (a hand-edited
+  file, or a list that shrank) gives the default; the route's settings come from it, so the page
+  shows what the call uses. The file keeps the level until a set changes it.
+- Page: settings errors go to `settingsError`, shown beside the note and cleared by a successful
+  settings save; the task's `error` banner is no longer touched by settings.
+- `GET …/model`: `available` comes from the same `call_settings()` reading as the rest.
+- Tests:
+  - `TestWeb::test_web_extraction_passes_effort_and_timeout` waited on a `running` key the
+    status answer does not have (`{'status': 'running'}`), so the wait returned at once. Failing
+    interleaving: the request thread returns from `POST …/extract` and reaches `call, =
+    rec.calls` before the extraction thread has called `run_process`: zero calls, the unpacking
+    fails (or, with a slower check, a test would look at calls of an unfinished extraction). It
+    now waits for `status == 'completed'`.
+  - `TestCopilotRefusal::test_web_task_pauses_with_nothing_stored` waited for `state ==
+    'paused'`. `TaskManager._pause_for` sets `task.state = 'paused'` and only then puts the
+    `backend_error` event: a test thread scheduled between the two reads no event and fails
+    `len(events) == 1`. It now waits for the event itself (and then checks the state).
+  - `test_failed_save_restores_effort_and_timeout` started at `high`, which Gemini takes, so it
+    passed without the effort rollback. It starts at `xhigh` now: the attempted save sees the
+    level reset (None) and the rollback restores `xhigh`.
+  - Added: only what is sent changes (stale-tab case), an unlisted stored model changes its
+    timeout (an effort for it is still refused), GET shows the fallback level, the fallback
+    reaches the command line, page markup (only the changed setting sent, own error field,
+    optgroups).
+- `scripts/verify/phase10_effort_check.py`: the reported level is printed only when it is one of
+  `KNOWN_LEVELS`, else `-` (Haiku 4.5 reports null).
+- `src/web/tasks.py`: the engine comment names the call settings.
+- The round-1 section of "Fix: export source path and `model` command" said `main` answered 400
+  for every non-object body; corrected (400 for `"opus"`/`["opus"]`, 500 for `1`/`true`, checked
+  in `main`'s code: `'model' in 1` raises `TypeError`).
+
+Declined:
+
+- An explicit `null` for `effort`/`timeout` in the PUT body means "not given" (as for `model`
+  and `backend`); there is no "reset to default" through the API.
+- `updated_at` changes on a load and save without edits: older than this branch.
+- The invented first names in the script's invented paragraph are not personal data.
+- The script fails when Copilot omits token accounting: a measurement without tokens is not one.
+
+### Addition: the full Copilot model list
+
+`copilot_cli.MODELS` lists the 20 chat models the owner named (no `auto`, coding-specific or
+internal models), descriptions with the premium-request multiplier the account shows; default
+still `claude-sonnet-5.5`.
+
+Levels, found without model calls (the research's method): for each model the product's
+`CopilotCLI.build_command` (its environment and working directory) was started with each of
+`none, minimal, low, medium, high, xhigh, max` and with no value; the CLI validates the level
+before any model call, and the process group was killed at the first of `user.message`,
+`assistant.turn_start`, `model.call_start` or an error. A level counts as accepted when the run
+reached that point without a `session.model_change` discarding it. 160 starts, 0 model calls.
+Script kept outside the repository (it starts the CLI; it is a one-off probe).
+
+Then one real call per model through the product's path (`TranslationEngine(max_calls=1)` with
+`CopilotCLI`, which runs the `agent_replacement` check in `classify_error`), an invented
+sentence, at the model's lowest level, timeout 180 s. 20 calls, no retries, no rate limit.
+
+| model | multiplier | accepted levels | default (none passed) | lowest-level call | replacement check | reply | wall s |
+|---|---|---|---|---|---|---|---|
+| claude-sonnet-5.5 | 1x | low…max | medium | low | passed | translation | 5.21 |
+| claude-sonnet-5 | 1x | low…max | medium | low | passed | translation | 4.94 |
+| claude-opus-5.5 | 15x | low…max | medium | low | passed | translation | 5.05 |
+| claude-haiku-5.5 | 1x | low…max | medium | low | passed | translation | 5.18 |
+| claude-haiku-4.5 | 0.33x | none (only `none`, discarded) | null | (none passed) | passed | translation | 9.15 |
+| gpt-6.2-sol | 1x | low…max | medium | low | passed | translation | 5.61 |
+| gpt-6.2-astra | 1x | low…max | medium | low | passed | translation | 5.90 |
+| gpt-6.1-sol | 1x | low…max | medium | low | passed | translation | 5.54 |
+| gpt-6.1-terra | 1x | low…max | medium | low | passed | translation | 5.92 |
+| gpt-6-sol | 1x | none, low…max | medium | none | passed | translation | 5.25 |
+| gpt-6-luna | 1x | none, low…max | medium | none | passed | translation | 6.07 |
+| gpt-6-astra | 1x | low…max | medium | low | passed | translation | 6.20 |
+| gpt-5.6-sol | 1x | none, low…max | medium | none | passed | translation | 4.75 |
+| gpt-5.6-luna | 1x | none, low…max | medium | none | passed | translation | 5.22 |
+| gemini-4-carbon | 1x | low, medium, high | medium | low | passed | translation | 7.10 |
+| gemini-4-argon | 1x | low, medium, high | medium | low | passed | translation | 7.20 |
+| gemini-4-hydrogen | 1x | low, medium, high | medium | low | passed | translation | 7.38 |
+| gemini-3.8-flash | 14x | low, medium, high | medium | low | passed | translation | 6.32 |
+| grok-4.7 | 1x | low, medium, high, xhigh | high | low | passed | translation | 7.68 |
+| grok-4.6 | 1x | low, medium, high, xhigh | medium | low | passed | translation | 6.48 |
+
+`low…max` = `low, medium, high, xhigh, max`. `minimal` was refused by every model. For
+`gpt-5.6-sol`/`-luna`, `none` is reported through a `session.model_change` from null to `none`
+(not a discard), and the `none` call answered normally. No model was left out.
+
+Consequences in the code: `KNOWN_LEVELS = ('none',) + EFFORT_LEVELS` (`src/llm/base.py`) is
+what load accepts and what the script prints; the four GPT models declare `none`; Claude Code
+models never do (its CLI knows no `none`). The web model selector groups options with
+`<optgroup>` by backend and alias family (`claude`, `gpt`, `gemini`, `grok`; generic, from the
+alias up to its first `-`); `model show` prints the aliases one line per family (one line for
+the Claude backend, as before). Checked in Chrome on an invented project: 5 groups; a timeout
+saved from a tab whose model selection was stale left the newer model stored; `gpt-6-sol`
+offered `none` and saved it; a refused timeout appeared in the settings error, the task banner
+stayed empty, and the next good save cleared it.
+
+### Commands and results (review round 1)
+
+```
+$ scripts/verify/mutation.sh main                      # first run after the fixes
+TOTAL mutants 670  killed 665  survived 5  timeout 0  suspicious 0  untested 0
+    new survivor: translate._model_lines, the group key of aliases without a family '' -> 'XXXX'
+    killed by TestSmallMessages::test_model_lines
+$ scripts/verify/mutation.sh main                      # final
+TOTAL mutants 670  killed 666  survived 4  timeout 0  suspicious 0  untested 0
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once
+2850 passed in 228.19s / 231.24s / 224.06s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+The 4 survivors are the equivalent `prompt_text` mutants justified above. Real model calls in
+this round: the 20 listed in the table (one per model) and none else; level probes made no
+model call.
