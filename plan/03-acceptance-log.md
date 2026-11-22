@@ -7498,3 +7498,27 @@ information
 PASS
 exit 0
 ```
+
+Mutation testing after the fixes (three runs this round; the first stopped in mutmut's stats run
+on a test that asserted whether three calls failing at once overlap in time, which depends on
+scheduling: no longer asserted; the second led to tests for the finished-turn bookkeeping, a
+turn stuck where the stop cannot reach it at exit, and the filter message):
+
+```
+$ scripts/verify/mutation.sh main
+TOTAL mutants 1120  killed 1084  survived 36  timeout 0  suspicious 0  untested 0
+```
+
+Not killed, and why (equivalent unless said otherwise):
+
+- `copilot_sdk.py`: `session = ""`, `running = None` (twice), `_thread = ""`, `_authenticated =
+  None`, `_closed = None` (only tested for truth, or replaced before use); the message of the two
+  `CancelledError`s the turn raises when stopped (6: nobody reads that result, the caller has
+  already raised its own); `_turns.pop(future, )` (the future is always there); the two deadline
+  comparisons `>=`/`>` (differ only at an exactly equal clock reading).
+- `phase12_sdk_check.py`: the same as in the first round (`request()`'s system prompt and
+  message role, `'Say OK.'`, the engine's backend and `_build_prompt`'s first two arguments, now
+  4: the text argument is not used when the HTML is given; `getmtime >`, `0 < latency`,
+  `latency <= 1`, `max(start) <= min(end)`; the log codec, 3); `latency < 2` (a bound the fake
+  cannot reach: the backend returns within one 0.1 s poll); `until`'s poll count and
+  `children_gone`'s 6 s instead of 5 (how long a runtime is given to go).
