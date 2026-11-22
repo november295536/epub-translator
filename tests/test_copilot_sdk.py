@@ -773,8 +773,8 @@ class TestRoundTwo:
         session_id = client.sessions[0].session_id
         warnings = [r for r in caplog.records if r.name == 'src.llm.copilot_sdk']
         assert [r.levelname for r in warnings] == ['WARNING']
-        assert session_id in warnings[0].getMessage()
-        assert 'SECRET' not in warnings[0].getMessage()
+        assert warnings[0].getMessage() == (f'copilot-sdk: session {session_id} not deleted; '
+                                            'its folder in ~/.copilot/session-state/ is left')
 
     def test_failed_delete_after_failed_creation_not_logged(self, client, monkeypatch, caplog):
         async def no_model(session_id, **options):

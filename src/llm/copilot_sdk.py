@@ -233,6 +233,7 @@ class _Runtime:
             self.stop_turn(stop)
         concurrent.futures.wait(turns, timeout=ABORT_WAIT_SECONDS + CLEANUP_SECONDS)
         client = self._client  # read now: a first turn may just have made it
+        # Bounds the graceful stop (inside _stop) and then the forced one
         if client is None:
             return
         try:
@@ -242,13 +243,12 @@ class _Runtime:
 
 
 async def _stop(client) -> None:
-    """A graceful stop, else a forced one; each bounded."""
+    """A graceful stop, bounded; else a forced one (bounded by close())."""
     try:
         async with asyncio.timeout(CLEANUP_SECONDS):
             await client.stop()
     except Exception:
-        async with asyncio.timeout(CLEANUP_SECONDS):
-            await client.force_stop()
+        await client.force_stop()
 
 
 async def _until(aw, stop: asyncio.Event):
