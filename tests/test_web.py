@@ -513,6 +513,25 @@ class TestModelAPI:
         )
         assert response.status_code == 400
 
+    def test_set_model_null_is_refused(self, client, project_with_translations):
+        """A null model is no model (select_model would take it as 'keep'):
+        refused, project.json unchanged."""
+        project_file = os.path.join(project_with_translations, PROJECT_NAME, 'project.json')
+        before = open(project_file, 'rb').read()
+        for body in ({'model': None}, {'model': None, 'backend': 'copilot-cli'}):
+            response = client.put(f'/api/projects/{PROJECT_NAME}/model', json=body)
+            assert response.status_code == 400
+            assert response.get_json()['error'] == '未提供模型名稱'
+        assert open(project_file, 'rb').read() == before
+
+    def test_set_invalid_model_message(self, client, project_with_translations):
+        project_file = os.path.join(project_with_translations, PROJECT_NAME, 'project.json')
+        before = open(project_file, 'rb').read()
+        response = client.put(f'/api/projects/{PROJECT_NAME}/model', json={'model': 'nope'})
+        assert response.status_code == 400
+        assert response.get_json()['error'] == '無效的模型：nope，可用模型：sonnet, opus, haiku'
+        assert open(project_file, 'rb').read() == before
+
     def test_get_model_nonexistent_project(self, client):
         response = client.get('/api/projects/nonexistent/model')
         assert response.status_code == 404
