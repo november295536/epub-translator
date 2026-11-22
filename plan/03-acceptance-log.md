@@ -7310,3 +7310,49 @@ session dirs 419 -> 419
 
 The pause cancelled the 3 calls in flight (nothing completed before it), their sessions were
 deleted; the run log holds only the task's and werkzeug's lines (the SDK's logger is at ERROR).
+
+### Mutation testing
+
+Four runs of `scripts/verify/mutation.sh main` (both new files added to `mutation.py`). The
+first (1135 mutants, 307 survived, 28 timeout, 4 suspicious) led to: simpler code where the
+survivors showed needless parts (the event type is always the SDK's enum; only
+`ProcessExitedError` skips the patterns, other disconnects fall through to transient anyway; a
+fixed poll interval; `close` guards on the client only; the script's waits on a condition
+instead of polling, one helper per repeated step); tests for messages, the cleanup and close
+bounds, the idle wait, the loop thread being a daemon, the working directory; and for the check
+script a stricter fake runtime (records each session's model, effort, prompt and deletion; a
+killed or stopped runtime still listed for one poll), its full expected output, one failing run
+per check, `--help`, flushing. The 4 suspicious mutants were the ones that dropped the runtime
+path: the SDK then tries to download its own runtime. The suite now sets
+`COPILOT_SKIP_CLI_DOWNLOAD=1` for the session (conftest), and a test shows a client without a
+path is refused.
+
+```
+$ scripts/verify/mutation.sh main          # final run, on the committed tree
+TOTAL mutants 1039  killed 1017  survived 19  timeout 3  suspicious 0  untested 0
+```
+
+Each one not killed, and why:
+
+- `src/llm/copilot_sdk.py`: `finished = None`, `_thread = ""`, `_authenticated = None`, `_closed
+  = None` (initial values only tested for truth, or replaced before use): equivalent.
+- `phase12_sdk_check.py`, `request()`: `system=None` and the message role `None`/`XXuserXX`/`USER`:
+  a one-message request with no system prompt is flattened to the message text alone
+  (`flatten_prompt`), so neither reaches the runtime: equivalent.
+- `'Say OK.'` changed (2): the prompt of the two refusals, which fail at session creation before
+  any message is sent: equivalent.
+- `TranslationEngine(backend=None)`, `_build_prompt(None, …)`, `_build_prompt('', None, …)`: the
+  text prompt does not depend on the engine's backend, an empty brief and `None` give the same
+  prompt, and a segment type other than code builds the text prompt: equivalent (the test
+  compares the whole prompt).
+- Boundaries `0 < latency`, `max(start) <= min(end)`, `getmtime(p) > run_start`: differ only for
+  exactly equal float clock readings.
+- `encoding=None` / `'UTF-8'` when reading the runtime logs: the same codec here (UTF-8 locale).
+- `watch.wait(lambda: None, …)` before the checks of an aborted call: with the fake runtime the
+  delete is already asked by then; the wait covers a real runtime's latency.
+- Timeout (3): the waits without a bound (`wait_for(…, None)`) hang when the condition never
+  holds, which the tests make happen: detected, as a hang rather than a failure.
+
+The one mutant of the first run that survived although its test fails when it is applied by hand
+(`asyncio.timeout(None)` in `_clean_up`: `test_cleanup_bounded` fails after 14 s) was killed in
+the later runs by a test that runs the cleanup on the test's own thread.
