@@ -841,9 +841,10 @@ As built:
   system temp dir as working directory. `client.start()` runs before every call: it returns at
   once while connected and starts a new runtime when the last one exited (the SDK checks the
   process). The first start checks `get_auth_status()`; not authenticated → `AuthError` with
-  `copilot login`. At interpreter exit `close` refuses later calls, stops the turns still
-  running and waits (10 s at most) until they deleted their sessions, then stops the client
-  (`stop()`, else `force_stop()`, 10 s at most). It is registered with `threading`'s exit hooks
+  `copilot login`. At interpreter exit `close` refuses later calls (and `client()` refuses
+  once closed), stops the turns submitted or running and waits (10 s at most) until they deleted
+  their sessions, reads the client only then (a first turn may just have made it: review round
+  2), and stops it (`stop()` bounded to 10 s, else `force_stop()`: about 20 s in all). It is registered with `threading`'s exit hooks
   (`threading._register_atexit`, private but the one `concurrent.futures` itself uses), which run
   before `concurrent.futures` shuts its executors down: from a plain `atexit` hook the SDK's
   `stop()` failed (`cannot schedule new futures after shutdown`, it runs blocking steps on the
@@ -860,8 +861,8 @@ As built:
   `flatten_prompt` (as for the CLIs). Reply = the final assistant message of `send_and_wait`
   (`''` when none); usage = the session's `assistant.usage` events summed; a last usage event
   with `finish_reason` `length` gives `stop_reason='truncated'` (the translator reads replies
-  only through their check, so nothing changes there), one with `content_filter_triggered` a
-  `RefusalError` (neither was observed: every real call reported `stop` and `false`). Afterwards the session
+  only through their check, so nothing changes there), a filtered last usage event (or a filtered call that left no reply) a
+  `RefusalError` (review round 2: an earlier filtered call followed by a reply is not) (neither was observed: every real call reported `stop` and `false`). Afterwards the session
   is deleted (`client.delete_session`, which removes `~/.copilot/session-state/<id>/`, the
   prompt, reply and reasoning text).
 - **Timeout and cancel.** `complete` is synchronous: it submits the turn to the loop and polls
@@ -869,9 +870,12 @@ As built:
   `CancelledError`, deadline → `TransientError`, each at once; it then sets the turn's stop event.
   The turn is never cancelled from outside (review round 1: cancelling it cut its cleanup short
   and skipped the delete): it waits for the reply or the stop event, whichever comes first; on
-  stop, or on any error, it aborts the turn (`session.abort()`), waits up to 5 s for
-  `session.idle`, then deletes the session. A stop that arrives while the session is being
-  created sends no prompt. A reply that arrives after the cancel or after the deadline is
+  stop, or on any error, it aborts the turn (`session.abort()`) and waits for `session.idle`
+  (together at most 5 s), then deletes the session (at most 10 s, attempted also when the abort
+  failed or hung: review round 2). The stop and the cancel are checked on entry, after the client
+  is ready and before the prompt is sent; starting the client and the send race the stop, session
+  creation does not (given up half-way it could leave a session) and is bounded by the request's
+  timeout. A stop that arrives while the session is being created sends no prompt. A reply that arrives after the cancel or after the deadline is
   refused, as for the CLIs. Up to 20 worker threads share
   the client; each call has its own session.
 - **Errors.** Error text only (the exception's message plus the session's `session.error`
@@ -902,11 +906,15 @@ Risks:
   would do the same.
 - The runtime is in the CLI's process group (the SDK starts it without a new session), so Ctrl-C
   in the CLI reaches it: it exits at once, no process is left, but the sessions of the calls in
-  flight are not deleted (observed: 3 folders with `events.jsonl`). A web pause, a normal end
+  flight are not deleted (observed: 3 folders with `events.jsonl`); the same for Ctrl-C in the
+  terminal of a web server during a translation (pause first). A web pause, a normal end
   and an end on a run-level error delete every session (review round 1: the exit hook waits for
   the turns still running). A session folder is also left when the process is killed.
 - The runtime writes its own log (`~/.copilot/logs/process-*.log`); the check found no prompt
-  text in it. The Copilot CLI backend keeps every call as a session (Phase 9) and has no delete.
+  text in it. The Copilot CLI backend keeps every call as a session (Phase 9) and has no delete;
+  it also writes every call into `~/.copilot/session-store.db`, and 1.0.114 has no per-call switch
+  (review round 2, `known-issues.md`), so `copilot-sdk` is the backend for real books. Both are
+  local files.
 
 Acceptance:
 

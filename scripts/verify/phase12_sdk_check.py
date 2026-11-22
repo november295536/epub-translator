@@ -282,8 +282,11 @@ def main(argv=None) -> int:
                                            args.model))
 
     threads = [threading.Thread(target=one, args=(i,)) for i in range(len(SENTENCES))]
-    for thread in threads:
+    for i, thread in enumerate(threads):
         thread.start()
+        # The next starts once this one has its session, so the sessions are
+        # created in the order of the results they are described with
+        until(lambda: len(watch.created) > n + i or not thread.is_alive(), CALL_TIMEOUT)
     for thread in threads:
         thread.join()
     for i, (sid, result) in enumerate(zip(watch.created[n:], results)):
