@@ -729,7 +729,7 @@ class TaskManager:
         tag = f"W{worker_id}"
         pm = task.pm
         gm = task._gm
-        engine, current = None, None  # made for the project's (backend, model)
+        engine, current = None, None  # made for the project's call settings
 
         def interrupted() -> bool:
             # A retry's backoff wait ends, and no call is made, once the

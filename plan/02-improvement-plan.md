@@ -717,9 +717,11 @@ Copilot CLI 1.0.114 on invented text: Gemini 4 Carbon at its default `medium` le
 on one paragraph). Two per-project settings, stored and chosen exactly like backend and model:
 
 - **Effort.** Each model declares the levels it accepts (`ModelInfo.efforts`, from the CLIs'
-  own validation): the three Claude Code models and Copilot's `claude-sonnet-5.5` and
-  `gpt-6.2-sol` take `low, medium, high, xhigh, max`, `gemini-4-carbon` takes `low, medium,
-  high`, `claude-haiku-4.5` takes none (nothing is passed). Default `low`. `project.json`
+  own validation): the three Claude Code models and Copilot's Claude 5/5.5 and GPT models take
+  `low, medium, high, xhigh, max` (four GPT models also `none`), the Gemini models `low, medium,
+  high`, the Grok models `low, medium, high, xhigh`, `claude-haiku-4.5` none (nothing is passed).
+  Copilot's model list is the 20 chat models the account offers (review round 1). Default `low`;
+  a stored level the model does not list is replaced by the default when calling. `project.json`
   `effort` is written only once set; absent means the default (and none for a model that takes
   no level). `ProjectManager.select_model(backend, model, effort, timeout)` refuses a level the
   model does not take, changing nothing; a model change drops a stored level the new model does

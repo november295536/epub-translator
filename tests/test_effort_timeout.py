@@ -20,7 +20,9 @@ from src.core.project import (
 )
 from src.core.translator import TranslationEngine
 from src.glossary.term_extractor import TermExtractor
-from src.llm import EFFORT_LEVELS, BackendUnavailableError, LLMRequest, Message, ModelInfo
+from src.llm import (
+    EFFORT_LEVELS, KNOWN_LEVELS, BackendUnavailableError, LLMRequest, Message, ModelInfo,
+)
 from src.llm.claude_cli import LEAN_FLAGS
 from src.llm.cli import ProcessResult
 from src.llm.copilot_cli import EFFORT_REJECTED_MESSAGE, PLUGIN_DIR, CopilotCLI
@@ -103,9 +105,19 @@ class TestModelLevels:
     def test_levels_per_model(self):
         assert {m.alias: m.efforts for m in llm.backend_for('claude-cli').list_models()} == {
             'sonnet': EFFORT_LEVELS, 'opus': EFFORT_LEVELS, 'haiku': EFFORT_LEVELS}
+        five, gemini, grok = EFFORT_LEVELS, ('low', 'medium', 'high'), ('low', 'medium', 'high', 'xhigh')
+        with_none = ('none',) + EFFORT_LEVELS
+        # as probed with Copilot CLI 1.0.114 (acceptance log, Phase 10 review round 1)
         assert {m.alias: m.efforts for m in llm.backend_for('copilot-cli').list_models()} == {
-            'claude-sonnet-5.5': EFFORT_LEVELS, 'gpt-6.2-sol': EFFORT_LEVELS,
-            'gemini-4-carbon': ('low', 'medium', 'high'), 'claude-haiku-4.5': ()}
+            'claude-sonnet-5.5': five, 'claude-sonnet-5': five, 'claude-opus-5.5': five,
+            'claude-haiku-5.5': five, 'claude-haiku-4.5': (),
+            'gpt-6.2-sol': five, 'gpt-6.2-astra': five, 'gpt-6.1-sol': five, 'gpt-6.1-terra': five,
+            'gpt-6-sol': with_none, 'gpt-6-luna': with_none, 'gpt-6-astra': five,
+            'gpt-5.6-sol': with_none, 'gpt-5.6-luna': with_none,
+            'gemini-4-carbon': gemini, 'gemini-4-argon': gemini, 'gemini-4-hydrogen': gemini,
+            'gemini-3.8-flash': gemini, 'grok-4.7': grok, 'grok-4.6': grok}
+        assert KNOWN_LEVELS == ('none', 'low', 'medium', 'high', 'xhigh', 'max')
+        assert llm.backend_for('copilot-cli').default_model == 'claude-sonnet-5.5'
 
     def test_effort_levels(self):
         assert effort_levels(None, 'opus') == EFFORT_LEVELS
@@ -159,6 +171,8 @@ class TestCommandLines:
         ('copilot-cli', 'gpt-6.2-sol', 'xhigh', ['--reasoning-effort', 'xhigh']),
         ('copilot-cli', 'gemini-4-carbon', 'high', ['--reasoning-effort', 'high']),
         ('copilot-cli', 'claude-haiku-4.5', None, []),         # not configurable
+        ('copilot-cli', 'gpt-6-sol', 'none', ['--reasoning-effort', 'none']),
+        ('copilot-cli', 'grok-4.7', 'xhigh', ['--reasoning-effort', 'xhigh']),
     ])
     def test_project_call(self, tmp_path, recorder, monkeypatch, backend, model, effort, flags):
         """From the stored settings to the program's arguments, environment
@@ -226,8 +240,14 @@ class TestCopilotRefusal:
         pm.save()
         rec = recorder(lambda cmd: _refused(REFUSALS[0]))
         task = fresh_tm.start_translation(PROJECT, str(tmp_path))
-        _wait(lambda: task.state == 'paused')
-        events = [e for e in task.progress.get_all() if e['event'] == 'backend_error']
+
+        def events():
+            return [e for e in task.progress.get_all() if e['event'] == 'backend_error']
+        # the event, not the state: _pause_for sets the state before it
+        # publishes the event
+        _wait(lambda: events())
+        events = events()
+        assert task.state == 'paused'
         assert len(events) == 1 and EFFORT_REJECTED_MESSAGE in events[0]['data']['error']
         assert len(rec.calls) == 1
         fresh_tm.stop_translation(PROJECT)
@@ -295,6 +315,16 @@ class TestSelect:
         pm.select_model(None, None, effort='max')
         pm.select_model('copilot-cli', None)
         assert _state(pm) == ('copilot-cli', 'claude-sonnet-5.5', 'max', None)
+
+    def test_none_where_the_model_takes_it(self, tmp_path, pm):
+        assert pm.select_model('copilot-cli', 'gpt-5.6-luna', effort='none') is True
+        assert pm.call_settings().effort == 'none'
+        pm.save()
+        assert _pm(pm.project_dir).call_settings().effort == 'none'  # loads
+        pm.select_model(None, 'gpt-6.2-sol')  # takes no `none`: back to the default
+        assert (pm.data.effort, pm.call_settings().effort) == (None, 'low')
+        with pytest.raises(SettingError):
+            pm.select_model('claude-cli', 'sonnet', effort='none')
 
     def test_effort_with_the_model_change(self, pm):
         pm.select_model(None, None, effort='max')
@@ -372,15 +402,21 @@ class TestProjectFile:
         with pytest.raises(ValueError):
             ProjectManager(path).load()
 
-    def test_stored_level_of_another_model_passed_as_it_is(self, tmp_path):
-        """A hand-edited level the model does not take: passed, so the CLI
-        says so (Copilot refuses: BackendUnavailableError)."""
+    def test_stored_level_the_model_does_not_take_falls_back(self, tmp_path, recorder):
+        """A hand-edited level (or a list that shrank): the calls use the
+        default, as the web shows it."""
         path = _make_project(tmp_path, n=1)
         raw = _raw(path)
         raw.update(backend='copilot-cli', model='gemini-4-carbon', effort='max')
         with open(os.path.join(path, 'project.json'), 'w', encoding='utf-8') as f:
             json.dump(raw, f)
-        assert _pm(path).call_settings().effort == 'max'
+        pm = _pm(path)
+        assert pm.data.effort == 'max'  # kept in the file until a set changes it
+        assert pm.call_settings().effort == 'low'
+        rec = recorder(_copilot_echo)
+        TranslationEngine(**pm.call_settings().call_args()).translate(
+            'Line 1.', html='<p>Line 1.</p>')
+        assert rec.calls[0]['cmd'][5:7] == ['--reasoning-effort', 'low']
 
     def test_unlisted_model_gets_no_level(self, tmp_path):
         path = _make_project(tmp_path, n=1)
@@ -403,7 +439,12 @@ class TestCLI:
         result = CliRunner().invoke(translate.cli, ['model', 'show', '-p', path])
         assert (result.exit_code, result.output) == (0, (
             '後端：copilot-cli\n模型：gemini-4-carbon\n'
-            '可用模型：claude-sonnet-5.5, gpt-6.2-sol, gemini-4-carbon, claude-haiku-4.5\n'
+            '可用模型：claude-sonnet-5.5, claude-sonnet-5, claude-opus-5.5, claude-haiku-5.5, '
+            'claude-haiku-4.5\n'
+            '          gpt-6.2-sol, gpt-6.2-astra, gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-luna, '
+            'gpt-6-astra, gpt-5.6-sol, gpt-5.6-luna\n'
+            '          gemini-4-carbon, gemini-4-argon, gemini-4-hydrogen, gemini-3.8-flash\n'
+            '          grok-4.7, grok-4.6\n'
             '推理強度：medium\n可用推理強度：low, medium, high\n呼叫逾時：300 秒\n'))
 
     def test_show_unconfigurable(self, tmp_path):
@@ -569,7 +610,10 @@ class TestWeb:
         {'model': 'sonnet', 'timeout': '60'},
         {'model': 'sonnet', 'timeout': True},
         {'model': 'opus', 'effort': 'high', 'timeout': 1},
-        {'effort': 'high'},  # no model: malformed, as before
+        {'effort': 'bogus'},  # without a model: checked against the stored one
+        {'timeout': 10},
+        {},  # nothing to set
+        {'effort': None, 'timeout': None},
     ])
     def test_refused_leaves_the_file(self, client, tmp_path, body):
         path = os.path.join(str(tmp_path), PROJECT)
@@ -579,10 +623,48 @@ class TestWeb:
         assert answer.get_json()['error']
         assert _bytes(path) == before
 
+    def test_only_what_is_sent_changes(self, client, tmp_path):
+        """A tab opened before another client switched the model sends only
+        its timeout: the new model stays (the page sends only what changed)."""
+        path = os.path.join(str(tmp_path), PROJECT)
+        assert client.put(URL, json={'model': 'gpt-6.2-sol', 'backend': 'copilot-cli',
+                                     'effort': 'max'}).status_code == 200
+        answer = client.put(URL, json={'timeout': 300})
+        assert answer.status_code == 200
+        assert answer.get_json() == {'status': 'ok', 'model': 'gpt-6.2-sol',
+                                     'backend': 'copilot-cli', 'effort': 'max',
+                                     'efforts': list(EFFORT_LEVELS), 'timeout': 300, 'note': ''}
+        answer = client.put(URL, json={'effort': 'medium'})
+        assert answer.get_json()['effort'] == 'medium'
+        assert _state(_pm(path)) == ('copilot-cli', 'gpt-6.2-sol', 'medium', 300)
+
+    def test_unlisted_stored_model_can_change_its_timeout(self, client, tmp_path):
+        path = os.path.join(str(tmp_path), PROJECT)
+        raw = _raw(path)
+        raw['model'] = 'retired-model'
+        with open(os.path.join(path, 'project.json'), 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+        answer = client.put(URL, json={'timeout': 600})
+        assert answer.status_code == 200, answer.get_json()
+        assert (answer.get_json()['model'], answer.get_json()['effort']) == ('retired-model', None)
+        assert (_raw(path)['model'], _raw(path)['timeout']) == ('retired-model', 600)
+        # an effort for it is still refused (it lists no level)
+        assert client.put(URL, json={'effort': 'low'}).status_code == 400
+
+    def test_get_shows_the_level_the_calls_use(self, client, tmp_path):
+        path = os.path.join(str(tmp_path), PROJECT)
+        raw = _raw(path)
+        raw.update(backend='copilot-cli', model='gemini-4-carbon', effort='max')
+        with open(os.path.join(path, 'project.json'), 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+        data = client.get(URL).get_json()
+        assert (data['effort'], data['efforts']) == ('low', ['low', 'medium', 'high'])
+        assert data['available'][0]['alias'] == 'claude-sonnet-5.5'  # of the same reading
+
     def test_failed_save_restores_effort_and_timeout(self, client, tmp_path, monkeypatch):
         from src.web.tasks import TaskManager
         pm = _pm(os.path.join(str(tmp_path), PROJECT))
-        pm.select_model(None, 'opus', effort='high', timeout=100)
+        pm.select_model(None, 'opus', effort='xhigh', timeout=100)
         monkeypatch.setattr(TaskManager, 'get_or_load_pm', lambda self, name, d: pm)
         seen = []
 
@@ -595,15 +677,18 @@ class TestWeb:
         with pytest.raises(OSError):
             client.put(URL, json={'model': 'gemini-4-carbon', 'backend': 'copilot-cli',
                                   'timeout': 200})
-        assert seen == [('copilot-cli', 'gemini-4-carbon', 'high', 200)]
-        assert _state(pm) == (None, 'opus', 'high', 100)
+        # the attempted save saw the level reset (Gemini does not take
+        # xhigh); the rollback put it back with the rest
+        assert seen == [('copilot-cli', 'gemini-4-carbon', None, 200)]
+        assert _state(pm) == (None, 'opus', 'xhigh', 100)
 
     def test_web_extraction_passes_effort_and_timeout(self, client, tmp_path, recorder):
         client.put(URL, json={'model': 'haiku', 'effort': 'medium', 'timeout': 333})
         rec = recorder(lambda cmd: ProcessResult(0, '[]', ''))
         assert client.post(f'/api/projects/{PROJECT}/glossary/extract').status_code == 200
-        _wait(lambda: not client.get(
-            f'/api/projects/{PROJECT}/glossary/extract/status').get_json().get('running'))
+        # the terminal status (the answer has no 'running' key)
+        _wait(lambda: client.get(
+            f'/api/projects/{PROJECT}/glossary/extract/status').get_json()['status'] == 'completed')
         call, = rec.calls
         assert call['cmd'][3:7] == ['--model', 'haiku', '--effort', 'medium']
         assert call['timeout'] == 333
@@ -629,6 +714,20 @@ class TestWeb:
         assert 'x-init="init()"' not in html
         assert "document.getElementById('effort-select').value = previous;" in html
         assert "document.getElementById('timeout-input').value = previous;" in html
+        # only what the user changed is sent; settings errors have their own field
+        assert 'body: JSON.stringify(body),' in html
+        assert 'this.putSettings({ effort: level })' in html
+        assert 'this.putSettings({ timeout: seconds })' in html
+        assert "this.settingsError = data.error || '模型設定失敗';" in html
+        assert "this.settingsError = '';" in html
+        assert 'x-text="settingsError"' in html
+        # models grouped by backend and alias family; no x-model on the select
+        model_select = html[html.index('<select id="model-select"'):]
+        model_select = model_select[:model_select.index('</select>')]
+        assert '<optgroup :label="g.label">' in model_select and 'x-model' not in model_select
+        assert "m.backend + '：' + m.alias.slice(0, dash) : m.backend" in html
+        start = html.index('async putSettings(body)')
+        assert 'this.error' not in html[start:html.index('async setModel(key)')]
 
 
 # --- a switch during a web run applies to the next segment -----------------------------

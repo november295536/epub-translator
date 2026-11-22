@@ -856,6 +856,15 @@ def model():
     (without translating)."""
 
 
+def _model_lines(aliases) -> str:
+    """The aliases one line per family (the part before the first '-':
+    claude-…, gpt-…), the later lines indented under the first."""
+    lines = {}
+    for alias in aliases:
+        lines.setdefault(alias.split('-')[0] if '-' in alias else '', []).append(alias)
+    return ('\n' + ' ' * 10).join(', '.join(group) for group in lines.values())
+
+
 @model.command('show')
 @click.option('--project', '-p', default=None, help='Project directory path')
 def model_show(project):
@@ -869,8 +878,7 @@ def model_show(project):
     settings = pm.call_settings()
     click.echo(f"後端：{pm.data.backend or llm.default_backend().name}")
     click.echo(f"模型：{pm.data.model}")
-    aliases = [m['alias'] for m in available_models(pm.data.backend)]
-    click.echo(f"可用模型：{', '.join(aliases)}")
+    click.echo('可用模型：' + _model_lines(m['alias'] for m in available_models(pm.data.backend)))
     click.echo(f"推理強度：{effort_label(settings.effort)}")
     levels = effort_levels(pm.data.backend, pm.data.model)
     click.echo(f"可用推理強度：{', '.join(levels) if levels else '無'}")

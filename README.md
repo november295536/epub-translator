@@ -27,13 +27,13 @@ python3 -m pytest tests/ -q           # 確認安裝
 | 後端 | 指令 | 模型 | 登入 |
 |---|---|---|---|
 | `claude-cli`（預設） | `claude -p` | `sonnet`（預設）、`opus`、`haiku` | `claude /login` |
-| `copilot-cli` | `copilot -p` | `claude-sonnet-5.5`（預設）、`gpt-6.2-sol`、`gemini-4-carbon`、`claude-haiku-4.5` | `copilot login` |
+| `copilot-cli` | `copilot -p` | Claude：`claude-sonnet-5.5`（預設）、`claude-sonnet-5`、`claude-opus-5.5`（15x）、`claude-haiku-5.5`、`claude-haiku-4.5`（0.33x）；GPT：`gpt-6.2-sol`、`gpt-6.2-astra`、`gpt-6.1-sol`、`gpt-6.1-terra`、`gpt-6-sol`、`gpt-6-luna`、`gpt-6-astra`、`gpt-5.6-sol`、`gpt-5.6-luna`；Gemini：`gemini-4-carbon`、`gemini-4-argon`、`gemini-4-hydrogen`、`gemini-3.8-flash`（14x）；Grok：`grok-4.7`、`grok-4.6`（未標示者 1x，為 Copilot 計算的 premium request 倍數） | `copilot login` |
 
 - 後端與模型存在專案裡，新專案預設 `claude-cli`。CLI 用 `model set -b/-m` 只儲存設定（`model show` 顯示目前的設定與可用模型），或用 `start --backend/-b`、`--model/-m` 設定後直接開始翻譯；之後的執行沿用。Web 在「翻譯」頁的模型選單切換（只儲存設定），翻譯中切換會從下一段開始生效。換成另一個後端且不指定模型時用該後端的預設模型（指定的是專案目前的後端時不改動模型）；模型必須屬於要使用的後端，否則拒絕且不改動專案。`glossary extract` 使用專案目前的後端。
 - **推理強度與呼叫逾時**：也存在專案裡，與模型一樣設定（CLI `model set -e/--effort`、`-t/--timeout`，`model show` 顯示目前的值與模型可用的推理強度；Web「翻譯」頁模型選單旁的「推理強度」與「呼叫逾時（秒）」），翻譯中變更從下一段開始生效，翻譯與術語提取都使用。
-  - 推理強度：`sonnet`、`opus`、`haiku`、`claude-sonnet-5.5`、`gpt-6.2-sol` 可選 `low`、`medium`、`high`、`xhigh`、`max`；`gemini-4-carbon` 可選 `low`、`medium`、`high`；`claude-haiku-4.5` 不可設定（不傳任何值）。預設 `low`。模型不接受的強度會被拒絕且不改動專案；換模型時若原本的強度新模型不接受，會改回預設並在確認訊息中說明。Claude 後端以 `--effort` 傳入（並忽略環境變數 `CLAUDE_CODE_EFFORT_LEVEL`），Copilot 後端以 `--reasoning-effort` 傳入；Copilot 拒絕強度時停下（Web 暫停、CLI 結束），不儲存結果。
+  - 推理強度：Claude 後端的三個模型與 Copilot 的 Claude 5/5.5 系列、GPT 系列可選 `low`、`medium`、`high`、`xhigh`、`max`，其中 `gpt-6-sol`、`gpt-6-luna`、`gpt-5.6-sol`、`gpt-5.6-luna` 另有 `none`；Gemini 系列可選 `low`、`medium`、`high`；Grok 系列可選 `low`、`medium`、`high`、`xhigh`；`claude-haiku-4.5` 不可設定（不傳任何值）。`model show` 與翻譯頁列出目前模型可選的強度。預設 `low`；專案檔裡的強度若不在模型的清單中（手動修改，或清單變短），呼叫與頁面都改用預設。模型不接受的強度會被拒絕且不改動專案；換模型時若原本的強度新模型不接受，會改回預設並在確認訊息中說明。Claude 後端以 `--effort` 傳入（並忽略環境變數 `CLAUDE_CODE_EFFORT_LEVEL`），Copilot 後端以 `--reasoning-effort` 傳入；Copilot 拒絕強度時停下（Web 暫停、CLI 結束），不儲存結果。
   - 呼叫逾時：預設 180 秒，可設 30–3600 的整數秒。
-  - 風險：較高的強度在較慢的模型（Gemini）上可能超過逾時，請調高逾時或降低強度；各模型可用的強度取自 CLI 本身的檢查（Claude Code 2.1.330、Copilot CLI 1.0.114），CLI 更新後可能改變。
+  - 風險：較高的強度在較慢的模型（Gemini）上可能超過逾時，請調高逾時或降低強度；Copilot 的模型清單、倍數與各模型可用的強度取自目前的帳號與 CLI 本身的檢查（Claude Code 2.1.330、Copilot CLI 1.0.114），CLI 或 Copilot 更新後可能改變（不接受的強度會讓翻譯停下並顯示 CLI 的訊息）。
 - **只有 Copilot 時**：建立專案後先執行 `python3 translate.py model set -b copilot-cli`（或在 Web「翻譯」頁選一個 Copilot 模型），再提取術語或翻譯。
 - 每次呼叫都以一句翻譯用的系統提示取代 CLI 內建的提示，並且不給模型任何工具；子程序在系統暫存目錄執行。
 - **Copilot 後端的需求與風險**：需要支援 `--experimental` 與 `--plugin-dir` 的 Copilot CLI（以 1.0.114 驗證）；系統提示由 `src/llm/copilot_plugin/` 的擴充功能替換，這依賴未公開的實驗性介面。每次呼叫結束後都會檢查替換是否生效，無法確認時不儲存結果並停下（Web 暫停、CLI 結束），不會改用約 2000 token 的內建提示繼續。Copilot 更新後可能需要調整後端；使用量上限的訊息取自 Copilot 文件，登入錯誤的判斷是推測的。

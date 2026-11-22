@@ -91,9 +91,9 @@ def effort_levels(backend: str | None, model: str) -> tuple:
 
 
 def check_effort(value) -> str:
-    """`value` when it is one of src.llm.EFFORT_LEVELS; raises ValueError
+    """`value` when it is one of src.llm.KNOWN_LEVELS; raises ValueError
     otherwise."""
-    if type(value) is not str or value not in llm.EFFORT_LEVELS:
+    if type(value) is not str or value not in llm.KNOWN_LEVELS:
         raise ValueError(f'unknown effort: {value!r}')
     return value
 
@@ -250,11 +250,16 @@ class ProjectData:
 
 
 def call_settings(data: ProjectData) -> CallSettings:
-    """The settings the project's model calls use. The stored effort is
-    passed as it is (load checked it is a level the CLIs know); a model that
-    takes no levels, or that its backend does not list, gets none."""
+    """The settings the project's model calls use. The effort is the stored
+    level when the model takes it, else DEFAULT_EFFORT (none stored, or a
+    level the model does not list: a hand-edited file or a shorter list);
+    a model that takes no levels, or that its backend does not list, gets
+    none."""
     levels = effort_levels(data.backend, data.model)
-    effort = (data.effort or DEFAULT_EFFORT) if levels else None
+    if not levels:
+        effort = None
+    else:
+        effort = data.effort if data.effort in levels else DEFAULT_EFFORT
     return CallSettings(data.backend, data.model, effort, data.timeout or DEFAULT_TIMEOUT)
 
 

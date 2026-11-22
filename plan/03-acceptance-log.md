@@ -6320,7 +6320,9 @@ Two approvals, one "changes requested". Fixed:
 
 - `PUT …/model` (`src/web/blueprints/translation.py`, `set_model`): a JSON body that is not an
   object (`"opus"`, `["opus"]`, `1`) raised `AttributeError` (500) after the first round; `main`
-  answered 400. It is 400 (`未提供模型名稱`) again (`isinstance(data, dict)`).
+  answered 400 for `"opus"`/`["opus"]` and 500 for `1`/`true`. It is 400 (`未提供模型名稱`) for
+  all of them now (`isinstance(data, dict)`). (Corrected in Phase 10 review round 1: this
+  said `main` answered 400 for every such body.)
 - Same route: the change and the save now run under `pm.mutex`, and a failed save puts the
   previous backend and model back on the manager, as the brief route does, so a running task's
   workers keep the saved values. `main` had the same gap (`set_model` then `save()` with no
