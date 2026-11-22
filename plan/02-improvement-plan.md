@@ -862,9 +862,9 @@ As built:
 - **Errors.** Error text only (the exception's message plus the session's `session.error`
   messages, redacted), never the reply: rate limit → `RateLimitError`, login → `AuthError`,
   refused effort → `BackendUnavailableError` (`EFFORT_REJECTED_MESSAGE`), unknown model →
-  `BackendUnavailableError`, content filter → `RefusalError`; a runtime that went away
-  (`ProcessExitedError`, EOF, a connection error, "not connected") and anything else →
-  `TransientError`; a failure to start the runtime → `BackendUnavailableError`. Observed with real
+  `BackendUnavailableError`, content filter → `RefusalError`; a runtime that exited
+  (`ProcessExitedError`, whose text can quote the runtime's stderr: no pattern is tried) and
+  anything else (also EOF, "Client not connected") → `TransientError`; a failure to start the runtime → `BackendUnavailableError`. Observed with real
   calls: unknown model (`Model "x" is not available.`, at session creation), refused effort
   (`Model 'x' does not support reasoning effort configuration` at creation; `Reasoning effort 'x'
   is not supported for model 'y'` at send), both before any model call; a killed runtime
