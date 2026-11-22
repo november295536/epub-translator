@@ -6828,8 +6828,10 @@ mutmut 3.8.1, ebooklib 0.21, werkzeug 3.1.9, soupsieve 4.1.3, jinja2 3.1.6
 The 3.9 environment had beautifulsoup4 4.14.3, click 8.1.8, lxml 6.0.2 (same libxml2 2.14.6),
 flask 3.1.2, pytest 8.4.2, ebooklib 0.20.
 
-Lower bounds: a 3.12 virtualenv with exactly the lowest versions the requirements allow (pip
-refuses `click==8.1.0` with `flask==3.0.0`; Flask 3.0 itself needs click 8.1.3):
+Lower bounds, application and test fixtures (mutmut left out: its own click requirement
+conflicts with these pins): a 3.12 virtualenv with exactly the lowest versions
+`requirements.txt` and ebooklib allow (pip refuses `click==8.1.0` with `flask==3.0.0`; Flask 3.0
+itself needs click 8.1.3):
 
 ```
 $ python3.12 -m venv <venvmin>
@@ -6865,7 +6867,8 @@ warnings as errors; it passes on both interpreters).
 
 - `zipfile`, writing (real difference, 3.14): `ZipFile._open_to_write` sets
   `zinfo.flag_bits = _MASK_UTF_FILENAME` on 3.14.7 (`0x00` on 3.12.7 and 3.13.7, checked with
-  `inspect.getsource(zipfile.ZipFile._open_to_write)` on each). The exporter's
+  `inspect.getsource(zipfile.ZipFile._open_to_write)` on each; which releases do it: review
+  round 1). The exporter's
   `_ZipInfo._encodeFilenameFlags` returned `flag_bits | name_flag`, so on 3.14 every member
   was written with the UTF-8 flag, and a cp437 name (`caf\x82.png`) became unreadable to
   `zipfile`. 50 of the 51 failures on 3.14 were this (the exporter's metadata tests and the
@@ -6875,8 +6878,9 @@ warnings as errors; it passes on both interpreters).
   it is covered on 3.12 as well.
 - `json` (3.14): `json.loads('[' * 100000 + ']' * 100000)` raises `RecursionError` on 3.12.7
   and parses on 3.14.7; at 1000000 levels it raises on 3.12.7, 3.13.7 and 3.14.7. The code
-  under test (`TermExtractor._consolidate` catching any decoder exception) is unchanged; the
-  test now uses 1000000 levels. That was the 51st failure.
+  under test (`TermExtractor.consolidate` catching any decoder exception) is unchanged; the
+  test first used 1000000 levels, and since review round 1 stubs the decoder instead. That was
+  the 51st failure.
 - Export output, 3.9 vs 3.12 vs 3.14, compared byte for byte. The test fixtures' books
   (`sample_epub`, `rich_sample_epub`, `epub_with_duplicate_spine` from `tests/conftest.py`, the
   raw book of `tests/test_exporter.py`, and that raw book plus a member with an Info-ZIP Unicode
@@ -6908,7 +6912,8 @@ warnings as errors; it passes on both interpreters).
 - `lxml`/`beautifulsoup4` serialisation: covered by the comparison above (chapters, OPF, NCX
   and nav are re-serialised by lxml: identical bytes, with lxml 6.0.2 on 3.9 and 6.1.3 on 3.12
   and 3.14, same libxml2 2.14.6) and by the suite's exact-output exporter and validation tests.
-  beautifulsoup4 is not imported by `src/` (only listed in the requirements).
+  beautifulsoup4 is imported by `src/core/migrate.py` (`html.parser`, to read schema 1
+  segment text); this item first said it was not, which was wrong: see review round 1.
 - `subprocess`, process groups, signals (`src/llm/cli.py`): `Popen(start_new_session=True)`,
   `communicate(timeout=…)` retries, `os.killpg(…, SIGKILL)` and the `atexit` hook are unchanged
   APIs; the suite's real-process tests (`tests/test_llm.py::TestRunProcess*`, including the

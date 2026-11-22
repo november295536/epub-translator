@@ -1373,7 +1373,7 @@ class TestReviewRound1Archive:
 
     def test_non_utf8_name_bytes_kept(self, tmp_path):
         class Cp437(zipfile.ZipInfo):
-            def _encodeFilenameFlags(self):  # without the UTF-8 flag (3.14 presets it)
+            def _encodeFilenameFlags(self):  # without the UTF-8 flag (some releases preset it)
                 return self.filename.encode('cp437'), self.flag_bits & ~0x800
         info = Cp437('OEBPS/Images/café.png')
         epub, project_dir = self._book_with(tmp_path, [(info, b'invented')])
@@ -2062,7 +2062,7 @@ class TestReviewRound3:
         raw = 'OEBPS/Images/café.png'.encode('utf-8')
 
         class Raw(zipfile.ZipInfo):
-            def _encodeFilenameFlags(self):  # without the UTF-8 flag (3.14 presets it)
+            def _encodeFilenameFlags(self):  # without the UTF-8 flag (some releases preset it)
                 return raw, self.flag_bits & ~0x800
         info = Raw('placeholder')
         field = b'\x01' + struct.pack('<L', zlib.crc32(raw)) + raw
@@ -2081,7 +2081,7 @@ class TestReviewRound3:
 
     @pytest.mark.parametrize('name, flag', [('OEBPS/a.css', 0), ('OEBPS/圖.png', 0x800)])
     def test_name_flag_replaces_a_preset_utf8_flag(self, name, flag):
-        # Python 3.14 sets flag_bits to the UTF-8 flag before writing a member
+        # some zipfile releases preset or keep the UTF-8 bit before writing a member
         source = zipfile.ZipInfo(name)
         source.flag_bits = flag  # as read from the source archive
         out = exporter._member_info(source, zipfile.ZIP_DEFLATED)

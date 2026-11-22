@@ -1,6 +1,7 @@
 """An interpreter older than src.MIN_PYTHON stops with one message, before
 any other project module is imported (the version is injected)."""
 
+import ast
 import os
 import subprocess
 import sys
@@ -40,13 +41,48 @@ def test_running_interpreter_passes():
 ])
 def test_entry_points_stop_first(entry, requested):
     # The version is replaced before the entry point runs; the message is
-    # all that is printed, and `src` is the last project import started (the
-    # audit event is raised when an import starts): nothing after it runs
+    # all that is printed. Every import started is recorded (the audit event
+    # is raised when an import starts): before the first project import only
+    # the standard library (a third-party import there would fail first on an
+    # old interpreter), and `src` is the last project import: nothing after it runs
     code = ("import sys; sys.version_info = (3, 11, 9, 'final', 0)\n"
-            "sys.addaudithook(lambda event, args: event == 'import' and "
-            f"args[0].split('.')[0] == {PACKAGE!r} and print(args[0]))\n" + entry)
+            "sys.addaudithook(lambda event, args: event == 'import' and print(args[0]))\n" + entry)
     proc = subprocess.run([sys.executable, '-c', code], cwd=ROOT, capture_output=True,
                           text=True, timeout=60)
     assert proc.returncode == 1
     assert proc.stderr == MESSAGE + '\n'
-    assert proc.stdout.split() == requested
+    started = proc.stdout.split()
+    first = next(i for i, name in enumerate(started) if name.split('.')[0] == PACKAGE)
+    assert [n for n in started[:first] if n.split('.')[0] not in sys.stdlib_module_names] == []
+    assert [n for n in started if n.split('.')[0] == PACKAGE] == requested
+
+
+@pytest.mark.parametrize('path', ['translate.py', os.path.join('src', '__init__.py')])
+def test_readable_by_an_old_interpreter(path):
+    # the message can only appear if an old interpreter can compile these
+    with open(os.path.join(ROOT, path), encoding='utf-8') as f:
+        ast.parse(f.read(), path, feature_version=(3, 9))
+
+
+@pytest.mark.skipif(subprocess.run(['git', '-C', ROOT, 'rev-parse'], capture_output=True).returncode != 0,
+                    reason='needs a git checkout (not in the mutation runner\'s copy)')
+@pytest.mark.parametrize('version, message', [
+    ((3, 11, 9), MESSAGE),
+    # a supported interpreter goes on to the next check (mutmut is hidden here)
+    ((3, 12, 0), 'mutmut not found: pip install -r requirements.txt -r requirements-dev.txt\n'
+                 'in the project environment, and activate it'),
+])
+def test_mutation_script_checks_the_interpreter_first(tmp_path, version, message):
+    # `python3` on PATH: this interpreter reporting `version`, without mutmut
+    fake = tmp_path / 'python3'
+    fake.write_text(f'#!{sys.executable}\n'
+                    'import os, sys\n'
+                    f'sys.version_info = {version!r}\n'
+                    'sys.path.insert(0, os.getcwd())\n'
+                    "sys.modules['mutmut'] = None\n"
+                    "exec(compile(sys.argv[2], '-c', 'exec'))\n")
+    fake.chmod(0o755)
+    proc = subprocess.run(['bash', os.path.join(ROOT, 'scripts', 'verify', 'mutation.sh'), 'main'],
+                          cwd=ROOT, capture_output=True, text=True, timeout=60,
+                          env=dict(os.environ, PATH=f'{tmp_path}:{os.environ["PATH"]}'))
+    assert (proc.returncode, proc.stdout, proc.stderr) == (2, '', message + '\n')

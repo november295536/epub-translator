@@ -786,25 +786,30 @@ Done:
   (with one environment it no longer earns its place). The other lower bounds are unchanged:
   the suite passes on 3.12 with exactly `beautifulsoup4==4.12.0`, `click==8.1.3` (Flask 3.0
   needs it), `lxml==4.9.3`, `flask==3.0.0`, `pytest==7.4.0`, `ebooklib==0.18`.
-- Python 3.14 (newest installed) found one real difference: from 3.14 `zipfile` sets a member's
-  `flag_bits` to the UTF-8 flag before writing it, and the exporter's `_ZipInfo` added the
-  source's flag to that, so every member was written flagged UTF-8 (on 3.14, 50 tests failed
-  on it: export metadata checks and the `phase3_export_check` tests built on them). The
-  exporter now replaces that bit with the source's. Two test fixtures that write raw names
+- Python 3.14.7 (newest installed) found one real difference: some `zipfile` releases preset
+  or keep the UTF-8 bit in a member's `flag_bits` before writing it (CPython source: `= 0x00` up
+  to 3.13.13 and 3.14.5, preset to the UTF-8 flag from 3.13.14 and 3.14.6, kept or set on the
+  current 3.14 branch), and the exporter's `_ZipInfo` added the source's flag to that, so every
+  member was written flagged UTF-8 (on 3.14.7, 50 tests failed on it: export metadata checks and
+  the `phase3_export_check` tests built on them). The exporter now replaces that bit with the
+  source's. Two test fixtures that write raw names
   without the flag clear it the same way; a unit test covers the preset flag on any version.
   The 51st failure: a test relied on 3.12's JSON decoder failing at 100000 nesting levels (3.14
-  parses them);
-  it uses 1000000 levels, which fail on 3.12, 3.13 and 3.14.
+  parses them); it now stubs the consolidation decoder to raise `RecursionError`.
 - 3.9 versus 3.12 versus 3.14: the test fixtures' books exported in all three formats under
   each interpreter are byte-identical archives (acceptance log).
 
 Risks:
 
 - `_ZipInfo` overrides a private `zipfile` method (`_encodeFilenameFlags`); a future Python can
-  change it again, as 3.14 did. The exporter tests that compare member metadata with the source
+  change it again, as 3.13.14 and 3.14.6 did. The exporter tests that compare member metadata with the source
   are what catches it.
 - `scripts/verify/mutation.py` hooks into mutmut 3.8.1 internals; the pin stays.
 - An existing virtualenv is bound to the interpreter that made it: owners rebuild it (README).
+- Migration: newer patch releases (3.12.13+, 3.13.10+, 3.14.1+ by CPython's `html/parser.py`;
+  observed on 3.14.7, not on 3.12.7 or 3.13.7) keep the content of `<iframe>`, `<noembed>`,
+  `<noframes>`, `<xmp>` as raw text in `html.parser`, so `migrate` can refuse a chapter where
+  such an element holds an entity (`known-issues.md`). Not worked around.
 
 ### Phase 12 — Copilot SDK backend
 

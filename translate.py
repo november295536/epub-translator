@@ -1,4 +1,5 @@
 """CLI entry point for the EPUB translator."""
+# Keep this file parseable by Python 3.9, so an old interpreter reaches the version message.
 
 from __future__ import annotations
 
