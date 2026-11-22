@@ -191,7 +191,7 @@ function translationController() {
         failedCount: {{ progress.failed }},
         availableModels: [],
         modelLoading: false,  // a settings save is pending (start, retry and resume wait for it)
-        _settingsSave: null,  // the pending settings saves, chained (null: none)
+        _settingsSave: null,  // the pending settings save (null: none)
         effort: null,      // the level the calls use; null: the model takes none
         timeout: 180,      // seconds per model call
         timeoutMin: 30,
@@ -317,22 +317,18 @@ function translationController() {
 
         // PUT only the settings in `body` (what the user changed; the server
         // keeps the others as stored); applies the stored ones on success and
-        // resolves to whether it succeeded. Saves run one after another; a
-        // run action waits for them through settingsSaved().
+        // resolves to whether it succeeded. One save at a time: the settings
+        // controls are disabled while it is pending (modelLoading), and a run
+        // action waits for it through settingsSaved().
         putSettings(body) {
-            const before = this._settingsSave || Promise.resolve(true);
-            const own = before.then(() => this._putSettings(body));  // after the earlier ones
-            // true only when this save and every earlier one still pending succeeded
-            const save = Promise.all([before, own]).then(([earlier, ok]) => earlier && ok);
+            const save = this._putSettings(body);
             this._settingsSave = save;
             this.modelLoading = true;
             save.finally(() => {
-                if (this._settingsSave === save) {  // the latest: nothing pending any more
-                    this._settingsSave = null;
-                    this.modelLoading = false;
-                }
+                this._settingsSave = null;
+                this.modelLoading = false;
             });
-            return own;
+            return save;
         },
 
         async _putSettings(body) {
@@ -363,16 +359,10 @@ function translationController() {
             return ok;
         },
 
-        // Waits for the settings saves still pending (also ones started
-        // meanwhile); false when one of them was refused or failed
+        // Waits for the pending settings save; true when there is none or it
+        // succeeded (a refused or failed one shows its error)
         async settingsSaved() {
-            let ok = true;
-            while (this._settingsSave) {
-                const pending = this._settingsSave;
-                ok = (await pending) && ok;
-                if (this._settingsSave === pending) break;
-            }
-            return ok;
+            return this._settingsSave ? await this._settingsSave : true;
         },
 
         async setModel(key) {
