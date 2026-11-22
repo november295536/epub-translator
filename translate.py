@@ -856,7 +856,8 @@ def model_show(project):
 
 @model.command('set')
 @click.option('--backend', '-b', default=None, type=click.Choice(sorted(llm.BACKENDS)),
-              help="Backend (without --model: that backend's default model)")
+              help="Backend; when it differs from the project's and --model is not given, "
+                   "that backend's default model is taken")
 @click.option('--model', '-m', 'model_name', default=None,
               help="Model: one of the backend's models")
 @click.option('--project', '-p', default=None, help='Project directory path')

@@ -764,11 +764,20 @@ class TestCLIModelCommand:
         assert (raw['backend'], raw['model']) == ('copilot-cli', 'fake-model')
 
     def test_own_backend_alone_changes_nothing(self, runner, tmp_path):
+        """The project's own backend without -m keeps a non-default model
+        and saves nothing (no reset to the default, no needless save)."""
         path = _make_project(str(tmp_path / 'p'), n=1)
+        pm = ProjectManager(path)
+        pm.load()
+        pm.set_model('opus')
+        pm.save()
         before = self._bytes(path)
-        result = runner.invoke(cli, ['model', 'set', '-b', 'claude-cli', '-p', path])
-        assert (result.exit_code, result.output) == (0, '已設定模型：sonnet（claude-cli）\n')
+        with patch.object(ProjectManager, 'save') as save:
+            result = runner.invoke(cli, ['model', 'set', '-b', 'claude-cli', '-p', path])
+        assert (result.exit_code, result.output) == (0, '已設定模型：opus（claude-cli）\n')
+        assert save.call_count == 0
         assert self._bytes(path) == before
+        assert ProjectManager(path).load().model == 'opus'
 
     @pytest.mark.parametrize('args, message', [
         (['-m', 'nope'],
@@ -810,7 +819,8 @@ class TestCLIModelCommand:
     def test_help(self, runner):
         output = ' '.join(runner.invoke(cli, ['model', 'set', '--help']).output.split())
         assert "--model TEXT Model: one of the backend's models" in output
-        assert "Backend (without --model: that backend's default model)" in output
+        assert ("Backend; when it differs from the project's and --model is not given, "
+                "that backend's default model is taken") in output
 
 
 class TestCLIBackendUnavailable:

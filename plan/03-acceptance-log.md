@@ -6246,6 +6246,9 @@ stored `epub_path` (projects without a copy). Readers found (every use of `epub_
 | `phase2_roundtrip.source_path`, `phase6_segmentation_check.source_of` | own copies of the choice | `source_epub_path` |
 | `phase2_migrate_copies.placed_chapters`, `phase3_export_check.check_copy` | `data.epub_path` | `source_epub_path` |
 
+Left unchanged: `plan/experiments/migrate_dryrun.py` (`check_project`) opens the stored
+`epub_path` directly; it is an old experiment, superseded by `migrate --dry-run`.
+
 Not readers of the source: `validate` and re-translation (they use `project.json` only); `init`
 and web `POST /api/projects` write the copy (unchanged); `EPUBExtractor` in the web upload and
 metadata endpoints reads the uploaded file.
