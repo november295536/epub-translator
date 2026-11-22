@@ -815,9 +815,98 @@ Risks:
 
 ### Phase 12 — Copilot SDK backend
 
-An additional backend beside `copilot-cli`, built on the Copilot SDK. To be specified after a
-feasibility check: authentication with the logged-in account and how usage is billed,
-availability of a Python SDK, and how pause and cancel map to a long-lived session.
+Depends on Phases 10 and 11. A third backend, `copilot-sdk` (`src/llm/copilot_sdk.py`), beside
+`claude-cli` and `copilot-cli`, on the Copilot Python SDK (`microsoft-copilot-sdk`, pure Python,
+`>=2.0.1,<3` in `requirements.txt`; verified with 2.0.1 and Copilot CLI 1.0.114). Nothing else
+changes. The feasibility check (invented prompts) found: a Python SDK exists and drives the same
+runtime as the CLI over JSON-RPC; the installed `copilot` program serves as that runtime; usage
+is billed per model call as for the CLI (`assistant.usage` `cost`, the premium-request multiplier:
+0.33 for Claude Haiku 4.5, 1.0 for Claude Haiku 5.5); and `send_and_wait`'s timeout only stops
+waiting: the turn ran on for 18 s and was billed, so a timeout needs an explicit abort.
+
+As built:
+
+- **Selection.** `BACKENDS['copilot-sdk']`; every place that lists backends derives from it (CLI
+  `start -b`, `model set -b` choices, web `GET|PUT …/model`, the page's model groups, `model
+  show`), so none changed. `phase10_effort_check` keeps to the command-line backends. Models,
+  their effort levels and the default are `copilot_cli.MODELS` / `CopilotCLI.default_model`
+  (one list); the auth hint, e-mail redaction and error patterns are copilot_cli's too (the
+  effort pattern now accepts the runtime's single quotes as well as the CLI's double quotes).
+- **Runtime.** One SDK client per Python process (`_Runtime`): its event loop runs in a daemon
+  thread, created on the first call. `_new_client` (the only place that creates a client)
+  imports the SDK lazily (missing → `BackendUnavailableError` naming `pip install -r
+  requirements.txt`, so the other backends work without it), finds `copilot` on PATH (missing →
+  `BackendUnavailableError` naming the Copilot CLI) and spawns it over stdio with an explicit
+  path (so the SDK never downloads its own runtime), mode `coding-agent`, no `COPILOT_HOME`, the
+  system temp dir as working directory. `client.start()` runs before every call: it returns at
+  once while connected and starts a new runtime when the last one exited (the SDK checks the
+  process). The first start checks `get_auth_status()`; not authenticated → `AuthError` with
+  `copilot login`. An `atexit` hook stops the client (`stop()`, else `force_stop()`, bounded to
+  10 s) and refuses later calls. The SDK's `copilot` logger is set to ERROR (it logs failures it
+  also raises, with tracebacks, and the runtime's stderr as warnings).
+- **One request = one session**, created with an id chosen by the backend (so a session whose
+  creation failed half-way is deleted too): system message `replace`d by `SYSTEM_PROMPT`,
+  `available_tools: []`, the built-in MCP servers (`github-mcp-server`, `githubiq`) disabled,
+  skills off, custom instructions skipped, config discovery, telemetry and infinite sessions
+  off, effort as `inference.reasoning_effort` (only when the model takes levels). The prompt is
+  `flatten_prompt` (as for the CLIs). Reply = the final assistant message of `send_and_wait`
+  (`''` when none); usage = the session's `assistant.usage` events summed. Afterwards the session
+  is deleted (`client.delete_session`, which removes `~/.copilot/session-state/<id>/`, the
+  prompt, reply and reasoning text).
+- **Timeout and cancel.** `complete` is synchronous: it submits the turn to the loop and polls
+  the future (0.1 s) for the cancel event and the deadline. Cancel → `CancelledError`, deadline →
+  `TransientError`, each at once; the future is cancelled, and on the loop the turn's cleanup
+  aborts it (`session.abort()`), waits up to 5 s for `session.idle`, then deletes the session. A
+  reply that arrives after the cancel is refused, as for the CLIs. Up to 20 worker threads share
+  the client; each call has its own session.
+- **Errors.** Error text only (the exception's message plus the session's `session.error`
+  messages, redacted), never the reply: rate limit → `RateLimitError`, login → `AuthError`,
+  refused effort → `BackendUnavailableError` (`EFFORT_REJECTED_MESSAGE`), unknown model →
+  `BackendUnavailableError`, content filter → `RefusalError`; a runtime that went away
+  (`ProcessExitedError`, EOF, a connection error, "not connected") and anything else →
+  `TransientError`; a failure to start the runtime → `BackendUnavailableError`. Observed with real
+  calls: unknown model (`Model "x" is not available.`, at session creation), refused effort
+  (`Model 'x' does not support reasoning effort configuration` at creation; `Reasoning effort 'x'
+  is not supported for model 'y'` at send), both before any model call; a killed runtime
+  (`ProcessExitedError` for the call in flight); no login (`AuthError`, runtime with an empty
+  home and no GitHub CLI). Not observed: rate limit, expired login, refusal (copilot_cli's
+  patterns, documented or guessed).
+
+Billing as observed: every completed call reported one `assistant.usage` event with `cost` (the
+multiplier) and tokens; an aborted call (cancelled 1 s into the model call, or timed out 6 s in)
+went idle with `aborted: true` and reported no `assistant.usage` event. The account's premium
+request count (`account.getQuota`) did not move within minutes of about 3.6 premium requests of
+completed calls, so it could not confirm either; billing is known only as the SDK reports it.
+
+Risks:
+
+- The SDK is new and parts of what is used are marked experimental (`cost`); the runtime's
+  interface can change with a Copilot CLI update. Pinned below 3.
+- Mode `empty` or another `COPILOT_HOME` silently authenticate with the GitHub CLI's token (a
+  different account in the check, 0 models); neither is set, and a user's own `COPILOT_HOME`
+  would do the same.
+- The runtime is in the CLI's process group (the SDK starts it without a new session), so Ctrl-C
+  in the CLI reaches it: it exits at once, no process is left, but the sessions of the calls in
+  flight are not deleted (observed: 3 folders with `events.jsonl`). A web pause and a normal end
+  delete every session. A session folder is also left when the process is killed.
+- The runtime writes its own log (`~/.copilot/logs/process-*.log`); the check found no prompt
+  text in it. The Copilot CLI backend keeps every call as a session (Phase 9) and has no delete.
+
+Acceptance:
+
+- Tests with a fake SDK client (`tests/test_copilot_sdk.py`; conftest's `no_real_sdk_client`
+  makes `_new_client` refuse and gives each test a fresh `_Runtime`): reply, usage, session
+  options (system message, no tools, effort), delete after each call, timeout and cancel → abort
+  → delete, an abort without idle, a late reply after cancel, 20 concurrent calls, a runtime death
+  followed by a new runtime, every error mapping, redaction, not logged in, start failure, missing
+  package and program, the real `_new_client` building a stdio connection on the `copilot` on
+  PATH, the exit hook (in a child process), the other backends without the SDK installed.
+- `scripts/verify/phase12_sdk_check.py` (REAL calls, invented text, the product's backend class):
+  refusals without a model call, three concurrent calls, a killed runtime replaced, a translation
+  with the real text prompt, the effort level reported by the model call, a cancelled and a
+  timed-out call each aborted with no usage, every session folder removed, no runtime left.
+- End to end through the CLI on an invented book (`model set -b copilot-sdk`, `start -w 3`,
+  `export`) and through the web (pause mid-call, resume, server stopped with SIGINT).
 
 ## 6. Order
 

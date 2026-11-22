@@ -390,6 +390,28 @@ def no_real_model_calls(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_real_sdk_client(monkeypatch):
+    """No test creates a real Copilot SDK client (which would start the
+    `copilot` runtime): `copilot_sdk._new_client` refuses unless a test
+    replaces it with a fake. Each test gets its own runtime state, whose
+    event loop is stopped and closed afterwards."""
+    from src.llm import copilot_sdk
+    from src.llm.base import BackendUnavailableError
+
+    def refuse():
+        raise BackendUnavailableError('tests do not start the real Copilot SDK runtime')
+
+    monkeypatch.setattr(copilot_sdk, '_new_client', refuse)
+    runtime = copilot_sdk._Runtime()
+    monkeypatch.setattr(copilot_sdk, '_runtime', runtime)
+    yield
+    if runtime._loop is not None:
+        runtime._loop.call_soon_threadsafe(runtime._loop.stop)
+        runtime._thread.join()
+        runtime._loop.close()
+
+
+@pytest.fixture(autouse=True)
 def no_cli_sleep(monkeypatch):
     """The CLI never sleeps through a rate-limit pause in a test: a test
     that expects one replaces translate._sleep itself."""

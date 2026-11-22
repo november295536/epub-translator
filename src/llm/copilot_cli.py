@@ -118,9 +118,10 @@ _AUTH_PATTERN = re.compile(r'not (?:logged in|authenticated)|copilot login|unaut
 _UNAVAILABLE_PATTERN = re.compile(r'Model "[^"]*" is not available', re.IGNORECASE)
 _REFUSAL_PATTERN = re.compile(r'content.?filter', re.IGNORECASE)
 # The model does not take the reasoning effort passed (exit 1 before any model
-# call): every call with this setting would fail the same way
+# call): every call with this setting would fail the same way. The CLI
+# quotes the level with ", the SDK's runtime (copilot_sdk.py) with '
 _EFFORT_REJECTED_PATTERN = re.compile(
-    r'Reasoning effort "[^"]*" is not supported for model'
+    r'Reasoning effort ["\'][^"\']*["\'] is not supported for model'
     r'|does not support reasoning effort configuration', re.IGNORECASE)
 EFFORT_REJECTED_MESSAGE = 'Copilot CLI 不接受此模型的推理強度設定，請改選推理強度或模型'
 

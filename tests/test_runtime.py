@@ -898,7 +898,7 @@ class TestBackendSelection:
         client = create_app(projects_dir=str(tmp_path)).test_client()
         data = client.get(f'/api/projects/{PROJECT}/model').get_json()
         assert data['backend'] == 'claude-cli' and data['current'] == 'sonnet'
-        assert [b['name'] for b in data['backends']] == ['claude-cli', 'copilot-cli']
+        assert [b['name'] for b in data['backends']] == ['claude-cli', 'copilot-cli', 'copilot-sdk']
         assert data['backends'][1]['models'][0]['alias'] == 'claude-sonnet-5.5'
         answer = client.put(f'/api/projects/{PROJECT}/model',
                             json={'model': 'gpt-6.2-sol', 'backend': 'copilot-cli'})
