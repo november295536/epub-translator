@@ -29,7 +29,7 @@ python3 -m pytest tests/ -q           # 確認安裝
 | `claude-cli`（預設） | `claude -p` | `sonnet`（預設）、`opus`、`haiku` | `claude /login` |
 | `copilot-cli` | `copilot -p` | `claude-sonnet-5.5`（預設）、`gpt-6.2-sol`、`gemini-4-carbon`、`claude-haiku-4.5` | `copilot login` |
 
-- 後端與模型存在專案裡，新專案預設 `claude-cli`。CLI 用 `model set -b/-m` 只儲存設定（`model show` 顯示目前的設定與可用模型），或用 `start --backend/-b`、`--model/-m` 設定後直接開始翻譯；之後的執行沿用。Web 在「翻譯」頁的模型選單切換（只儲存設定），翻譯中切換會從下一段開始生效。只換後端不指定模型時用該後端的預設模型；模型必須屬於要使用的後端，否則拒絕且不改動專案。`glossary extract` 使用專案目前的後端。
+- 後端與模型存在專案裡，新專案預設 `claude-cli`。CLI 用 `model set -b/-m` 只儲存設定（`model show` 顯示目前的設定與可用模型），或用 `start --backend/-b`、`--model/-m` 設定後直接開始翻譯；之後的執行沿用。Web 在「翻譯」頁的模型選單切換（只儲存設定），翻譯中切換會從下一段開始生效。換成另一個後端且不指定模型時用該後端的預設模型（指定的是專案目前的後端時不改動模型）；模型必須屬於要使用的後端，否則拒絕且不改動專案。`glossary extract` 使用專案目前的後端。
 - **只有 Copilot 時**：建立專案後先執行 `python3 translate.py model set -b copilot-cli`（或在 Web「翻譯」頁選一個 Copilot 模型），再提取術語或翻譯。
 - 每次呼叫都以一句翻譯用的系統提示取代 CLI 內建的提示，並且不給模型任何工具；子程序在系統暫存目錄執行。
 - **Copilot 後端的需求與風險**：需要支援 `--experimental` 與 `--plugin-dir` 的 Copilot CLI（以 1.0.114 驗證）；系統提示由 `src/llm/copilot_plugin/` 的擴充功能替換，這依賴未公開的實驗性介面。每次呼叫結束後都會檢查替換是否生效，無法確認時不儲存結果並停下（Web 暫停、CLI 結束），不會改用約 2000 token 的內建提示繼續。Copilot 更新後可能需要調整後端；使用量上限的訊息取自 Copilot 文件，登入錯誤的判斷是推測的。
@@ -112,7 +112,7 @@ python3 translate.py migrate projects/book             # 全部章節對得上�
 
 匯出以原書為底，只改動有譯文的章節、OPF、NCX、導覽文件（雙語格式另加一個樣式表），其餘檔案的內容原樣複製（ZIP 本身重新寫過）。章節的區塊與記錄不符、或段落未通過檢查時以原文輸出，匯出報告會列出原因；`validate` 通過不代表匯出一定用到該譯文。
 
-匯出讀的是專案目錄裡的 `source.epub`，所以搬移或改名專案目錄後仍可匯出；沒有這個副本的舊專案才讀 `project.json` 記錄的原書路徑。讀到的檔案必須與建立專案時記錄的雜湊值相同，否則拒絕匯出。
+匯出讀的是專案目錄裡的 `source.epub`（建立專案或遷移時寫入），所以搬移或改名專案目錄後仍可匯出。讀到的檔案必須與建立專案或遷移時記錄的雜湊值相同，否則拒絕匯出。
 
 ## 專案資料
 
@@ -140,7 +140,7 @@ python3 -m pytest tests/ -q -p no:cacheprovider -rfw
 - 呼叫卡住時先暫停或 Ctrl-C；仍有殘留的 `claude -p`／`copilot -p` 程序時，用 `pgrep -fl 'claude -p'` 找出、確認是這個專案的那一個 PID 再 `kill <PID>`。不要用 `pkill -f`：會砍到其他工作階段的程序。程序列表的參數裡有書的內容，不要貼到公開的地方。
 - 「專案被鎖住」（Web 409、CLI 訊息）：另一個程序（CLI 翻譯、Web 翻譯、匯出）正在使用 `project.lock`。
 - 匯出或 `validate` 拒絕舊格式專案：先執行 `migrate`。
-- 匯出顯示「無法讀取來源 EPUB」：專案目錄裡沒有 `source.epub`，而 `project.json` 記錄的原書路徑也已不存在（較舊的專案離開了原書所在位置）；把原書複製到專案目錄並命名為 `source.epub`。雜湊值不符表示那個檔案不是建立專案時的那本書。
+- 匯出顯示「無法讀取來源 EPUB」：專案目錄裡的 `source.epub` 不見了（被刪除或改名），`project.json` 記錄的原書路徑也讀不到；把原書放回專案目錄並命名為 `source.epub`。雜湊值不符表示那個檔案不是建立專案或遷移時記錄的那本書。
 - Copilot 停在「無法確認 Copilot CLI 已套用翻譯用的系統提示」：外掛沒有載入或 CLI 改了介面；確認 `copilot --help` 有 `--experimental` 與 `--plugin-dir`。
 - Web 翻譯日誌：`projects/<name>/log/translation_*.log`。
 
