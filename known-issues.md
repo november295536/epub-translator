@@ -11,3 +11,9 @@
 **影響**：`translate.py migrate` 用 Beautiful Soup 的 `html.parser` 取出舊段落的文字，再與 lxml 讀到的章節文字比對。較新的 Python 修補版本把某些元素的內容當成原始文字：子標記與註解變成字面文字（`<iframe>A <b>B</b></iframe>` 得到 `A <b>B</b>`，lxml 得到 `A B`），`<iframe>`、`<noembed>`、`<noframes>`、`<xmp>`、`<plaintext>` 裡的字元參照也不解開（`A &amp; B`），於是這一章「text differs」，遷移不寫入任何資料。依 CPython 原始碼（`Lib/html/parser.py`），`<title>`、`<textarea>` 從 3.12.12、3.13.6、3.14.0 起這樣處理，`<iframe>`、`<noembed>`、`<noframes>`、`<xmp>`、`<plaintext>` 從 3.12.13、3.13.10、3.14.1 起；實測遷移：3.12.7 全部通過，3.14.7 全部被拒；3.13.7 只比對了解析結果，`<title>`／`<textarea>` 的子標記與 lxml 不一致。
 
 **暫時做法**：遷移被拒、而章節裡有上述元素時，改用 3.12.11 以前或 3.13.5 以前的修補版本建立的虛擬環境執行 `migrate`（沒有不受影響的 3.14 版本）；只有遷移需要，遷移後的專案不再經過 `html.parser`。
+
+## `copilot-cli` 後端把每次呼叫寫進 Copilot 的跨工作階段資料庫
+
+**影響**：用 `copilot-cli` 後端時，Copilot CLI 會把每次呼叫的提示與回覆（也就是書的原文與譯文）寫進 `~/.copilot/session-store.db`，供 Copilot 搜尋與列出過去的工作階段；工作階段資料夾 `~/.copilot/session-state/<id>/` 也留著。Copilot CLI 1.0.114 沒有能逐次呼叫關閉它的旗標、環境變數或設定：`copilot --help`、`copilot help config`、`copilot help environment` 都沒有；執行環境有 `enableSessionStore` 這個工作階段選項，但只有 SDK 建立工作階段時能傳，`-p` 不行，擴充功能在加入工作階段時傳 `state: { enableCrossSessionStore: false }` 也無效（實測一次呼叫，資料庫仍多了一筆）。這兩個位置都是本機上的檔案，不會因此上傳。
+
+**暫時做法**：翻譯真正的書時用 `copilot-sdk` 後端，它不寫入這個資料庫，且每次呼叫後刪除工作階段資料夾。已經用 `copilot-cli` 翻譯過的，可在 Copilot CLI 裡用 `/session delete` 或 `/session prune` 刪除那些工作階段（是否一併移除資料庫中的紀錄未驗證）。

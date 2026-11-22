@@ -372,8 +372,23 @@ def model_programs_replaced(tmp_path_factory):
         path.chmod(0o755)
     previous = os.environ.get('PATH', '')
     os.environ['PATH'] = str(bin_dir) + os.pathsep + previous
+    # Nor does the Copilot SDK download its own runtime (it would without a
+    # path), find one through COPILOT_CLI_PATH, or look in the machine's cache
+    sdk_env = {'COPILOT_SKIP_CLI_DOWNLOAD': '1', 'COPILOT_CLI_PATH': None,
+               'COPILOT_CLI_EXTRACT_DIR': str(tmp_path_factory.mktemp('copilot-sdk-cache'))}
+    saved = {name: os.environ.get(name) for name in sdk_env}
+    for name, value in sdk_env.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
     yield str(bin_dir)
     os.environ['PATH'] = previous
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 @pytest.fixture(autouse=True)
@@ -387,6 +402,28 @@ def no_real_model_calls(monkeypatch):
         return ProcessResult(1, '', 'tests do not run the real CLI')
 
     monkeypatch.setattr('src.llm.cli.run_process', refuse)
+
+
+@pytest.fixture(autouse=True)
+def no_real_sdk_client(monkeypatch):
+    """No test creates a real Copilot SDK client (which would start the
+    `copilot` runtime): `copilot_sdk._new_client` refuses unless a test
+    replaces it with a fake. Each test gets its own runtime state, whose
+    event loop is stopped and closed afterwards."""
+    from src.llm import copilot_sdk
+    from src.llm.base import BackendUnavailableError
+
+    def refuse():
+        raise BackendUnavailableError('tests do not start the real Copilot SDK runtime')
+
+    monkeypatch.setattr(copilot_sdk, '_new_client', refuse)
+    runtime = copilot_sdk._Runtime()
+    monkeypatch.setattr(copilot_sdk, '_runtime', runtime)
+    yield
+    if runtime._loop is not None:
+        runtime._loop.call_soon_threadsafe(runtime._loop.stop)
+        runtime._thread.join()
+        runtime._loop.close()
 
 
 @pytest.fixture(autouse=True)

@@ -1,7 +1,8 @@
 """Base class for backends that run a command-line program per call.
 
 This module and its subclasses are the only place where the application
-starts processes for model calls.
+starts a process per model call (the Copilot SDK backend's one runtime
+process is started by the SDK: copilot_sdk.py).
 """
 
 from __future__ import annotations

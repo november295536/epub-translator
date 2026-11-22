@@ -51,7 +51,7 @@ from src.core.segmenter import SegmentType  # noqa: E402
 from src.core.translator import TranslationEngine  # noqa: E402
 from src.llm import LLMRequest, Message  # noqa: E402
 from src.llm import copilot_cli  # noqa: E402
-from src.llm.cli import run_process  # noqa: E402
+from src.llm.cli import CLIBackend, run_process  # noqa: E402
 from src.llm.fake import FakeBackend  # noqa: E402
 
 # Invented: no book text
@@ -152,7 +152,10 @@ def line(backend: str, model: str, call: dict) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    parser.add_argument('--backend', required=True, choices=sorted(llm.BACKENDS))
+    # The command-line backends (the SDK backend's check is phase12_sdk_check)
+    parser.add_argument('--backend', required=True,
+                        choices=sorted(n for n, cls in llm.BACKENDS.items()
+                                       if issubclass(cls, CLIBackend)))
     parser.add_argument('--model', required=True, help="One of the backend's models")
     parser.add_argument('--levels', nargs='+', default=['low', 'high'], metavar='LEVEL',
                         help='Levels to call with, in order (default: low high)')
