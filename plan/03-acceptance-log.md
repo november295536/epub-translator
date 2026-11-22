@@ -7522,3 +7522,18 @@ Not killed, and why (equivalent unless said otherwise):
   `latency <= 1`, `max(start) <= min(end)`; the log codec, 3); `latency < 2` (a bound the fake
   cannot reach: the backend returns within one 0.1 s poll); `until`'s poll count and
   `children_gone`'s 6 s instead of 5 (how long a runtime is given to go).
+
+Suite and guards after the fixes:
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once, 3.12.7
+2959 passed in 248.81s / 255.69s / 251.78s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+Real calls this round: 2 aborted calls on the previous code and 2 on the fixed one (exit
+reproduction), 2 completed calls for the store comparison, the check script (6 completed, 2
+aborted, 2.32 premium requests reported).
