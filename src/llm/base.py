@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import List, Optional, Protocol
+from typing import List, Optional, Protocol, Tuple
+
+# Every reasoning effort level a backend's models may accept, lowest first
+# (the values both CLIs know; each model declares its own in ModelInfo.efforts)
+EFFORT_LEVELS = ('low', 'medium', 'high', 'xhigh', 'max')
 
 
 @dataclass
@@ -31,7 +35,7 @@ class LLMRequest:
     timeout: float
     temperature: Optional[float] = None  # hints; ignored if unsupported
     max_output_tokens: Optional[int] = None
-    effort: Optional[str] = None
+    effort: Optional[str] = None      # a level the model accepts; None: pass none
 
 
 @dataclass
@@ -56,6 +60,9 @@ class ModelInfo:
     alias: str
     label: str
     description: str
+    # The reasoning effort levels the model accepts (of EFFORT_LEVELS);
+    # empty: it cannot be configured, and no level is passed
+    efforts: Tuple[str, ...] = ()
 
 
 class LLMError(Exception):

@@ -16,8 +16,8 @@ from src import __version__
 from src.epub.extractor import EPUBError, EPUBExtractor
 from src.core.segmenter import Segmenter, SegmentType
 from src.core.project import (
-    ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus, sha256_file,
-    source_epub_path,
+    MAX_TIMEOUT, MIN_TIMEOUT, ProjectLock, ProjectLockedError, ProjectManager, SegmentStatus,
+    SettingError, effort_label, effort_levels, effort_reset_note, sha256_file, source_epub_path,
 )
 from src.core.runcontrol import DebouncedSaver, resume_delay
 from src.core.translator import (
@@ -121,12 +121,28 @@ def init(epub_file):
     click.echo("使用 'python translate.py start' 開始翻譯")
 
 
-def _select_model(pm, backend, model) -> bool:
-    """pm.select_model, an unknown model being a usage error of -m."""
+# The option each refused setting is reported against
+_SETTING_OPTIONS = {'backend': "'--backend' / '-b'", 'model': "'--model' / '-m'",
+                    'effort': "'--effort' / '-e'", 'timeout': "'--timeout' / '-t'"}
+
+
+def _select_model(pm, backend, model, effort=None, timeout=None) -> bool:
+    """pm.select_model, a refused value being a usage error of its option.
+    Echoes the note when a stored effort was dropped."""
+    previous = pm.data.effort
     try:
-        return pm.select_model(backend, model)
-    except ValueError as e:
-        raise click.BadParameter(str(e), param_hint="'--model' / '-m'") from e
+        changed = pm.select_model(backend, model, effort=effort, timeout=timeout)
+    except SettingError as e:
+        raise click.BadParameter(str(e), param_hint=_SETTING_OPTIONS[e.setting]) from e
+    note = effort_reset_note(previous, pm.data)
+    if note:
+        click.echo(note)
+    return changed
+
+
+def _settings_line(pm) -> str:
+    settings = pm.call_settings()
+    return f"推理強度：{effort_label(settings.effort)}，呼叫逾時：{settings.timeout} 秒"
 
 
 @cli.command()
@@ -176,6 +192,7 @@ def _start(project_dir, backend, model, workers, retry_failed):
     progress = pm.get_progress()
     click.echo(f"使用模型：{pm.data.model}"
                + (f"（{pm.data.backend}）" if pm.data.backend else ''))
+    click.echo(_settings_line(pm))
     click.echo(f"繼續翻譯：{progress['translated']}/{progress['total']} 已完成 ({progress['percent']}%)")
     click.echo(f"剩餘 {len(pending)} 個段落待翻譯")
     if workers > 1:
@@ -244,7 +261,7 @@ class _RunStopped(Exception):
 
 def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
     """Single-worker sequential translation. Returns the number of failed segments."""
-    engine = TranslationEngine(model=pm.data.model, backend=llm.backend_for(pm.data.backend))
+    engine = TranslationEngine(**pm.call_settings().call_args())
     failed = 0
     streak = UnexpectedStreak()
     saver = _saver(pm, log_dir)
@@ -318,7 +335,7 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
         # A retry's backoff wait ends, and no call is made, once the run
         # stops or a rate limit pauses it
         engine = TranslationEngine(
-            model=pm.data.model, backend=llm.backend_for(pm.data.backend),
+            **pm.call_settings().call_args(),
             interrupted=lambda: error_event.is_set() or not gate.is_set())
 
         while not error_event.is_set():
@@ -726,7 +743,7 @@ def glossary_extract(project):
     pm.load()
 
     from src.glossary.term_extractor import ExtractionError, TermExtractor
-    extractor = TermExtractor(model=pm.data.model, backend=llm.backend_for(pm.data.backend))
+    extractor = TermExtractor(**pm.call_settings().call_args())
 
     segments = [{'text': s.text} for s in pm.data.segments if s.segment_type == SegmentType.TEXT]
     click.echo(f"正在從 {len(segments)} 個文字段落中提取術語...")
@@ -835,23 +852,29 @@ def brief_set(text, project):
 
 @cli.group()
 def model():
-    """Show or set the project's backend and model (without translating)."""
+    """Show or set the project's backend, model, reasoning effort and call timeout
+    (without translating)."""
 
 
 @model.command('show')
 @click.option('--project', '-p', default=None, help='Project directory path')
 def model_show(project):
-    """Show the project's backend and model."""
+    """Show the project's backend, model, reasoning effort and call timeout."""
     project_dir = _find_project(project)
     if not project_dir:
         click.echo("找不到專案。")
         sys.exit(1)
     pm = ProjectManager(project_dir)
     pm.load()
+    settings = pm.call_settings()
     click.echo(f"後端：{pm.data.backend or llm.default_backend().name}")
     click.echo(f"模型：{pm.data.model}")
     aliases = [m['alias'] for m in available_models(pm.data.backend)]
     click.echo(f"可用模型：{', '.join(aliases)}")
+    click.echo(f"推理強度：{effort_label(settings.effort)}")
+    levels = effort_levels(pm.data.backend, pm.data.model)
+    click.echo(f"可用推理強度：{', '.join(levels) if levels else '無'}")
+    click.echo(f"呼叫逾時：{settings.timeout} 秒")
 
 
 @model.command('set')
@@ -860,11 +883,18 @@ def model_show(project):
                    "that backend's default model is taken")
 @click.option('--model', '-m', 'model_name', default=None,
               help="Model: one of the backend's models")
+@click.option('--effort', '-e', default=None,
+              help="Reasoning effort: one of the model's levels (model show lists them); "
+                   "a stored level the new model does not take goes back to the default")
+@click.option('--timeout', '-t', default=None, type=int,
+              help=f"Seconds per model call ({MIN_TIMEOUT}-{MAX_TIMEOUT}), "
+                   "for translation and glossary extract")
 @click.option('--project', '-p', default=None, help='Project directory path')
-def model_set(backend, model_name, project):
-    """Set the backend and/or the model used by later runs and glossary extract."""
-    if backend is None and model_name is None:
-        raise click.UsageError("請指定 --backend/-b 或 --model/-m（或兩者）")
+def model_set(backend, model_name, effort, timeout, project):
+    """Set the backend, model, reasoning effort and/or call timeout used by
+    later runs and glossary extract."""
+    if backend is None and model_name is None and effort is None and timeout is None:
+        raise click.UsageError("請指定 --backend/-b、--model/-m、--effort/-e 或 --timeout/-t（可合併）")
     project_dir = _find_project(project)
     if not project_dir:
         click.echo("找不到專案。")
@@ -873,12 +903,13 @@ def model_set(backend, model_name, project):
         with ProjectLock(project_dir):
             pm = ProjectManager(project_dir)
             pm.load()
-            if _select_model(pm, backend, model_name):
+            if _select_model(pm, backend, model_name, effort, timeout):
                 pm.save()
     except ProjectLockedError as e:
         click.echo(str(e))
         sys.exit(1)
     click.echo(f"已設定模型：{pm.data.model}（{pm.data.backend or llm.default_backend().name}）")
+    click.echo(_settings_line(pm))
 
 
 def _find_project(project_dir: str | None) -> str | None:

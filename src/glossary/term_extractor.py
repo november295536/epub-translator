@@ -8,6 +8,7 @@ import threading
 from collections import Counter
 
 import src.llm as llm
+from src.core.project import DEFAULT_TIMEOUT
 from src.llm import (
     AuthError, BackendUnavailableError, LLMError, LLMRequest, Message, RateLimitError,
 )
@@ -164,17 +165,18 @@ def _split_text(text: str, limit: int) -> list[str]:
 class TermExtractor:
     """Extracts technical terms from text through an LLM backend."""
 
-    def __init__(self, model: str = '', timeout: int = 180,
-                 backend: llm.LLMBackend | None = None):
+    def __init__(self, model: str = '', timeout: int = DEFAULT_TIMEOUT,
+                 backend: llm.LLMBackend | None = None, effort: str | None = None):
         self.model = model
         self.timeout = timeout
+        self.effort = effort  # passed with every call (None: none)
         self.backend = backend if backend is not None else llm.default_backend()
 
     def _call(self, prompt: str) -> str | None:
         """The reply to one prompt; None when the call failed (logged).
         Raises ExtractionError on an error every further call would hit too."""
         request = LLMRequest(system='', messages=[Message('user', prompt)],
-                             model=self.model, timeout=self.timeout)
+                             model=self.model, timeout=self.timeout, effort=self.effort)
         try:
             return self.backend.complete(request, threading.Event()).text
         except (AuthError, RateLimitError, BackendUnavailableError) as e:

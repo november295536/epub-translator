@@ -47,6 +47,28 @@
                     <span x-show="modelLoading" class="spinner" style="margin-left: 0.5rem;"></span>
                 </div>
                 <div>
+                    <label for="effort-select" style="font-weight: 600; margin-right: 0.5rem;">推理強度</label>
+                    <select id="effort-select"
+                            :disabled="modelLoading || currentEfforts().length === 0"
+                            @change="saveEffort($event.target.value)"
+                            style="padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
+                        <template x-if="currentEfforts().length === 0">
+                            <option value="" selected>此模型不可設定</option>
+                        </template>
+                        <template x-for="level in currentEfforts()" :key="level">
+                            <option :value="level" :selected="level === effort" x-text="level"></option>
+                        </template>
+                    </select>
+                </div>
+                <div>
+                    <label for="timeout-input" style="font-weight: 600; margin-right: 0.5rem;">呼叫逾時（秒）</label>
+                    <input id="timeout-input" type="number" step="1"
+                           :min="timeoutMin" :max="timeoutMax" :value="timeout"
+                           :disabled="modelLoading"
+                           @change="saveTimeout($event.target.value)"
+                           style="width: 6rem; padding: 0.4rem 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
+                </div>
+                <div>
                     <label for="workers-select" style="font-weight: 600; margin-right: 0.5rem;">並行 Workers</label>
                     <select id="workers-select" x-model="workers"
                             :disabled="state === 'running'"
@@ -67,6 +89,8 @@
                           x-text="activeWorkers + ' 個活躍中'"></span>
                 </div>
             </div>
+
+            <div x-show="settingsNote" class="text-muted" style="margin-bottom: 1rem;" x-text="settingsNote"></div>
 
             <!-- Book brief -->
             <div style="margin-bottom: 1rem;">
@@ -160,6 +184,11 @@ function translationController() {
         failedCount: {{ progress.failed }},
         availableModels: [],
         modelLoading: false,
+        effort: null,      // the level the calls use; null: the model takes none
+        timeout: 180,      // seconds per model call
+        timeoutMin: 30,
+        timeoutMax: 3600,
+        settingsNote: '',  // e.g. a stored level the new model does not take
         workers: 1,
         activeWorkers: 0,
         _pauseInFlight: false,
@@ -195,7 +224,11 @@ function translationController() {
                 const data = await res.json();
                 this.model = data.current;
                 this.backend = data.backend;
-                // Every backend's models; the project's backend first
+                this.effort = data.effort;
+                this.timeout = data.timeout;
+                this.timeoutMin = data.timeout_min;
+                this.timeoutMax = data.timeout_max;
+                // Every backend's models (each with its effort levels); the project's backend first
                 const lists = (data.backends || []).filter(b => b.name !== data.backend);
                 lists.unshift({ name: data.backend, models: data.available });
                 this.availableModels = lists.flatMap(b => b.models.map(m => ({
@@ -204,7 +237,7 @@ function translationController() {
                 // changed only when another one is picked
                 if (!this.availableModels.some(m => m.key === this.modelKey())) {
                     this.availableModels = [{ alias: this.model, label: this.model, description: '目前設定，後端未列出',
-                                              backend: this.backend, key: this.modelKey() },
+                                              efforts: data.efforts, backend: this.backend, key: this.modelKey() },
                                             ...this.availableModels];
                 }
             } catch (e) {
@@ -253,11 +286,15 @@ function translationController() {
             return this.backend + '/' + this.model;
         },
 
-        async setModel(key) {
-            const previous = this.modelKey();
-            const chosen = this.availableModels.find(m => m.key === key);
-            if (!chosen) return;
-            const alias = chosen.alias;
+        // The effort levels of the selected model ([]: not configurable)
+        currentEfforts() {
+            const current = this.availableModels.find(m => m.key === this.modelKey());
+            return current ? current.efforts : [];
+        },
+
+        // PUT the settings (the current model unless another is given);
+        // applies the stored ones on success, returns whether it succeeded
+        async putSettings(body) {
             this.modelLoading = true;
             let data = {};
             let ok = false;
@@ -265,7 +302,7 @@ function translationController() {
                 const res = await fetch('/api/projects/{{ project_name }}/model', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model: alias, backend: chosen.backend }),
+                    body: JSON.stringify({ model: this.model, backend: this.backend, ...body }),
                 });
                 data = await res.json();
                 ok = res.ok && data.status === 'ok';
@@ -275,12 +312,40 @@ function translationController() {
             if (ok) {
                 this.model = data.model;
                 this.backend = data.backend;
+                this.effort = data.effort;
+                this.timeout = data.timeout;
+                this.settingsNote = data.note;
             } else {
-                // Not saved: show the stored model again
-                document.getElementById('model-select').value = previous;
                 this.error = data.error || '模型設定失敗';
             }
             this.modelLoading = false;
+            return ok;
+        },
+
+        async setModel(key) {
+            const previous = this.modelKey();
+            const chosen = this.availableModels.find(m => m.key === key);
+            if (!chosen) return;
+            if (!await this.putSettings({ model: chosen.alias, backend: chosen.backend })) {
+                // Not saved: show the stored model again
+                document.getElementById('model-select').value = previous;
+            }
+        },
+
+        async saveEffort(level) {
+            const previous = this.effort;
+            if (!await this.putSettings({ effort: level })) {
+                document.getElementById('effort-select').value = previous;  // the stored one
+            }
+        },
+
+        async saveTimeout(value) {
+            const previous = this.timeout;
+            // sent as typed (a number when it is one): the server checks it
+            const seconds = /^\d+$/.test(value.trim()) ? parseInt(value, 10) : value;
+            if (!await this.putSettings({ timeout: seconds })) {
+                document.getElementById('timeout-input').value = previous;  // the stored one
+            }
         },
 
         async refreshFailedCount() {

@@ -144,7 +144,7 @@ class TestTranslationEngine:
 
         # run_process always captures text output; only the timeout is passed
         call_kwargs = mock_run.call_args[1]
-        assert call_kwargs['timeout'] == 120
+        assert call_kwargs['timeout'] == 180
 
 
 class TestSubprocessIsolation:
@@ -889,7 +889,7 @@ class TestTranslateSegment:
                                              status=SegmentStatus.TRANSLATED, issues=[],
                                              model='haiku', usage=Usage(5, 7))
         assert fake.requests[0].model == 'haiku'
-        assert fake.requests[0].timeout == 120
+        assert (fake.requests[0].timeout, fake.requests[0].effort) == (180, None)
         assert '<p k="1">One sentence.</p>' in fake.prompts[0]
         assert not os.path.exists(tmp_path / 'failed')
 

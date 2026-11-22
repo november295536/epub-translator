@@ -46,7 +46,7 @@ import re
 from typing import List, Optional
 
 from src.llm.base import (
-    AuthError, BackendUnavailableError, Capabilities, LLMError, LLMRequest,
+    EFFORT_LEVELS, AuthError, BackendUnavailableError, Capabilities, LLMError, LLMRequest,
     LLMResponse, ModelInfo, RateLimitError, RefusalError, TransientError, Usage,
 )
 from src.llm.cli import (
@@ -54,11 +54,14 @@ from src.llm.cli import (
 )
 
 # From the account's model catalog when this backend was written; the
-# multiplier is what Copilot counts per request
+# multiplier is what Copilot counts per request. Effort levels: the ones the
+# CLI (1.0.114) accepted for `--reasoning-effort` with each model (no command
+# lists them; they can change with the CLI); Claude Haiku 4.5 accepts none.
 MODELS = [
-    ModelInfo('claude-sonnet-5.5', 'Claude Sonnet 5.5', '品質與速度兼顧（1x）'),
-    ModelInfo('gpt-6.2-sol', 'GPT-6.2 Sol', 'OpenAI 模型（1x）'),
-    ModelInfo('gemini-4-carbon', 'Gemini 4 Carbon', 'Google 模型，較慢（1x）'),
+    ModelInfo('claude-sonnet-5.5', 'Claude Sonnet 5.5', '品質與速度兼顧（1x）', EFFORT_LEVELS),
+    ModelInfo('gpt-6.2-sol', 'GPT-6.2 Sol', 'OpenAI 模型（1x）', EFFORT_LEVELS),
+    ModelInfo('gemini-4-carbon', 'Gemini 4 Carbon', 'Google 模型，較慢（1x）',
+              ('low', 'medium', 'high')),
     ModelInfo('claude-haiku-4.5', 'Claude Haiku 4.5', '最便宜，適合簡單內容（0.33x）'),
 ]
 
@@ -93,6 +96,12 @@ _AUTH_PATTERN = re.compile(r'not (?:logged in|authenticated)|copilot login|unaut
                            re.IGNORECASE)
 _UNAVAILABLE_PATTERN = re.compile(r'Model "[^"]*" is not available', re.IGNORECASE)
 _REFUSAL_PATTERN = re.compile(r'content.?filter', re.IGNORECASE)
+# The model does not take the reasoning effort passed (exit 1 before any model
+# call): every call with this setting would fail the same way
+_EFFORT_REJECTED_PATTERN = re.compile(
+    r'Reasoning effort "[^"]*" is not supported for model'
+    r'|does not support reasoning effort configuration', re.IGNORECASE)
+EFFORT_REJECTED_MESSAGE = 'Copilot CLI 不接受此模型的推理強度設定，請改選推理強度或模型'
 
 # What looks like an e-mail address (an account name) in kept error text
 _EMAIL_PATTERN = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+')
@@ -191,6 +200,8 @@ class CopilotCLI(CLIBackend):
         cmd = ['copilot', '-p', prompt]
         if request.model:
             cmd += ['--model', request.model]
+        if request.effort:
+            cmd += ['--reasoning-effort', request.effort]
         return cmd + ['--output-format', 'json', '--available-tools', NO_TOOLS,
                       '--no-custom-instructions', '--disable-builtin-mcps', '--no-ask-user',
                       '--no-auto-update', '--experimental', '--plugin-dir', PLUGIN_DIR]
@@ -224,19 +235,23 @@ class CopilotCLI(CLIBackend):
         answered = result.returncode == 0 and bool(_reply(events))
         if answered and not errors:
             return _replacement_error(events, joined)
-        patterns = ((_RATE_LIMIT_PATTERN, RateLimitError), (_AUTH_PATTERN, AuthError))
+
+        def named(cls):
+            return lambda: cls(f'copilot CLI: {joined}')
+
+        # (pattern, the error it means), the first match wins
+        patterns = ((_RATE_LIMIT_PATTERN, named(RateLimitError)),
+                    (_AUTH_PATTERN, lambda: AuthError(f'Copilot CLI 認證失敗，{AUTH_HINT}：{joined}')))
         if not answered:
-            patterns += ((_UNAVAILABLE_PATTERN, BackendUnavailableError),
-                         (UNKNOWN_OPTION_PATTERN, BackendUnavailableError),
-                         (_EXTENSION_REJECTED_PATTERN, None),
-                         (_REFUSAL_PATTERN, RefusalError))
-        for pattern, cls in patterns:
+            patterns += ((_EFFORT_REJECTED_PATTERN,
+                          lambda: BackendUnavailableError(f'{EFFORT_REJECTED_MESSAGE}：{joined}')),
+                         (_UNAVAILABLE_PATTERN, named(BackendUnavailableError)),
+                         (UNKNOWN_OPTION_PATTERN, named(BackendUnavailableError)),
+                         (_EXTENSION_REJECTED_PATTERN, lambda: _not_replaced(joined)),
+                         (_REFUSAL_PATTERN, named(RefusalError)))
+        for pattern, error in patterns:
             if any(pattern.search(t) for t in texts):
-                if cls is AuthError:
-                    return AuthError(f'Copilot CLI 認證失敗，{AUTH_HINT}：{joined}')
-                if cls is None:
-                    return _not_replaced(joined)
-                return cls(f'copilot CLI: {joined}')
+                return error()
         # A reply, or a clean exit without one and without a recognized message
         if answered or (result.returncode == 0 and not errors):
             return _replacement_error(events, joined)
