@@ -6,6 +6,7 @@ import concurrent.futures
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -607,11 +608,17 @@ class TestNothingCutShort:
         thread.join(WAIT)
 
     def test_reply_after_the_deadline_refused(self, client, monkeypatch):
+        """The reply is there (the wait for it is long, the fake answers at
+        once), but the clock says the deadline passed: refused."""
+        monkeypatch.setattr(copilot_sdk, 'POLL_SECONDS', WAIT)
         clock = iter([0.0, 0.0])
         monkeypatch.setattr(copilot_sdk, 'time', SimpleNamespace(
             monotonic=lambda: next(clock, 1000.0)))
+        started = time.monotonic()
         with pytest.raises(TransientError, match='timed out after 30 s'):
             CopilotSDK().complete(_req(timeout=30), threading.Event())
+        assert time.monotonic() - started < WAIT / 2  # not through a wait that ran out
+        assert client.log[-1][0] == 'delete' and not client.sessions[0].aborted.is_set()
 
     def test_poll_never_waits_past_the_deadline(self, client, monkeypatch):
         waits = []
@@ -635,6 +642,155 @@ def _raises(call):
     except BaseException as e:  # noqa: BLE001 - returned to the test
         return e
     return None
+
+
+class TestRoundTwo:
+    """Review round 2: the delete after a failed abort, the close race at a
+    cold start, a cancel between steps, a wedged setup, a hanging stop."""
+
+    def test_abort_raises_delete_still_happens(self, client, monkeypatch):
+        client._respond = _forever
+
+        async def broken(self):
+            self.aborted.set()
+            raise Exception('JSON-RPC Error -32603: session is idle')
+
+        monkeypatch.setattr(FakeSession, 'abort', broken)
+        with pytest.raises(TransientError):
+            CopilotSDK().complete(_req(timeout=0.2), threading.Event())
+        assert client.deleted.wait(WAIT)
+
+    def test_abort_hangs_delete_still_happens(self, client, monkeypatch):
+        monkeypatch.setattr(copilot_sdk, 'ABORT_WAIT_SECONDS', 0.1)
+        client._respond = _forever
+
+        async def hangs(self):
+            self.aborted.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(FakeSession, 'abort', hangs)
+        with pytest.raises(TransientError):
+            CopilotSDK().complete(_req(timeout=0.2), threading.Event())
+        assert client.deleted.wait(WAIT)
+
+    def test_close_before_the_first_turn_reaches_the_client(self, monkeypatch):
+        """A first turn submitted but not yet run (the loop is held busy)
+        when close() is called: close waits for it, and it makes no client,
+        so no runtime is left started; client() refuses once closed."""
+        made = []
+        monkeypatch.setattr(copilot_sdk, '_new_client', lambda: made.append(1) or FakeClient())
+        runtime = copilot_sdk._runtime
+        hold = threading.Event()
+
+        async def busy():
+            hold.wait(WAIT)  # blocks the loop itself
+
+        runtime.submit(busy(), asyncio.Event())
+        errors = []
+        caller = threading.Thread(target=lambda: errors.append(_raises(
+            lambda: CopilotSDK().complete(_req(), threading.Event()))))
+        caller.start()
+        assert _wait(lambda: len(runtime._turns) == 2)
+        closer = threading.Thread(target=runtime.close)
+        closer.start()
+        assert _wait(lambda: runtime._closed)
+        hold.set()
+        closer.join(WAIT)
+        caller.join(WAIT)
+        assert not closer.is_alive() and not caller.is_alive()
+        assert made == [] and isinstance(errors[0], CancelledError)
+        with pytest.raises(CancelledError):
+            asyncio.run(runtime.client())
+
+    def test_close_while_the_first_turn_starts_the_runtime(self, client, monkeypatch):
+        """close() during the first start(): the start is given up, and the
+        client made is stopped all the same."""
+        starting = threading.Event()
+
+        async def slow_start():
+            starting.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(client, 'start', slow_start)
+        caller = threading.Thread(target=lambda: _raises(
+            lambda: CopilotSDK().complete(_req(), threading.Event())))
+        caller.start()
+        assert starting.wait(WAIT)
+        copilot_sdk._runtime.close()
+        caller.join(WAIT)
+        assert client.log == [('stop',)] and client.sessions == []
+
+    def test_cancel_between_creation_and_send(self, client, monkeypatch):
+        """The cancel comes while the session is created, and creation ends
+        before the caller's next poll: nothing is sent."""
+        monkeypatch.setattr(copilot_sdk, 'POLL_SECONDS', 2)
+        gate = threading.Event()
+        creating = threading.Event()
+        create = client.create_session
+
+        async def slow_create(session_id, **options):
+            creating.set()
+            await asyncio.to_thread(gate.wait, WAIT)
+            return await create(session_id=session_id, **options)
+
+        monkeypatch.setattr(client, 'create_session', slow_create)
+        cancel = threading.Event()
+        errors = []
+        caller = threading.Thread(target=lambda: errors.append(_raises(
+            lambda: CopilotSDK().complete(_req(), cancel))))
+        caller.start()
+        assert creating.wait(WAIT)
+        cancel.set()
+        gate.set()  # before the caller is joined (and before its next poll)
+        assert client.deleted.wait(WAIT)
+        caller.join(WAIT)
+        assert isinstance(errors[0], CancelledError)
+        assert not client.sessions[0].sent.is_set()
+
+    @pytest.mark.parametrize('step', ['start', 'get_auth_status', 'create_session'])
+    def test_wedged_setup_ends_and_a_later_call_works(self, client, monkeypatch, step):
+        real = getattr(client, step)
+        wedged = [True]
+
+        async def stuck(*args, **kwargs):
+            if wedged[0]:
+                await asyncio.Event().wait()
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(client, step, stuck)
+        with pytest.raises(TransientError):
+            CopilotSDK().complete(_req(timeout=0.2), threading.Event())
+        assert _wait(lambda: copilot_sdk._runtime._turns == {})
+        wedged[0] = False
+        assert CopilotSDK().complete(_req('AGAIN'), threading.Event()).text == 'ANSWER AGAIN'
+
+    def test_hanging_stop_is_forced(self, client, monkeypatch):
+        monkeypatch.setattr(copilot_sdk, 'CLEANUP_SECONDS', 0.1)
+
+        async def hangs():
+            await asyncio.Event().wait()
+
+        CopilotSDK().complete(_req(), threading.Event())
+        monkeypatch.setattr(client, 'stop', hangs)
+        copilot_sdk._runtime.close()
+        assert client.log[-1] == ('force_stop',)
+
+    @pytest.mark.parametrize('filtered, text, refused', [
+        ([True, False], 'reply', False), ([False, True], 'reply', True),
+        ([True, False], '', True), ([False, False], '', False)])
+    def test_filter_only_when_it_cost_the_reply(self, client, filtered, text, refused):
+        async def respond(session, prompt):
+            for flag in filtered:
+                session.emit(_event('assistant.usage', input_tokens=1, output_tokens=1,
+                                    content_filter_triggered=flag))
+            return _event('assistant.message', content=text)
+
+        client._respond = respond
+        if refused:
+            with pytest.raises(RefusalError):
+                CopilotSDK().complete(_req(), threading.Event())
+        else:
+            assert CopilotSDK().complete(_req(), threading.Event()).text == text
 
 
 class TestErrors:
@@ -810,31 +966,53 @@ class TestShutdown:
         assert runtime._loop is None
 
     def test_stopped_at_interpreter_exit(self):
-        """In a child process: a call, then a normal exit; the exit hook
-        stops the client (on the loop thread, which is still running)."""
+        """In a child process: a call still running when the main thread
+        ends. The exit hook stops it, its session is deleted and the client
+        stopped, both through asyncio.to_thread as the SDK's are: from a
+        plain atexit hook (or with concurrent.futures' hook running first)
+        the executor is already shut down and neither happens."""
         code = """
-import threading
+import asyncio, threading
 from types import SimpleNamespace
 from src.llm import copilot_sdk
 from src.llm.base import LLMRequest, Message
 
+sent = threading.Event()
+
 class Session:
-    def on(self, handler): pass
+    def on(self, handler): self.handler = handler
     async def send_and_wait(self, prompt, timeout):
-        return SimpleNamespace(data=SimpleNamespace(content='OK'))
+        sent.set()
+        await asyncio.Event().wait()
+    async def abort(self):
+        self.handler(SimpleNamespace(type=SimpleNamespace(value='session.idle'),
+                                     data=SimpleNamespace(aborted=True)))
 
 class Client:
     async def start(self): pass
     async def get_auth_status(self): return SimpleNamespace(is_authenticated=True)
     async def create_session(self, session_id, **options): return Session()
-    async def delete_session(self, session_id): pass
-    async def stop(self): print('STOPPED', flush=True)
+    async def delete_session(self, session_id):
+        await asyncio.to_thread(print, 'DELETED', flush=True)
+    async def stop(self):
+        await asyncio.to_thread(print, 'STOPPED', flush=True)
+    async def force_stop(self):
+        print('FORCED', flush=True)
 
 copilot_sdk._new_client = Client
-request = LLMRequest(system='', messages=[Message('user', 'x')], model='m', timeout=30)
-print(copilot_sdk.CopilotSDK().complete(request, threading.Event()).text, flush=True)
+request = LLMRequest(system='', messages=[Message('user', 'x')], model='m', timeout=600)
+def call():
+    try:
+        copilot_sdk.CopilotSDK().complete(request, threading.Event())
+    except BaseException:
+        pass  # stopped at exit; a traceback printed while the interpreter
+              # finalizes can abort it (stderr's lock)
+
+threading.Thread(target=call, daemon=True).start()
+sent.wait(10)
+print('EXIT', flush=True)
 """
         result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
-                                cwd=ROOT, timeout=20)
+                                cwd=ROOT, timeout=60)
         assert result.returncode == 0, result.stderr
-        assert result.stdout.split() == ['OK', 'STOPPED']
+        assert result.stdout.split() == ['EXIT', 'DELETED', 'STOPPED']

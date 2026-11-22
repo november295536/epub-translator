@@ -7196,7 +7196,7 @@ made from a scratch directory, with a scratch `projects/` for the end-to-end run
 - The Copilot CLI backend keeps every call as a session (Phase 9, `phase9_copilot_overhead`
   docstring); `copilot -p` has no option to avoid it, and that backend does not delete them.
 
-### Check script (REAL calls: 6 completed, 2 aborted; 2.32 premium requests reported)
+### Check script (REAL calls: 5 completed, 2 aborted; 2.32 premium requests reported)
 
 Final version of the script, on the final backend:
 
@@ -7535,5 +7535,5 @@ exit 0                      (not killed 0; 81 KILLED)
 ```
 
 Real calls this round: 9 calls aborted mid-turn for the exit reproduction (2 on the previous
-code, 2 with the hook but without the import, 5 on the fixed code with and without a trace), 2 completed calls for the store comparison, the check script (6 completed, 2
+code, 2 with the hook but without the import, 5 on the fixed code with and without a trace), 2 completed calls for the store comparison, the check script (5 completed, 2
 aborted, 2.32 premium requests reported).
