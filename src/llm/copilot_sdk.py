@@ -113,17 +113,6 @@ def session_options(request: LLMRequest) -> dict:
     return options
 
 
-def _event_type(event) -> str:
-    return getattr(event.type, 'value', event.type)
-
-
-def _is_disconnect(error: BaseException) -> bool:
-    """Whether `error` says the runtime went away (not a request it refused)."""
-    return (type(error).__name__ == 'ProcessExitedError'
-            or isinstance(error, (EOFError, ConnectionError))
-            or 'not connected' in str(error))
-
-
 def _error(error: Exception, messages: List[str]) -> LLMError:
     """The LLMError a failed call represents; `messages` are the session's
     `session.error` messages."""
@@ -132,6 +121,9 @@ def _error(error: Exception, messages: List[str]) -> LLMError:
     joined = redact(' | '.join([str(error)] + messages))[:ERROR_CHARS]
     if isinstance(error, TimeoutError):
         return TransientError(f'copilot SDK timed out: {joined}')
+    if type(error).__name__ == 'ProcessExitedError':
+        # The runtime exited (its message can quote its stderr): never a pattern
+        return TransientError(f'copilot SDK: {joined}')
     # (pattern, the error it means), the first match wins
     patterns = ((_RATE_LIMIT_PATTERN, lambda: RateLimitError(f'copilot SDK: {joined}')),
                 (_AUTH_PATTERN, lambda: AuthError(f'Copilot SDK 認證失敗，{AUTH_HINT}：{joined}')),
@@ -139,10 +131,10 @@ def _error(error: Exception, messages: List[str]) -> LLMError:
                  lambda: BackendUnavailableError(f'{EFFORT_REJECTED_MESSAGE}：{joined}')),
                 (_UNAVAILABLE_PATTERN, lambda: BackendUnavailableError(f'copilot SDK: {joined}')),
                 (_REFUSAL_PATTERN, lambda: RefusalError(f'copilot SDK: {joined}')))
-    if not _is_disconnect(error):
-        for pattern, make in patterns:
-            if pattern.search(joined):
-                return make()
+    for pattern, make in patterns:
+        if pattern.search(joined):
+            return make()
+    # Anything else, also a connection that went away (EOF, "not connected")
     return TransientError(f'copilot SDK: {joined}')
 
 
@@ -198,7 +190,7 @@ class _Runtime:
         with self._guard:
             self._closed = True
             loop, client = self._loop, self._client
-        if loop is None or client is None:
+        if client is None:  # a client exists only on a running loop
             return
         try:
             asyncio.run_coroutine_threadsafe(_stop(client), loop).result(CLEANUP_SECONDS)
@@ -238,9 +230,8 @@ class CopilotSDK:
         future = _runtime.submit(self._turn(request, flatten_prompt(request)))
         try:
             while True:
-                wait = min(POLL_SECONDS, max(0.0, deadline - time.monotonic()))
                 try:
-                    response = future.result(timeout=wait)
+                    response = future.result(timeout=POLL_SECONDS)
                 except TimeoutError:
                     # Still running (the turn raises only LLMErrors)
                     if cancel.is_set():
@@ -263,11 +254,11 @@ class CopilotSDK:
         idle = asyncio.Event()
 
         def record(event) -> None:
-            kind = _event_type(event)
+            kind = event.type.value
             if kind == 'assistant.usage':
                 usages.append(event.data)
             elif kind == 'session.error':
-                messages.append(str(getattr(event.data, 'message', '') or ''))
+                messages.append(event.data.message)
             elif kind == 'session.idle':
                 idle.set()
 

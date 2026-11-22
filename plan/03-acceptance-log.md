@@ -7160,3 +7160,147 @@ $ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # 3.12.7
 ```
 
 Only tests and documentation changed in this round. No real model calls.
+
+## Phase 12 — Copilot SDK backend
+
+`copilot-sdk` (`src/llm/copilot_sdk.py`) on `microsoft-copilot-sdk` 2.0.1 with Copilot CLI
+1.0.114 as its runtime, Python 3.12.7. Every real call used invented text only; the runs were
+made from a scratch directory, with a scratch `projects/` for the end-to-end runs.
+
+### Findings before building (no model call unless noted)
+
+- The wheel is pure Python (dependencies `httpx`, `pydantic`, `python-dateutil`): `pip install`
+  alone. With an explicit `path` the SDK uses that program (`_resolve_runtime_entrypoint`:
+  explicit > `COPILOT_CLI_PATH` > download); the download runs only without one.
+- `client.start()` on a client whose runtime was killed (SIGKILL between calls) started a new
+  runtime in 0.29 s (new pid), and `create_session` then worked: no new client is needed.
+- `delete_session` removes `~/.copilot/session-state/<id>/`. A session whose creation failed
+  (effort refused at `session.create`) left a folder with only `workspace.yaml`, which is why the
+  backend chooses the session id and deletes it in every case.
+- Error texts: unknown model `JSON-RPC Error -32603: Request session.create failed with message:
+  Model "no-such-model-xyz" is not available.`; effort on Claude Haiku 4.5 `… session
+  construction failed: Model 'claude-haiku-4.5' does not support reasoning effort
+  configuration. …`; `xhigh` on Gemini 4 Argon `Execution failed: Reasoning effort 'xhigh' is not
+  supported for model 'gemini-4-argon'.` (at send, `session.error` errorType `query`, no usage).
+  The CLI's effort pattern expected double quotes; it now takes either.
+- The runtime exits when its parent dies: product runtime started, then the Python process
+  killed with SIGKILL, SIGTERM, or SIGINT to its process group (a terminal's Ctrl-C): no runtime
+  left in each case.
+- No login: the product backend with `COPILOT_HOME` set to an empty scratch directory and no
+  GitHub CLI on PATH (and no token variables) → `AuthError Copilot SDK 沒有已登入的帳號，請在終端執行
+  copilot login 重新登入`. (This only simulates a missing login; the product never sets
+  `COPILOT_HOME`.)
+- Account premium request count (`account.getQuota`, `premium_interactions.usedRequests`): the
+  same value before and minutes after about 3.6 premium requests of completed calls, so it is not
+  usable as billing evidence; the check script reports the SDK's per-call `cost` instead.
+- The Copilot CLI backend keeps every call as a session (Phase 9, `phase9_copilot_overhead`
+  docstring); `copilot -p` has no option to avoid it, and that backend does not delete them.
+
+### Check script (REAL calls: 6 completed, 2 aborted; 2.32 premium requests reported)
+
+```
+$ python3 scripts/verify/phase12_sdk_check.py; echo "exit $?"
+1. refusals before any model call
+  ok   unknown model/effort: BackendUnavailableError  BackendUnavailableError
+  ok   unknown: no model call
+  ok   effort model/effort: BackendUnavailableError  BackendUnavailableError
+  ok   effort: no model call
+2. three concurrent calls
+  concurrent 0 reply                    wall   3.78 s  in    96  out   253  cost [0.33]  effort [None]
+  concurrent 1 reply                    wall   4.75 s  in    97  out   276  cost [0.33]  effort [None]
+  concurrent 2 reply                    wall   5.74 s  in    93  out   463  cost [0.33]  effort [None]
+  ok   all three answered in Chinese
+  ok   the three calls overlapped in time
+  ok   one runtime process  1
+3. runtime killed, then a translation with the product prompt
+  translation  reply                    wall  10.82 s  in  1408  out   795  cost [0.33]  effort [None]
+  ok   translation reply in Chinese
+  ok   a new runtime process
+  ok   usage reported
+4. effort low on claude-haiku-5.5
+  effort       reply                    wall   1.31 s  in    83  out    20  cost [1.0]  effort ['low']
+  ok   the model call reports effort low  ['low']
+5. cancel and timeout mid-turn
+  cancelled    CancelledError           wall   1.18 s  in     0  out     0  cost []  effort []
+  ok   cancelled: CancelledError
+  ok   cancelled: the model call had started
+  ok   cancelled: returned within 1 s  0.03 s
+  ok   cancelled: session went idle as aborted  idle events 1
+  ok   cancelled: no assistant.usage (nothing reported billed)
+  ok   cancelled: session deleted
+  timed out    TransientError           wall   6.00 s  in     0  out     0  cost []  effort []
+  ok   timed out: TransientError
+  ok   timed out: the model call had started
+  ok   timed out: returned within 1 s  0.00 s
+  ok   timed out: session went idle as aborted  idle events 1
+  ok   timed out: no assistant.usage (nothing reported billed)
+  ok   timed out: session deleted
+6. session files
+  ok   no session directory left of the 9 sessions  0 left
+  ok   a delete asked for every session
+7. stop
+  ok   no runtime process left  0
+information
+  cost the SDK reported in total: 2.32 premium requests
+  runtime logs written during the run: 2; hold prompt text: no
+PASS
+exit 0
+```
+
+What this shows and what it does not: the effort line is the runtime's own record of the model
+call (`assistant.usage` `reasoningEffort`), not a measurement of how much the model reasoned.
+"Nothing reported billed" means the SDK reported no usage for the aborted turn; the account's
+own count could not confirm it (above). An earlier run of the same script (before the deletion
+was recorded when asked rather than after it returned) passed every other check, 2.32 premium
+requests as well.
+
+### End to end, CLI (invented two-chapter book, 4 segments; REAL calls, Claude Haiku 4.5)
+
+```
+$ translate.py init harbour.epub            -> 提取了 2 個章節 / 分段完成：共 4 個段落
+$ translate.py model set -p projects/harbour -b copilot-sdk -m claude-haiku-4.5
+已設定模型：claude-haiku-4.5（copilot-sdk）
+推理強度：此模型不可設定，呼叫逾時：180 秒
+$ translate.py start -p projects/harbour -w 3
+  [W1] [1/4] ✓ chapter_0_seg0002（7 字）
+  [W2] [2/4] ✓ chapter_1_seg0001（35 字）
+  [W1] [3/4] ✓ chapter_1_seg0002（7 字）
+  [W0] [4/4] ✓ chapter_0_seg0001（62 字）
+全部翻譯完成！                               (exit 0, 14.0 s)
+$ translate.py status -p projects/harbour   -> 總段落數 4，已翻譯 4，失敗 0
+$ translate.py export -p projects/harbour
+已輸出：projects/harbour/output/harbour-bilingual-horizontal.epub
+以譯文匯出 2 段，保留原文 2 段（另有 0 段未翻譯或翻譯失敗，以原文匯出）
+  程式碼區塊含標記（code_markup）：2
+```
+
+The two code segments stay in English at export for `code_markup`, the exporter's existing rule
+for these `<pre><code>` blocks, not the backend. No runtime process was left after `start`, and
+the number of session folders was the same before and after.
+
+Ctrl-C: a second copy of the book, `start -w 3`, SIGINT to the CLI's process group 2.5 s after
+the runtime started → `翻譯中斷，正在停止進行中的段落……`, exit 1, nothing saved as translated, no
+runtime left; but 3 session folders (only `events.jsonl`, holding the prompt) were left: the
+runtime received the same SIGINT and exited before the backend could delete the sessions of the
+3 calls in flight. Recorded as a risk (plan); the folders, invented text, were removed by hand.
+
+### End to end, web (same project; REAL calls)
+
+App factory on the scratch `projects/`, model API, start with 3 workers, pause after 3 s, resume,
+server stopped with SIGINT to its process group:
+
+```
+backends ['claude-cli', 'copilot-cli', 'copilot-sdk'] current copilot-sdk claude-haiku-4.5
+start ok
+pause {'state': 'paused', 'status': 'ok'}
+after pause {'state': 'paused', 'completed': 0, 'total': 4, 'failed': None}
+runtime children while paused 1
+resume {'state': 'running', 'status': 'ok'}
+end {'state': 'completed', 'completed': 4, 'total': 4, 'failed': None}
+server exit 0
+runtime left []
+session dirs 419 -> 419
+```
+
+The pause cancelled the 3 calls in flight (nothing completed before it), their sessions were
+deleted; the run log holds only the task's and werkzeug's lines (the SDK's logger is at ERROR).

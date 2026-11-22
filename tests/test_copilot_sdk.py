@@ -33,7 +33,8 @@ def _req(prompt='PROMPT', model='claude-haiku-5.5', effort=None, timeout=30, sys
 
 
 def _event(kind, **data):
-    return SimpleNamespace(type=kind, data=SimpleNamespace(**data))
+    """An SDK session event: `type` is an enum member, `data` the payload."""
+    return SimpleNamespace(type=SimpleNamespace(value=kind), data=SimpleNamespace(**data))
 
 
 class ProcessExitedError(Exception):
@@ -182,6 +183,13 @@ class TestNewClient:
         assert str(e.value) == copilot_sdk.MISSING_CLI_MESSAGE
         assert 'Copilot CLI' in str(e.value)
 
+    def test_sdk_never_downloads_in_tests(self):
+        """Without a runtime path the SDK would download one; in tests it
+        refuses (conftest sets COPILOT_SKIP_CLI_DOWNLOAD)."""
+        from copilot import CopilotClient
+        with pytest.raises(RuntimeError):
+            CopilotClient(mode='coding-agent')
+
     def test_uses_the_installed_program(self, monkeypatch, tmp_path):
         """The runtime is the `copilot` on PATH, spawned over stdio, with the
         default mode and Copilot home; constructing starts nothing."""
@@ -194,6 +202,7 @@ class TestNewClient:
         assert isinstance(connection, SpawnedStdioRuntimeConnection)
         assert connection.path == str(program)
         assert connection.base_directory is None and connection.env is None
+        assert connection.working_directory == copilot_sdk.tempfile.gettempdir()
         assert built._options.mode == 'coding-agent'
         assert built._options.github_token is None
         assert built._process is None
@@ -245,6 +254,7 @@ class TestComplete:
         async def two_calls(session, prompt):
             session.emit(_event('assistant.usage', input_tokens=5, output_tokens=1))
             session.emit(_event('assistant.usage', input_tokens=None, output_tokens=2))
+            session.emit(_event('assistant.usage', input_tokens=4, output_tokens=None))
             return _event('assistant.message', content='X')
 
         async def none(session, prompt):
@@ -252,7 +262,7 @@ class TestComplete:
 
         client._respond = two_calls
         usage = CopilotSDK().complete(_req(), threading.Event()).usage
-        assert (usage.input_tokens, usage.output_tokens) == (5, 3)
+        assert (usage.input_tokens, usage.output_tokens) == (9, 3)
         client._respond = none
         response = CopilotSDK().complete(_req(), threading.Event())
         assert response.text == '' and response.usage is None
@@ -260,7 +270,7 @@ class TestComplete:
     def test_cancelled_before(self, client):
         cancel = threading.Event()
         cancel.set()
-        with pytest.raises(CancelledError):
+        with pytest.raises(CancelledError, match='^cancelled$'):
             CopilotSDK().complete(_req(), cancel)
         assert client.starts == 0
 
@@ -302,6 +312,7 @@ class TestComplete:
         thread.join(WAIT)
         assert not thread.is_alive()
         assert len(errors) == 1 and isinstance(errors[0], CancelledError)
+        assert str(errors[0]) == 'cancelled'
         session = client.sessions[0]
         assert session.aborted.wait(WAIT) and client.deleted.wait(WAIT)
         assert client.log[-1] == ('delete', session.session_id)
@@ -320,6 +331,45 @@ class TestComplete:
             CopilotSDK().complete(_req(timeout=0.2), threading.Event())
         assert client.deleted.wait(WAIT)
 
+    def test_delete_waits_for_idle(self, client, monkeypatch):
+        """After the abort the session is deleted once it went idle, not
+        before (other events do not count), and not only after the wait."""
+        monkeypatch.setattr(copilot_sdk, 'ABORT_WAIT_SECONDS', 1000)
+        client._respond = _forever
+        idle_now = threading.Event()
+
+        async def abort_then_idle(self):
+            self.aborted.set()
+            self.emit(_event('assistant.message_delta', delta='x'))
+            await asyncio.to_thread(idle_now.wait, WAIT)
+            self.emit(_event('session.idle', aborted=True))
+
+        monkeypatch.setattr(FakeSession, 'abort', abort_then_idle)
+        with pytest.raises(TransientError):
+            CopilotSDK().complete(_req(timeout=0.2), threading.Event())
+        assert client.sessions[0].aborted.wait(WAIT)
+        assert not client.deleted.is_set()
+        idle_now.set()
+        assert client.deleted.wait(WAIT)
+
+    def test_cleanup_bounded(self, client, monkeypatch):
+        """A runtime that no longer answers cannot hold a cleanup forever."""
+        monkeypatch.setattr(copilot_sdk, 'CLEANUP_SECONDS', 0.1)
+        client._respond = _forever
+
+        async def hang(session_id):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(client, 'delete_session', hang)
+        with pytest.raises(TransientError):
+            CopilotSDK().complete(_req(timeout=0.2), threading.Event())
+        loop = copilot_sdk._runtime._loop
+
+        async def others():
+            return len(asyncio.all_tasks()) - 1
+
+        assert _wait(lambda: asyncio.run_coroutine_threadsafe(others(), loop).result(WAIT) == 0)
+
     def test_reply_refused_after_cancel(self, client):
         cancel = threading.Event()
 
@@ -328,7 +378,7 @@ class TestComplete:
             return _event('assistant.message', content='LATE')
 
         client._respond = cancel_then_answer
-        with pytest.raises(CancelledError):
+        with pytest.raises(CancelledError, match='^cancelled$'):
             CopilotSDK().complete(_req(), cancel)
 
     def test_concurrent_calls(self, client):
@@ -380,13 +430,14 @@ class TestComplete:
         assert CopilotSDK().complete(_req('AGAIN'), threading.Event()).text == 'ANSWER AGAIN'
         assert client.runtimes == 2
 
-    @pytest.mark.parametrize('message', ['Client not connected', 'unexpected EOF'])
-    def test_connection_errors_transient(self, client, message):
+    @pytest.mark.parametrize('error', [RuntimeError('Client not connected'),
+                                       EOFError('Unexpected end of stream')])
+    def test_connection_errors_transient(self, client, error):
         async def fail(session, prompt):
-            raise (RuntimeError if 'not' in message else EOFError)(message)
+            raise error
 
         client._respond = fail
-        with pytest.raises(TransientError):
+        with pytest.raises(TransientError, match=str(error)):
             CopilotSDK().complete(_req(), threading.Event())
 
 
@@ -416,6 +467,26 @@ class TestErrors:
         assert type(e.value) is error and text in str(e.value)
         # The half-created session is deleted, and nothing was aborted
         assert client.log == [('create', client.log[0][1]), ('delete', client.log[0][1])]
+
+    def test_message_and_events_joined(self, client):
+        async def failed(session, prompt):
+            session.emit(_event('session.error', message='first'))
+            session.emit(_event('session.error', message='second'))
+            raise Exception('Session error: see event')
+
+        client._respond = failed
+        with pytest.raises(TransientError) as e:
+            CopilotSDK().complete(_req(), threading.Event())
+        assert str(e.value) == 'copilot SDK: Session error: see event | first | second'
+
+    def test_runtime_exit_never_a_pattern(self, client):
+        async def died(session, prompt):
+            raise ProcessExitedError('CLI process exited with code 1: Model "x" is not available.')
+
+        client._respond = died
+        with pytest.raises(TransientError) as e:
+            CopilotSDK().complete(_req(), threading.Event())
+        assert type(e.value) is TransientError
 
     def test_session_error_events_classified_and_redacted(self, client):
         async def failed(session, prompt):
@@ -455,7 +526,8 @@ class TestErrors:
         monkeypatch.setattr(client, 'start', broken)
         with pytest.raises(BackendUnavailableError) as e:
             CopilotSDK().complete(_req(), threading.Event())
-        assert '無法啟動' in str(e.value) and 'alice@example.com' not in str(e.value)
+        assert str(e.value) == ('無法啟動 Copilot SDK 的執行環境（copilot）：'
+                                'Copilot CLI not found at /x (<redacted>)')
 
     def test_missing_sdk_reaches_the_caller(self, monkeypatch):
         def missing():
@@ -472,8 +544,26 @@ class TestShutdown:
         CopilotSDK().complete(_req(), threading.Event())
         copilot_sdk._runtime.close()
         assert client.log[-1] == ('stop',)
-        with pytest.raises(CancelledError):
+        with pytest.raises(CancelledError, match='^shutting down$'):
             CopilotSDK().complete(_req(), threading.Event())
+
+    def test_loop_thread(self, client):
+        CopilotSDK().complete(_req(), threading.Event())
+        thread = copilot_sdk._runtime._thread
+        assert thread.daemon and thread.name == 'copilot-sdk' and thread.is_alive()
+
+    def test_close_bounded(self, client, monkeypatch):
+        monkeypatch.setattr(copilot_sdk, 'CLEANUP_SECONDS', 0.1)
+
+        async def hang():
+            await asyncio.Event().wait()
+
+        CopilotSDK().complete(_req(), threading.Event())
+        monkeypatch.setattr(client, 'stop', hang)
+        done = threading.Event()
+        threading.Thread(target=lambda: (copilot_sdk._runtime.close(), done.set()),
+                         daemon=True).start()
+        assert done.wait(WAIT)
 
     def test_close_force_stops_when_stop_fails(self, client, monkeypatch):
         async def failing_stop():
@@ -515,6 +605,6 @@ request = LLMRequest(system='', messages=[Message('user', 'x')], model='m', time
 print(copilot_sdk.CopilotSDK().complete(request, threading.Event()).text, flush=True)
 """
         result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
-                                cwd=ROOT, timeout=60)
+                                cwd=ROOT, timeout=20)
         assert result.returncode == 0, result.stderr
         assert result.stdout.split() == ['OK', 'STOPPED']

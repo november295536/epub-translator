@@ -2,8 +2,10 @@
 
 import importlib.util
 import json
+import re
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -5787,7 +5789,9 @@ class FakeSDKRuntime:
     """A fake SDK client for phase12_sdk_check, and the runtime processes
     it pretends to start (pids, which the script's children() returns)."""
 
-    def __init__(self, usage_after_abort=False):
+    def __init__(self, usage_after_abort=False, logs=None, broken=()):
+        self.broken = set(broken)  # behaviours that make one check fail
+        self.logs = logs  # where the runtime's logs go (written on the long prompt)
         self.pids = []
         self.next_pid = 100
         self.usage_after_abort = usage_after_abort
@@ -5799,7 +5803,7 @@ class FakeSDKRuntime:
         runtime = self
 
         def event(kind, **data):
-            return SimpleNamespace(type=kind, data=SimpleNamespace(**data))
+            return SimpleNamespace(type=SimpleNamespace(value=kind), data=SimpleNamespace(**data))
 
         class Session:
             def __init__(self, options):
@@ -5813,8 +5817,13 @@ class FakeSDKRuntime:
                     handler(e)
 
             async def send_and_wait(self, prompt, timeout):
-                self.emit(event('model.call_start'))
+                if 'no_call_start' not in runtime.broken:
+                    self.emit(event('model.call_start'))
                 if prompt == sdk_check.LONG:
+                    if runtime.logs is not None:
+                        runtime.logs.mkdir(exist_ok=True)
+                        (runtime.logs / 'process-1.log').write_text(f'prompt {prompt}')
+                        (runtime.logs / 'process-2.log').write_text('nothing')
                     await asyncio.Event().wait()
                 if prompt.startswith('Translate to Traditional Chinese: ') and any(
                         s in prompt for s in sdk_check.SENTENCES):
@@ -5825,19 +5834,27 @@ class FakeSDKRuntime:
                         runtime.all_sentences.set()
                     await runtime.all_sentences.wait()
                 level = (self.options.get('inference') or {}).get('reasoning_effort')
-                self.emit(event('assistant.usage', cost=0.33, reasoning_effort=level,
-                                input_tokens=10, output_tokens=5))
-                return event('assistant.message', content='譯文')
+                if 'wrong_level' in runtime.broken and level:
+                    level = 'high'
+                if 'no_usage' in runtime.broken:
+                    return event('assistant.message', content='譯文')
+                cost = 1.0 if self.options['model'] == 'claude-haiku-5.5' else 0.33
+                calls = 2 if 'Traditional Chinese' not in prompt else 1  # the real prompt: 2
+                for _ in range(calls):
+                    self.emit(event('assistant.usage', cost=cost, reasoning_effort=level,
+                                    input_tokens=min(len(prompt), 500), output_tokens=7))
+                return event('assistant.message',
+                             content='text' if 'english' in runtime.broken else '譯文')
 
             async def abort(self):
                 if runtime.usage_after_abort:
                     self.emit(event('assistant.usage', cost=0.33, reasoning_effort=None,
                                     input_tokens=1, output_tokens=1))
-                self.emit(event('session.idle', aborted=True))
+                self.emit(event('session.idle', aborted='not_aborted' not in runtime.broken))
 
         class Client:
             async def start(self):
-                if not runtime.pids:
+                if not runtime.pids and not (runtime.next_pid > 100 and 'no_restart' in runtime.broken):
                     runtime.pids.append(runtime.next_pid)
                     runtime.next_pid += 1
 
@@ -5845,7 +5862,7 @@ class FakeSDKRuntime:
                 return SimpleNamespace(is_authenticated=True, login='someone')
 
             async def create_session(self, session_id, **options):
-                if options['model'] == 'no-such-model-phase12':
+                if options['model'] == 'no-such-model-phase12' and 'accepts' not in runtime.broken:
                     raise Exception('Model "no-such-model-phase12" is not available.')
                 if 'inference' in options and options['model'] == 'claude-haiku-4.5':
                     raise Exception("Model 'claude-haiku-4.5' does not support reasoning "
@@ -5856,9 +5873,58 @@ class FakeSDKRuntime:
                 pass
 
             async def stop(self):
-                runtime.pids.clear()
+                if 'left' not in runtime.broken:
+                    runtime.pids.clear()
 
         return Client()
+
+
+PHASE12_EXPECTED = """\
+1. refusals before any model call
+  ok   unknown model/effort: BackendUnavailableError  BackendUnavailableError
+  ok   unknown: no model call
+  ok   effort model/effort: BackendUnavailableError  BackendUnavailableError
+  ok   effort: no model call
+2. three concurrent calls
+  concurrent 0 reply                    wall   N s  in    73  out     7  cost [0.33]  effort [None]
+  concurrent 1 reply                    wall   N s  in    77  out     7  cost [0.33]  effort [None]
+  concurrent 2 reply                    wall   N s  in    72  out     7  cost [0.33]  effort [None]
+  ok   all three answered in Chinese
+  ok   the three calls overlapped in time
+  ok   one runtime process  1
+3. runtime killed, then a translation with the product prompt
+  translation  reply                    wall   N s  in  1000  out    14  cost [0.33, 0.33]  effort [None, None]
+  ok   translation reply in Chinese
+  ok   a new runtime process
+  ok   usage reported
+4. effort low on claude-haiku-5.5
+  effort       reply                    wall   N s  in    72  out     7  cost [1.0]  effort ['low']
+  ok   the model call reports effort low  ['low']
+5. cancel and timeout mid-turn
+  cancelled    CancelledError           wall   N s  in     0  out     0  cost []  effort []
+  ok   cancelled: CancelledError
+  ok   cancelled: the model call had started
+  ok   cancelled: returned within 1 s  N s
+  ok   cancelled: session went idle as aborted  idle events 1
+  ok   cancelled: no assistant.usage (nothing reported billed)
+  ok   cancelled: session deleted
+  timed out    TransientError           wall   N s  in     0  out     0  cost []  effort []
+  ok   timed out: TransientError
+  ok   timed out: the model call had started
+  ok   timed out: returned within 1 s  N s
+  ok   timed out: session went idle as aborted  idle events 1
+  ok   timed out: no assistant.usage (nothing reported billed)
+  ok   timed out: session deleted
+6. session files
+  ok   no session directory left of the 9 sessions  0 left
+  ok   a delete asked for every session
+7. stop
+  ok   no runtime process left  0
+information
+  cost the SDK reported in total: 2.65 premium requests
+  runtime logs written during the run: 2; hold prompt text: yes
+PASS
+"""
 
 
 class TestPhase12SdkCheck:
@@ -5869,20 +5935,58 @@ class TestPhase12SdkCheck:
         monkeypatch.setattr(sdk_check, 'children', lambda: list(fake.pids))
         monkeypatch.setattr(sdk_check.os, 'kill', lambda pid, sig: fake.pids.remove(pid))
         monkeypatch.setattr(sdk_check, '_pause', lambda seconds: None)
+        monkeypatch.setattr(sdk_check, 'SETTLE_SECONDS', 2)
+        monkeypatch.setattr(sdk_check, 'CANCELLED_TIMEOUT', 3)
         monkeypatch.setattr(sdk_check, 'SESSION_STATE', str(tmp_path / 'state'))
         monkeypatch.setattr(sdk_check, 'RUNTIME_LOGS', str(tmp_path / 'logs' / '*.log'))
         code = sdk_check.main(['--timeout-s', '0.5'])
         return code, capsys.readouterr().out
 
     def test_all_checks_pass(self, monkeypatch, tmp_path, capsys):
-        code, out = self._run(monkeypatch, tmp_path, capsys, FakeSDKRuntime())
+        old = tmp_path / 'logs' / 'process-0.log'  # from before the run: not counted
+        old.parent.mkdir()
+        old.write_text(sdk_check.MARKER)
+        os.utime(old, (0, 0))
+        code, out = self._run(monkeypatch, tmp_path, capsys,
+                              FakeSDKRuntime(logs=tmp_path / 'logs'))
         assert code == 0, out
-        assert out.splitlines()[-1] == 'PASS'
-        assert 'FAIL' not in out
-        assert "effort ['low']" in out and 'cost [0.33]' in out
-        assert 'cost the SDK reported in total: 1.65 premium requests' in out
+        assert re.sub(r'\d+\.\d\d s', 'N s', out) == PHASE12_EXPECTED
         # No reply text, no account data
         assert '譯文' not in out and 'someone' not in out
+
+    @pytest.mark.parametrize('broken, failed', [
+        ('no_call_start', ['cancelled: the model call had started',
+                           'timed out: the model call had started']),
+        ('wrong_level', ["the model call reports effort low  ['high']"]),
+        ('no_usage', ['usage reported', "the model call reports effort low  []"]),
+        ('english', ['all three answered in Chinese', 'translation reply in Chinese']),
+        ('not_aborted', ['cancelled: session went idle as aborted  idle events 1',
+                         'timed out: session went idle as aborted  idle events 1']),
+        ('no_restart', ['a new runtime process']),
+        ('accepts', ['unknown model/effort: BackendUnavailableError', 'unknown: no model call']),
+        ('left', ['no runtime process left  1']),
+    ])
+    def test_each_check_can_fail(self, monkeypatch, tmp_path, capsys, broken, failed):
+        code, out = self._run(monkeypatch, tmp_path, capsys, FakeSDKRuntime(broken=[broken]))
+        assert code == 1
+        assert [line[len('  FAIL '):] for line in out.splitlines()
+                if line.startswith('  FAIL ')] == failed, out
+        assert out.splitlines()[-1].startswith('FAIL: ')
+
+    def test_children_are_the_runtimes(self, tmp_path):
+        """children() lists this process's `copilot … --headless` children only."""
+        program = tmp_path / 'copilot'
+        program.write_text('#!/bin/sh\nsleep 30\n')
+        program.chmod(0o755)
+        runtime = subprocess.Popen([str(program), '--headless', '--stdio'], start_new_session=True)
+        other = subprocess.Popen([str(program), '--other'], start_new_session=True)
+        try:
+            assert sdk_check.children() == [runtime.pid]
+        finally:
+            for proc in (runtime, other):  # with the sleep each one started
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+        assert sdk_check.children() == []
 
     def test_usage_after_abort_fails(self, monkeypatch, tmp_path, capsys):
         code, out = self._run(monkeypatch, tmp_path, capsys,
