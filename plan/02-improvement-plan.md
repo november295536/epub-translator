@@ -842,9 +842,10 @@ As built:
   once while connected and starts a new runtime when the last one exited (the SDK checks the
   process). The first start checks `get_auth_status()`; not authenticated → `AuthError` with
   `copilot login`. At interpreter exit `close` refuses later calls (and `client()` refuses
-  once closed), stops the turns submitted or running and waits (10 s at most) until they deleted
-  their sessions, reads the client only then (a first turn may just have made it: review round
-  2), and stops it (`stop()` bounded to 10 s, else `force_stop()`: about 20 s in all). It is registered with `threading`'s exit hooks
+  once closed), stops the turns submitted or running and waits (15 s at most, one cleanup: review round 3)
+  until they deleted their sessions, reads the client only then (a first turn may just have made
+  it: review round 2), and stops it (`stop()` bounded to 10 s, else `force_stop()` bounded to
+  10 s: at most about 35 s in all). It is registered with `threading`'s exit hooks
   (`threading._register_atexit`, private but the one `concurrent.futures` itself uses), which run
   before `concurrent.futures` shuts its executors down: from a plain `atexit` hook the SDK's
   `stop()` failed (`cannot schedule new futures after shutdown`, it runs blocking steps on the
@@ -871,8 +872,12 @@ As built:
   The turn is never cancelled from outside (review round 1: cancelling it cut its cleanup short
   and skipped the delete): it waits for the reply or the stop event, whichever comes first; on
   stop, or on any error, it aborts the turn (`session.abort()`) and waits for `session.idle`
-  (together at most 5 s), then deletes the session (at most 10 s, attempted also when the abort
-  failed or hung: review round 2). The stop and the cancel are checked on entry, after the client
+  (together at most 5 s) when the prompt was sent, then deletes the session (at most 10 s,
+  attempted also when the abort failed or hung: review round 2); an error during session
+  creation leads to the delete only, and a stop before creation to neither (review round 3). A
+  delete that fails for a created session is logged as a warning with the session id only (CLI:
+  stderr; web: the server's output and the run's `log/translation_*.log`), since its folder keeps
+  the prompt and reply. The stop and the cancel are checked on entry, after the client
   is ready and before the prompt is sent; starting the client and the send race the stop, session
   creation does not (given up half-way it could leave a session) and is bounded by the request's
   timeout. A stop that arrives while the session is being created sends no prompt. A reply that arrives after the cancel or after the deadline is

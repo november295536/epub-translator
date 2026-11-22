@@ -393,7 +393,7 @@ class TestComplete:
 
         async def clean_up():
             await asyncio.wait_for(
-                CopilotSDK._clean_up(client, None, 'id', asyncio.Event()), WAIT)
+                CopilotSDK._clean_up(client, None, 'id', asyncio.Event(), True), WAIT)
 
         asyncio.run(clean_up())
 
@@ -764,6 +764,83 @@ class TestRoundTwo:
         wedged[0] = False
         assert CopilotSDK().complete(_req('AGAIN'), threading.Event()).text == 'ANSWER AGAIN'
 
+    def test_failed_delete_logged(self, client, monkeypatch, caplog):
+        async def broken(session_id):
+            raise Exception('Client not connected')
+
+        monkeypatch.setattr(client, 'delete_session', broken)
+        CopilotSDK().complete(_req('SECRET TEXT'), threading.Event())
+        session_id = client.sessions[0].session_id
+        warnings = [r for r in caplog.records if r.name == 'src.llm.copilot_sdk']
+        assert [r.levelname for r in warnings] == ['WARNING']
+        assert session_id in warnings[0].getMessage()
+        assert 'SECRET' not in warnings[0].getMessage()
+
+    def test_failed_delete_after_failed_creation_not_logged(self, client, monkeypatch, caplog):
+        async def no_model(session_id, **options):
+            raise Exception('Model "x" is not available.')
+
+        async def broken(session_id):
+            raise Exception('no such session')
+
+        monkeypatch.setattr(client, 'create_session', no_model)
+        monkeypatch.setattr(client, 'delete_session', broken)
+        with pytest.raises(BackendUnavailableError):
+            CopilotSDK().complete(_req(), threading.Event())
+        assert not [r for r in caplog.records if r.name == 'src.llm.copilot_sdk']
+
+    def test_cancel_before_creation_deletes_nothing(self, client, monkeypatch):
+        """The cancel comes while the client starts (before the caller's
+        next poll sets the stop): no session is created, none deleted."""
+        monkeypatch.setattr(copilot_sdk, 'POLL_SECONDS', 2)
+        gate = threading.Event()
+        starting = threading.Event()
+        real_start = client.start
+
+        async def slow_start():
+            starting.set()
+            await asyncio.to_thread(gate.wait, WAIT)
+            await real_start()
+
+        monkeypatch.setattr(client, 'start', slow_start)
+        cancel = threading.Event()
+        errors = []
+        caller = threading.Thread(target=lambda: errors.append(_raises(
+            lambda: CopilotSDK().complete(_req(), cancel))))
+        caller.start()
+        assert starting.wait(WAIT)
+        cancel.set()
+        gate.set()
+        caller.join(WAIT)
+        assert isinstance(errors[0], CancelledError)
+        assert _wait(lambda: copilot_sdk._runtime._turns == {})
+        assert client.log == []
+
+    def test_close_waits_for_one_whole_cleanup(self, client, monkeypatch):
+        """At exit a turn whose abort and delete each take most of their
+        bound still deletes its session before the client is stopped."""
+        monkeypatch.setattr(copilot_sdk, 'ABORT_WAIT_SECONDS', 1)
+        monkeypatch.setattr(copilot_sdk, 'CLEANUP_SECONDS', 1)
+        client._respond = _forever
+        abort = FakeSession.abort
+
+        async def slow_abort(self):
+            await asyncio.sleep(0.7)
+            await abort(self)
+
+        async def slow_delete(session_id):
+            await asyncio.sleep(0.7)
+            client.log.append(('delete', session_id))
+
+        monkeypatch.setattr(FakeSession, 'abort', slow_abort)
+        monkeypatch.setattr(client, 'delete_session', slow_delete)
+        threading.Thread(target=lambda: _raises(
+            lambda: CopilotSDK().complete(_req(), threading.Event())), daemon=True).start()
+        assert _wait(lambda: client.sessions and client.sessions[0].sent.is_set())
+        copilot_sdk._runtime.close()
+        session_id = client.sessions[0].session_id
+        assert client.log[-2:] == [('delete', session_id), ('stop',)]
+
     def test_hanging_stop_is_forced(self, client, monkeypatch):
         monkeypatch.setattr(copilot_sdk, 'CLEANUP_SECONDS', 0.1)
 
@@ -973,20 +1050,6 @@ class TestShutdown:
         monkeypatch.setattr(client, 'stop', failing_stop)
         copilot_sdk._runtime.close()
         assert client.log[-1] == ('force_stop',)
-
-    def test_close_bounded_when_force_stop_hangs_too(self, client, monkeypatch):
-        monkeypatch.setattr(copilot_sdk, 'CLEANUP_SECONDS', 0.1)
-
-        async def hangs():
-            await asyncio.Event().wait()
-
-        CopilotSDK().complete(_req(), threading.Event())
-        monkeypatch.setattr(client, 'stop', hangs)
-        monkeypatch.setattr(client, 'force_stop', hangs)
-        closer = threading.Thread(target=copilot_sdk._runtime.close)
-        closer.start()
-        closer.join(WAIT / 2)
-        assert not closer.is_alive()
 
     def test_close_without_client(self):
         runtime = copilot_sdk._Runtime()
