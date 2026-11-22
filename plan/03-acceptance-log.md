@@ -6313,3 +6313,50 @@ after the change reported `cli7` SURVIVED: its anchor matched the new `model sho
 Click commands (`model show`, `model set`) are decorated, so mutmut does not mutate them; their
 lines are covered by `TestCLIModelCommand`. The scripts that read real projects were not run (no
 access to the projects directory on this branch). No real model calls.
+
+## Fix: export source path and `model` command — review round 1
+
+Two approvals, one "changes requested". Fixed:
+
+- `PUT …/model` (`src/web/blueprints/translation.py`, `set_model`): a JSON body that is not an
+  object (`"opus"`, `["opus"]`, `1`) raised `AttributeError` (500) after the first round; `main`
+  answered 400. It is 400 (`未提供模型名稱`) again (`isinstance(data, dict)`).
+- Same route: the change and the save now run under `pm.mutex`, and a failed save puts the
+  previous backend and model back on the manager, as the brief route does, so a running task's
+  workers keep the saved values. `main` had the same gap (`set_model` then `save()` with no
+  restore), so this is an existing defect fixed here, not one the branch introduced.
+- `model set -b` help: the backend's default model is taken only when the backend differs from
+  the project's and `-m` is not given (it said "without --model"). README says the same now;
+  CLAUDE.md already said "a new backend".
+- `TestCLIModelCommand::test_own_backend_alone_changes_nothing` starts on `opus` and checks
+  that `ProjectManager.save` is not called, the bytes are unchanged and the model is still `opus`.
+- Docs (CLAUDE.md Export paragraph and troubleshooting, README export note and troubleshooting):
+  every schema 2 project has its own `source.epub`, written at creation (web since its first
+  version, CLI `init` since schema 2) or by `migrate`. "無法讀取來源 EPUB" therefore means that
+  copy is missing (removed or renamed) and the stored path does not work either. The digest is
+  the one recorded at creation or migration. The `epub_path` fallback is described as such only
+  for the migration of schema 1 projects.
+- `plan/experiments/migrate_dryrun.py` is listed above as a reader left unchanged.
+
+Considered and declined:
+
+- Phase 2/6 check scripts load `project.json` even when the copy exists: acceptable (one small
+  read; the scripts' results do not depend on it).
+
+Tests: 6 added (`test_web.py`: 4 bodies that are not objects, a failed save with and without a
+backend switch), 2 changed (the no-op test, the help text). Reverting each fix makes its new
+tests fail (checked by editing the route back: 2 and 3 failures).
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw      # three at once
+2725 passed in 224.25s / 231.91s / 231.48s           (no failure, no warning in any)
+$ scripts/verify/mutation.sh main
+TOTAL mutants 104  killed 104  survived 0  timeout 0  suspicious 0  untested 0
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+The route fixes are in a decorated Flask view, which mutmut 3.8.1 does not mutate (the mutant
+count is unchanged); the new web tests cover them. No real model calls.
