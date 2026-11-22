@@ -6366,3 +6366,142 @@ exit 0                      (not killed 0; 81 KILLED)
 
 The route fixes are in a decorated Flask view, which mutmut 3.8.1 does not mutate (the mutant
 count is unchanged); the new web tests cover them. No real model calls.
+
+## Phase 10 — Reasoning effort and call timeout
+
+Branch `feat/reasoning-effort-and-timeout`. Two per-project settings, chosen like backend and
+model (plan, Phase 10). Installed CLIs: Claude Code 2.1.330 (`claude --help`: `--effort <level>
+(low, medium, high, xhigh, max)`), Copilot CLI 1.0.114 (`copilot --help`: `--reasoning-effort
+<level>`, "supported levels depend on the model").
+
+### Design
+
+- Levels per model: `ModelInfo.efforts` (`src/llm/base.py`, `EFFORT_LEVELS` = the five values),
+  declared in `MODELS` of `claude_cli.py` and `copilot_cli.py`; `effort_levels(backend, model)`
+  (`src/core/project.py`) reads them; a model the backend does not list has none.
+- Project fields `effort` and `timeout` (`ProjectData`), None when the file has no key, never
+  written while None (like `backend`/`brief`), so old files round-trip. `call_settings(data)` →
+  `CallSettings(backend, model, effort, timeout)`: effort = stored or `DEFAULT_EFFORT` (`low`) for a
+  model with levels, None otherwise; timeout = stored or `DEFAULT_TIMEOUT` (180).
+  `CallSettings.call_args()` gives the keyword arguments of `TranslationEngine` and `TermExtractor`
+  (both take `effort` and `timeout`; the engine puts the effort on `LLMRequest.effort`). Load
+  refuses an `effort` outside `EFFORT_LEVELS` and a `timeout` outside 30–3600 (as it refuses an
+  unknown backend). A stored level the model does not take (only by hand editing, or a CLI
+  catalog change) is passed as it is: Copilot then refuses it and the run stops with its message.
+- `ProjectManager.select_model(backend, model, effort=None, timeout=None)`: every refusal is a
+  `SettingError` (a `ValueError` with `setting`) raised before anything changes; a stored level
+  the resulting model does not take becomes None (the default); `effort_reset_note` builds the
+  message (`原推理強度 X 不適用於 M，已改回預設：low|此模型不可設定`).
+- Callers: web worker (`tasks.py`, re-reads `pm.call_settings()` per segment and rebuilds the
+  engine when any of the four changes), CLI sequential and parallel runs, `glossary extract`
+  (CLI and web), web re-translation.
+- Claude: `--effort LEVEL` after `--model`; `CLAUDE_CODE_EFFORT_LEVEL` removed from the child
+  environment. Copilot: `--reasoning-effort LEVEL` after `--model`, nothing for
+  `claude-haiku-4.5`; its two refusal texts → `BackendUnavailableError`
+  (`EFFORT_REJECTED_MESSAGE` + the CLI text); `classify_error`'s pattern table now maps each
+  pattern to a function building its error (same messages as before for the others).
+- CLI: `model set -e/--effort`, `-t/--timeout` (click `INT`; range from `select_model`), each
+  refusal a usage error of its own option; `model show` adds 推理強度, 可用推理強度, 呼叫逾時;
+  `start` prints the effort/timeout line after 使用模型.
+- Web: `GET …/model` adds `effort`, `efforts`, `timeout`, `timeout_min`, `timeout_max`, and every
+  model in `available`/`backends` carries `efforts` (so the page shows the right levels as soon
+  as another model is picked). `PUT` takes `effort`, `timeout` beside `model` (still required),
+  answers the stored settings and `note`, restores all four on a failed save. Page: effort
+  `<select>` (`:selected` + `@change`, no `x-model`; disabled "此模型不可設定" when the model has
+  no levels), timeout number field; on a refusal the control shows the stored value again.
+  Checked in Chrome against a server on an invented project: xhigh saved; switching to Gemini
+  showed `low, medium, high`, selected `low`, and the reset note; Haiku 4.5 showed the disabled
+  "此模型不可設定"; timeout 10 refused with the message and the field back at 180; 240 saved.
+
+### Tests (115 added, 11 assertions changed)
+
+- `tests/test_effort_timeout.py` (93): per-model levels; exact Claude and Copilot command lines
+  with and without a level; Claude environment without `CLAUDE_CODE_EFFORT_LEVEL` (Copilot's
+  unchanged); seven backend/model/level combinations from stored settings to the program's
+  argv, timeout and environment through the engine; the three Copilot refusal texts (stderr and
+  error event) → `BackendUnavailableError`, a reply quoting them is no error; a CLI run exits 1
+  and a web task pauses (`backend_error`) after one call with every segment still pending and no
+  failure log; `select_model` (defaults, effort/timeout alone, kept or reset on a model change,
+  unconfigurable model, 12 refusals changing nothing); project files (old file loads as the
+  defaults and saves without the keys, set values written, bad stored values refused, a stored
+  level passed as it is, an unlisted model gets none); CLI show/set/reset note/7 refusals
+  byte-identical/start line/effort and timeout reach `start` (1 and 2 workers) and `glossary
+  extract`/help; web GET/PUT/reset note/12 refused bodies byte-identical/failed save restores
+  all four/extraction and re-translation get both/page markup; a mid-run switch of effort and
+  timeout reaches the second segment's request.
+- `tests/test_verify_scripts.py::TestPhase10EffortScript` (20).
+- Changed: the 180 s default (2 in `test_translator.py`), `ModelInfo` with levels
+  (`test_llm.py`, `test_web.py` ×2), `model show`/`set` output and the usage error
+  (`test_cli.py` ×5), the PUT answer (`test_runtime.py` ×2).
+
+### Real calls (`scripts/verify/phase10_effort_check.py`, invented paragraph)
+
+13 calls, one per cell, no repeats, no rate limit. `reported` is the level Copilot's
+`session.start` names (Claude reports none). Tokens: Claude input = input + cache creation +
+cache read; output includes the reasoning tokens.
+
+```
+$ python3 scripts/verify/phase10_effort_check.py --backend claude-cli --model haiku --levels low high
+claude-cli   haiku              low     reported -       wall    3.82 s  in   2200  out    290  reasoning      0  ok
+claude-cli   haiku              high    reported -       wall    9.53 s  in   2200  out   1662  reasoning   1342  ok
+$ … --backend claude-cli --model sonnet --levels low high
+claude-cli   sonnet             low     reported -       wall    4.91 s  in   2179  out    337  reasoning      0  ok
+claude-cli   sonnet             high    reported -       wall    4.57 s  in   2179  out    336  reasoning      0  ok
+$ … --backend claude-cli --model sonnet --levels max
+claude-cli   sonnet             max     reported -       wall   82.27 s  in   2179  out  11601  reasoning  11270  ok
+$ … --backend claude-cli --model opus --levels low high
+claude-cli   opus               low     reported -       wall    6.25 s  in   2175  out    321  reasoning      0  ok
+claude-cli   opus               high    reported -       wall    7.74 s  in   2175  out    426  reasoning    114  ok
+$ … --backend copilot-cli --model claude-sonnet-5.5 --levels low high
+copilot-cli  claude-sonnet-5.5  low     reported low     wall   11.66 s  in   1651  out    327  reasoning      0  ok
+copilot-cli  claude-sonnet-5.5  high    reported high    wall    7.84 s  in   1651  out    324  reasoning      0  ok
+$ … --backend copilot-cli --model gpt-6.2-sol --levels low high
+copilot-cli  gpt-6.2-sol        low     reported low     wall    7.38 s  in   1273  out    250  reasoning      0  ok
+copilot-cli  gpt-6.2-sol        high    reported high    wall   10.16 s  in   1273  out    565  reasoning    310  ok
+$ … --backend copilot-cli --model gemini-4-carbon --levels low medium
+copilot-cli  gemini-4-carbon    low     reported low     wall    9.08 s  in   1086  out    215  reasoning      0  ok
+copilot-cli  gemini-4-carbon    medium  reported medium  wall   11.52 s  in   1086  out    421  reasoning    209  ok
+```
+
+Every call exited 0. Evidence that the flag reaches the CLI: Copilot names the level passed in
+every call; Claude's reasoning tokens change with the level (haiku 0 → 1342, opus 0 → 114,
+sonnet 0 at low and high but 11270 at max). Sonnet thought nothing at `high` on this paragraph,
+so a third Sonnet call at `max` was made (13 calls in all). Gemini was measured at `low` and
+`medium`, not `high`: in the research `high` did not finish a comparable paragraph in 300 s,
+beyond the 180 s default. `claude-haiku-4.5` on Copilot takes no level and was not called.
+Single samples: adaptive reasoning varies from call to call.
+
+### Commands and results
+
+```
+$ source <repo>/venv/bin/activate                     # Python 3.9 suite; mutmut on its 3.12
+$ scripts/verify/mutation.sh main                      # run 1
+TOTAL mutants 642  killed 581  survived 61  timeout 0  suspicious 0  untested 0
+$ scripts/verify/mutation.sh main                      # run 2, after tests for the survivors
+TOTAL mutants 642  killed 634  survived 8  timeout 0  suspicious 0  untested 0
+$ scripts/verify/mutation.sh main                      # run 3 (final)
+TOTAL mutants 642  killed 638  survived 4  timeout 0  suspicious 0  untested 0
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw     # three at once
+2840 passed in 218.43s / 225.69s / 220.93s            (no failure, no warning in any)
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+Run 1 survivors were killed by tests (in the commits after the feature): exact messages of
+`check_effort` and of `call_settings` without a loaded project; and in the script: the request
+handed to `build_command`, every argparse option (required, choices, help, metavar, the
+description's first line only), the refusal message with and without levels, flushing each line,
+the wall time of a failed call, the prompt passed to `classify_error`, an empty Claude reply, a
+Copilot run without `session.start`. Run 2 left `--model` required and the description; killed.
+
+The 4 survivors of run 3 are equivalent on any machine; all are in `prompt_text` of the script,
+which builds the engine's real text prompt: `TranslationEngine(backend=None)` (the default
+backend instead of a fake; `_build_prompt` never uses the backend), and the first two arguments
+of `_build_prompt` as `None`/`'XXXX'` text and `None` segment type (with `html` given the text is
+not used, and any type other than CODE takes the same text path).
+
+No phase 1 guard entry had to be re-anchored. Decorated functions (click commands, Flask views)
+are not mutated by mutmut 3.8.1; their lines are covered by `TestCLI` and `TestWeb`. The scripts
+that read real projects were not run (no access to the projects directory on this branch).

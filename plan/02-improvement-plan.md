@@ -709,7 +709,61 @@ Risks:
   (the SDK documentation says so). The calls have no tools, so the model can only answer text.
 - One more process per call (the extension runs in Node, started by the CLI).
 
-### Phase 10 — Copilot SDK backend
+### Phase 10 — Reasoning effort and call timeout
+
+Depends on Phase 9. Both CLIs let a call set how much the model reasons, and slow models need
+more time than the fixed 120 s per translation call (measured with Claude Code 2.1.330 and
+Copilot CLI 1.0.114 on invented text: Gemini 4 Carbon at its default `medium` level took 170 s
+on one paragraph). Two per-project settings, stored and chosen exactly like backend and model:
+
+- **Effort.** Each model declares the levels it accepts (`ModelInfo.efforts`, from the CLIs'
+  own validation): the three Claude Code models and Copilot's `claude-sonnet-5.5` and
+  `gpt-6.2-sol` take `low, medium, high, xhigh, max`, `gemini-4-carbon` takes `low, medium,
+  high`, `claude-haiku-4.5` takes none (nothing is passed). Default `low`. `project.json`
+  `effort` is written only once set; absent means the default (and none for a model that takes
+  no level). `ProjectManager.select_model(backend, model, effort, timeout)` refuses a level the
+  model does not take, changing nothing; a model change drops a stored level the new model does
+  not take back to the default and the CLI / web confirmation says so. Claude gets `--effort`
+  (`CLAUDE_CODE_EFFORT_LEVEL` is removed from its environment: it overrides the flag; the CLI
+  ignores an unknown value silently, so only declared levels are passed); Copilot gets
+  `--reasoning-effort`. Copilot's refusal of a level (`Reasoning effort "…" is not supported for
+  model …`, `does not support reasoning effort configuration`) is a `BackendUnavailableError`:
+  nothing stored, the web task pauses, the CLI exits 1.
+- **Timeout.** One setting for translation and term extraction calls, default 180 s, 30–3600
+  integer seconds; `project.json` `timeout` written only once set.
+- Both are read per segment by a web task (a change applies to the next segment), and used by
+  re-translation and term extraction. CLI `model set -e/-t`, `model show`; web `GET|PUT
+  …/model` (`effort`, `efforts`, `timeout`, and each model's levels for the page); the
+  translation page has an effort selector (only the model's levels; "此模型不可設定") and a
+  timeout field.
+
+Not built, on purpose: a timeout scaled by level, hiding levels that might time out, a check of
+which level the CLI really used, reasoning-token accounting, JSON output for the Claude backend.
+
+Acceptance:
+
+- Tests with fake processes: the command line and environment per backend, model and level;
+  refused values leave `project.json` byte-identical; the reset on a model change; the Copilot
+  refusals stop the run with nothing stored; the timeout reaches translation and extraction
+  calls; a mid-run switch applies to the next segment; old project files load as the defaults
+  and round-trip.
+- `scripts/verify/phase10_effort_check.py`: real calls on an invented paragraph, one per level
+  for a model; prints tokens (reasoning included) and wall time; exits non-zero if a call fails.
+
+Risks:
+
+- High levels on slow models can exceed the timeout (Gemini at `high` did not finish in 300 s
+  in the research); the user raises the timeout or lowers the level.
+- The per-model level lists come from the CLIs' validation and can change between versions:
+  a Copilot model that stops taking a level stops the run with the CLI's message; for Claude an
+  unknown level would be ignored by the CLI, which is why the lists are checked before calls.
+
+### Phase 11 — Python upgrade (3.12+), upgrade only
+
+Move the project environment from Python 3.9 to 3.12 or later, with no behaviour change: the test
+suite and the mutation run on one interpreter. To be specified.
+
+### Phase 12 — Copilot SDK backend
 
 An additional backend beside `copilot-cli`, built on the Copilot SDK. To be specified after a
 feasibility check: authentication with the logged-in account and how usage is billed,
@@ -719,12 +773,13 @@ availability of a Python SDK, and how pause and cancel map to a long-lived sessi
 
 ```
 Phase 0 ── independent
-Phase 1 ─┬─> Phase 7 ─> Phase 9 ─> Phase 10
+Phase 1 ─┬─> Phase 7 ─> Phase 9 ─> Phase 10 ─> Phase 12
          └─┐
 Phase 2 ───┼─> Phase 3 ─┐
            └─> Phase 4 ─┼─> Phase 5
                         └─> Phase 6
 Phase 8 ── after Phase 1
+Phase 11 ── independent (before Phase 12)
 ```
 
 ## 7. Tests
