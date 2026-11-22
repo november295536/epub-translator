@@ -5664,11 +5664,14 @@ class TestPhase10EffortScript:
         assert "--model MODEL One of the backend's models" in out
         assert '--levels LEVEL [LEVEL ...] Levels to call with, in order (default: low high)' in out
         assert '--timeout TIMEOUT Seconds per call (default 180, the product default)' in out
-        for args in (['--model', 'opus'], ['--backend', 'claude-cli'],
-                     ['--backend', 'nope', '--model', 'opus']):
+        assert 'Makes REAL calls' not in out  # the first line only
+        for args, message in ((['--model', 'opus'], 'required: --backend'),
+                              (['--backend', 'claude-cli'], 'required: --model'),
+                              (['--backend', 'nope', '--model', 'opus'], "invalid choice: 'nope'")):
             with pytest.raises(SystemExit) as e:
                 effort_check.main(args)
             assert e.value.code == 2
+            assert message in capsys.readouterr().err
 
     @pytest.mark.parametrize('args, message', [
         (['--backend', 'copilot-cli', '--model', 'gemini-4-carbon', '--levels', 'xhigh', 'max'],
