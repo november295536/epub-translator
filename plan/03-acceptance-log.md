@@ -6806,3 +6806,214 @@ exit 0                      (not killed 0; 81 KILLED)
 
 The 4 survivors are the equivalent `prompt_text` mutants justified in the Phase 10 entry. No
 real model calls.
+
+## Phase 11 — Python upgrade (3.12+), upgrade only
+
+Date: 2026-11-22. Branch: `chore/python-312`. No new dependency. Interpreters used: Python
+3.12.7 (project virtualenv `venv/`, made with `python3.12 -m venv venv`), Python 3.14.7 (the
+newest installed; a throwaway virtualenv), and the previous project interpreter, Python 3.9.6,
+only as a read-only interpreter for the export comparison below. `<venv314>`, `<venvmin>` and
+`<scratch>` are throwaway directories outside the repository, deleted afterwards.
+
+### 1. Installed versions
+
+`pip install -r requirements.txt -r requirements-dev.txt` resolved the same versions on 3.12.7
+and 3.14.7 (every package has a 3.14 build; nothing was worked around):
+
+```
+beautifulsoup4 4.15.0, click 8.5.1, lxml 6.1.3 (libxml2 2.14.6), flask 3.1.3, pytest 9.2.0,
+mutmut 3.8.1, ebooklib 0.21, werkzeug 3.1.9, soupsieve 4.1.3, jinja2 3.1.6
+```
+
+The 3.9 environment had beautifulsoup4 4.14.3, click 8.1.8, lxml 6.0.2 (same libxml2 2.14.6),
+flask 3.1.2, pytest 8.4.2, ebooklib 0.20.
+
+Lower bounds: a 3.12 virtualenv with exactly the lowest versions the requirements allow (pip
+refuses `click==8.1.0` with `flask==3.0.0`; Flask 3.0 itself needs click 8.1.3):
+
+```
+$ python3.12 -m venv <venvmin>
+$ <venvmin>/bin/pip install --only-binary lxml beautifulsoup4==4.12.0 click==8.1.3 lxml==4.9.3 \
+      flask==3.0.0 pytest==7.4.0 ebooklib==0.18
+$ <venvmin>/bin/python -m pytest tests/ -q -p no:cacheprovider -rfw
+2871 passed in 234.05s     (no warning; run before the last test was added)
+$ <venvmin>/bin/pip download --no-deps --only-binary :all: lxml==4.9.2
+ERROR: No matching distribution found for lxml==4.9.2
+```
+
+So `lxml>=4.9` became `lxml>=4.9.3` (the first release with 3.12 wheels); the other lower bounds
+stay. `mutmut==3.8.1` lost its `python_version >= "3.10"` marker.
+
+### 2. Test suite
+
+Before any change, on 3.12.7: 2860 passed, no warning. On 3.14.7: 51 failed (section 3).
+After the changes:
+
+```
+$ source venv/bin/activate && python3 -m pytest tests/ -q -p no:cacheprovider -rfw   # three at once
+2872 passed in 229.65s / 226.90s / 227.79s            (no failure, no warning in any)
+$ <venv314>/bin/python -m pytest tests/ -q -p no:cacheprovider -rfw
+2872 passed in 254.10s                                (no failure, no warning)
+```
+
+The 12 new tests: `tests/test_python_version.py` (9, section 4),
+`test_exporter.py::TestReviewRound3::test_name_flag_replaces_a_preset_utf8_flag` (2) and the
+compile check of the new test file (`tests/test_sources_compile.py` compiles every source with
+warnings as errors; it passes on both interpreters).
+
+### 3. Behaviour that differs between 3.9, 3.12 and 3.14
+
+- `zipfile`, writing (real difference, 3.14): `ZipFile._open_to_write` sets
+  `zinfo.flag_bits = _MASK_UTF_FILENAME` on 3.14.7 (`0x00` on 3.12.7 and 3.13.7, checked with
+  `inspect.getsource(zipfile.ZipFile._open_to_write)` on each). The exporter's
+  `_ZipInfo._encodeFilenameFlags` returned `flag_bits | name_flag`, so on 3.14 every member
+  was written with the UTF-8 flag, and a cp437 name (`caf\x82.png`) became unreadable to
+  `zipfile`. 50 of the 51 failures on 3.14 were this (the exporter's metadata tests and the
+  `phase3_export_check` tests whose check compares member metadata). Fixed in
+  `src/epub/exporter.py` (`(flag_bits & ~0x800) | name_flag`); the two test fixtures that write
+  raw names "without the flag" clear the preset bit too. New unit test with the flag preset, so
+  it is covered on 3.12 as well.
+- `json` (3.14): `json.loads('[' * 100000 + ']' * 100000)` raises `RecursionError` on 3.12.7
+  and parses on 3.14.7; at 1000000 levels it raises on 3.12.7, 3.13.7 and 3.14.7. The code
+  under test (`TermExtractor._consolidate` catching any decoder exception) is unchanged; the
+  test now uses 1000000 levels. That was the 51st failure.
+- Export output, 3.9 vs 3.12 vs 3.14, compared byte for byte. The test fixtures' books
+  (`sample_epub`, `rich_sample_epub`, `epub_with_duplicate_spine` from `tests/conftest.py`, the
+  raw book of `tests/test_exporter.py`, and that raw book plus a member with an Info-ZIP Unicode
+  Path field) were built once on 3.12, with projects whose segments all carry a translation (rules
+  2 for the ebooklib books, `RAW_TRANSLATIONS` for the raw ones). Each interpreter then exported
+  copies of the same projects in the three formats with the current exporter (on 3.9 the version
+  check was bypassed by replacing `sys.version_info` in the scratch script; run from the worktree,
+  `PYTHONDONTWRITEBYTECODE=1`, nothing installed). Scratch scripts, not kept:
+
+  ```
+  $ PYTHONPATH=. <py> <scratch>/export_all.py <scratch>/cmp <tag>        # 39, 312, 314
+  reports identical in all three (per book and format: translated / kept counts)
+  $ python3 <scratch>/compare.py <scratch>/cmp/out-39  <scratch>/cmp/out-312 <scratch>/cmp/books
+  $ python3 <scratch>/compare.py <scratch>/cmp/out-312 <scratch>/cmp/out-314 <scratch>/cmp/books
+  $ python3 <scratch>/compare.py <scratch>/cmp/out-39  <scratch>/cmp/out-314 <scratch>/cmp/books
+  archives 15, members 127, differences 0, archives byte-identical 15/15,
+  untouched members equal to the source (bytes + metadata) 42/42          (each of the three)
+  ```
+
+  Compared per member: `orig_filename`, `filename`, `date_time`, `compress_type`, `comment`,
+  `extra`, `create_system`, `create_version`, `extract_version`, `flag_bits`, `internal_attr`,
+  `external_attr`, `CRC`, `file_size`, `compress_size`, `header_offset`, and the uncompressed
+  bytes; then the whole archive files. Before the exporter fix the 3.12-vs-3.14 comparison gave
+  93 differences (every `flag_bits`, and the Unicode Path member's name read back differently),
+  3.9-vs-3.12 already 0. The added bilingual stylesheet takes the export time as its date: the
+  three runs fell in the same two-second DOS time step, so in general archives can differ there
+  and only there. Compressed bytes were identical too (same zlib on all three builds); the
+  guarantee is about uncompressed bytes anyway.
+- `lxml`/`beautifulsoup4` serialisation: covered by the comparison above (chapters, OPF, NCX
+  and nav are re-serialised by lxml: identical bytes, with lxml 6.0.2 on 3.9 and 6.1.3 on 3.12
+  and 3.14, same libxml2 2.14.6) and by the suite's exact-output exporter and validation tests.
+  beautifulsoup4 is not imported by `src/` (only listed in the requirements).
+- `subprocess`, process groups, signals (`src/llm/cli.py`): `Popen(start_new_session=True)`,
+  `communicate(timeout=…)` retries, `os.killpg(…, SIGKILL)` and the `atexit` hook are unchanged
+  APIs; the suite's real-process tests (`tests/test_llm.py::TestRunProcess*`, including the
+  setsid grandchild holding the pipes, and the killed-at-exit tests) pass on 3.12 and 3.14. The
+  stand-in `claude`/`copilot` programs on `PATH` and the `run_process` refusal still apply on
+  both (no real model call was made in this phase).
+- `fcntl` locks: `ProjectLock` uses `fcntl.flock`; the lock tests with a second process
+  (`hold_lock_in_child`, CLI and web 409 tests) pass on both.
+- `threading` / `queue` in `src/web/tasks.py`: no removed or deprecated API in use
+  (`grep` for `setDaemon`, `isAlive`, `currentThread`, `activeCount`: none); the task tests pass
+  three at once on 3.12 and on 3.14.
+- `datetime`: not used anywhere (`grep -rn datetime src`: none); timestamps come from
+  `time.strftime`, so the 3.12 `utcnow` deprecation does not apply.
+- `ast` / `compile`: no `ast` use; `test_sources_compile.py` compiles every source with
+  warnings as errors on both interpreters.
+- Hashing and ordering: str hashing is randomised on every version, dict order is insertion
+  order since 3.7; the suite's output comparisons pass on three concurrent runs and on 3.14.
+- Mutation tooling: section 5.
+
+### 4. Version check
+
+`src/__init__.py`: `MIN_PYTHON = (3, 12)`, `require_python(version=None)`; on import the
+package calls it only when `sys.version_info < MIN_PYTHON`. `translate.py` imports
+`src` before `click`; `flask --app src.web.server:create_app` imports the package `src` before
+`src.web.server`. Tests (`tests/test_python_version.py`): the message for an injected
+`(3, 11, 9)`, supported versions pass, and in a child process with `sys.version_info` replaced
+before the entry point runs: exit 1, the message alone on stderr, and `src` is the last project
+import started (an audit hook on `import` events). On the real 3.9 interpreter, read-only:
+
+```
+$ PYTHONDONTWRITEBYTECODE=1 <repo>/venv/bin/python -B translate.py --help; echo "exit $?"
+需要 Python 3.12 以上版本（目前是 3.9.6）；請以 python3.12 重建虛擬環境（見 README.md「安裝」）。
+exit 1
+$ PYTHONDONTWRITEBYTECODE=1 <repo>/venv/bin/python -B -m flask --app src.web.server:create_app routes; echo "exit $?"
+需要 Python 3.12 以上版本（目前是 3.9.6）；請以 python3.12 重建虛擬環境（見 README.md「安裝」）。
+exit 1
+```
+
+Why the call is conditional: the first version called `require_python()` unconditionally at
+import. mutmut then aborted (`KeyError` in `ForkRunner.wait_for_result`, 0 of 27 mutants run).
+Cause, reproduced with a pytest plugin that records `Popen` children and makes `require_python`
+raise in child processes only: mutmut's forced-fail run sets `MUTANT_UNDER_TEST=fail` in the
+environment, so every child process importing `src` fails at import;
+`test_cli.py::TestCLILock::test_start_refused_while_other_process_holds_lock` then fails with its
+lock-holding child unreaped, and mutmut's later `os.wait()` collects that pid. With the call made
+only on an old interpreter, the trampoline is not reached on import.
+
+### 5. Mutation run in the project environment
+
+`scripts/verify/mutation.sh` now runs `scripts/verify/mutation.py` on the active environment's
+`python3`; `MUTATION_VENV` is removed (one environment now has both mutmut and the
+requirements). Without mutmut it still exits 2:
+
+```
+$ PATH=<venvmin>/bin:$PATH scripts/verify/mutation.sh main; echo "exit $?"
+mutmut not found: pip install -r requirements.txt -r requirements-dev.txt
+in the project environment, and activate it
+exit 2
+```
+
+```
+$ source venv/bin/activate && python3 --version
+Python 3.12.7
+$ scripts/verify/mutation.sh main
+mutating the changed lines of src/__init__.py, src/epub/exporter.py, translate.py
+TOTAL mutants 26  killed 26  survived 0  timeout 0  suspicious 0  untested 0
+```
+
+Earlier runs on this branch: the aborted one (section 4); then 27 mutants with 2 survivors, both
+answered: `~0x800` → `~2049` (also clears bit 0; the preset-flag test now sets bits 0x1 and 0x8
+and expects them kept) and `version[:2]` → `version[:3]` (equivalent; the comparison now uses
+the whole tuple, `(3, 12, 0, …) > (3, 12)`, with the exact `(3, 12)` boundary tested). The
+`translate.py` change is a module-level import, which mutmut does not mutate.
+
+### 6. Phase 1 guards, on 3.12
+
+```
+$ python3 scripts/verify/phase1_reverts.py; echo "exit $?"
+exit 0                      (reverts not detected: 0; 105 OK)
+$ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
+exit 0                      (not killed 0; 81 KILLED)
+```
+
+Nothing needed re-anchoring. No real model calls in this phase.
+
+### 7. Noticed and left (upgrade only)
+
+- `from __future__ import annotations` in most modules, `typing.List` / `Optional` in a few
+  (`src/llm/cli.py` and four others): valid on 3.12, a style rewrite.
+- `translate.py` imports `src` before `click` now; the remaining import order is unchanged.
+- `tests/conftest.py::hold_lock_in_child` leaves its child unreaped when the test fails before
+  the child is waited for (what tripped mutmut in section 4); harmless in a normal run (no
+  unreaped child at session end, checked with the recording plugin), not changed.
+- The exporter still overrides the private `zipfile.ZipInfo._encodeFilenameFlags` (risk in the
+  plan's Phase 11 section).
+
+### 8. Owner's environment after the merge
+
+The root virtualenv is Python 3.9 and stops with the new message. Rebuild it (README 「重建既有的
+虛擬環境」):
+
+```
+deactivate 2>/dev/null; rm -rf venv
+python3.12 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+python3 --version
+```
