@@ -27,12 +27,14 @@ translate.py validate PROJECT_DIR [--mark-failed]
 translate.py migrate PROJECT_DIR [--dry-run]
 translate.py brief show
 translate.py brief set TEXT                 (empty TEXT removes it)
+translate.py model show
+translate.py model set [-b claude-cli|copilot-cli] [-m MODEL]   (at least one; does not translate)
 translate.py glossary show | extract | add TERM TRANSLATION [-c CAT] [-g GENDER] [-n NOTE] | import FILE | export FILE
 translate.py export [-f chinese-only|bilingual-horizontal|bilingual-vertical]   (default bilingual-horizontal)
 translate.py review [--port 5000]
 ```
 
-Backend and model are stored in the project; from the CLI only `start -b/-m` sets them (and then translates). `glossary extract` uses the stored backend, so a Copilot-only user picks a Copilot model on the web translation page first.
+Backend and model are stored in the project; from the CLI `model set -b/-m` sets them (takes `project.lock` like `brief set`) and `start -b/-m` sets them and then translates. Both and the web `PUT …/model` go through `ProjectManager.select_model`: the project's own backend is not stored again, a new backend without a model takes its default model, a model must belong to the backend it will run with, refused values change nothing. `glossary extract` uses the stored backend, so a Copilot-only user runs `model set -b copilot-cli` (or picks a Copilot model on the web translation page) first.
 
 ## Architecture
 
@@ -43,7 +45,7 @@ Backend and model are stored in the project; from the CLI only `start -b/-m` set
 4. **Translation** (`src/core/translator.py`) — `translate_segment` / `TranslationEngine`: text prompts get the brief at the top, the glossary and context (nearest non-code segment of the chapter before/after; with rules 2 the one before as its translation when it has one); code prompts get none of these. Protected HTML in, reply checked, at most `MAX_CALLS`=4 calls per `translate_segment` (request, one retry with the errors, one split in two halves; a requeued segment starts a new budget), 120 s per call. Returns a `TranslationOutcome` with typed `Issue`s; a failure writes `log/failed/<id>-<digest>.txt`. `ProjectManager.apply_outcome`: a failed outcome makes a pending segment `failed`; a translated/reviewed one keeps its text and status and only gets the issues (so `--retry-failed` does not select it).
 5. **Validation** (`src/core/validation.py`) — attributes replaced by keys (`<p k="1">`; `alt`/`title`/`aria-label` stay visible to be translated); `p = protect(html); restore(p.html, p) == html`. Shared rules in `check_html` / `check_code`, used by model replies (after `check_keys` on the keyed form), by `check_segment` (review saves/approvals and `validate`, plus glossary warnings) and by the export (which also checks the chapter's blocks, so passing `validate` does not guarantee export). Structural rules block (`structure_mismatch`, `key_mismatch`, `tag_count`, `code_changed`, …); quality/glossary rules warn (`length_ratio`, `untranslated`, `term_not_applied`).
 6. **Review** (`src/web/`) — side-by-side editing; a save or approval that fails the structural check is refused (422).
-7. **Export** (`src/epub/exporter.py`) — ZIP written from the source EPUB at the recorded absolute `epub_path` (hash checked against `source_sha256`; a moved project directory therefore cannot export). Only translated chapters, OPF, NCX, nav (and one stylesheet for bilingual) differ; every other member keeps identical uncompressed bytes (the archive itself is rewritten). A chapter whose blocks no longer match the stored ranges/fingerprints, or a segment that fails the check, stays in the original language; the report says why. Takes `project.lock`.
+7. **Export** (`src/epub/exporter.py`) — ZIP written from the source EPUB that `source_epub_path` (`src/core/project.py`) resolves: the project directory's own `source.epub` (every schema 2 project has one, written at creation or by migrate), else the recorded `epub_path`, so a moved or renamed project still exports; the file opened is hash-checked against `source_sha256` (the digest recorded at creation or migration) and may not be the output; `epub_path` is not rewritten. Only translated chapters, OPF, NCX, nav (and one stylesheet for bilingual) differ; every other member keeps identical uncompressed bytes (the archive itself is rewritten). A chapter whose blocks no longer match the stored ranges/fingerprints, or a segment that fails the check, stays in the original language; the report says why. Takes `project.lock`.
 
 ### Backends (`src/llm/`)
 - `LLMBackend` protocol (`base.py`); `BACKENDS` / `backend_for(name)` in `__init__.py`; project field `backend` (absent = `claude-cli`). `CLIBackend` (`cli.py`) is the only place that starts model processes: own process group, cancel/deadline polling, killed on cancel and at interpreter exit, working directory = system temp dir, one `SYSTEM_PROMPT`.
@@ -61,8 +63,8 @@ Backend and model are stored in the project; from the CLI only `start -b/-m` set
 
 ### Project data (`projects/<name>/`, not in git)
 - `project.json`: `schema` 2 for new projects (project-level `source_sha256` and absolute `epub_path`; segments with `block_start`/`block_end`/`fingerprints`). `backend`, `segmentation`, `brief` are omitted when absent, so older files round-trip; a missing `model` is filled with the backend's default on load and written by the next save. Status: `pending`, `translated`, `reviewed`, `failed`.
-- Schema 1 (pre-plan projects) translates but cannot be exported or validated: `translate.py migrate` (`src/core/migrate.py`) once. Needs the source EPUB (`source.epub`, else `epub_path`); refuses when `project.schema1.json` exists or the project is locked; changes no project data unless every chapter matches (the lock file is still created). A merged group with a pending/failed/empty member keeps no translation (the old text stays in `project.schema1.json`): read the dry run's notes first. Copies `source.epub` when missing.
-- Web `POST /api/projects` replaces an idle project of the same name (new `project.json` and `source.epub`, `log/failed/` removed, `glossary.json` kept); CLI `init` refuses an existing one.
+- Schema 1 (pre-plan projects) translates but cannot be exported or validated: `translate.py migrate` (`src/core/migrate.py`) once. Needs the source EPUB (`source_epub_path`: `source.epub`, else `epub_path`); refuses when `project.schema1.json` exists or the project is locked; changes no project data unless every chapter matches (the lock file is still created). A merged group with a pending/failed/empty member keeps no translation (the old text stays in `project.schema1.json`): read the dry run's notes first. Copies `source.epub` when missing.
+- Web `POST /api/projects` replaces an idle project of the same name (new `project.json` and `source.epub`, `log/failed/` removed, `glossary.json` kept); CLI `init` refuses an existing one. Known issue: "idle" means no translation task; a web export of that project running in the same server is not refused (the lock is shared by the server's threads), so its result should be discarded (`known-issues.md`).
 - Also `glossary.json`, `source.epub`, `log/translation_*.log` (web runs), `log/failed/`, `output/*.epub`.
 
 ### Glossary (`src/glossary/`)
@@ -97,6 +99,6 @@ API (`/api/...`):
 - Translation calls time out after 120 s, extraction calls after 180 s; transient errors are retried within the segment's budget. A pending segment then becomes `failed` (`log/failed/`; retry with `start --retry-failed` or the retry button); a translated/reviewed one keeps its text and only gets issues (retranslate it from review/search). Stored translations that fail the check: `validate --mark-failed`, then `start --retry-failed`.
 - "project locked" (409 / CLI message): another process (a CLI run, the web task, an export, a migration) holds `project.lock`.
 - Export or validate refuses a schema 1 project: run `migrate` first.
-- Export cannot read the source EPUB after the project directory was moved: it opens the absolute `epub_path` recorded at creation.
+- Export cannot read the source EPUB ("無法讀取來源 EPUB"): the project's `source.epub` is missing (removed or renamed) and the recorded `epub_path` does not lead to the book either; put the book back as `source.epub` in the project directory. A hash mismatch means that file is not the book whose digest was recorded at creation or migration.
 - Copilot run stopped with "無法確認 Copilot CLI 已套用翻譯用的系統提示": the plugin did not load or the CLI changed; check `copilot --help` for `--experimental`/`--plugin-dir`.
 - Web run log: `projects/<name>/log/translation_*.log`.

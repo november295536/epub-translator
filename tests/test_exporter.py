@@ -2240,3 +2240,124 @@ class TestRound2Export:
             assert els[0].get(machine[0]) == machine[1]  # untouched
         else:  # the original keeps the source's value, the copy gets the translation's
             assert [e.get(name) for e in els] == [source_value, value]
+
+
+class TestSourceOfAMovedProject:
+    """Export reads the project's own source.epub (src.core.project.
+    source_epub_path), so a moved or renamed project directory still
+    exports; a project without a copy reads the stored epub_path."""
+
+    @staticmethod
+    def _init_and_translate(tmp_path, monkeypatch):
+        """A project created by `translate.py init` (it copies the book in
+        as source.epub), every segment translated (its text nodes replaced)."""
+        import re
+        from translate import cli
+        epub = _raw_book(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        result = CliRunner().invoke(cli, ['init', epub])
+        assert result.exit_code == 0, result.output
+        project_dir = str(tmp_path / 'projects' / 'book')
+        pm = ProjectManager(project_dir)
+        pm.load()
+        for seg in pm.data.segments:
+            pm.mark_translated(seg.segment_id, re.sub(r'>[^<\s][^<]*<', '>譯<', seg.html))
+        pm.save()
+        os.remove(epub)  # only the project's copy is left
+        return project_dir
+
+    @staticmethod
+    def _members(path):
+        z = zipfile.ZipFile(path)
+        return [(n, z.read(n)) for n in z.namelist()]
+
+    def test_renamed_and_moved_project_exports_the_same(self, tmp_path, monkeypatch):
+        project_dir = self._init_and_translate(tmp_path, monkeypatch)
+        before = {}
+        for fmt in FORMATS:
+            out = str(tmp_path / 'before' / f'{fmt}.epub')
+            report = export_project(project_dir, out, fmt)
+            assert report.summary()['translated'] > 0 and report.summary()['kept'] == 0
+            before[fmt] = self._members(out)
+        stored = ProjectManager(project_dir).load().epub_path
+        renamed = str(tmp_path / 'elsewhere' / 'renamed')
+        os.makedirs(os.path.dirname(renamed))
+        os.rename(project_dir, renamed)
+        assert not os.path.exists(stored)
+        for fmt in FORMATS:
+            out = str(tmp_path / 'after' / f'{fmt}.epub')
+            report = export_project(renamed, out, fmt)
+            assert self._members(out) == before[fmt]
+            assert report.summary()['kept'] == 0
+        # the stored path is not rewritten by an export
+        assert ProjectManager(renamed).load().epub_path == stored
+
+    def test_moved_project_cli_export(self, tmp_path, monkeypatch):
+        from translate import cli
+        project_dir = self._init_and_translate(tmp_path, monkeypatch)
+        moved = str(tmp_path / 'moved')
+        os.rename(project_dir, moved)
+        result = CliRunner().invoke(cli, ['export', '-p', moved, '-f', 'chinese-only'])
+        assert result.exit_code == 0, result.output
+        assert os.path.isfile(os.path.join(moved, 'output', 'moved-chinese-only.epub'))
+
+    def test_replaced_source_copy_is_refused(self, tmp_path, monkeypatch):
+        project_dir = self._init_and_translate(tmp_path, monkeypatch)
+        moved = str(tmp_path / 'moved')
+        os.rename(project_dir, moved)
+        other = _raw_book(tmp_path, version='2.0', name='other.epub')
+        os.replace(other, os.path.join(moved, 'source.epub'))
+        out = str(tmp_path / 'o.epub')
+        with pytest.raises(ExportError, match='雜湊值不符'):
+            export_project(moved, out, 'chinese-only')
+        assert not os.path.exists(out)
+
+    def test_own_copy_preferred_over_the_stored_path(self, tmp_path, monkeypatch):
+        """The stored path names a different, existing file: the project's
+        copy (whose hash is the recorded one) is the one read."""
+        project_dir = self._init_and_translate(tmp_path, monkeypatch)
+        pm = ProjectManager(project_dir)
+        pm.load()
+        decoy = _raw_book(tmp_path, version='2.0', name='decoy.epub')
+        pm.data.epub_path = decoy
+        pm.save()
+        report = export_project(project_dir, str(tmp_path / 'o.epub'), 'chinese-only')
+        assert report.summary()['kept'] == 0
+        assert b'version="3.0"' in zipfile.ZipFile(str(tmp_path / 'o.epub')).read(
+            'OEBPS/content.opf')
+
+    def test_output_onto_the_copy_read_is_refused(self, tmp_path, monkeypatch):
+        """The guard compares with the file actually opened: the copy in a
+        moved project, whose stored path no longer exists."""
+        project_dir = self._init_and_translate(tmp_path, monkeypatch)
+        moved = str(tmp_path / 'moved')
+        os.rename(project_dir, moved)
+        own = os.path.join(moved, 'source.epub')
+        data = open(own, 'rb').read()
+        with pytest.raises(ExportError) as e:
+            export_project(moved, own, 'chinese-only')
+        assert str(e.value) == '輸出檔不能是來源 EPUB 本身'
+        assert open(own, 'rb').read() == data
+
+    def test_project_without_a_copy_reads_the_stored_path(self, tmp_path, raw_project):
+        assert not os.path.exists(os.path.join(raw_project, 'source.epub'))
+        stored = ProjectManager(raw_project).load().epub_path
+        assert os.path.dirname(stored) != raw_project
+        report, z = _export(tmp_path, raw_project, 'chinese-only')
+        assert report.summary()['translated'] == 4
+        assert '守燈人' in z.read('OEBPS/Text/one.xhtml').decode()
+        with pytest.raises(ExportError) as e:
+            export_project(raw_project, stored, 'chinese-only')
+        assert str(e.value) == '輸出檔不能是來源 EPUB 本身'
+
+    def test_source_epub_path(self, tmp_path):
+        from src.core.project import source_epub_path
+        project_dir = str(tmp_path / 'p')
+        os.makedirs(os.path.join(project_dir, 'source.epub', 'dir'))  # not a file
+        assert source_epub_path(project_dir, '/stored.epub') == '/stored.epub'
+        os.rmdir(os.path.join(project_dir, 'source.epub', 'dir'))
+        os.rmdir(os.path.join(project_dir, 'source.epub'))
+        assert source_epub_path(project_dir, '/stored.epub') == '/stored.epub'
+        open(os.path.join(project_dir, 'source.epub'), 'wb').close()
+        assert source_epub_path(project_dir, '/stored.epub') == os.path.join(
+            project_dir, 'source.epub')

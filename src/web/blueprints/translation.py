@@ -205,7 +205,8 @@ def set_model(project_name: str):
     projects_dir = current_app.config['PROJECTS_DIR']
 
     data = request.get_json()
-    if not data or 'model' not in data:
+    # an object with a model (select_model would take None as 'keep')
+    if not isinstance(data, dict) or data.get('model') is None:
         return jsonify({'error': '未提供模型名稱'}), 400
 
     model = data['model']
@@ -216,16 +217,19 @@ def set_model(project_name: str):
     tm = _get_task_manager()
     try:
         with tm.transaction(project_name, projects_dir) as pm:
-            if backend == (pm.data.backend or llm.default_backend().name):
-                backend = None  # the project's backend already: nothing new to store
-            chosen = backend if backend is not None else pm.data.backend
-            valid_aliases = [m['alias'] for m in available_models(chosen)]
-            if model not in valid_aliases:
-                return jsonify({'error': f'無效的模型：{model}，'
-                                         f'可用模型：{", ".join(valid_aliases)}'}), 400
-            pm.set_model(model, backend=backend)
-            pm.save()
-            chosen = pm.data.backend or llm.default_backend().name
+            with pm.mutex:  # a running task reads them under the mutex
+                previous = (pm.data.backend, pm.data.model)
+                try:
+                    pm.select_model(backend, model)
+                except ValueError as e:  # nothing changed
+                    return jsonify({'error': str(e)}), 400
+                try:
+                    pm.save()
+                except BaseException:
+                    # not saved: the workers keep the old ones
+                    pm.data.backend, pm.data.model = previous
+                    raise
+                chosen = pm.data.backend or llm.default_backend().name
     except (FileNotFoundError, ValueError) as e:
         return jsonify({'error': str(e)}), 404
 

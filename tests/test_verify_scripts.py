@@ -752,6 +752,27 @@ class TestMigrateCopiesCheck:
         monkeypatch.setattr(migrate_check, 'read_package', read_package)
         assert migrate_check.placed_chapters(directory) == (2, 1)
 
+    def test_placed_chapters_source_resolved(self, tmp_path):
+        """placed_chapters reads the source as the exporter does
+        (source_epub_path): the copy, else the stored path."""
+        import shutil
+        root = tmp_path / 'projects'
+        root.mkdir()
+        directory = _migratable(root, 'alpha')
+        migrate_check.migrate_project(directory)
+        own = os.path.join(directory, 'source.epub')
+        elsewhere = str(tmp_path / 'elsewhere.epub')
+        shutil.move(own, elsewhere)
+        pm = migrate_check.ProjectManager(directory)
+        pm.load()
+        pm.data.epub_path = elsewhere
+        pm.save()
+        assert migrate_check.placed_chapters(directory) == (2, 2)
+        moved = str(tmp_path / 'moved')
+        shutil.move(elsewhere, own)
+        os.rename(directory, moved)  # the stored path is stale now
+        assert migrate_check.placed_chapters(moved) == (2, 2)
+
     @pytest.mark.parametrize('change', ['nav', 'media_type', 'entity', 'not_well_formed'])
     def test_chapters_the_exporter_refuses_not_placed(self, tmp_path, monkeypatch, change):
         # review round 1: the exporter's own chapter filter and loader

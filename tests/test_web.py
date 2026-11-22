@@ -513,6 +513,63 @@ class TestModelAPI:
         )
         assert response.status_code == 400
 
+    def test_set_model_null_is_refused(self, client, project_with_translations):
+        """A null model is no model (select_model would take it as 'keep'):
+        refused, project.json unchanged."""
+        project_file = os.path.join(project_with_translations, PROJECT_NAME, 'project.json')
+        before = open(project_file, 'rb').read()
+        for body in ({'model': None}, {'model': None, 'backend': 'copilot-cli'}):
+            response = client.put(f'/api/projects/{PROJECT_NAME}/model', json=body)
+            assert response.status_code == 400
+            assert response.get_json()['error'] == '未提供模型名稱'
+        assert open(project_file, 'rb').read() == before
+
+    @pytest.mark.parametrize('body', ['"opus"', '["opus"]', '1', 'null'])
+    def test_set_model_body_not_an_object(self, client, project_with_translations, body):
+        project_file = os.path.join(project_with_translations, PROJECT_NAME, 'project.json')
+        before = open(project_file, 'rb').read()
+        response = client.put(f'/api/projects/{PROJECT_NAME}/model', data=body,
+                              content_type='application/json')
+        assert response.status_code == 400
+        assert response.get_json()['error'] == '未提供模型名稱'
+        assert open(project_file, 'rb').read() == before
+
+    @pytest.mark.parametrize('body, saved', [
+        ({'model': 'opus'}, (None, 'opus')),
+        ({'model': 'fake-model', 'backend': 'copilot-cli'}, ('copilot-cli', 'fake-model')),
+    ])
+    def test_failed_save_restores_backend_and_model(self, client, project_with_translations,
+                                                    monkeypatch, body, saved):
+        """The shared manager (a running task's) gets the old values back
+        when the save fails, so the workers keep using them."""
+        import src.llm as llm
+        from src.llm.fake import FakeBackend
+        from src.web.tasks import TaskManager
+        monkeypatch.setitem(llm.BACKENDS, 'copilot-cli', lambda: FakeBackend([]))
+        pm = ProjectManager(os.path.join(project_with_translations, PROJECT_NAME))
+        pm.load()
+        pm.set_model('haiku')
+        monkeypatch.setattr(TaskManager, 'get_or_load_pm', lambda self, name, d: pm)
+        seen = []
+
+        def broken():
+            seen.append((pm.data.backend, pm.data.model))  # the save sees the new ones
+            raise OSError('disk full')
+
+        monkeypatch.setattr(pm, 'save', broken)
+        with pytest.raises(OSError):
+            client.put(f'/api/projects/{PROJECT_NAME}/model', json=body)
+        assert seen == [saved]
+        assert (pm.data.backend, pm.data.model) == (None, 'haiku')
+
+    def test_set_invalid_model_message(self, client, project_with_translations):
+        project_file = os.path.join(project_with_translations, PROJECT_NAME, 'project.json')
+        before = open(project_file, 'rb').read()
+        response = client.put(f'/api/projects/{PROJECT_NAME}/model', json={'model': 'nope'})
+        assert response.status_code == 400
+        assert response.get_json()['error'] == '無效的模型：nope，可用模型：sonnet, opus, haiku'
+        assert open(project_file, 'rb').read() == before
+
     def test_get_model_nonexistent_project(self, client):
         response = client.get('/api/projects/nonexistent/model')
         assert response.status_code == 404
