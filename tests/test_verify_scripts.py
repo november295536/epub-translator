@@ -5803,6 +5803,7 @@ class FakeSDKRuntime:
         self.all_sentences = None
         self.requests = []
         self.deleted = []
+        self.starting = 0
 
     def children(self):
         if self.dying:
@@ -5876,6 +5877,13 @@ class FakeSDKRuntime:
 
         class Client:
             async def start(self):
+                # A call that starts alone is slower to get ready than calls
+                # that start while it waits: calls started all at once would
+                # reach their sessions in another order than they started
+                runtime.starting += 1
+                if runtime.starting == 1:
+                    await asyncio.sleep(0.05)
+                runtime.starting -= 1
                 if runtime.pids or runtime.dying:
                     return
                 if runtime.next_pid > 100 and 'no_restart' in runtime.broken:
