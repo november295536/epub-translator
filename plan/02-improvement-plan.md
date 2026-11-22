@@ -763,7 +763,48 @@ Risks:
 ### Phase 11 — Python upgrade (3.12+), upgrade only
 
 Move the project environment from Python 3.9 to 3.12 or later, with no behaviour change: the test
-suite and the mutation run on one interpreter. To be specified.
+suite and the mutation run on one interpreter. Phase 12 needs it (the Copilot Python SDK needs
+3.11+). Nothing else changes: no new feature, no style rewrite (`from __future__ import
+annotations`, `typing.List`/`Optional` and the like stay).
+
+Done:
+
+- Minimum Python 3.12. `src/__init__.py` (`MIN_PYTHON`, `require_python(version=None)`) exits
+  with one Traditional Chinese message when the package is imported on an older interpreter.
+  Importing `src` comes before any other project module in both entry points: `translate.py`
+  imports it first (before `click`), and `flask --app src.web.server:create_app` imports the
+  package before `src.web.server`. Tested with the version injected (`require_python((3, 11,
+  9))`) and, in a child process, with `sys.version_info` replaced before each entry point
+  (`tests/test_python_version.py`); also checked once on the real 3.9 interpreter. The import
+  calls `require_python()` only when the version is too old: an unconditional call goes through
+  mutmut's trampoline on every import, so in mutmut's forced-fail run every child process that
+  imports `src` failed, a lock test left such a child unreaped, and mutmut's `os.wait()` then
+  collected it (`KeyError` in `wait_for_result`, run aborted).
+- Requirements: `lxml>=4.9.3` (the first lxml with 3.12 wheels); `mutmut==3.8.1` without its
+  `python_version >= "3.10"` marker, so the project environment runs the mutation tests.
+  `scripts/verify/mutation.sh` uses the active environment's `python3`; `MUTATION_VENV` is gone
+  (with one environment it no longer earns its place). The other lower bounds are unchanged:
+  the suite passes on 3.12 with exactly `beautifulsoup4==4.12.0`, `click==8.1.3` (Flask 3.0
+  needs it), `lxml==4.9.3`, `flask==3.0.0`, `pytest==7.4.0`, `ebooklib==0.18`.
+- Python 3.14 (newest installed) found one real difference: from 3.14 `zipfile` sets a member's
+  `flag_bits` to the UTF-8 flag before writing it, and the exporter's `_ZipInfo` added the
+  source's flag to that, so every member was written flagged UTF-8 (on 3.14, 50 tests failed
+  on it: export metadata checks and the `phase3_export_check` tests built on them). The
+  exporter now replaces that bit with the source's. Two test fixtures that write raw names
+  without the flag clear it the same way; a unit test covers the preset flag on any version.
+  The 51st failure: a test relied on 3.12's JSON decoder failing at 100000 nesting levels (3.14
+  parses them);
+  it uses 1000000 levels, which fail on 3.12, 3.13 and 3.14.
+- 3.9 versus 3.12 versus 3.14: the test fixtures' books exported in all three formats under
+  each interpreter are byte-identical archives (acceptance log).
+
+Risks:
+
+- `_ZipInfo` overrides a private `zipfile` method (`_encodeFilenameFlags`); a future Python can
+  change it again, as 3.14 did. The exporter tests that compare member metadata with the source
+  are what catches it.
+- `scripts/verify/mutation.py` hooks into mutmut 3.8.1 internals; the pin stays.
+- An existing virtualenv is bound to the interpreter that made it: owners rebuild it (README).
 
 ### Phase 12 — Copilot SDK backend
 

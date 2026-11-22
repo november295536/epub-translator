@@ -734,7 +734,8 @@ class TestRound1Consolidation:
 
     def test_reply_that_cannot_be_parsed_is_unusable(self, small_batches, caplog):
         caplog.set_level(logging.WARNING, logger='src.glossary.term_extractor')
-        deep = '[' * 100000 + ']' * 100000  # the decoder raises RecursionError
+        # the decoder raises RecursionError (3.14 still parses 100000 levels)
+        deep = '[' * 1000000 + ']' * 1000000
         fake = FakeBackend([_reply(('Orrin', '歐林', 'person')), _reply(('Orrin', '奧林', 'person')),
                             _reply(('Orrin', '奧林', 'person')), deep])
         terms = TermExtractor(backend=fake).extract_from_segments(_segments(3))

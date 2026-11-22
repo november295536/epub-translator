@@ -1373,8 +1373,8 @@ class TestReviewRound1Archive:
 
     def test_non_utf8_name_bytes_kept(self, tmp_path):
         class Cp437(zipfile.ZipInfo):
-            def _encodeFilenameFlags(self):
-                return self.filename.encode('cp437'), self.flag_bits
+            def _encodeFilenameFlags(self):  # without the UTF-8 flag (3.14 presets it)
+                return self.filename.encode('cp437'), self.flag_bits & ~0x800
         info = Cp437('OEBPS/Images/café.png')
         epub, project_dir = self._book_with(tmp_path, [(info, b'invented')])
         assert b'caf\x82.png' in open(epub, 'rb').read()   # Info-ZIP style source
@@ -2055,15 +2055,15 @@ class TestReviewRound3:
 
     def test_stored_name_bytes_kept_with_a_unicode_path_field(self, tmp_path):
         # The name bytes are UTF-8 without the UTF-8 flag, plus an Info-ZIP
-        # Unicode Path field (0x7075). Python 3.12 takes `filename` from the
-        # field, 3.9 does not; the stored bytes must be written either way.
+        # Unicode Path field (0x7075), from which zipfile takes `filename`;
+        # the stored bytes must be written, not `filename`.
         import struct
         import zlib
         raw = 'OEBPS/Images/café.png'.encode('utf-8')
 
         class Raw(zipfile.ZipInfo):
-            def _encodeFilenameFlags(self):
-                return raw, self.flag_bits
+            def _encodeFilenameFlags(self):  # without the UTF-8 flag (3.14 presets it)
+                return raw, self.flag_bits & ~0x800
         info = Raw('placeholder')
         field = b'\x01' + struct.pack('<L', zlib.crc32(raw)) + raw
         info.extra = struct.pack('<HH', 0x7075, len(field)) + field
@@ -2078,6 +2078,15 @@ class TestReviewRound3:
             i.orig_filename for i in source.infolist()]
         # headers and the field, as in the source
         assert open(out, 'rb').read().count(raw) == open(epub, 'rb').read().count(raw) == 4
+
+    @pytest.mark.parametrize('name, flag', [('OEBPS/a.css', 0), ('OEBPS/圖.png', 0x800)])
+    def test_name_flag_replaces_a_preset_utf8_flag(self, name, flag):
+        # Python 3.14 sets flag_bits to the UTF-8 flag before writing a member
+        source = zipfile.ZipInfo(name)
+        source.flag_bits = flag  # as read from the source archive
+        out = exporter._member_info(source, zipfile.ZIP_DEFLATED)
+        out.flag_bits = 0x800 | 0x8 | 0x1  # other bits are kept
+        assert out._encodeFilenameFlags() == (name.encode('utf-8'), 0x8 | 0x1 | flag)
 
     @pytest.mark.parametrize('fmt', BILINGUAL)
     def test_prefixed_xhtml_without_head(self, tmp_path, fmt):

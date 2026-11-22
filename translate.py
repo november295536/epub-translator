@@ -8,11 +8,12 @@ import sys
 import time
 from collections import Counter
 
+from src import __version__  # first: stops an unsupported Python (src/__init__.py)
+
 import click
 
 import src.llm as llm
 
-from src import __version__
 from src.epub.extractor import EPUBError, EPUBExtractor
 from src.core.segmenter import Segmenter, SegmentType
 from src.core.project import (
