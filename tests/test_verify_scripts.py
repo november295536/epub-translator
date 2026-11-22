@@ -5820,6 +5820,8 @@ class FakeSDKRuntime:
         runtime = self
 
         def event(kind, **data):
+            if kind == 'assistant.usage':
+                data = {'finish_reason': 'stop', 'content_filter_triggered': False, **data}
             return SimpleNamespace(type=SimpleNamespace(value=kind), data=SimpleNamespace(**data))
 
         class Session:
@@ -5886,6 +5888,7 @@ class FakeSDKRuntime:
 
             async def create_session(self, session_id, **options):
                 assert options['model'] is not None
+                os.makedirs(os.path.join(sdk_check.SESSION_STATE, session_id))
                 if options['model'] == 'no-such-model-phase12' and 'accepts' not in runtime.broken:
                     raise Exception('Model "no-such-model-phase12" is not available.')
                 if 'inference' in options and options['model'] == 'claude-haiku-4.5':
@@ -5895,6 +5898,8 @@ class FakeSDKRuntime:
 
             async def delete_session(self, session_id):
                 await asyncio.sleep(0.05)  # the runtime takes a moment
+                if 'keeps_folders' not in runtime.broken:
+                    shutil.rmtree(os.path.join(sdk_check.SESSION_STATE, session_id))
                 runtime.deleted.append(session_id)
 
             async def stop(self):
@@ -5961,7 +5966,12 @@ class TestPhase12SdkCheck:
         monkeypatch.setattr(sdk_check, 'children', fake.children)
         monkeypatch.setattr(sdk_check.os, 'kill', fake.kill)
         self.pauses = []
-        monkeypatch.setattr(sdk_check, '_pause', self.pauses.append)
+
+        def pause(seconds):  # recorded, and a short real wait for what the loop does
+            self.pauses.append(seconds)
+            threading.Event().wait(0.01)
+
+        monkeypatch.setattr(sdk_check, '_pause', pause)
         monkeypatch.setattr(sdk_check, 'SETTLE_SECONDS', 2)
         monkeypatch.setattr(sdk_check, 'CALL_TIMEOUT', 3)
         monkeypatch.setattr(sdk_check, 'SESSION_STATE', str(tmp_path / 'state'))
@@ -6005,7 +6015,7 @@ class TestPhase12SdkCheck:
         # The cancel came 1 s (pause) into the model call; it returned at once
         cancelled = re.search(r'cancelled +CancelledError +wall +(\d+\.\d\d) s', out)
         assert float(cancelled.group(1)) < 1
-        assert sorted(self.pauses) == [0.1, 0.1, 1, 3, 3]
+        assert self.pauses.count(1) == 1 and set(self.pauses) == {0.1, 1}
         # No reply text, no account data
         assert '譯文' not in out and 'someone' not in out
 
@@ -6046,7 +6056,7 @@ class TestPhase12SdkCheck:
         code, out = self._run(monkeypatch, tmp_path, capsys, fake)
         assert code == 1
         assert self._fails(out) == ['the runtime is gone', 'a new runtime process']
-        assert self.pauses.count(0.1) == 50 + 1
+        assert self.pauses.count(0.1) >= 50  # the 5 s the runtime is given to go
 
     def test_logs_without_the_prompt(self, monkeypatch, tmp_path, capsys):
         code, out = self._run(monkeypatch, tmp_path, capsys,
@@ -6063,23 +6073,11 @@ class TestPhase12SdkCheck:
         assert re.search(r'cancelled +CancelledError .* in +1  out +1  cost \[0\.333\]', out)
 
     def test_session_left_fails(self, monkeypatch, tmp_path, capsys):
-        fake = FakeSDKRuntime()
-        real_client = fake.client
-
-        def leaving():
-            client = real_client()
-            create = client.create_session
-
-            async def create_and_keep(session_id, **options):
-                (tmp_path / 'state' / session_id).mkdir(parents=True, exist_ok=True)
-                return await create(session_id=session_id, **options)
-            client.create_session = create_and_keep
-            return client
-
-        fake.client = leaving
-        code, out = self._run(monkeypatch, tmp_path, capsys, fake)
+        code, out = self._run(monkeypatch, tmp_path, capsys,
+                              FakeSDKRuntime(broken=['keeps_folders']))
         assert code == 1
-        assert self._fails(out) == ['no session directory left of the 9 sessions  9 left']
+        assert self._fails(out) == ['cancelled: session deleted', 'timed out: session deleted',
+                                    'no session directory left of the 9 sessions  9 left']
 
     def test_lines_flushed(self, monkeypatch, tmp_path):
         """Every result line is flushed as it is printed (the run is slow)."""

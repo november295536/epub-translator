@@ -52,6 +52,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
 
@@ -150,13 +151,22 @@ def children() -> list:
     return [int(p) for p in out.split()]
 
 
-def children_gone() -> bool:
-    """Whether the runtime processes are gone (polled for up to 5 s)."""
-    for _ in range(50):
-        if not children():
+def until(condition, seconds) -> bool:
+    """Whether condition() holds within `seconds` (polled every 0.1 s)."""
+    for _ in range(round(seconds * 10)):
+        if condition():
             return True
         _pause(0.1)
-    return False
+    return condition()
+
+
+def children_gone() -> bool:
+    """Whether the runtime processes are gone (within 5 s)."""
+    return until(lambda: not children(), 5)
+
+
+def folder(sid) -> str:
+    return os.path.join(SESSION_STATE, str(sid))
 
 
 def request(prompt, model, effort=None, timeout=CALL_TIMEOUT):
@@ -212,8 +222,8 @@ def aborted_turn(watch, checks, backend, label, model, *, timeout, cancel_after=
         threading.Thread(target=canceller).start()
     result = call(backend, request(LONG, model, timeout=timeout), cancel)
     sid = watch.first_since(n)
-    watch.wait(lambda: sid in watch.deleted, SETTLE_SECONDS)
-    _pause(3)  # anything the runtime still reports for the session
+    # Once the folder is gone the session can report nothing more
+    deleted = until(lambda: not os.path.exists(folder(sid)), SETTLE_SECONDS)
     describe(watch, label, sid, result)
     expected = CancelledError if cancel_after is not None else TransientError
     checks.check(f'{label}: {expected.__name__}',
@@ -228,7 +238,7 @@ def aborted_turn(watch, checks, backend, label, model, *, timeout, cancel_after=
                  f'idle events {len(idles)}')
     checks.check(f'{label}: no assistant.usage (nothing reported billed)',
                  sid is not None and not watch.of(sid, 'assistant.usage'))
-    checks.check(f'{label}: session deleted', sid in watch.deleted)
+    checks.check(f'{label}: session deleted', sid is not None and deleted)
 
 
 def main(argv=None) -> int:
@@ -319,7 +329,7 @@ def main(argv=None) -> int:
     aborted_turn(watch, checks, backend, 'timed out', args.model, timeout=args.timeout_s)
 
     print('6. session files')
-    left = [sid for sid in watch.created if os.path.exists(os.path.join(SESSION_STATE, sid))]
+    left = [sid for sid in watch.created if os.path.exists(folder(sid))]
     checks.check(f'no session directory left of the {len(watch.created)} sessions', not left,
                  f'{len(left)} left')
     checks.check('a delete asked for every session', set(watch.created) <= watch.deleted)
@@ -332,7 +342,7 @@ def main(argv=None) -> int:
     reported = sum(c for sid in watch.created for c in costs(watch, sid)[0] if c)
     print(f'  cost the SDK reported in total: {round(reported, 2)} premium requests')
     logs = [p for p in glob.glob(RUNTIME_LOGS) if os.path.getmtime(p) >= run_start]
-    holds = any(MARKER in open(p, encoding='utf-8', errors='replace').read() for p in logs)
+    holds = any(MARKER in Path(p).read_text(encoding='utf-8', errors='replace') for p in logs)
     print(f'  runtime logs written during the run: {len(logs)}; hold prompt text: '
           f'{"yes" if holds else "no"}')
 

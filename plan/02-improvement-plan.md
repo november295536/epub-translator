@@ -841,26 +841,41 @@ As built:
   system temp dir as working directory. `client.start()` runs before every call: it returns at
   once while connected and starts a new runtime when the last one exited (the SDK checks the
   process). The first start checks `get_auth_status()`; not authenticated → `AuthError` with
-  `copilot login`. An `atexit` hook stops the client (`stop()`, else `force_stop()`, bounded to
-  10 s) and refuses later calls. The SDK's `copilot` logger is set to ERROR (it logs failures it
+  `copilot login`. At interpreter exit `close` refuses later calls, stops the turns still
+  running and waits (10 s at most) until they deleted their sessions, then stops the client
+  (`stop()`, else `force_stop()`, 10 s at most). It is registered with `threading`'s exit hooks
+  (`threading._register_atexit`, private but the one `concurrent.futures` itself uses), which run
+  before `concurrent.futures` shuts its executors down: from a plain `atexit` hook the SDK's
+  `stop()` failed (`cannot schedule new futures after shutdown`, it runs blocking steps on the
+  loop's executor) and the sessions of the calls just ended were left (review round 1).
+  `concurrent.futures.thread` is imported first so that its hook runs after this one; `atexit`
+  stays as a fallback. The SDK's `copilot` logger is set to ERROR (it logs failures it
   also raises, with tracebacks, and the runtime's stderr as warnings).
 - **One request = one session**, created with an id chosen by the backend (so a session whose
   creation failed half-way is deleted too): system message `replace`d by `SYSTEM_PROMPT`,
   `available_tools: []`, the built-in MCP servers (`github-mcp-server`, `githubiq`) disabled,
-  skills off, custom instructions skipped, config discovery, telemetry and infinite sessions
-  off, effort as `inference.reasoning_effort` (only when the model takes levels). The prompt is
+  skills off, custom instructions skipped, config discovery, telemetry, infinite sessions and
+  the cross-session store off (`~/.copilot/session-store.db`, which by default indexes the
+  prompt and reply outside the session folder), effort as `inference.reasoning_effort` (only when the model takes levels). The prompt is
   `flatten_prompt` (as for the CLIs). Reply = the final assistant message of `send_and_wait`
-  (`''` when none); usage = the session's `assistant.usage` events summed. Afterwards the session
+  (`''` when none); usage = the session's `assistant.usage` events summed; a last usage event
+  with `finish_reason` `length` gives `stop_reason='truncated'` (the translator reads replies
+  only through their check, so nothing changes there), one with `content_filter_triggered` a
+  `RefusalError` (neither was observed: every real call reported `stop` and `false`). Afterwards the session
   is deleted (`client.delete_session`, which removes `~/.copilot/session-state/<id>/`, the
   prompt, reply and reasoning text).
 - **Timeout and cancel.** `complete` is synchronous: it submits the turn to the loop and polls
-  the future (0.1 s) for the cancel event and the deadline. Cancel → `CancelledError`, deadline →
-  `TransientError`, each at once; the future is cancelled, and on the loop the turn's cleanup
-  aborts it (`session.abort()`), waits up to 5 s for `session.idle`, then deletes the session. A
-  reply that arrives after the cancel is refused, as for the CLIs. Up to 20 worker threads share
+  the future (0.1 s, never past the deadline) for the cancel event and the deadline. Cancel →
+  `CancelledError`, deadline → `TransientError`, each at once; it then sets the turn's stop event.
+  The turn is never cancelled from outside (review round 1: cancelling it cut its cleanup short
+  and skipped the delete): it waits for the reply or the stop event, whichever comes first; on
+  stop, or on any error, it aborts the turn (`session.abort()`), waits up to 5 s for
+  `session.idle`, then deletes the session. A stop that arrives while the session is being
+  created sends no prompt. A reply that arrives after the cancel or after the deadline is
+  refused, as for the CLIs. Up to 20 worker threads share
   the client; each call has its own session.
 - **Errors.** Error text only (the exception's message plus the session's `session.error`
-  messages, redacted), never the reply: rate limit → `RateLimitError`, login → `AuthError`,
+  type and message, redacted; matched in full, shown cut to 500 characters), never the reply: rate limit → `RateLimitError`, login → `AuthError`,
   refused effort → `BackendUnavailableError` (`EFFORT_REJECTED_MESSAGE`), unknown model →
   `BackendUnavailableError`, content filter → `RefusalError`; a runtime that exited
   (`ProcessExitedError`, whose text can quote the runtime's stderr: no pattern is tried) and
@@ -887,8 +902,9 @@ Risks:
   would do the same.
 - The runtime is in the CLI's process group (the SDK starts it without a new session), so Ctrl-C
   in the CLI reaches it: it exits at once, no process is left, but the sessions of the calls in
-  flight are not deleted (observed: 3 folders with `events.jsonl`). A web pause and a normal end
-  delete every session. A session folder is also left when the process is killed.
+  flight are not deleted (observed: 3 folders with `events.jsonl`). A web pause, a normal end
+  and an end on a run-level error delete every session (review round 1: the exit hook waits for
+  the turns still running). A session folder is also left when the process is killed.
 - The runtime writes its own log (`~/.copilot/logs/process-*.log`); the check found no prompt
   text in it. The Copilot CLI backend keeps every call as a session (Phase 9) and has no delete.
 

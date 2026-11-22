@@ -2,6 +2,7 @@
 no runtime is started and no model is called (conftest.no_real_sdk_client)."""
 
 import asyncio
+import concurrent.futures
 import subprocess
 import sys
 import threading
@@ -33,8 +34,12 @@ def _req(prompt='PROMPT', model='claude-haiku-5.5', effort=None, timeout=30, sys
 
 
 def _event(kind, **data):
-    """An SDK session event: `type` is an enum member, `data` the payload."""
-    return SimpleNamespace(type=SimpleNamespace(value=kind), data=SimpleNamespace(**data))
+    """An SDK session event: `type` is an enum member, `data` the payload
+    (with the SDK's fields the backend reads, defaulted)."""
+    defaults = {'assistant.usage': {'finish_reason': 'stop', 'content_filter_triggered': False},
+                'session.error': {'error_type': 'query'}}.get(kind, {})
+    return SimpleNamespace(type=SimpleNamespace(value=kind),
+                           data=SimpleNamespace(**{**defaults, **data}))
 
 
 class ProcessExitedError(Exception):
@@ -63,8 +68,13 @@ class FakeSession:
         return await self.client.respond(self, prompt)
 
     async def abort(self):
+        """As the SDK's: returns before the runtime reports the session idle."""
         self.aborted.set()
         self.client.log.append(('abort', self.session_id))
+        asyncio.get_running_loop().call_soon(self.idle)
+
+    def idle(self):
+        self.client.log.append(('idle', self.session_id))
         self.emit(_event('session.idle', aborted=True))
 
 
@@ -220,7 +230,8 @@ class TestSessionOptions:
         assert options['skills'] == {'enabled': False}
         assert options['enable_config_discovery'] is False
         assert options['github'] == {'telemetry_enabled': False}
-        assert options['state'] == {'infinite_sessions': {'enabled': False}}
+        assert options['state'] == {'infinite_sessions': {'enabled': False},
+                                    'enable_cross_session_store': False}
         assert options['working_directory'] == copilot_sdk.tempfile.gettempdir()
         assert 'inference' not in options
 
@@ -282,7 +293,7 @@ class TestComplete:
         assert session.aborted.wait(WAIT)
         assert client.deleted.wait(WAIT)
         assert client.log == [('create', session.session_id), ('abort', session.session_id),
-                              ('delete', session.session_id)]
+                              ('idle', session.session_id), ('delete', session.session_id)]
 
     def test_sdk_timeout_is_transient(self, client):
         async def timeout(session, prompt):
@@ -381,7 +392,7 @@ class TestComplete:
 
         async def clean_up():
             await asyncio.wait_for(
-                CopilotSDK._clean_up(client, None, 'id', True, asyncio.Event()), WAIT)
+                CopilotSDK._clean_up(client, None, 'id', asyncio.Event()), WAIT)
 
         asyncio.run(clean_up())
 
@@ -456,6 +467,149 @@ class TestComplete:
             CopilotSDK().complete(_req(), threading.Event())
 
 
+class TestNothingCutShort:
+    """The cleanup of a turn (abort, idle wait, delete) is never interrupted:
+    `complete` returns at once and the turn finishes it on the loop. The
+    fake's abort, idle and delete really yield, and its send honours a
+    timeout (one shorter than the request's, so the loop times out first)."""
+
+    @staticmethod
+    def _gate():
+        """An awaitable gate the test opens from its thread."""
+        gate = threading.Event()
+
+        async def passed():
+            await asyncio.to_thread(gate.wait, WAIT)
+        return gate, passed
+
+    def test_loop_timeout_first(self, client, monkeypatch):
+        gate, passed = self._gate()
+
+        async def times_out(session, prompt):
+            await asyncio.wait_for(asyncio.Event().wait(), session.timeout / 2)
+
+        async def slow_abort(self):
+            self.aborted.set()
+            await passed()
+            self.client.log.append(('abort', self.session_id))
+            self.idle()
+
+        client._respond = times_out
+        monkeypatch.setattr(FakeSession, 'abort', slow_abort)
+        with pytest.raises(TransientError):
+            CopilotSDK().complete(_req(timeout=0.4), threading.Event())
+        assert client.sessions[0].aborted.wait(WAIT)
+        gate.set()
+        assert client.deleted.wait(WAIT)
+
+    def test_pause_while_deleting(self, client, monkeypatch):
+        gate, passed = self._gate()
+        deleting = threading.Event()
+        cancel = threading.Event()
+
+        async def slow_delete(session_id):
+            deleting.set()
+            await passed()
+            client.log.append(('delete', session_id))
+            client.deleted.set()
+
+        monkeypatch.setattr(client, 'delete_session', slow_delete)
+        errors = []
+        thread = threading.Thread(target=lambda: errors.append(_raises(
+            lambda: CopilotSDK().complete(_req(), cancel))))
+        thread.start()
+        assert deleting.wait(WAIT)
+        cancel.set()
+        thread.join(WAIT)
+        assert isinstance(errors[0], CancelledError)
+        gate.set()
+        assert client.deleted.wait(WAIT)
+
+    def test_cancel_while_creating_sends_nothing(self, client, monkeypatch):
+        gate, passed = self._gate()
+        creating = threading.Event()
+        cancel = threading.Event()
+        create = client.create_session
+
+        async def slow_create(session_id, **options):
+            creating.set()
+            await passed()
+            return await create(session_id=session_id, **options)
+
+        monkeypatch.setattr(client, 'create_session', slow_create)
+        errors = []
+        thread = threading.Thread(target=lambda: errors.append(_raises(
+            lambda: CopilotSDK().complete(_req(), cancel))))
+        thread.start()
+        assert creating.wait(WAIT)
+        cancel.set()
+        thread.join(WAIT)
+        assert isinstance(errors[0], CancelledError)
+        gate.set()
+        assert client.deleted.wait(WAIT)
+        session = client.sessions[0]
+        assert not session.sent.is_set() and not session.aborted.is_set()
+        assert client.log == [('create', session.session_id), ('delete', session.session_id)]
+
+    def test_close_waits_for_cleanups(self, client, monkeypatch):
+        """At exit the turns still running are stopped and their sessions
+        deleted before the client is stopped."""
+        gate, passed = self._gate()
+        client._respond = _forever
+        sent = threading.Event()
+        cancel = threading.Event()
+
+        async def slow_delete(session_id):
+            await passed()
+            client.log.append(('delete', session_id))
+
+        monkeypatch.setattr(client, 'delete_session', slow_delete)
+        thread = threading.Thread(target=lambda: _raises(
+            lambda: CopilotSDK().complete(_req(), cancel)), daemon=True)
+        thread.start()
+        assert _wait(lambda: client.sessions and client.sessions[0].sent.is_set())
+        closed = threading.Thread(target=copilot_sdk._runtime.close)
+        closed.start()
+        assert client.sessions[0].aborted.wait(WAIT)
+        assert ('stop',) not in client.log
+        gate.set()
+        closed.join(WAIT)
+        session_id = client.sessions[0].session_id
+        assert client.log[-3:] == [('idle', session_id), ('delete', session_id), ('stop',)]
+        cancel.set()
+        thread.join(WAIT)
+
+    def test_reply_after_the_deadline_refused(self, client, monkeypatch):
+        clock = iter([0.0, 0.0])
+        monkeypatch.setattr(copilot_sdk, 'time', SimpleNamespace(
+            monotonic=lambda: next(clock, 1000.0)))
+        with pytest.raises(TransientError, match='timed out after 30 s'):
+            CopilotSDK().complete(_req(timeout=30), threading.Event())
+
+    def test_poll_never_waits_past_the_deadline(self, client, monkeypatch):
+        waits = []
+        real = concurrent.futures.Future.result
+
+        def result(self, timeout=None):
+            waits.append(timeout)
+            return real(self, timeout)
+
+        monkeypatch.setattr(concurrent.futures.Future, 'result', result)
+        client._respond = _forever
+        with pytest.raises(TransientError):
+            CopilotSDK().complete(_req(timeout=0.25), threading.Event())
+        assert all(w <= copilot_sdk.POLL_SECONDS for w in waits)
+        assert any(0 < w < copilot_sdk.POLL_SECONDS for w in waits)
+
+
+def _raises(call):
+    try:
+        call()
+    except BaseException as e:  # noqa: BLE001 - returned to the test
+        return e
+    return None
+
+
 class TestErrors:
 
     @pytest.mark.parametrize('message, error, text', [
@@ -492,7 +646,40 @@ class TestErrors:
         client._respond = failed
         with pytest.raises(TransientError) as e:
             CopilotSDK().complete(_req(), threading.Event())
-        assert str(e.value) == 'copilot SDK: Session error: see event | first | second'
+        assert str(e.value) == 'copilot SDK: Session error: see event | query first | query second'
+
+    def test_pattern_after_a_long_preamble(self, client):
+        """Matched on the whole text; only the message is cut."""
+        async def failed(session, prompt):
+            raise Exception('x' * 2000 + " You've hit the rate limit for this model.")
+
+        client._respond = failed
+        with pytest.raises(RateLimitError) as e:
+            CopilotSDK().complete(_req(), threading.Event())
+        assert str(e.value) == 'copilot SDK: ' + 'x' * copilot_sdk.ERROR_CHARS
+
+    def test_filtered_reply_refused(self, client):
+        async def filtered(session, prompt):
+            session.emit(_event('assistant.usage', input_tokens=1, output_tokens=1,
+                                content_filter_triggered=True))
+            return _event('assistant.message', content='partial')
+
+        client._respond = filtered
+        with pytest.raises(RefusalError, match='content filter'):
+            CopilotSDK().complete(_req(), threading.Event())
+
+    @pytest.mark.parametrize('reasons, stop_reason', [
+        (['stop', 'length'], 'truncated'), (['length', 'stop'], 'complete'),
+        ([None], 'complete')])
+    def test_length_cutoff_truncated(self, client, reasons, stop_reason):
+        async def cut(session, prompt):
+            for reason in reasons:
+                session.emit(_event('assistant.usage', input_tokens=1, output_tokens=1,
+                                    finish_reason=reason))
+            return _event('assistant.message', content='part')
+
+        client._respond = cut
+        assert CopilotSDK().complete(_req(), threading.Event()).stop_reason == stop_reason
 
     def test_runtime_exit_never_a_pattern(self, client):
         async def died(session, prompt):

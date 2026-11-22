@@ -17,8 +17,10 @@ removes `~/.copilot/session-state/<id>/`, which holds the prompt and reply).
 Timeout and cancel: `send_and_wait`'s own timeout does not stop the turn (it
 keeps running and is billed), so a call that times out or is cancelled
 aborts the session's turn (`session.abort()`), waits briefly for the session
-to go idle, then deletes it. `complete` returns at once; the abort and the
-delete finish on the event loop.
+to go idle, then deletes it. `complete` returns at once and sets the turn's
+stop event; the turn is never cancelled from outside, so this cleanup always
+runs to its end on the event loop. At interpreter exit the turns still
+running are stopped and waited for before the client is stopped.
 
 Authentication: the Copilot CLI's logged-in account (mode `coding-agent`,
 default COPILOT_HOME). Mode `empty` or another COPILOT_HOME silently use a
@@ -40,6 +42,10 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import concurrent.futures
+# Imported now so that its exit hook (which shuts the executors down) is
+# registered before this module's, and so runs after it
+import concurrent.futures.thread  # noqa: F401
 import logging
 import shutil
 import tempfile
@@ -104,7 +110,9 @@ def session_options(request: LLMRequest) -> dict:
         mcp={'disabled_servers': list(BUILTIN_MCP_SERVERS)},
         skills={'enabled': False},
         enable_config_discovery=False,
-        state={'infinite_sessions': {'enabled': False}},
+        # The cross-session store (`~/.copilot/session-store.db`) would index
+        # the prompt and reply outside the session folder
+        state={'infinite_sessions': {'enabled': False}, 'enable_cross_session_store': False},
         github={'telemetry_enabled': False},
         working_directory=tempfile.gettempdir(),
     )
@@ -118,7 +126,9 @@ def _error(error: Exception, messages: List[str]) -> LLMError:
     `session.error` messages."""
     if isinstance(error, LLMError):
         return error
-    joined = redact(' | '.join([str(error)] + messages))[:ERROR_CHARS]
+    # Matched in full, shown truncated
+    full = redact(' | '.join([str(error)] + messages))
+    joined = full[:ERROR_CHARS]
     if isinstance(error, TimeoutError):
         return TransientError(f'copilot SDK timed out: {joined}')
     if type(error).__name__ == 'ProcessExitedError':
@@ -132,7 +142,7 @@ def _error(error: Exception, messages: List[str]) -> LLMError:
                 (_UNAVAILABLE_PATTERN, lambda: BackendUnavailableError(f'copilot SDK: {joined}')),
                 (_REFUSAL_PATTERN, lambda: RefusalError(f'copilot SDK: {joined}')))
     for pattern, make in patterns:
-        if pattern.search(joined):
+        if pattern.search(full):
             return make()
     # Anything else, also a connection that went away (EOF, "not connected")
     return TransientError(f'copilot SDK: {joined}')
@@ -150,9 +160,11 @@ class _Runtime:
         self._client = None
         self._authenticated = False
         self._closed = False
+        self._turns = {}  # future of each turn not yet finished -> its stop event
 
-    def submit(self, coro):
-        """Run `coro` on the loop; a concurrent.futures.Future."""
+    def submit(self, coro, stop: asyncio.Event):
+        """Run the turn `coro` on the loop; a concurrent.futures.Future.
+        `stop` tells it to abort (`stop_turn`)."""
         with self._guard:
             if self._closed:
                 coro.close()
@@ -162,7 +174,22 @@ class _Runtime:
                 self._thread = threading.Thread(target=self._loop.run_forever,
                                                 name='copilot-sdk', daemon=True)
                 self._thread.start()
-            return asyncio.run_coroutine_threadsafe(coro, self._loop)
+                # Before concurrent.futures shuts its executors down at
+                # interpreter exit (the SDK's stop runs on them; atexit hooks
+                # run later, too late); threading's exit hooks run in reverse
+                threading._register_atexit(self.close)
+            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+            self._turns[future] = stop
+        future.add_done_callback(self._finished)
+        return future
+
+    def _finished(self, future) -> None:
+        with self._guard:
+            self._turns.pop(future, None)
+
+    def stop_turn(self, stop: asyncio.Event) -> None:
+        """Tell a turn to abort (it then deletes its session itself)."""
+        self._loop.call_soon_threadsafe(stop.set)
 
     async def client(self):
         """The started client (on the loop): a new runtime when the last one
@@ -185,13 +212,19 @@ class _Runtime:
         return client
 
     def close(self) -> None:
-        """At interpreter exit: stop the client (and so its runtime), and
-        let no call start after it."""
+        """At interpreter exit: let no call start, stop the turns still
+        running and wait (bounded) until they deleted their sessions, then
+        stop the client (and so its runtime). Once only."""
         with self._guard:
+            if self._closed:
+                return
             self._closed = True
-            loop, client = self._loop, self._client
-        if client is None:  # a client exists only on a running loop
+            loop, client, turns = self._loop, self._client, dict(self._turns)
+        if client is None or loop.is_closed():  # a client exists only on a loop
             return
+        for stop in turns.values():
+            self.stop_turn(stop)
+        concurrent.futures.wait(turns, timeout=CLEANUP_SECONDS)
         try:
             asyncio.run_coroutine_threadsafe(_stop(client), loop).result(CLEANUP_SECONDS)
         except BaseException:
@@ -227,11 +260,13 @@ class CopilotSDK:
         if cancel.is_set():
             raise CancelledError('cancelled')
         deadline = time.monotonic() + request.timeout
-        future = _runtime.submit(self._turn(request, flatten_prompt(request)))
+        stop = asyncio.Event()
+        future = _runtime.submit(self._turn(request, flatten_prompt(request), stop), stop)
         try:
             while True:
                 try:
-                    response = future.result(timeout=POLL_SECONDS)
+                    response = future.result(
+                        timeout=max(0.0, min(POLL_SECONDS, deadline - time.monotonic())))
                 except TimeoutError:
                     # Still running (the turn raises only LLMErrors)
                     if cancel.is_set():
@@ -239,17 +274,20 @@ class CopilotSDK:
                     if time.monotonic() >= deadline:
                         raise TransientError(f'{self.name} timed out after {request.timeout:g} s')
                     continue
-                # Finished: still refuse the reply of a cancelled call
+                # Finished: still refuse the reply of a cancelled or late call
                 if cancel.is_set():
                     raise CancelledError('cancelled')
+                if time.monotonic() > deadline:
+                    raise TransientError(f'{self.name} timed out after {request.timeout:g} s')
                 return response
         finally:
-            # A turn still running is aborted and its session deleted (on the loop)
-            future.cancel()
+            # A turn still running aborts and deletes its session (on the
+            # loop, never interrupted); one that finished ignores this
+            _runtime.stop_turn(stop)
 
-    async def _turn(self, request: LLMRequest, prompt: str) -> LLMResponse:
-        """One request in a fresh session, deleted afterwards. Raises only
-        LLMErrors (and asyncio.CancelledError when `complete` gave up)."""
+    async def _turn(self, request: LLMRequest, prompt: str, stop: asyncio.Event) -> LLMResponse:
+        """One request in a fresh session, deleted afterwards (also when
+        `stop` is set: the turn is aborted first). Raises only LLMErrors."""
         usages, messages = [], []
         idle = asyncio.Event()
 
@@ -258,7 +296,7 @@ class CopilotSDK:
             if kind == 'assistant.usage':
                 usages.append(event.data)
             elif kind == 'session.error':
-                messages.append(event.data.message)
+                messages.append(f'{event.data.error_type} {event.data.message}')
             elif kind == 'session.idle':
                 idle.set()
 
@@ -267,29 +305,41 @@ class CopilotSDK:
         # is deleted too
         session_id = str(uuid.uuid4())
         session = None
-        finished = False
+        running = False  # the prompt was sent and the turn has not ended
         try:
             session = await client.create_session(session_id=session_id, **session_options(request))
             session.on(record)
-            reply = await session.send_and_wait(prompt, timeout=request.timeout)
-            finished = True
+            if stop.is_set():  # the caller gave up while the session was created
+                raise CancelledError('cancelled')
+            send = asyncio.ensure_future(session.send_and_wait(prompt, timeout=request.timeout))
+            running = True
+            stopped = asyncio.ensure_future(stop.wait())
+            await asyncio.wait((send, stopped), return_when=asyncio.FIRST_COMPLETED)
+            stopped.cancel()
+            if not send.done():
+                send.cancel()
+                raise CancelledError('cancelled')
+            reply = send.result()  # raised: aborted (a timeout leaves the turn running)
+            running = False
         except Exception as e:
             raise _error(e, messages)
         finally:
-            await self._clean_up(client, session, session_id, finished, idle)
+            await self._clean_up(client, session if running else None, session_id, idle)
+        if any(u.content_filter_triggered for u in usages):
+            raise RefusalError('copilot SDK: the reply was filtered (content filter)')
         text = getattr(getattr(reply, 'data', None), 'content', None) or ''
-        return LLMResponse(text=text, stop_reason='complete', usage=_usage(usages),
-                           model=request.model)
+        truncated = bool(usages) and usages[-1].finish_reason == 'length'
+        return LLMResponse(text=text, stop_reason='truncated' if truncated else 'complete',
+                           usage=_usage(usages), model=request.model)
 
     @staticmethod
-    async def _clean_up(client, session, session_id: str, finished: bool,
-                        idle: asyncio.Event) -> None:
-        """Abort an unfinished turn (waiting briefly for the session to go
-        idle), then delete the session. Failures are ignored: a runtime that
-        died took its turns with it."""
+    async def _clean_up(client, session, session_id: str, idle: asyncio.Event) -> None:
+        """Abort the turn of `session` if one is given (waiting briefly for
+        it to go idle), then delete the session. Failures are ignored: a
+        runtime that died took its turns with it."""
         try:
             async with asyncio.timeout(CLEANUP_SECONDS):
-                if session is not None and not finished:
+                if session is not None:
                     await session.abort()
                     try:
                         await asyncio.wait_for(idle.wait(), ABORT_WAIT_SECONDS)
