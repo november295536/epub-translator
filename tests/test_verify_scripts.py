@@ -5776,3 +5776,157 @@ class TestPhase10EffortScript:
         events = [json.loads(line) for line in _copilot_json().splitlines()][1:]
         values = effort_check.copilot_values('\n'.join(json.dumps(e) for e in events))
         assert values['reported'] == '-'
+
+
+# --- Phase 12: Copilot SDK check -------------------------------------------------
+
+sdk_check = _load('phase12_sdk_check')
+
+
+class FakeSDKRuntime:
+    """A fake SDK client for phase12_sdk_check, and the runtime processes
+    it pretends to start (pids, which the script's children() returns)."""
+
+    def __init__(self, usage_after_abort=False):
+        self.pids = []
+        self.next_pid = 100
+        self.usage_after_abort = usage_after_abort
+        self.sentences = []
+        self.all_sentences = None
+
+    def client(self):
+        import asyncio
+        runtime = self
+
+        def event(kind, **data):
+            return SimpleNamespace(type=kind, data=SimpleNamespace(**data))
+
+        class Session:
+            def __init__(self, options):
+                self.options, self.handlers = options, []
+
+            def on(self, handler):
+                self.handlers.append(handler)
+
+            def emit(self, e):
+                for handler in self.handlers:
+                    handler(e)
+
+            async def send_and_wait(self, prompt, timeout):
+                self.emit(event('model.call_start'))
+                if prompt == sdk_check.LONG:
+                    await asyncio.Event().wait()
+                if prompt.startswith('Translate to Traditional Chinese: ') and any(
+                        s in prompt for s in sdk_check.SENTENCES):
+                    runtime.sentences.append(prompt)
+                    if runtime.all_sentences is None:
+                        runtime.all_sentences = asyncio.Event()
+                    if len(runtime.sentences) == len(sdk_check.SENTENCES):
+                        runtime.all_sentences.set()
+                    await runtime.all_sentences.wait()
+                level = (self.options.get('inference') or {}).get('reasoning_effort')
+                self.emit(event('assistant.usage', cost=0.33, reasoning_effort=level,
+                                input_tokens=10, output_tokens=5))
+                return event('assistant.message', content='譯文')
+
+            async def abort(self):
+                if runtime.usage_after_abort:
+                    self.emit(event('assistant.usage', cost=0.33, reasoning_effort=None,
+                                    input_tokens=1, output_tokens=1))
+                self.emit(event('session.idle', aborted=True))
+
+        class Client:
+            async def start(self):
+                if not runtime.pids:
+                    runtime.pids.append(runtime.next_pid)
+                    runtime.next_pid += 1
+
+            async def get_auth_status(self):
+                return SimpleNamespace(is_authenticated=True, login='someone')
+
+            async def create_session(self, session_id, **options):
+                if options['model'] == 'no-such-model-phase12':
+                    raise Exception('Model "no-such-model-phase12" is not available.')
+                if 'inference' in options and options['model'] == 'claude-haiku-4.5':
+                    raise Exception("Model 'claude-haiku-4.5' does not support reasoning "
+                                    "effort configuration.")
+                return Session(options)
+
+            async def delete_session(self, session_id):
+                pass
+
+            async def stop(self):
+                runtime.pids.clear()
+
+        return Client()
+
+
+class TestPhase12SdkCheck:
+
+    def _run(self, monkeypatch, tmp_path, capsys, fake):
+        from src.llm import copilot_sdk
+        monkeypatch.setattr(copilot_sdk, '_new_client', fake.client)
+        monkeypatch.setattr(sdk_check, 'children', lambda: list(fake.pids))
+        monkeypatch.setattr(sdk_check.os, 'kill', lambda pid, sig: fake.pids.remove(pid))
+        monkeypatch.setattr(sdk_check, '_pause', lambda seconds: None)
+        monkeypatch.setattr(sdk_check, 'SESSION_STATE', str(tmp_path / 'state'))
+        monkeypatch.setattr(sdk_check, 'RUNTIME_LOGS', str(tmp_path / 'logs' / '*.log'))
+        code = sdk_check.main(['--timeout-s', '0.5'])
+        return code, capsys.readouterr().out
+
+    def test_all_checks_pass(self, monkeypatch, tmp_path, capsys):
+        code, out = self._run(monkeypatch, tmp_path, capsys, FakeSDKRuntime())
+        assert code == 0, out
+        assert out.splitlines()[-1] == 'PASS'
+        assert 'FAIL' not in out
+        assert "effort ['low']" in out and 'cost [0.33]' in out
+        assert 'cost the SDK reported in total: 1.65 premium requests' in out
+        # No reply text, no account data
+        assert '譯文' not in out and 'someone' not in out
+
+    def test_usage_after_abort_fails(self, monkeypatch, tmp_path, capsys):
+        code, out = self._run(monkeypatch, tmp_path, capsys,
+                              FakeSDKRuntime(usage_after_abort=True))
+        assert code == 1
+        assert 'FAIL cancelled: no assistant.usage (nothing reported billed)' in out
+        assert 'FAIL timed out: no assistant.usage (nothing reported billed)' in out
+
+    def test_session_left_fails(self, monkeypatch, tmp_path, capsys):
+        fake = FakeSDKRuntime()
+        real_client = fake.client
+
+        def leaving():
+            client = real_client()
+            create = client.create_session
+
+            async def create_and_keep(session_id, **options):
+                (tmp_path / 'state' / session_id).mkdir(parents=True, exist_ok=True)
+                return await create(session_id=session_id, **options)
+            client.create_session = create_and_keep
+            return client
+
+        fake.client = leaving
+        code, out = self._run(monkeypatch, tmp_path, capsys, fake)
+        assert code == 1 and 'FAIL no session directory left of the 9 sessions' in out
+
+    def test_without_a_runtime_in_tests(self, capsys, monkeypatch):
+        """Under the suite's guard (conftest.no_real_sdk_client) the script
+        reaches no runtime: every call fails and so does the script."""
+        monkeypatch.setattr(sdk_check, '_pause', lambda seconds: None)
+        assert sdk_check.main(['--timeout-s', '0.5']) == 1
+        out = capsys.readouterr().out
+        assert 'FAIL all three answered in Chinese' in out
+
+    def test_options(self, capsys):
+        with pytest.raises(SystemExit) as e:
+            sdk_check.main(['--level', 'max', '--effort-model', 'gemini-4-argon'])
+        assert e.value.code == 2
+        with pytest.raises(SystemExit) as e:
+            sdk_check.main(['--model', 'claude-haiku-5.5'])
+        assert e.value.code == 2
+        assert 'must take no effort level' in capsys.readouterr().err
+
+    def test_header(self):
+        doc = ' '.join(sdk_check.__doc__.split())
+        assert 'Makes REAL model calls' in doc
+        assert 'It prints no account data' in doc
