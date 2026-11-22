@@ -659,3 +659,16 @@ class TestMidRunSwitch:
             task._coordinator.join(timeout=20)
         assert task.state == 'completed'
         assert [(r.effort, r.timeout) for r in fake.requests] == [('low', 180), ('high', 500)]
+
+
+class TestSmallMessages:
+
+    def test_check_effort(self):
+        from src.core.project import check_effort
+        assert check_effort('xhigh') == 'xhigh'
+        with pytest.raises(ValueError, match=r"^unknown effort: 'bogus'$"):
+            check_effort('bogus')
+
+    def test_call_settings_without_load(self, tmp_path):
+        with pytest.raises(RuntimeError, match='^No project loaded.$'):
+            ProjectManager(str(tmp_path)).call_settings()

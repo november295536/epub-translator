@@ -5643,3 +5643,87 @@ class TestPhase10EffortScript:
     def test_help(self, tmp_path):
         result = _run_script('phase10_effort_check', ['--help'], str(tmp_path))
         assert result.returncode == 0 and '--levels' in result.stdout
+
+    def test_request_handed_to_the_product_command(self, monkeypatch):
+        from src.llm import LLMRequest, Message
+        backend = effort_check.llm.backend_for('copilot-cli')
+        seen = []
+        monkeypatch.setattr(backend, 'build_command', lambda p, r: seen.append(r) or ['x'])
+        assert effort_check.command(backend, 'PROMPT', 'gpt-6.2-sol', 'xhigh') == ['x']
+        assert seen == [LLMRequest(system='', messages=[Message('user', 'PROMPT')],
+                                   model='gpt-6.2-sol', timeout=0, effort='xhigh')]
+
+    def test_options(self, capsys):
+        with pytest.raises(SystemExit) as e:
+            effort_check.main(['--help'])
+        assert e.value.code == 0
+        out = ' '.join(capsys.readouterr().out.split())
+        assert out.startswith('usage: ') and '--backend {claude-cli,copilot-cli} --model MODEL' in out
+        assert '[--levels LEVEL [LEVEL ...]]' in out
+        assert 'Phase 10 measurement: does the project\'s reasoning effort reach the CLI?' in out
+        assert "--model MODEL One of the backend's models" in out
+        assert '--levels LEVEL [LEVEL ...] Levels to call with, in order (default: low high)' in out
+        assert '--timeout TIMEOUT Seconds per call (default 180, the product default)' in out
+        for args in (['--model', 'opus'], ['--backend', 'claude-cli'],
+                     ['--backend', 'nope', '--model', 'opus']):
+            with pytest.raises(SystemExit) as e:
+                effort_check.main(args)
+            assert e.value.code == 2
+
+    @pytest.mark.parametrize('args, message', [
+        (['--backend', 'copilot-cli', '--model', 'gemini-4-carbon', '--levels', 'xhigh', 'max'],
+         'gemini-4-carbon (copilot-cli) does not take xhigh, max; it takes: low, medium, high'),
+        (['--backend', 'copilot-cli', '--model', 'claude-haiku-4.5', '--levels', 'low'],
+         'claude-haiku-4.5 (copilot-cli) does not take low; it takes: none'),
+    ])
+    def test_refusal_message(self, capsys, args, message):
+        with pytest.raises(SystemExit):
+            effort_check.main(args)
+        assert capsys.readouterr().err.splitlines()[-1].endswith(f'error: {message}')
+
+    def test_lines_flushed(self, monkeypatch):
+        import io
+        self._run(monkeypatch, lambda cmd: _claude_json())
+
+        class Observed(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.flushed_at = []
+
+            def flush(self):
+                self.flushed_at.append(self.getvalue().count('\n'))
+                super().flush()
+
+        stream = Observed()
+        monkeypatch.setattr(sys, 'stdout', stream)
+        effort_check.main(['--backend', 'claude-cli', '--model', 'haiku'])
+        assert 2 in stream.flushed_at and 3 in stream.flushed_at
+
+    def test_failed_call_wall(self, monkeypatch):
+        ticks = iter([10.0, 14.0])
+        monkeypatch.setattr(effort_check, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
+
+        def broken(cmd, **kw):
+            raise OSError('x')
+        monkeypatch.setattr(effort_check, 'run_process', broken)
+        call = effort_check.one_call(effort_check.llm.backend_for('claude-cli'), 'p', 'haiku',
+                                     'low', 5)
+        assert call == {'level': 'low', 'ok': False, 'error': 'OSError', 'wall': 4.0}
+
+    def test_echoed_phrase_is_no_error(self, monkeypatch):
+        """The prompt goes to the backend's classification: a short reply that
+        repeats a phrase of the request is not taken for an error."""
+        reply = json.dumps({'result': 'authentication_error', 'usage': {
+            'input_tokens': 1, 'output_tokens': 1}})
+        self._run(monkeypatch, lambda cmd: reply)
+        call = effort_check.one_call(effort_check.llm.backend_for('claude-cli'),
+                                     'translate: authentication_error', 'haiku', 'low', 5)
+        assert call['ok'] is True
+
+    def test_missing_reply_and_level(self):
+        values = effort_check.claude_values(json.dumps({'result': None, 'usage': {
+            'input_tokens': 1, 'output_tokens': 2}}))
+        assert values['reply'] == ''
+        events = [json.loads(line) for line in _copilot_json().splitlines()][1:]
+        values = effort_check.copilot_values('\n'.join(json.dumps(e) for e in events))
+        assert values['reported'] == '-'
