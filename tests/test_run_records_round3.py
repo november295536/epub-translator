@@ -199,3 +199,61 @@ def test_page_keeps_completed_after_a_refused_pause(tmp_path):
         .get(f'/project/{PROJECT}/translation').get_data(as_text=True)
     assert 'if (data.ending) {' in page
     assert "this.state = 'completed';\n                this.error = null;" in page
+
+
+class TestExtractionEnds:
+    def _cli(self, tmp_path, monkeypatch, patch):
+        import json
+        from click.testing import CliRunner
+        import translate
+        from src.llm.fake import FakeBackend
+        from tests.conftest import use_fake_backend
+        path = _make_project(tmp_path, n=1)
+        patch()
+        reply = json.dumps([{'term': 'Quillfeather', 'translation': '羽筆', 'category': 'term'}])
+        with use_fake_backend(FakeBackend([reply])):
+            CliRunner().invoke(translate.cli, ['glossary', 'extract', '-p', path])
+        return path, _of(_records(path), 'run_end')
+
+    def test_ctrl_c_during_the_save(self, tmp_path, monkeypatch):
+        from src.glossary.glossary_manager import GlossaryManager
+
+        def interrupt(self, *a, **k):
+            raise KeyboardInterrupt()
+        _, [end] = self._cli(tmp_path, monkeypatch,
+                             lambda: monkeypatch.setattr(GlossaryManager, 'save', interrupt))
+        assert (end['state'], end['error'], end['terms']) == ('interrupted', 'KeyboardInterrupt', 1)
+
+    def test_closed_pipe_after_the_save_keeps_added(self, tmp_path, monkeypatch):
+        import click
+        import translate
+        echo = click.echo
+
+        def closed(message=None, *a, **k):
+            if message and str(message).startswith('已儲存到'):
+                raise BrokenPipeError()
+            return echo(message, *a, **k)
+        path, [end] = self._cli(tmp_path, monkeypatch,
+                                lambda: monkeypatch.setattr(translate.click, 'echo', closed))
+        assert (end['added'], end['terms']) == (1, 1) and end['error'] == 'BrokenPipeError'
+        assert os.path.exists(os.path.join(path, 'glossary.json'))
+
+    def test_web_save_failure_keeps_terms(self, tmp_path, monkeypatch):
+        import json
+        from src.glossary.glossary_manager import GlossaryManager
+        from src.llm.fake import FakeBackend
+        from src.web.server import create_app
+        from tests.conftest import use_fake_backend
+        path = _make_project(tmp_path, n=1)
+
+        def explode(self, *a, **k):
+            raise OSError('disk full')
+        monkeypatch.setattr(GlossaryManager, 'save', explode)
+        client = create_app(projects_dir=str(tmp_path)).test_client()
+        reply = json.dumps([{'term': 'Quillfeather', 'translation': '羽筆', 'category': 'term'}])
+        with use_fake_backend(FakeBackend([reply])):
+            assert client.post(f'/api/projects/{PROJECT}/glossary/extract').status_code == 200
+            _wait(lambda: _of(_records(path), 'run_end'))
+        [end] = _of(_records(path), 'run_end')
+        assert (end['state'], end['error'], end['terms']) == ('failed', 'OSError', 1)
+        assert 'added' not in end

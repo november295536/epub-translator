@@ -190,7 +190,8 @@ def extract_terms(project_name: str):
                         end['state'], len(terms), count)
         except Exception as e:
             logger.exception("術語提取失敗: %s", project_name)
-            end = {'state': 'failed', 'error': type(e).__name__}
+            # terms found stay in the record, as in the CLI (`added` only once saved)
+            end = {**end, 'state': 'failed', 'error': type(e).__name__}
             _extraction_tasks[project_name]['error'] = str(e)
         finally:
             # before the status says it ended

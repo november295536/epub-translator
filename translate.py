@@ -892,8 +892,8 @@ def glossary_extract(project):
             # Keep what the finished batches found
             stopped, terms = e, e.terms
             click.echo(f"提取中斷：{e}")
+        end = {'state': 'interrupted', 'terms': len(terms)}  # until the save went through
         click.echo(f"提取到 {len(terms)} 個術語")
-        end = {'state': 'failed', 'terms': len(terms)}  # until the save went through
         if terms:
             gm = GlossaryManager(_get_glossary_path(project_dir))
             gm.load()
@@ -903,10 +903,15 @@ def glossary_extract(project):
                             gender=old.gender if old else '', note=old.note if old else '',
                             save=False)
             gm.save()  # once, right after the glossary was read
-            click.echo(f"已儲存到 {_get_glossary_path(project_dir)}")
+        # Saved: recorded before the confirmation, which can fail (a closed pipe)
         # (a stop's cause is in the record of the call that hit it)
         end = {'state': 'completed' if stopped is None else 'stopped', 'terms': len(terms),
                'added': len(terms)}
+        if terms:
+            click.echo(f"已儲存到 {_get_glossary_path(project_dir)}")
+    except KeyboardInterrupt as e:
+        end = {**end, 'state': 'interrupted', 'error': type(e).__name__}
+        raise
     except Exception as e:
         end = {**end, 'state': 'failed', 'error': type(e).__name__}
         raise
