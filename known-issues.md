@@ -68,6 +68,7 @@
 ## 其他事件紀錄的已知限制
 
 - Web 翻譯在暫停中時停止伺服器，該次執行在紀錄裡一直是「未結束」。
+- 平行的 CLI 翻譯（`-w 2` 以上）在一個結果已計數、但它的 `segment` 行還沒寫出時按 Ctrl-C，`run_end` 的計數會比 `segment` 行多一，`run_records_check.py` 會因此判定該次執行失敗。
 - 用這版程式翻譯過、之後才 `migrate` 的 schema 1 專案：較早的紀錄行寫的是已不存在的段落 ID，`scripts/verify/run_records_check.py` 會因此判定失敗。
 - 術語提取的回覆若是清單但沒有可用的項目（缺 term 或 translation），會和真正沒有術語的回覆一樣記為 accepted；Copilot SDK 因內容過濾而拒絕的回覆，其 tokens 不會記錄。
 
