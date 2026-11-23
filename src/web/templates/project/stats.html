@@ -39,15 +39,16 @@
                     <table class="export-file-table stats-table">
                         <thead>
                             <tr>
-                                <th>後端</th><th>模型</th><th>推理強度</th><th>模型呼叫</th>
-                                <th>段落</th><th>首次即通過</th><th>需重試或分割</th><th>其中分割</th>
+                                <th>用途</th><th>後端</th><th>模型</th><th>推理強度</th><th>模型呼叫</th>
+                                <th>段落</th><th>首次即通過</th><th>需多次呼叫</th><th>其中分割</th>
                                 <th>最終失敗</th><th>耗時中位數</th><th>耗時 p90</th>
                                 <th>輸入 tokens</th><th>輸出 tokens</th>
                             </tr>
                         </thead>
                         <tbody>
-                            <template x-for="g in stats.models" :key="g.backend + '/' + g.model + '/' + g.effort">
+                            <template x-for="g in stats.models" :key="g.work + '/' + g.backend + '/' + g.model + '/' + g.effort">
                                 <tr>
+                                    <td x-text="g.work === 'extraction' ? '術語提取' : '翻譯'"></td>
                                     <td x-text="g.backend"></td>
                                     <td x-text="g.model"></td>
                                     <td x-text="g.effort || '-'"></td>
@@ -66,12 +67,12 @@
                         </tbody>
                     </table>
                     <p class="text-muted" style="margin: 0.75rem 1rem; font-size: 0.85rem;">
-                        段落依其最後一次模型呼叫歸類；「需重試或分割」包括逾時後的重試。claude-cli 不回報 tokens。
+                        段落依其最後一次模型呼叫歸類；「需多次呼叫」是翻譯成功但用了一次以上的呼叫（退回後重試、逾時後重試、分割），「其中分割」是其中經過分割的段落。claude-cli 不回報 tokens。
                         各呼叫結果（滑鼠移到「模型呼叫」上可看）：
                     </p>
                     <ul class="text-muted" style="margin: 0 1rem 0.75rem; font-size: 0.85rem;">
-                        <template x-for="g in stats.models" :key="'o' + g.backend + '/' + g.model + '/' + g.effort">
-                            <li x-text="g.model + (g.effort ? ' / ' + g.effort : '') + '：' + outcomes(g.outcomes)"></li>
+                        <template x-for="g in stats.models" :key="'o' + g.work + '/' + g.backend + '/' + g.model + '/' + g.effort">
+                            <li x-text="(g.work === 'extraction' ? '術語提取：' : '翻譯：') + g.backend + ' / ' + g.model + (g.effort ? ' / ' + g.effort : '') + '：' + outcomes(g.outcomes)"></li>
                         </template>
                     </ul>
                 </div>

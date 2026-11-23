@@ -315,3 +315,122 @@ class TestExtractionRecordedAfterParsing:
         assert extractor.extract_from_text('Nothing here.') == []
         [c] = _of(_records(str(tmp_path)), 'call')
         assert c['outcome'] == 'accepted'
+
+
+class TestStatisticsRound1:
+    def test_split_is_a_part_of_more_calls(self):
+        from src.core.stats import summarize
+        from tests.test_run_records import _call, _rec
+        records = [_call('s1', 1), _rec('segment', segment='s1', result='failed', calls=4,
+                                        split=True, issues=['tag_count']),
+                   _call('s2', 1), _rec('segment', segment='s2', result='translated', calls=4,
+                                        split=True)]
+        [g] = summarize(records)['models']
+        assert (g['more_calls'], g['split'], g['failed']) == (1, 1, 1)
+
+    def test_extraction_calls_apart(self):
+        from src.core.stats import summarize, text_report
+        from tests.test_run_records import _call, _rec
+
+        def extraction(kind, **fields):
+            return _rec('call', kind=kind, backend='b', model='m1', effort='low',
+                        outcome='accepted', seconds=1.0, **{**fields})
+        records = [_call('s1', 1), extraction('extract'),
+                   {**extraction('consolidate'), 'outcome': 'rejected',
+                    'issues': ['unusable_reply']}]
+        s = summarize(records)
+        assert [(g['work'], g['calls']) for g in s['models']] == [('translation', 1),
+                                                                 ('extraction', 2)]
+        assert any(line.startswith('  術語提取：b / m1 / low') for line in
+                   text_report({**s, 'exists': True}))
+
+    def test_since_out_of_range(self, tmp_path):
+        import pytest
+        from click.testing import CliRunner
+        import translate
+        from src.core.stats import parse_since
+        from src.web.server import create_app
+        from tests.test_run_records import PROJECT
+        with pytest.raises(ValueError):
+            parse_since('0001-01-01T00:00:00+14:00')
+        path = _make_project(tmp_path)
+        result = CliRunner().invoke(translate.cli, ['stats', '-p', path, '--since',
+                                                    '0001-01-01T00:00:00+14:00'])
+        assert result.exit_code == 2 and not isinstance(result.exception, OverflowError)
+        client = create_app(projects_dir=str(tmp_path)).test_client()
+        assert client.get(f'/api/projects/{PROJECT}/stats?since=0001-01-01T00:00:00%2B14:00') \
+            .status_code == 400
+
+    def test_wrong_types_are_skipped(self, tmp_path):
+        import json
+        from src.core.events import events_path
+        from src.core.stats import project_stats
+        from tests.test_run_records import _call, _rec
+        lines = [_call('s1', 1, issues=7), _rec('segment', segment=['s1'], result='translated'),
+                 _call('s2', 1, seconds='slow'), _rec('segment', segment='s2', split='yes'),
+                 _call('s3', 1)]
+        os.makedirs(os.path.join(tmp_path, 'log'))
+        with open(events_path(str(tmp_path)), 'w', encoding='utf-8') as f:
+            f.write(''.join(json.dumps(r) + '\n' for r in lines))
+        s = project_stats(str(tmp_path))
+        assert (s['records'], s['skipped_lines']) == (1, 4)
+
+    def test_cli_records_workers_asked_for(self, tmp_path):
+        from click.testing import CliRunner
+        import translate
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        from tests.test_run_records import _of, _records
+        path = _make_project(tmp_path, n=1)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '好'))):
+            assert CliRunner().invoke(translate.cli, ['start', '-p', path, '-w', '3']).exit_code == 0
+        assert _of(_records(path), 'run_start')[0]['workers'] == 3  # as the web: asked for
+
+    def test_page_lists_work_and_backend(self, tmp_path):
+        from src.web.server import create_app
+        from tests.test_run_records import PROJECT
+        _make_project(tmp_path)
+        page = create_app(projects_dir=str(tmp_path)).test_client() \
+            .get(f'/project/{PROJECT}/stats').get_data(as_text=True)
+        assert "g.backend + ' / ' + g.model" in page and '<th>用途</th>' in page
+        assert '需多次呼叫' in page and '需重試或分割' not in page
+
+
+class TestCheckScriptRound1:
+    def _check(self, projects, capsys):
+        from tests.test_run_records import TestRunRecordsCheckScript
+        code = TestRunRecordsCheckScript._check(None, projects)
+        return code, capsys.readouterr().out
+
+    def test_book_with_enum_words_passes(self, tmp_path, capsys):
+        """A book whose text has the record's own words (request, accepted,
+        completed, pending, timeout...) passes: closed sets, no word list."""
+        from click.testing import CliRunner
+        import translate
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        word = 'Request accepted, completed, pending timeout rejected selected'
+        path = _make_project(tmp_path, n=2, word=word)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '好'))):
+            assert CliRunner().invoke(translate.cli, ['start', '-p', path]).exit_code == 0
+        code, out = self._check(tmp_path, capsys)
+        assert code == 0, out
+
+    def test_unknown_key_and_text_not_printed(self, tmp_path, capsys):
+        from src.core.events import RunEvents
+        path = _make_project(tmp_path, n=1)
+        RunEvents(path, 'cli', run_id='20260101T000000Z-abcdef').emit(
+            'call', kind='request', backend='fake', model='m', timeout=60, seconds=1.0,
+            outcome='accepted', Zorblaxian='x', error='Zorblaxian')
+        code, out = self._check(tmp_path, capsys)
+        assert code == 1 and '1 unknown keys' in out and 'error: a string' in out
+        assert 'Zorblaxian' not in out
+
+    def test_required_fields_and_skipped_lines(self, tmp_path, capsys):
+        from src.core.events import RunEvents, events_path
+        path = _make_project(tmp_path, n=1)
+        RunEvents(path, 'cli', run_id='20260101T000000Z-abcdef').emit('segment', result='failed')
+        with open(events_path(path), 'a', encoding='utf-8') as f:
+            f.write('{"cut\n')
+        code, out = self._check(tmp_path, capsys)
+        assert code == 1 and 'segment without segment' in out and 'skipped lines 1' in out
