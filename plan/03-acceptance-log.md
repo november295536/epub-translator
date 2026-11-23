@@ -8373,6 +8373,27 @@ Three suites at once at `dbae00f` (the final code and tests): `3171 passed in 29
 detected (exit 0); `scripts/verify/phase1_survivor_kills.py`: every recorded mutant killed
 (`not killed 0`, exit 0), both at `16ccb89`.
 
+## Run records — review round 4
+
+Each finding was first reproduced by a test (appended to `tests/test_run_records_round3.py`)
+that failed on the round's starting commit `de0b3fd` (a `git archive` copy) and passes after the
+fix.
+
+| # | Finding | Reproduced | Change |
+|---|---------|------------|--------|
+| 1 | The coordinator's `finally` fallback (a way out that left no terminal state) recorded `failed` and released the lock but left the workers running: one parked at the pause gate waited for ever, and as `finishing` makes stop a no-op the project could not be started again | yes (`test_unexpected_exit_stops_a_worker_at_the_pause_gate`: the worker was still alive after the coordinator left) | the fallback sets stop, cancel and the pause gate as `_fail_task` does, joins the workers (`STOP_WAIT_SECONDS` each), then writes `run_end` and the failed state and releases the lock; the test starts the same project again and it completes (`d7fee58`) |
+| 2 | The pause endpoint checked `finishing` once, before the manager's call, and `stop_event` not at all: a pause/resume refused because the run began ending in between, or after a streak stop, answered 500 with the running state | yes (`TestPauseEndpointEnding`, both triggers: 500 instead of 409) | 409 `{ending: true}` when `finishing` or `stop_event` is set, before the call and again after a refused one (`b261057`) |
+| 3 | CLI `glossary extract`: a closed stdout at the stop notice lost the term count in `run_end` | yes (`test_stopped_extraction_keeps_terms_when_stdout_closes`: `KeyError: 'terms'`) | the count is in the end record before the notice is printed (`b261057`; the survivor-kill anchor `cli90` follows the notice's new text) |
+| 4 | `proclog`'s module docstring still spoke of the git commit | — (text) | corrected; a grep of CLAUDE.md, README, `known-issues.md`, `CHANGELOG.md`, `src/` and `translate.py` for `git describe`, `git commit`, `rev-parse`, `GIT_OPTIONAL_LOCKS` and `dirty` finds no other leftover (`b261057`) |
+
+Optional item: the start-line test no longer also searches proclog's source for `subprocess`;
+the behavioural part (`subprocess.Popen` patched to fail during `proclog.setup`) stays. The other
+source-text tests of round 3 (the page's handlers, the changelog) were kept: the page cannot be
+driven here (see "Not verified").
+
+Mutation was not rerun for these four changes: each behaviour change has a test that failed
+first on `de0b3fd` and passes now, and the round asked for no mutation run. No real model calls.
+
 ### Not verified, for the whole feature
 
 - Real rate limits, timeouts, refusals and truncated replies: their outcome classes are tested with
