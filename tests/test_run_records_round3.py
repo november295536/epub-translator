@@ -4,6 +4,8 @@ before the fix). All text is invented."""
 import os
 import threading
 
+import pytest
+
 from src.core.events import RunEvents, events_path
 from tests.test_run_records import PROJECT, _make_project, _of, _records, _wait
 
@@ -393,3 +395,65 @@ def test_extraction_recorder_from_the_snapshot(tmp_path, monkeypatch):
         _wait(lambda: not glossary_module._extraction_tasks[PROJECT]['running'])
     assert replaced[0].wait(10)
     assert not os.path.exists(events_path(path))
+
+
+# --- survivors of the final mutation pass that pointed at gaps -------------------------
+
+def test_two_timeouts_counted():
+    from src.core.stats import summarize
+    from tests.test_run_records import _call
+    [g] = summarize([_call('s1', 1, 'timeout'), _call('s1', 2, 'timeout')])['models']
+    assert g['timeouts'] == 2
+
+
+@pytest.mark.filterwarnings('ignore::pytest.PytestUnhandledThreadExceptionWarning')
+def test_coordinator_left_by_a_base_exception(tmp_path, monkeypatch):
+    """A way out that is not an Exception (no handler ran): the run still
+    ends failed, with a class name for it, and finishing set. (The
+    exception then leaves the thread, as it should: the warning pytest
+    gives for that is expected here.)"""
+    from src.web import tasks as tasks_module
+    from tests.conftest import like
+    tm = _tm(monkeypatch)
+
+    def leave(self, task, pm, res):
+        raise GeneratorExit()  # a BaseException, not an Exception
+    monkeypatch.setattr(tasks_module.TaskManager, '_apply_result', leave)
+    try:
+        task, path = _run(tm, tmp_path, lambda r: like(r, '好'))
+    finally:
+        _reset()
+    [end] = _of(_records(path), 'run_end')
+    assert (task.state, end['state'], end['error']) == ('failed', 'failed', 'UnexpectedExit')
+    assert task.finishing
+
+
+class TestCheckScriptFinal:
+    def _check(self, tmp_path, capsys):
+        from tests import test_run_records as trr
+        code = trr.TestRunRecordsCheckScript._check(None, tmp_path)
+        return code, capsys.readouterr().out
+
+    def test_lines_after_a_blank_one_and_two_cut_lines(self, tmp_path, capsys):
+        path = _make_project(tmp_path, n=1)
+        RunEvents(path, 'cli', run_id='20260101T000000Z-abcdef').emit('pause', reason='user')
+        with open(events_path(path), 'a', encoding='utf-8') as f:
+            f.write('\n{"cut\n{"cut\n{"leak": "x"}\n')
+        code, out = self._check(tmp_path, capsys)
+        assert code == 1 and 'skipped lines 2' in out and 'line 5: no event, run or ts' in out
+
+    def test_translation_call_keeps_the_base_requirements(self, tmp_path, capsys):
+        path = _make_project(tmp_path, n=1)
+        RunEvents(path, 'cli', run_id='20260101T000000Z-abcdef').emit(
+            'call', kind='request', segment='c1_seg0001', attempt=1, model='m1', timeout=60,
+            seconds=1.0, outcome='accepted')  # no backend
+        code, out = self._check(tmp_path, capsys)
+        assert code == 1 and 'call without backend' in out
+
+    def test_extraction_call_needs_no_segment(self, tmp_path, capsys):
+        path = _make_project(tmp_path, n=1)
+        RunEvents(path, 'extract', run_id='20260101T000000Z-abcdef').emit(
+            'call', kind='extract', backend='fake', model='m1', timeout=60, seconds=1.0,
+            outcome='accepted')
+        code, out = self._check(tmp_path, capsys)
+        assert code == 0, out
