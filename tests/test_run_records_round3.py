@@ -469,24 +469,39 @@ def test_unexpected_exit_stops_a_worker_at_the_pause_gate(tmp_path, monkeypatch)
     from src.web import tasks as tasks_module
     from tests.conftest import like, use_fake_backend
     tm = _tm(monkeypatch)
-    _make_project(tmp_path, n=3)
-    first = threading.Event()
+    _make_project(tmp_path, n=2)
+    paused, parked = threading.Event(), threading.Event()
+
+    class Gate(threading.Event):
+        def wait(self, timeout=None):
+            if not self.is_set():
+                parked.set()  # a worker waits at the closed gate
+            return super().wait(timeout)
 
     def leave(self, task, pm, res):
-        # the user paused, the worker waits at the gate; then the coordinator leaves
+        # first result: the user pauses while the worker's second call runs;
+        # once the worker waits at the gate the coordinator leaves
+        gate = Gate()
+        gate.set()
+        task.pause_event = gate
         assert tm.pause_translation(PROJECT)
-        _wait(lambda: not task.result_queue.qsize() and task.active_workers == 1)
+        paused.set()
+        assert parked.wait(20)
         raise GeneratorExit()
     monkeypatch.setattr(tasks_module.TaskManager, '_apply_result', leave)
+    calls = []
 
     def responder(request):
-        first.set()
+        calls.append(1)
+        if len(calls) == 2:
+            assert paused.wait(20)  # the second call ends after the pause
         return like(request, '好')
     try:
         with use_fake_backend(FakeBackend(responder=responder)):
             task = tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
             task._coordinator.join(20)
             assert not task._coordinator.is_alive()
+            assert task.error_class == 'UnexpectedExit'  # the fallback, not _fail_task
             assert not task.threads_alive() and task.state == 'failed'
             monkeypatch.undo()  # the next run applies results normally
             monkeypatch.setattr(tasks_module, 'COORDINATOR_TICK_SECONDS', 0.02)
@@ -495,7 +510,6 @@ def test_unexpected_exit_stops_a_worker_at_the_pause_gate(tmp_path, monkeypatch)
     finally:
         _reset()
     assert again.state == 'completed'
-
 
 class TestPauseEndpointEnding:
     """Round 4: a pause/resume refused because the run began ending between
