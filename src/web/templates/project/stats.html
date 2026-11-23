@@ -108,7 +108,7 @@
                         <tbody>
                             <template x-for="r in stats.runs" :key="r.run">
                                 <tr>
-                                    <td x-text="time(r.start)"></td>
+                                    <td x-text="r.start ? time(r.start) : '（開始不在所選紀錄中）'"></td>
                                     <td x-text="r.end ? time(r.end) : '-'"></td>
                                     <td x-text="secs(r.duration)"></td>
                                     <td x-text="sources[r.source] || r.source"></td>

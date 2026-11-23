@@ -1204,10 +1204,12 @@ class TestCheapKills:
         assert mixed['models'][1]['seconds_median'] == 1.23456
 
     def test_since_is_inclusive_and_unfinished_duration(self):
-        records = [_rec('call', ts='2026-01-01T00:00:00.000Z'),
+        records = [_rec('run_start', ts='2026-01-01T00:00:00.000Z'),
                    _rec('pause', ts='2026-01-01T00:00:10.000Z')]
         s = summarize(records, since='2026-01-01T00:00:00.000Z')
         assert s['records'] == 2 and s['runs'][0]['duration'] == 10.0
+        # without its run_start (review round 3): no start, no duration
+        assert summarize(records[1:])['runs'][0]['duration'] is None
 
     def test_report_helpers_and_states(self, utc):
         from src.core import stats as st
@@ -1216,7 +1218,7 @@ class TestCheapKills:
         r['runs'][0]['state'] = 'weird'
         text = '\n'.join(text_report(r))
         assert '（300.0 秒）  weird\n' in text           # unknown state shown as is, no error
-        assert '→ -（0.0 秒）  未結束（執行中或程序已終止）\n' in text
+        assert '（開始不在所選紀錄中） → -（-）  未結束（執行中或程序已終止）\n' in text
         assert text.endswith('模型呼叫 1 次')            # no segment count without run_start
 
     def test_empty_reports(self):

@@ -257,3 +257,30 @@ class TestExtractionEnds:
         [end] = _of(_records(path), 'run_end')
         assert (end['state'], end['error'], end['terms']) == ('failed', 'OSError', 1)
         assert 'added' not in end
+
+
+def test_run_started_before_since():
+    from src.core.stats import START_UNKNOWN, summarize, text_report
+    from tests.test_run_records import _call, _rec
+    records = [_rec('run_start', ts='2026-01-01T09:00:00.000Z'),
+               _call('s1', 1, ts='2026-01-01T09:30:00.000Z'),
+               _call('s2', 1, ts='2026-01-01T11:00:00.000Z'),
+               _rec('run_end', ts='2026-01-01T11:00:05.000Z', state='completed', seconds=7205.0),
+               _rec('run_start', run='r2', ts='2026-01-01T11:10:00.000Z'),
+               _call('s3', 1, run='r2', ts='2026-01-01T11:20:00.000Z')]
+    s = summarize(records, since='2026-01-01T10:00:00.000Z')
+    first, second = s['runs']
+    assert (first['start'], first['duration']) == (None, 7205.0)  # its own measure, start unknown
+    assert (second['start'], second['duration']) == ('2026-01-01T11:10:00.000Z', 600.0)
+    unfinished = summarize(records[:3], since='2026-01-01T10:00:00.000Z')['runs'][0]
+    assert (unfinished['start'], unfinished['duration']) == (None, None)
+    text = '\n'.join(text_report({**s, 'exists': True}))
+    assert f'{START_UNKNOWN} → ' in text
+
+
+def test_page_shows_unknown_start(tmp_path):
+    from src.web.server import create_app
+    _make_project(tmp_path)
+    page = create_app(projects_dir=str(tmp_path)).test_client() \
+        .get(f'/project/{PROJECT}/stats').get_data(as_text=True)
+    assert "r.start ? time(r.start) : '（開始不在所選紀錄中）'" in page
