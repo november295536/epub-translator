@@ -1,7 +1,9 @@
 """Mutation testing over the lines changed on this branch (mutmut 3.8.1).
 
 Run through scripts/verify/mutation.sh, in the project environment (both
-requirements files, mutmut 3.8.1). argv: BASE.
+requirements files, mutmut 3.8.1). argv: BASE [MAX_CHILDREN] (MAX_CHILDREN:
+mutmut's --max-children, the number of mutant workers; default: mutmut's,
+one per core; a smaller number bounds the memory and CPU used).
 
 Mutates only the lines added or changed versus the merge base with BASE in
 FILES, in a copy of the working tree under a temporary directory (the
@@ -86,7 +88,7 @@ with open('changed.json') as f:
     CHANGED = {os.path.abspath(p): set(lines) for p, lines in json.load(f).items()}
 main.get_covered_lines_for_file = lambda filename, covered: CHANGED.get(
     os.path.abspath(filename), set())
-sys.argv = ['mutmut', 'run']
+sys.argv = ['mutmut', 'run'] + sys.argv[1:]
 main.cli()
 '''
 
@@ -189,7 +191,7 @@ def stop_group(proc) -> None:
         time.sleep(1)  # let the other members act on the signal
 
 
-def main(base: str) -> int:
+def main(base: str, max_children: int | None = None) -> int:
     if version('mutmut') != MUTMUT_VERSION:
         print(f'mutmut {MUTMUT_VERSION} required (found {version("mutmut")}): '
               'pip install -r requirements-dev.txt', file=sys.stderr)
@@ -212,7 +214,8 @@ def main(base: str) -> int:
         print('mutating the changed lines of ' + ', '.join(changed), flush=True)
         with open(os.path.join(work, 'run.log'), 'w') as log:
             # its own process group, stopped as a whole on any exit
-            proc = subprocess.Popen([sys.executable, '-c', RUNNER], cwd=copy, env=env,
+            limit = [] if max_children is None else ['--max-children', str(max_children)]
+            proc = subprocess.Popen([sys.executable, '-c', RUNNER] + limit, cwd=copy, env=env,
                                     stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             returncode = proc.wait()
         if returncode != 0:
@@ -257,4 +260,5 @@ def main(base: str) -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else 'main'))
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else 'main',
+                  int(sys.argv[2]) if len(sys.argv) > 2 else None))
