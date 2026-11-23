@@ -174,6 +174,7 @@ class TranslationTask:
                          repr=False)
     started: float = 0.0  # TaskManager.clock() at the start
     error_class: str | None = None  # the exception that failed the coordinator
+    end_recorded: bool = False  # run_end written (once)
 
     def threads_alive(self) -> bool:
         """True while the coordinator or any worker of this task runs."""
@@ -365,9 +366,11 @@ class TaskManager:
                 task._coordinator = coordinator
                 coordinator.start()
                 self.tasks[project_name] = task
-            except BaseException:
+            except BaseException as e:
                 if task.project_lock is None or not task.threads_alive():
-                    # Nothing started that would release it
+                    # Nothing started that would release it (nor end the record)
+                    task.error_class = type(e).__name__
+                    self._end_record(task, 'failed')
                     task.state = 'failed'
                     lock.release()
                 raise
@@ -589,16 +592,24 @@ class TaskManager:
             if streak_stop:
                 raise RuntimeError(streak_stop)
 
-            # Set final state
-            if task.stop_event.is_set() or task.state == 'stopped':
-                task.state = 'stopped'
+            # Set final state; under the lock, so a pause cannot come
+            # between. A pause that came after the last result (the workers
+            # had ended on an empty queue) leaves nothing to resume: completed
+            with task._lock:
+                if task.stop_event.is_set() or task.state == 'stopped':
+                    final = 'stopped'
+                else:
+                    final = 'completed'
+                self._end_record(task, final)  # before anyone sees the end
+                task.state = final
+                task.resume_at = None
+            if final == 'stopped':
                 logger.info("翻譯已停止: 已完成 %d 段", task.completed)
                 task.progress.put({'event': 'stopped', 'data': {
                     'completed': task.completed,
                     'remaining': task.total - task.completed,
                 }})
-            elif task.state == 'running':
-                task.state = 'completed'
+            else:
                 logger.info("翻譯完成: 共翻譯 %d 段", task.completed)
                 task.progress.put({'event': 'complete', 'data': {
                     'total_translated': task.completed,
@@ -607,13 +618,20 @@ class TaskManager:
         except Exception as e:
             self._fail_task(task, e, saver)
         finally:
+            self._end_record(task, task.state)  # when nothing above wrote it
             if task.project_lock is not None:
                 task.project_lock.release()
             teardown_project_logging(handler)
-            if task.events is not None:
-                task.events.emit('run_end', state=task.state, **task.counts,
-                                 seconds=round(self.clock() - task.started, 3),
-                                 error=task.error_class)
+
+    def _end_record(self, task: TranslationTask, state: str) -> None:
+        """The run_end line, once: written before the end is published
+        (state, SSE event, lock release)."""
+        if task.events is None or task.end_recorded:
+            return
+        task.end_recorded = True
+        task.events.emit('run_end', state=state, **task.counts,
+                         seconds=round(self.clock() - task.started, 3),
+                         error=task.error_class)
 
     def _workers_done(self, task: TranslationTask) -> bool:
         """Every worker has ended and every result was taken. A segment
@@ -683,6 +701,7 @@ class TaskManager:
             message += f'（{len(unsaved)} 個段落的結果未儲存：{", ".join(unsaved)}）'
         logger.error("Translation task failed: %s", message)
         task.error = message
+        self._end_record(task, 'failed')
         task.progress.put({'event': 'error', 'data': {
             'error': message,
             'unsaved': unsaved,
