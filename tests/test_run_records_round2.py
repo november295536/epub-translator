@@ -387,3 +387,22 @@ def test_page_sorts_codes_by_count(tmp_path):
     page = create_app(projects_dir=str(tmp_path)).test_client() \
         .get(f'/project/{PROJECT}/stats').get_data(as_text=True)
     assert 'this.byCount(counts)' in page and 'b[1] - a[1]' in page
+
+
+def test_no_run_end_without_run_start(tmp_path, monkeypatch):
+    import pytest
+    from src.web import tasks as tasks_module
+    from tests.test_run_records import PROJECT
+    tm = _tm(monkeypatch)
+    path = _make_project(tmp_path, n=1)
+
+    def explode(settings):
+        raise ZeroDivisionError('invented')
+    monkeypatch.setattr(tasks_module, 'settings_fields', explode)
+    try:
+        with pytest.raises(ZeroDivisionError):
+            tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+    finally:
+        from src.web.tasks import TaskManager
+        TaskManager._instance = None
+    assert not os.path.exists(events_path(path))  # neither a run_start nor a lone run_end
