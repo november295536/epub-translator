@@ -68,3 +68,50 @@ class TestTerminalOutput:
                 str(tmp_path / 'relative-logs' / 'cli.log')
         finally:
             proclog.teardown()
+
+
+class TestCallLostWhenCheckRaises:
+    """A reply whose cleaning or check raises is still a call made: it is
+    recorded, and the unexpected outcome counts it."""
+
+    def _run(self, tmp_path, monkeypatch, where, error, module=None):
+        import src.core.translator as translator
+        from src.core.events import RunEvents
+        from src.core.translator import TranslationEngine, translate_segment
+        from src.llm.fake import FakeBackend
+        from tests.test_run_records import _of, _records, _seg
+
+        def explode(*a, **k):
+            raise error
+        monkeypatch.setattr(module or translator, where, explode)
+        ev = RunEvents(str(tmp_path), 'cli', run_id='r')
+        engine = TranslationEngine(backend=FakeBackend(['<p k="1">你好。</p>']), events=ev,
+                                   wait=lambda *a: False)
+        try:
+            outcome = translate_segment(engine, _seg(), [_seg()])
+        except BaseException as e:  # noqa: BLE001 - Ctrl-C goes through
+            outcome = e
+        return outcome, _of(_records(str(tmp_path)), 'call')
+
+    def test_check_raises(self, tmp_path, monkeypatch):
+        from src.core import validation
+        outcome, calls = self._run(tmp_path, monkeypatch, 'check_keys',
+                                   ZeroDivisionError('invented'), module=validation)
+        assert outcome.issues[0].code == 'unexpected' and outcome.calls == 1
+        [c] = calls
+        assert (c['outcome'], c['error']) == ('unexpected', 'ZeroDivisionError')
+
+    def test_clean_raises(self, tmp_path, monkeypatch):
+        outcome, calls = self._run(tmp_path, monkeypatch, '_clean_html',
+                                   ZeroDivisionError('invented'))
+        assert outcome.issues[0].code == 'unexpected'
+        assert outcome.calls == 1 and outcome.failure.calls == 1
+        [c] = calls
+        assert (c['outcome'], c['error'], c['attempt']) == ('unexpected', 'ZeroDivisionError', 1)
+        assert c['chars_out'] > 0
+
+    def test_ctrl_c_in_clean(self, tmp_path, monkeypatch):
+        outcome, calls = self._run(tmp_path, monkeypatch, '_clean_html', KeyboardInterrupt())
+        assert isinstance(outcome, KeyboardInterrupt)
+        [c] = calls
+        assert c['outcome'] == 'cancelled'

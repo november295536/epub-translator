@@ -370,6 +370,17 @@ class _Session:
         self.record(kind, seconds, outcome, issues=blocking,
                     warnings=[i.code for i in result.issues if not i.blocking], **fields)
 
+    def unchecked(self, error: BaseException) -> None:
+        """Record the last reply when cleaning or checking it raised
+        `error` (or Ctrl-C came): the call was made, its outcome is the
+        error's class."""
+        pending, self.pending = self.pending, None
+        if pending is None:
+            return
+        kind, seconds, fields = pending
+        fields.pop('truncated')
+        self.record(kind, seconds, events.error_outcome(error), error=error, **fields)
+
     def call(self, messages: list, clean, kind: str = 'request') -> str:
         """One reply to `messages`, passed through `clean`. A transient
         error is retried while calls are left; raises TranslationError
@@ -456,8 +467,12 @@ class _Session:
         Returns (text, result); raises _Rejected."""
         messages = [Message('user', prompt)]
         while True:
-            reply = self.call(messages, clean, kind)
-            text, result = check(reply)
+            try:
+                reply = self.call(messages, clean, kind)
+                text, result = check(reply)
+            except BaseException as e:
+                self.unchecked(e)
+                raise
             self.checked(result)
             if not result.blocking:
                 return text, result
@@ -608,6 +623,11 @@ class TranslationEngine:
         except _Rejected as e:
             issues = e.result.blocking
             session.fail(issues[0].code, issues[0].detail, issues)
+        except Exception as e:
+            if not isinstance(e, (TranslationError, LLMError)):
+                # An unexpected error: its outcome still counts the calls made
+                e.session_calls = (session.used, session.split)
+            raise
         return Reply(accepted, session.usage, list(result.issues), session.used, session.split)
 
     def _translate_html(self, session: _Session, html: str, fingerprints, build) -> tuple:
@@ -847,11 +867,15 @@ def unexpected_error_outcome(model: str, error: BaseException,
     traceback."""
     detail = f'未預期的錯誤：{type(error).__name__}: {error}'[:ERROR_MESSAGE_CHARS]
     trace = ''.join(traceback.format_exception(type(error), error, error.__traceback__))
+    # The calls made before it, when the engine raised it (translate_reply)
+    calls, split = getattr(error, 'session_calls', (0, False))
     return TranslationOutcome(
         text=None, status=SegmentStatus.FAILED, model=model, usage=None,
         issues=[Issue(kind='backend', code='unexpected', detail=detail, blocking=True)],
         failure=TranslationError(detail, code='unexpected', prompt=prompt,
-                                 attempts=[(f'{type(error).__name__}: {error}', trace)]))
+                                 attempts=[(f'{type(error).__name__}: {error}', trace)],
+                                 calls=calls, split=split),
+        calls=calls, split=split)
 
 
 # A run stops after this many unexpected failures in a row: one defect
