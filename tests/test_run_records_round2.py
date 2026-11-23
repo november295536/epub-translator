@@ -70,3 +70,81 @@ def test_durations_over_replies_only():
         3, 10.0, 12.0, 1)
     text = '\n'.join(text_report({**summarize(records), 'exists': True}))
     assert '回覆耗時（3 次有回覆的呼叫）：中位數 10.0 秒，p90 12.0 秒；逾時 1 次' in text
+
+
+def _tm(monkeypatch):
+    from src.web import tasks as tasks_module
+    from src.web.tasks import TaskManager
+    TaskManager._instance = None
+    monkeypatch.setattr(tasks_module, 'COORDINATOR_TICK_SECONDS', 0.02)
+    return TaskManager()
+
+
+def _run_web(tmp_path, monkeypatch, tm, responder, n=1, **start):
+    from src.llm.fake import FakeBackend
+    from tests.conftest import use_fake_backend
+    from tests.test_run_records import PROJECT, _of, _records, _wait
+    path = _make_project(tmp_path, n=n)
+    with use_fake_backend(FakeBackend(responder=responder)):
+        task = tm.start_translation(PROJECT, str(tmp_path), num_workers=1, **start)
+        _wait(lambda: task.state in ('completed', 'stopped', 'failed') and not task.threads_alive())
+    _wait(lambda: _of(_records(path), 'run_end'))
+    return task, path
+
+
+class TestPauseRecord:
+    def test_no_pause_or_resume_once_the_run_ends(self, tmp_path, monkeypatch):
+        from tests.conftest import like
+        from tests.test_run_records import PROJECT, _of, _records
+        tm = _tm(monkeypatch)
+        done = tm._workers_done
+        answers = []
+
+        def workers_done(task):
+            if done(task):  # forced: a pause and a resume right after the last result
+                answers.append((tm.pause_translation(PROJECT), tm.resume_translation(PROJECT)))
+                return True
+            return False
+        monkeypatch.setattr(tm, '_workers_done', workers_done)
+        try:
+            task, path = _run_web(tmp_path, monkeypatch, tm, lambda r: like(r, '好'))
+        finally:
+            from src.web.tasks import TaskManager
+            TaskManager._instance = None
+        records = _records(path)
+        assert answers == [(False, False)] and task.state == 'completed'
+        assert not _of(records, 'pause') and not _of(records, 'resume')
+        assert records[-1]['event'] == 'run_end' and len(task._threads) == 1
+
+    def test_pause_line_written_in_the_transition(self, tmp_path, monkeypatch):
+        import threading
+        from src.core import events as events_module
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        from tests.test_run_records import PROJECT, _wait
+        tm = _tm(monkeypatch)
+        path = _make_project(tmp_path, n=2)
+        held = []
+        emit = events_module.RunEvents.emit
+
+        def spy(self, event, **fields):
+            if event == 'pause':
+                held.append(tm.tasks[PROJECT]._lock.locked())
+            return emit(self, event, **fields)
+        monkeypatch.setattr(events_module.RunEvents, 'emit', spy)
+        go = threading.Event()
+
+        def responder(request):
+            go.wait(10)
+            return like(request, '好')
+        try:
+            with use_fake_backend(FakeBackend(responder=responder)):
+                task = tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+                assert tm.pause_translation(PROJECT)
+                go.set()
+                tm.stop_translation(PROJECT)
+                _wait(lambda: not task.threads_alive())
+        finally:
+            from src.web.tasks import TaskManager
+            TaskManager._instance = None
+        assert held == [True]
