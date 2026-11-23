@@ -1115,3 +1115,144 @@ class TestWholeRunLines:
         with caplog.at_level(logging.ERROR):
             proclog._thread_excepthook(args)
         assert not caplog.records and handed == [args]
+
+
+class TestCheapKills:
+    """Mutants that survived the second mutation pass and are cheap to kill."""
+
+    def test_record_line_is_compact_utc(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('TZ', 'Asia/Taipei')
+        time.tzset()
+        try:
+            import datetime as dt
+            before = dt.datetime.now(dt.timezone.utc).replace(microsecond=0, tzinfo=None)
+            ev = RunEvents(str(tmp_path), 'cli')
+            ev.emit('pause', reason='user')
+            line = open(events_path(str(tmp_path)), encoding='utf-8').read()
+            stamp = json.loads(line)['ts']
+            run_stamp = dt.datetime.strptime(ev.run_id.split('-')[0], '%Y%m%dT%H%M%SZ')
+            aside = events.set_aside(str(tmp_path))
+        finally:
+            monkeypatch.undo()
+            time.tzset()
+        assert '"event":"pause","reason":"user"' in line  # no spaces
+        ts = dt.datetime.strptime(stamp, '%Y-%m-%dT%H:%M:%S.%fZ')
+        assert abs((ts - before).total_seconds()) < 5          # UTC, not local (+8 h)
+        assert abs((run_stamp - before).total_seconds()) < 5
+        aside_stamp = dt.datetime.strptime(os.path.basename(aside)[7:22], '%Y%m%dT%H%M%S')
+        assert abs((aside_stamp - before).total_seconds()) < 5
+
+    def test_call_fields_and_settings(self, tmp_path):
+        ev = RunEvents(str(tmp_path), 'cli', run_id='r')
+        ev.call(kind='request', backend='b', model='m', effort=None, timeout=5,
+                seconds=1.23456, outcome='accepted', warnings=['length_ratio'])
+        [c] = _of(_records(str(tmp_path)), 'call')
+        assert c['seconds'] == 1.235 and c['warnings'] == ['length_ratio']
+        assert 'issues' not in c and 'effort' not in c
+        from src.core.project import CallSettings
+        assert events.settings_fields(CallSettings('copilot-sdk', 'mx', 'high', 60)) == {
+            'backend': 'copilot-sdk', 'model': 'mx', 'effort': 'high', 'timeout': 60}
+
+    def test_read_records_field_checks(self, tmp_path):
+        path = events_path(str(tmp_path))
+        os.makedirs(os.path.dirname(path))
+        good = {'ts': 't', 'run': 'r', 'event': 'pause'}  # no v: version 1
+        lines = [good, {**good, 'run': 1}, {**good, 'ts': None}, {**good, 'event': 2},
+                 {**good, 'v': 2}]
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(''.join(json.dumps(r) + '\n' for r in lines))
+        records, skipped = read_records(path)
+        assert records == [good] and skipped == 4
+
+    def test_summarize_counts_add_up(self):
+        twice = RICH + [{**r, 'run': 'b'} for r in RICH] + [
+            _rec('pause', run='a', reason='user')]
+        s = summarize(twice)
+        m1 = next(g for g in s['models'] if g['model'] == 'm1')
+        assert (m1['calls'], m1['more_calls'], m1['split'], m1['calls_with_tokens'],
+                m1['tokens_out']) == (6, 2, 2, 2, 14)
+        assert next(g for g in s['models'] if g['model'] == 'm3')['failed'] == 2
+        assert [r['pauses'] for r in s['runs']] == [2, 1]
+        both = summarize([_call('s', 1, model=None, tokens_in=1),
+                          {**_call('s', 1, tokens_in=2), 'backend': None, 'effort': None},
+                          _rec('segment', segment='x', result='translated', calls=1)])
+        assert [(g['backend'], g['model'], g['effort'], g['first_attempt'])
+                for g in both['models']] == [('?', '?', None, 1), ('?', 'm1', None, 0),
+                                             ('b', '?', 'low', 0)]
+        mixed = summarize([_call('s', 1, seconds=1.23456),
+                           {**_call('s', 1), 'effort': None}])
+        assert [g['effort'] for g in mixed['models']] == [None, 'low']
+        assert mixed['models'][1]['seconds_median'] == 1.235
+
+    def test_since_is_inclusive_and_unfinished_duration(self):
+        records = [_rec('call', ts='2026-01-01T00:00:00.000Z'),
+                   _rec('pause', ts='2026-01-01T00:00:10.000Z')]
+        s = summarize(records, since='2026-01-01T00:00:00.000Z')
+        assert s['records'] == 2 and s['runs'][0]['duration'] == 10.0
+
+    def test_report_helpers_and_states(self, utc):
+        from src.core import stats as st
+        assert st._local(None) == '' and st._pct(None) == '-'
+        r = {**summarize(SAMPLE), 'exists': True}
+        r['runs'][0]['state'] = 'weird'
+        text = '\n'.join(text_report(r))
+        assert '（300.0 秒）  weird\n' in text           # unknown state shown as is, no error
+        assert '→ -（0.0 秒）  未結束（執行中或程序已終止）\n' in text
+        assert text.endswith('模型呼叫 1 次')            # no segment count without run_start
+
+    def test_empty_reports(self):
+        assert text_report({'records': 0, 'skipped_lines': 0, 'exists': False}) == [
+            '此專案還沒有事件紀錄（log/events.jsonl）：翻譯或提取術語後才會產生。']
+        assert text_report({'records': 0, 'skipped_lines': 3}) == [
+            '事件紀錄中沒有符合條件的紀錄。', '略過 3 行無法解析的紀錄。']
+
+    def test_extractor_logs_a_record_failure(self, tmp_path, monkeypatch, caplog):
+        ev = RunEvents(str(tmp_path), 'extract')
+        monkeypatch.setattr(ev, 'call', lambda **k: 1 / 0)
+        extractor = TermExtractor(model='m9', backend=FakeBackend(['[]']), events=ev)
+        with caplog.at_level(logging.WARNING, logger='src.glossary.term_extractor'):
+            extractor._call('abc')
+        [rec] = caplog.records
+        assert rec.getMessage() == '無法記錄模型呼叫' and rec.exc_info[0] is ZeroDivisionError
+
+
+class TestCheckScriptOutput:
+    def _main(self, argv):
+        import importlib.util
+        path = os.path.join(_REPO_ROOT, 'scripts', 'verify', 'run_records_check.py')
+        spec = importlib.util.spec_from_file_location('scripts.verify.run_records_check', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.main(argv)
+
+    def test_whole_output(self, tmp_path, capsys):
+        clean = _make_project(tmp_path, name='a-clean')
+        RunEvents(clean, 'cli', run_id='20260101T000000Z-abcdef').emit(
+            'segment', segment='c1_seg0001', result='translated')
+        bad = _make_project(tmp_path, name='b-bad')
+        ev = RunEvents(bad, 'cli', run_id='20260101T000000Z-abcdef')
+        ev.emit('segment', segment='nowhere', result='failed', issues=['zorblaxian'])
+        ev.emit('run_end', state='completed', translated=1)
+        _make_project(tmp_path, name='c-none')
+        assert self._main(['--projects-dir', str(tmp_path), '--anonymize']) == 1
+        assert capsys.readouterr().out == (
+            'project-1: PASS  records 1, skipped lines 0, runs 1\n'
+            'project-2: FAIL  records 2, skipped lines 0, runs 1\n'
+            '  record 1: issues: a word of the source text\n'
+            '  run 20260101T000000Z-abcdef: run_end translated=1, segment records 0\n'
+            '  run 20260101T000000Z-abcdef: run_end failed=0, segment records 1\n'
+            '  1 records name a segment id not in project.json\n'
+            'project-3: no event record\n'
+            'FAIL\n')
+        assert self._main(['--projects-dir', str(tmp_path)]) == 1
+        assert capsys.readouterr().out.startswith('a-clean: PASS')
+
+    def test_clean_and_missing(self, tmp_path, capsys):
+        clean = _make_project(tmp_path, name='a')
+        RunEvents(clean, 'cli', run_id='20260101T000000Z-abcdef').emit('pause', reason='user')
+        assert self._main(['--projects-dir', str(tmp_path)]) == 0
+        assert capsys.readouterr().out == (
+            'a: PASS  records 1, skipped lines 0, runs 1\nPASS\n')
+        assert self._main(['--projects-dir', str(tmp_path / 'missing')]) == 2
+        assert capsys.readouterr().out == (
+            'cannot list the projects directory: FileNotFoundError\n')
