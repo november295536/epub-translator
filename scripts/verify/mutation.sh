@@ -2,8 +2,9 @@
 # Mutation testing over the lines changed on this branch (mutmut 3.8.1).
 #
 #   source venv/bin/activate    (the project environment, both requirements files)
-#   scripts/verify/mutation.sh [BASE] [MAX_CHILDREN]   (default BASE: main;
-#                     MAX_CHILDREN: mutant workers, default one per core)
+#   scripts/verify/mutation.sh [BASE] [MAX_CHILDREN [FILE...]]   (default BASE: main;
+#                     MAX_CHILDREN: mutant workers, default one per core;
+#                     FILE...: only these files of mutation.py's list)
 #
 # Runs scripts/verify/mutation.py (see its docstring) on the active
 # environment's python3. The repository is not edited: mutmut works on a
@@ -26,4 +27,4 @@ if ! python3 -c 'import mutmut, pytest' 2>/dev/null; then
     exit 2
 fi
 
-exec python3 scripts/verify/mutation.py "${1:-main}" ${2:+"$2"}
+exec python3 scripts/verify/mutation.py "${1:-main}" "${@:2}"

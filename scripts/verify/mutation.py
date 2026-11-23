@@ -1,9 +1,11 @@
 """Mutation testing over the lines changed on this branch (mutmut 3.8.1).
 
 Run through scripts/verify/mutation.sh, in the project environment (both
-requirements files, mutmut 3.8.1). argv: BASE [MAX_CHILDREN] (MAX_CHILDREN:
-mutmut's --max-children, the number of mutant workers; default: mutmut's,
-one per core; a smaller number bounds the memory and CPU used).
+requirements files, mutmut 3.8.1). argv: BASE [MAX_CHILDREN [FILE...]]
+(MAX_CHILDREN: mutmut's --max-children, the number of mutant workers, '' or
+absent: mutmut's default, one per core; a smaller number bounds the memory
+and CPU used. FILE...: only these of FILES are mutated; a name not in FILES
+is refused, exit 2).
 
 Mutates only the lines added or changed versus the merge base with BASE in
 FILES, in a copy of the working tree under a temporary directory (the
@@ -191,13 +193,19 @@ def stop_group(proc) -> None:
         time.sleep(1)  # let the other members act on the signal
 
 
-def main(base: str, max_children: int | None = None) -> int:
+def main(base: str, max_children: int | None = None, only: list | None = None) -> int:
     if version('mutmut') != MUTMUT_VERSION:
         print(f'mutmut {MUTMUT_VERSION} required (found {version("mutmut")}): '
               'pip install -r requirements-dev.txt', file=sys.stderr)
         return 2
     os.chdir(git('rev-parse', '--show-toplevel').strip())
+    unknown = sorted(set(only or ()) - set(FILES))
+    if unknown:
+        print('not in FILES: ' + ', '.join(unknown), file=sys.stderr)
+        return 2
     changed = changed_lines(git('merge-base', base, 'HEAD').strip())
+    if only:
+        changed = {f: lines for f, lines in changed.items() if f in only}
     if not changed:
         print('no changed lines')
         return 2
@@ -261,4 +269,5 @@ def main(base: str, max_children: int | None = None) -> int:
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else 'main',
-                  int(sys.argv[2]) if len(sys.argv) > 2 else None))
+                  int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None,
+                  sys.argv[3:]))
