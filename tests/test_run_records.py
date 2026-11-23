@@ -430,6 +430,10 @@ class TestCliRun:
         assert (end['state'], end['error'], end['translated']) == (
             'interrupted', 'KeyboardInterrupt', 1)
         assert _of(_records(path), 'call')[1]['outcome'] == 'unexpected'
+        log = open(os.path.join(os.environ[proclog.LOG_DIR_ENV], 'cli.log'),
+                   encoding='utf-8').read()
+        assert 'interrupted (Ctrl-C)' in log
+        assert 'end: exit 1 after' in log.rstrip().split('\n')[-1]
 
     def test_rate_limit_pause_and_resume(self, tmp_path, monkeypatch):
         path = _make_project(tmp_path, n=1)
