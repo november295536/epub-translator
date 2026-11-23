@@ -78,6 +78,10 @@ def pause_translation(project_name: str):
     action = data.get('action')
     if action not in ('pause', 'resume'):
         return jsonify({'error': 'action 必須是 pause 或 resume'}), 400
+    if task.finishing:
+        # The run is ending (its last result is in, or it failed): nothing to
+        # pause or resume. No state: the page keeps what the stream told it
+        return jsonify({'error': '翻譯正在結束', 'ending': True}), 409
     if action == 'resume':
         # Resume — optionally adjust workers
         num_workers = None

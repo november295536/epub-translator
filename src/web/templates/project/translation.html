@@ -491,6 +491,11 @@ function translationController() {
                     body: JSON.stringify(body),
                 });
                 const data = await res.json();
+                if (data.ending) {
+                    // 409: the run is ending; its complete/error event says how
+                    // (and may have come already): keep the state, show nothing
+                    return;
+                }
                 if (data.state) {
                     this.state = data.state;
                     this.autoResume = false;  // a user pause lasts; a resume ends any wait
@@ -624,6 +629,7 @@ function translationController() {
             this.eventSource.addEventListener('complete', (e) => {
                 const data = JSON.parse(e.data);
                 this.state = 'completed';
+                this.error = null;  // e.g. a refused pause while the run ended
                 this.autoResume = false;
                 this.currentSegment = null;
                 this.completed = data.total_translated;

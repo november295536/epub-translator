@@ -160,3 +160,42 @@ def test_a_failing_failure_handler_still_ends_the_run(tmp_path, monkeypatch):
     [end] = _of(_records(path), 'run_end')
     assert (task.state, end['state']) == ('failed', 'failed')
     assert end['error'] == 'ZeroDivisionError' and real
+
+
+def test_pause_or_resume_while_finishing_answers_409(tmp_path, monkeypatch):
+    from src.web.server import create_app
+    from src.web.tasks import TaskManager
+    from tests.conftest import like
+    tm = _tm(monkeypatch)
+    answers = []
+    client_box = {}
+    done = tm._workers_done
+
+    def workers_done(task):
+        if done(task):
+            client = client_box['client']
+            for action in ('pause', 'resume'):
+                res = client.post(f'/api/projects/{PROJECT}/translate/pause', json={'action': action})
+                answers.append((res.status_code, res.get_json()))
+            return True
+        return False
+    monkeypatch.setattr(tm, '_workers_done', workers_done)
+    try:
+        app = create_app(projects_dir=str(tmp_path))
+        monkeypatch.setattr('src.web.blueprints.translation._get_task_manager', lambda: tm)
+        client_box['client'] = app.test_client()
+        task, path = _run(tm, tmp_path, lambda r: like(r, '好'))
+    finally:
+        _reset()
+    assert [code for code, _ in answers] == [409, 409]
+    assert all('state' not in body and body['ending'] for _, body in answers)
+    assert task.state == 'completed'
+
+
+def test_page_keeps_completed_after_a_refused_pause(tmp_path):
+    from src.web.server import create_app
+    _make_project(tmp_path)
+    page = create_app(projects_dir=str(tmp_path)).test_client() \
+        .get(f'/project/{PROJECT}/translation').get_data(as_text=True)
+    assert 'if (data.ending) {' in page
+    assert "this.state = 'completed';\n                this.error = null;" in page
