@@ -8394,6 +8394,13 @@ the current time, so two writes on either side of a zip time step (2 s) differ. 
 the book twice 2.1 s apart (digests differed); `write_raw_epub` now uses a fixed member time and
 the forced check gives the same digest (`c3da4e3`).
 
+Suite once alone at `b261057` (the four fixes): `3175 passed in 301.22s`, no failure, no
+warning. Three suites at once at `40ffa4c` (after both test fixes): `3175 passed in 307.10s /
+300.84s / 304.03s`, no failure, no warning. At the same commit
+`scripts/verify/phase1_survivor_kills.py` killed every recorded mutant (`not killed 0`, the changed
+anchor `cli90` included) and `scripts/verify/phase1_reverts.py` detected every revert
+(`reverts not detected: 0`).
+
 Optional item: the start-line test no longer also searches proclog's source for `subprocess`;
 the behavioural part (`subprocess.Popen` patched to fail during `proclog.setup`) stays. The other
 source-text tests of round 3 (the page's handlers, the changelog) were kept: the page cannot be
