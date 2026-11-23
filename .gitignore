@@ -31,3 +31,6 @@ uploads/
 
 # Mutation testing (mutmut)
 .mutmut-cache
+
+# Process logs (src/core/proclog.py), beside projects/
+logs/

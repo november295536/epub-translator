@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from flask import Blueprint, Response, jsonify, request, current_app
 
@@ -14,6 +15,8 @@ import src.llm as llm
 from src.core.translator import available_backends, available_models
 from src.web.tasks import TaskManager
 
+
+logger = logging.getLogger(__name__)
 
 translation_bp = Blueprint('translation', __name__)
 
@@ -256,6 +259,9 @@ def set_model(project_name: str):
                     raise
                 answer = _settings(pm.call_settings())
                 note = effort_reset_note(previous[2], pm.data)
+                logger.info("模型設定已變更: %s → 後端 %s, 模型 %s, 推理強度 %s, 逾時 %s 秒",
+                            project_name, answer['backend'], answer['current'],
+                            answer['effort'], answer['timeout'])
     except (FileNotFoundError, ValueError) as e:
         return jsonify({'error': str(e)}), 404
 
@@ -296,6 +302,7 @@ def set_brief(project_name: str):
                     pm.data.brief = previous  # not saved: the workers keep the old one
                     raise
                 brief = pm.data.brief or ''
+                logger.info("書籍簡介已變更: %s (%d 字元)", project_name, len(brief))
     except (FileNotFoundError, ValueError) as e:
         return jsonify({'error': str(e)}), 404
     return jsonify({'status': 'ok', 'brief': brief})
