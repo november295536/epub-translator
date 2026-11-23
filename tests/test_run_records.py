@@ -426,7 +426,8 @@ class TestCliRun:
         path = _make_project(tmp_path, n=2)
         with use_fake_backend(FakeBackend(['<p k="1">好</p>', KeyboardInterrupt()])):
             result = CliRunner().invoke(translate.cli, ['start', '-p', path])
-        assert isinstance(result.exception, KeyboardInterrupt) or result.exit_code != 0
+        # click turns Ctrl-C into Abort: "Aborted!" and exit status 1
+        assert result.exit_code == 1 and result.output.endswith('Aborted!\n')
         end = _of(_records(path), 'run_end')[0]
         assert (end['state'], end['error'], end['translated']) == (
             'interrupted', 'KeyboardInterrupt', 1)
@@ -997,6 +998,9 @@ class TestMorePauseRecords:
         with use_fake_backend(FakeBackend(responder=_limited_twice('好'))):
             task = fresh_tm.start_translation(PROJECT, str(tmp_path), num_workers=2)
             _wait(lambda: len(_of(_records(path), 'call')) == 2)
+            # the second worker's rate limit extends the wait: not before
+            # it is recorded may the run stop (it could stop first)
+            _wait(lambda: _of(_records(path), 'wait_extended'))
             _wait(lambda: task.state == 'paused')
             fresh_tm.stop_translation(PROJECT)
             _wait(lambda: not task.threads_alive())
