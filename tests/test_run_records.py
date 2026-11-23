@@ -155,7 +155,8 @@ class TestAppend:
 
 
 @pytest.mark.parametrize('error, outcome', [
-    (CancelledError('c'), 'cancelled'), (RateLimitError('r'), 'rate_limit'),
+    (CancelledError('c'), 'cancelled'), (KeyboardInterrupt(), 'cancelled'),
+    (RateLimitError('r'), 'rate_limit'),
     (AuthError('a'), 'auth'), (BackendUnavailableError('b'), 'backend_unavailable'),
     (RefusalError('n'), 'refusal'), (CallTimeoutError('t'), 'timeout'),
     (TransientError('x'), 'transient'), (LLMError('e'), 'error'), (ValueError('v'), 'unexpected'),
@@ -429,7 +430,7 @@ class TestCliRun:
         end = _of(_records(path), 'run_end')[0]
         assert (end['state'], end['error'], end['translated']) == (
             'interrupted', 'KeyboardInterrupt', 1)
-        assert _of(_records(path), 'call')[1]['outcome'] == 'unexpected'
+        assert _of(_records(path), 'call')[1]['outcome'] == 'cancelled'
         log = open(os.path.join(os.environ[proclog.LOG_DIR_ENV], 'cli.log'),
                    encoding='utf-8').read()
         assert 'interrupted (Ctrl-C)' in log

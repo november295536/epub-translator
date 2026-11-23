@@ -102,6 +102,7 @@ def append_record(path: str, record: dict) -> bool:
 # The outcome class of a call that raised, by exception class (first match)
 _ERROR_OUTCOMES = (
     (CancelledError, 'cancelled'),
+    (KeyboardInterrupt, 'cancelled'),  # Ctrl-C ends the call in flight
     (RateLimitError, 'rate_limit'),
     (AuthError, 'auth'),
     (BackendUnavailableError, 'backend_unavailable'),
