@@ -198,7 +198,8 @@ def test_page_keeps_completed_after_a_refused_pause(tmp_path):
     page = create_app(projects_dir=str(tmp_path)).test_client() \
         .get(f'/project/{PROJECT}/translation').get_data(as_text=True)
     assert 'if (data.ending) {' in page
-    assert "this.state = 'completed';\n                this.error = null;" in page
+    assert ("this.state = 'completed';\n                this.autoResume = false;\n"
+            "                this.error = null;") in page
 
 
 class TestExtractionEnds:
@@ -287,10 +288,9 @@ def test_page_shows_unknown_start(tmp_path):
 
 
 def test_version_leaves_the_index_alone(tmp_path, monkeypatch):
-    """In a scratch repository whose index is stat-dirty (a file touched):
-    the version commands do not rewrite .git/index (`describe --dirty`
-    did, with or without GIT_OPTIONAL_LOCKS), and a content change still
-    gives -dirty."""
+    """In a temporary repository with a modified tracked file (so a status
+    or describe --dirty would refresh the index): the version lookup leaves
+    .git/index as it was and names the commit."""
     import subprocess
     import time
     from src.core import proclog
@@ -299,26 +299,30 @@ def test_version_leaves_the_index_alone(tmp_path, monkeypatch):
            'PATH': os.environ['PATH'], 'HOME': str(tmp_path)}
 
     def git(*args):
-        subprocess.run(['git', '-C', str(tmp_path), *args], check=True, env=env,
-                       capture_output=True)
+        return subprocess.run(['git', '-C', str(tmp_path), *args], check=True, env=env,
+                              capture_output=True, text=True).stdout.strip()
     git('init', '-q')
     (tmp_path / 'f').write_text('a')
     git('add', 'f')
     git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'x')
-    index = tmp_path / '.git' / 'index'
-
-    def version():
-        monkeypatch.setattr(proclog, '_REPO', str(tmp_path))
-        monkeypatch.setattr(proclog, '_commit', None)
-        return proclog.program_version()
-    time.sleep(1.1)  # a later mtime than the index records: the index is stale
-    os.utime(tmp_path / 'f')
-    before = (index.stat().st_mtime_ns, index.read_bytes())
-    assert not version().endswith('-dirty)')
-    assert (index.stat().st_mtime_ns, index.read_bytes()) == before
+    time.sleep(1.1)  # a later mtime than the index records: a stale index entry
     (tmp_path / 'f').write_text('b')
-    assert version().endswith('-dirty)')
+    index = tmp_path / '.git' / 'index'
+    before = (index.stat().st_mtime_ns, index.read_bytes())
+    monkeypatch.setattr(proclog, '_REPO', str(tmp_path))
+    monkeypatch.setattr(proclog, '_commit', None)
+    assert proclog.program_version() == f'1.0.0 ({git("rev-parse", "--short=12", "HEAD")})'
     assert (index.stat().st_mtime_ns, index.read_bytes()) == before
+
+
+def test_version_without_git(tmp_path, monkeypatch):
+    from src.core import proclog
+    monkeypatch.setattr(proclog, '_REPO', str(tmp_path))  # not a checkout
+    monkeypatch.setattr(proclog, '_commit', None)
+    assert proclog.program_version() == '1.0.0'
+    monkeypatch.setenv('PATH', str(tmp_path))  # no git program at all
+    monkeypatch.setattr(proclog, '_commit', None)
+    assert proclog.program_version() == '1.0.0'
 
 
 def _replacement_now(project_dir):
