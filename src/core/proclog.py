@@ -59,19 +59,29 @@ def log_dir_for(projects_dir: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(projects_dir)), 'logs')
 
 
+def _git(*args: str) -> subprocess.CompletedProcess:
+    # GIT_OPTIONAL_LOCKS=0: `git status` then leaves the index alone
+    return subprocess.run(['git', '-C', _REPO, *args], capture_output=True, text=True,
+                          timeout=5, check=False,
+                          env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0'})
+
+
 def program_version() -> str:
-    """The package version and the git commit (`git describe --always
-    --dirty`) when the code runs from a checkout; computed once."""
+    """The package version and the git commit when the code runs from a
+    checkout (`git describe --always`, plus `-dirty` when tracked files
+    differ); computed once. Neither command writes the index: `describe
+    --dirty` would refresh it and take .git/index.lock whatever
+    GIT_OPTIONAL_LOCKS says (tried with git 2.50), so a git add or commit
+    at that moment could fail; `status` honours the variable."""
     global _commit
     if _commit is None:
         try:
-            result = subprocess.run(
-                ['git', '-C', _REPO, 'describe', '--always', '--dirty', '--abbrev=12'],
-                capture_output=True, text=True, timeout=5, check=False,
-                # --dirty refreshes the index: without this it takes
-                # .git/index.lock, and a git add/commit at that moment fails
-                env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0'})
+            result = _git('describe', '--always', '--abbrev=12')
             _commit = result.stdout.strip() if result.returncode == 0 else ''
+            if _commit:
+                status = _git('status', '--porcelain', '--untracked-files=no')
+                if status.returncode == 0 and status.stdout.strip():
+                    _commit += '-dirty'
         except (OSError, subprocess.SubprocessError):
             _commit = ''
     return f'{__version__} ({_commit})' if _commit else __version__

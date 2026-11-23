@@ -664,13 +664,14 @@ class TestProcessLog:
 
         def fake_run(cmd, **kwargs):
             calls.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, 'abc123def456-dirty\n', '')
+            out = ' M f\n' if 'status' in cmd else 'abc123def456\n'
+            return subprocess.CompletedProcess(cmd, 0, out, '')
         monkeypatch.setattr(proclog, '_commit', None)
         monkeypatch.setattr(proclog.subprocess, 'run', fake_run)
         assert proclog.program_version() == '1.0.0 (abc123def456-dirty)'
-        assert proclog.program_version() == '1.0.0 (abc123def456-dirty)'
-        assert len(calls) == 1 and calls[0][:3] == ['git', '-C', proclog._REPO]
-        assert 'describe' in calls[0] and '--dirty' in calls[0]
+        assert proclog.program_version() == '1.0.0 (abc123def456-dirty)'  # asked once
+        assert len(calls) == 2 and calls[0][:3] == ['git', '-C', proclog._REPO]
+        assert 'describe' in calls[0] and '--dirty' not in calls[0] and 'status' in calls[1]
         monkeypatch.setattr(proclog, '_commit', None)
         monkeypatch.setattr(proclog.subprocess, 'run', lambda cmd, **k: subprocess.CompletedProcess(
             cmd, 128, '', 'not a git repository'))

@@ -284,3 +284,38 @@ def test_page_shows_unknown_start(tmp_path):
     page = create_app(projects_dir=str(tmp_path)).test_client() \
         .get(f'/project/{PROJECT}/stats').get_data(as_text=True)
     assert "r.start ? time(r.start) : '（開始不在所選紀錄中）'" in page
+
+
+def test_version_leaves_the_index_alone(tmp_path, monkeypatch):
+    """In a scratch repository whose index is stat-dirty (a file touched):
+    the version commands do not rewrite .git/index (`describe --dirty`
+    did, with or without GIT_OPTIONAL_LOCKS), and a content change still
+    gives -dirty."""
+    import subprocess
+    import time
+    from src.core import proclog
+    env = {'GIT_AUTHOR_NAME': 'n', 'GIT_AUTHOR_EMAIL': 'n@example.invalid',
+           'GIT_COMMITTER_NAME': 'n', 'GIT_COMMITTER_EMAIL': 'n@example.invalid',
+           'PATH': os.environ['PATH'], 'HOME': str(tmp_path)}
+
+    def git(*args):
+        subprocess.run(['git', '-C', str(tmp_path), *args], check=True, env=env,
+                       capture_output=True)
+    git('init', '-q')
+    (tmp_path / 'f').write_text('a')
+    git('add', 'f')
+    git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'x')
+    index = tmp_path / '.git' / 'index'
+
+    def version():
+        monkeypatch.setattr(proclog, '_REPO', str(tmp_path))
+        monkeypatch.setattr(proclog, '_commit', None)
+        return proclog.program_version()
+    time.sleep(1.1)  # a later mtime than the index records: the index is stale
+    os.utime(tmp_path / 'f')
+    before = (index.stat().st_mtime_ns, index.read_bytes())
+    assert not version().endswith('-dirty)')
+    assert (index.stat().st_mtime_ns, index.read_bytes()) == before
+    (tmp_path / 'f').write_text('b')
+    assert version().endswith('-dirty)')
+    assert (index.stat().st_mtime_ns, index.read_bytes()) == before
