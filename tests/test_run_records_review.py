@@ -279,3 +279,39 @@ def test_short_write_is_reported(tmp_path, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger='src.core.events'):
         assert events_module.RunEvents(str(tmp_path), 'cli').emit('pause') is False
     assert '只寫入 3 /' in caplog.text
+
+
+class TestExtractionRecordedAfterParsing:
+    """An extraction or consolidation reply that cannot be read is
+    recorded rejected (issue code unusable_reply), not accepted."""
+
+    def test_unusable_replies(self, tmp_path):
+        import json
+        from src.core.events import RunEvents
+        from src.glossary.term_extractor import UNUSABLE_REPLY, TermExtractor
+        from src.llm.fake import FakeBackend
+        from tests.test_run_records import _of, _records
+        word = 'Quillfeather'
+        replies = [json.dumps([{'term': word, 'translation': '羽筆', 'category': 'term'}]),
+                   json.dumps([{'term': word, 'translation': '鵝毛筆', 'category': 'term'}]),
+                   'I cannot help with that.',            # third batch: no JSON
+                   '{"term": "x", "translation": "y"}']  # consolidation: not a list
+        extractor = TermExtractor(model='m', backend=FakeBackend(replies),
+                                  events=RunEvents(str(tmp_path), 'extract'))
+        extractor.extract_from_segments([{'text': f'{word} ' * 300} for _ in range(3)])
+        calls = _of(_records(str(tmp_path)), 'call')
+        assert [(c['kind'], c['outcome'], c.get('issues')) for c in calls] == [
+            ('extract', 'accepted', None), ('extract', 'accepted', None),
+            ('extract', 'rejected', [UNUSABLE_REPLY]),
+            ('consolidate', 'rejected', [UNUSABLE_REPLY])]
+
+    def test_empty_list_is_accepted(self, tmp_path):
+        from src.core.events import RunEvents
+        from src.glossary.term_extractor import TermExtractor
+        from src.llm.fake import FakeBackend
+        from tests.test_run_records import _of, _records
+        extractor = TermExtractor(model='m', backend=FakeBackend(['[]']),
+                                  events=RunEvents(str(tmp_path), 'extract'))
+        assert extractor.extract_from_text('Nothing here.') == []
+        [c] = _of(_records(str(tmp_path)), 'call')
+        assert c['outcome'] == 'accepted'

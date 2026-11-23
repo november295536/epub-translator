@@ -1045,6 +1045,7 @@ class TestExtractionCallFields:
         extractor = TermExtractor(model='m9', backend=FakeBackend([reply]), effort='high',
                                   timeout=77, events=ev)
         assert extractor._call('prompt of 19 chars.', 'consolidate') == '[]'
+        extractor._parsed(True)  # recorded once its reply is read
         [c] = _of(_records(str(tmp_path)), 'call')
         assert {k: v for k, v in c.items() if k != 'ts'} == {
             'v': 1, 'run': 'x', 'source': 'extract', 'event': 'call', 'kind': 'consolidate',
@@ -1217,6 +1218,7 @@ class TestCheapKills:
         extractor = TermExtractor(model='m9', backend=FakeBackend(['[]']), events=ev)
         with caplog.at_level(logging.WARNING, logger='src.glossary.term_extractor'):
             extractor._call('abc')
+            extractor._parsed(True)
         [rec] = caplog.records
         assert rec.getMessage() == '無法記錄模型呼叫' and rec.exc_info[0] is ZeroDivisionError
 

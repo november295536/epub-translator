@@ -18,6 +18,11 @@ from src.llm import (
 logger = logging.getLogger(__name__)
 
 
+# The issue code of an extraction or consolidation reply that could not be
+# read (not a JSON list) in the event record
+UNUSABLE_REPLY = 'unusable_reply'
+
+
 class ExtractionError(Exception):
     """Raised when term extraction stops on an error that every further
     batch would hit too (rate limit, expired login, backend unavailable).
@@ -92,14 +97,14 @@ def _top_level_list(reply: str) -> list:
     """The entries of a consolidation reply: it must be one JSON list (a
     surrounding Markdown fence is removed). No array is searched for inside
     other text, so a cut-off object cannot pass for an answer (the extraction
-    replies keep that recovery, _parse_response). Raises when it is not JSON;
-    [] when it is JSON but not a list."""
+    replies keep that recovery, _parse_response). Raises ValueError when it
+    is not JSON or not a list (an unusable reply)."""
     text = reply.strip()
     if text.startswith('```'):
         text = '\n'.join(line for line in text.split('\n') if not line.strip().startswith('```'))
     data = json.loads(text)
     if not isinstance(data, list):
-        return []
+        raise ValueError('not a list')
     return [d for d in data if isinstance(d, dict) and 'term' in d and 'translation' in d]
 
 
@@ -175,6 +180,7 @@ class TermExtractor:
         self.timeout = timeout
         self.effort = effort  # passed with every call (None: none)
         self.backend = backend if backend is not None else llm.default_backend()
+        self._pending = None  # the last reply's record, until parsed
 
     def _record(self, kind: str, started: float, outcome: str, **fields) -> None:
         if self.events is None:
@@ -183,6 +189,26 @@ class TermExtractor:
             self.events.call(kind=kind, backend=self.backend.name, model=self.model,
                              effort=self.effort, timeout=self.timeout,
                              seconds=time.monotonic() - started, outcome=outcome, **fields)
+        except Exception:  # noqa: BLE001 - a record never stops an extraction
+            logger.warning("無法記錄模型呼叫", exc_info=True)
+
+    def _parsed(self, usable: bool) -> None:
+        """Record the last reply: accepted, or rejected with the issue code
+        UNUSABLE_REPLY when it could not be read (truncated either way when
+        cut off)."""
+        pending, self._pending = self._pending, None
+        if pending is None or self.events is None:
+            return
+        kind, seconds, fields = pending
+        if fields.pop('truncated'):
+            outcome = 'truncated'
+        else:
+            outcome = 'accepted' if usable else 'rejected'
+        try:
+            self.events.call(kind=kind, backend=self.backend.name, model=self.model,
+                             effort=self.effort, timeout=self.timeout, seconds=seconds,
+                             outcome=outcome, issues=None if usable else [UNUSABLE_REPLY],
+                             **fields)
         except Exception:  # noqa: BLE001 - a record never stops an extraction
             logger.warning("無法記錄模型呼叫", exc_info=True)
 
@@ -200,9 +226,11 @@ class TermExtractor:
                 self._record(kind, started, events.error_outcome(e), error=e,
                              chars_in=len(prompt))
                 raise
-            self._record(kind, started, 'truncated' if response.stop_reason == 'truncated'
-                         else 'accepted', usage=response.usage, chars_in=len(prompt),
-                         chars_out=len(response.text))
+            # Recorded once its reply is parsed (_parsed)
+            self._pending = (kind, time.monotonic() - started, {
+                'usage': response.usage, 'chars_in': len(prompt),
+                'chars_out': len(response.text),
+                'truncated': response.stop_reason == 'truncated'})
             return response.text
         except (AuthError, RateLimitError, BackendUnavailableError) as e:
             # Every further call would fail the same way
@@ -220,10 +248,12 @@ class TermExtractor:
         if reply is None:
             return []
         try:
-            return self._parse_response(reply.strip())
+            terms = self._parse_reply(reply.strip())
         except Exception as e:
             logger.warning("Term extraction error: %s", e)
-            return []
+            terms = None
+        self._parsed(terms is not None)
+        return terms or []
 
     def extract_from_segments(self, segments: list[dict]) -> list[dict]:
         """Extract terms from multiple segments in batches, then consolidate.
@@ -302,7 +332,9 @@ class TermExtractor:
             items = _top_level_list(reply)
         except Exception as e:  # noqa: BLE001 - e.g. not JSON, or a too deeply nested reply
             logger.warning("Term consolidation error: %s", type(e).__name__)
-            items = []
+            items = None
+        self._parsed(items is not None)
+        items = items or []
         wanted = {g['term'].lower(): g for g in groups}
         decided: dict = {}
         contradicted = set()
@@ -325,7 +357,13 @@ class TermExtractor:
 
     @staticmethod
     def _parse_response(output: str) -> list[dict]:
-        """Parse Claude's JSON response, handling potential formatting issues."""
+        """Parse Claude's JSON response, handling potential formatting
+        issues; [] when it cannot be read."""
+        return TermExtractor._parse_reply(output) or []
+
+    @staticmethod
+    def _parse_reply(output: str) -> list[dict] | None:
+        """The entries of an extraction reply; None when it cannot be read."""
         # Try to find JSON array in the output
         output = output.strip()
 
@@ -345,7 +383,7 @@ class TermExtractor:
                 return [d for d in data
                         if isinstance(d, dict) and 'term' in d and 'translation' in d]
             logger.warning("Could not parse term extraction response")
-            return []
+            return None
 
         # Try to find JSON array within the text
         start = output.find('[')
@@ -360,4 +398,4 @@ class TermExtractor:
                 pass
 
         logger.warning("Could not parse term extraction response")
-        return []
+        return None
