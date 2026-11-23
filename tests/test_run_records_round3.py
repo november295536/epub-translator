@@ -319,3 +319,76 @@ def test_version_leaves_the_index_alone(tmp_path, monkeypatch):
     (tmp_path / 'f').write_text('b')
     assert version().endswith('-dirty)')
     assert (index.stat().st_mtime_ns, index.read_bytes()) == before
+
+
+def _replacement_now(project_dir):
+    """A replacement of the project from another thread, as the web create
+    does it (set_aside under the project mutex). Returns once it is done,
+    or once it is blocked because this thread holds the mutex."""
+    from src.core import events as events_module
+    from src.core.project import project_mutex
+    mutex = project_mutex(project_dir)
+    done, blocked = threading.Event(), threading.Event()
+
+    def replace():
+        if not mutex.acquire(blocking=False):
+            blocked.set()
+            mutex.acquire()
+        try:
+            events_module.set_aside(project_dir)
+        finally:
+            mutex.release()
+            done.set()
+    threading.Thread(target=replace, daemon=True).start()
+    _wait(lambda: done.is_set() or blocked.is_set())
+    return done
+
+
+def test_retranslation_recorder_from_the_snapshot(tmp_path, monkeypatch):
+    """A replacement between the snapshot and the call: the old work must
+    not get the new book's record."""
+    from src.llm.fake import FakeBackend
+    from src.web.blueprints import review as review_module
+    from src.web.server import create_app
+    from tests.conftest import like, use_fake_backend
+    path = _make_project(tmp_path, n=1)
+    RunEvents(path, 'cli').emit('run_start')  # the old book's record exists
+    glossary = review_module._glossary
+    replaced = []
+
+    def replace_then_glossary(project_dir):
+        # right after the snapshot's transaction, before the model call
+        replaced.append(_replacement_now(path))
+        return glossary(project_dir)
+    monkeypatch.setattr(review_module, '_glossary', replace_then_glossary)
+    client = create_app(projects_dir=str(tmp_path)).test_client()
+    with use_fake_backend(FakeBackend(responder=lambda r: like(r, '好'))):
+        client.post(f'/api/projects/{PROJECT}/segments/c1_seg0001/retranslate')
+    assert replaced[0].wait(10)
+    assert not os.path.exists(events_path(path))  # nothing in the new book's record
+
+
+def test_extraction_recorder_from_the_snapshot(tmp_path, monkeypatch):
+    import json
+    from src.core.project import ProjectManager
+    from src.llm.fake import FakeBackend
+    from src.web.blueprints import glossary as glossary_module
+    from src.web.server import create_app
+    from tests.conftest import use_fake_backend
+    path = _make_project(tmp_path, n=1)
+    RunEvents(path, 'cli').emit('run_start')
+    settings = ProjectManager.call_settings
+    replaced = []
+
+    def settings_then_replace(self):
+        value = settings(self)
+        replaced.append(_replacement_now(path))
+        return value
+    monkeypatch.setattr(ProjectManager, 'call_settings', settings_then_replace)
+    client = create_app(projects_dir=str(tmp_path)).test_client()
+    reply = json.dumps([{'term': 'Quill', 'translation': '羽', 'category': 'term'}])
+    with use_fake_backend(FakeBackend([reply])):
+        assert client.post(f'/api/projects/{PROJECT}/glossary/extract').status_code == 200
+        _wait(lambda: not glossary_module._extraction_tasks[PROJECT]['running'])
+    assert replaced[0].wait(10)
+    assert not os.path.exists(events_path(path))
