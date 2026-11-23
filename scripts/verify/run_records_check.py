@@ -3,8 +3,9 @@
 and add up.
 
 For each directory of --projects-dir that contains a project.json and a
-log/events.jsonl, reads the record (src/core/stats.read_records, the reader
-of `translate.py stats`) and checks every record:
+log/events.jsonl, reads every line of the record (`read_lines`: unlike
+src/core/stats.read_records, the reader of `translate.py stats`, it keeps
+JSON lines of the wrong shape) and checks each:
 
   - per event kind, its required fields (REQUIRED); the type of every
     field (src/core/stats.py shape_problem, which `stats` shares: a record
@@ -22,8 +23,10 @@ of `translate.py stats`) and checks every record:
     number of its segment records of each result.
 
 Prints per project: records, skipped (unparsable) lines, runs, and the
-result. Unparsable lines are counted and printed, not failed (a crash
-mid-write).
+result. A line that is not JSON is counted and printed, not failed (a crash
+mid-write); a JSON line of the wrong shape (src/core/stats.py shape_problem:
+`stats` skips it) FAILs. Diagnostics name lines and runs by position, never
+by their content.
 
 Read-only: it reads project.json and log/events.jsonl only; it writes
 nothing and takes no lock, so it can run while a translation appends.
@@ -49,7 +52,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from src.core.events import events_path  # noqa: E402
 from src.core import validation  # noqa: E402
-from src.core.stats import FIELDS, read_records, shape_problem  # noqa: E402
+from src.core.stats import FIELDS, shape_problem  # noqa: E402
 from src.glossary.term_extractor import UNUSABLE_REPLY  # noqa: E402
 from src.llm import BACKENDS, KNOWN_LEVELS  # noqa: E402
 
@@ -114,7 +117,10 @@ def record_problems(record: dict, segment_ids: set) -> list[str]:
     event = record['event']
     if event not in REQUIRED:
         return ['an unknown event']
-    missing = [k for k in REQUIRED[event] if record.get(k) is None]
+    required = REQUIRED[event]
+    if event == 'call' and record.get('kind') in TRANSLATION_KINDS:
+        required += ('segment', 'attempt')
+    missing = [k for k in required if record.get(k) is None]
     if missing:
         problems.append(f'{event} without {", ".join(missing)}')
     extra = len(set(record) - ALLOWED_KEYS)
@@ -129,38 +135,69 @@ def record_problems(record: dict, segment_ids: set) -> list[str]:
     return problems
 
 
+RESULTS = ('translated', 'failed', 'dropped')
+# Kinds of a translation call: these name their segment and attempt
+TRANSLATION_KINDS = ('request', 'retry', 'split')
+
+
+def read_lines(path: str) -> tuple[list[tuple[int, object]], int]:
+    """(line number, parsed JSON) of every line that is JSON, and the number
+    of lines that are not (a cut-off line: tolerated). Unlike
+    stats.read_records, a JSON line of the wrong shape is kept, so that it
+    FAILs here instead of passing as skipped."""
+    lines, unparsable = [], 0
+    with open(path, 'rb') as f:
+        for i, raw in enumerate(f, 1):
+            if not raw.strip():
+                continue
+            try:
+                lines.append((i, json.loads(raw.decode('utf-8'))))
+            except (UnicodeDecodeError, ValueError):
+                unparsable += 1
+    return lines, unparsable
+
+
 def check_project(project_dir: str) -> tuple[list[str], dict]:
     """(problems, counts) of one project's record."""
     with open(os.path.join(project_dir, 'project.json'), encoding='utf-8') as f:
         data = json.load(f)
     segment_ids = {s.get('segment_id') or s.get('id') for s in data.get('segments', [])}
-    records, skipped = read_records(events_path(project_dir))
+    lines, skipped = read_lines(events_path(project_dir))
     problems = []
     runs: dict[str, dict] = {}
     unknown_segments = 0
+    records = 0
 
-    for i, r in enumerate(records, 1):
-        for message in record_problems(r, segment_ids):
-            if len(problems) < 20:
-                problems.append(f'record {i}: {message}')
+    def bad(message):
+        if len(problems) < 20:
+            problems.append(message)
+
+    for i, r in lines:
+        messages = record_problems(r, segment_ids)
+        for message in messages:
+            bad(f'line {i}: {message}')
+        if shape_problem(r) is not None:
+            continue  # not a record: counted above, nothing more to read from it
+        records += 1
         if r.get('segment') is not None and r['segment'] not in segment_ids:
             unknown_segments += 1
         info = runs.setdefault(r['run'], {'translated': 0, 'failed': 0, 'dropped': 0, 'end': None})
-        if r['event'] == 'segment' and r.get('result') in info:
+        if r['event'] == 'segment' and r.get('result') in RESULTS:
             info[r['result']] += 1
         elif r['event'] == 'run_end':
             info['end'] = r
-    for run_id, info in runs.items():
+    for k, info in enumerate(runs.values(), 1):
         end = info['end']
         if end is None or end.get('source') == 'extract':
             continue
-        for field in ('translated', 'failed', 'dropped'):
+        for field in RESULTS:
             if end.get(field, 0) != info[field]:
-                problems.append(f'run {run_id}: run_end {field}={end.get(field, 0)}, '
-                                f'segment records {info[field]}')
+                # the run by its position: an invalid run id could be text
+                bad(f'run {k}: run_end {field}={end.get(field, 0)}, '
+                    f'segment records {info[field]}')
     if unknown_segments:
         problems.append(f'{unknown_segments} records name a segment id not in project.json')
-    return problems, {'records': len(records), 'skipped': skipped, 'runs': len(runs)}
+    return problems, {'records': records, 'skipped': skipped, 'runs': len(runs)}
 
 
 def main(argv=None) -> int:

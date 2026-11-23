@@ -420,7 +420,7 @@ class TestCheckScriptRound1:
         from src.core.events import RunEvents
         path = _make_project(tmp_path, n=1)
         RunEvents(path, 'cli', run_id='20260101T000000Z-abcdef').emit(
-            'call', kind='request', backend='fake', model='m', timeout=60, seconds=1.0,
+            'call', kind='extract', backend='fake', model='m', timeout=60, seconds=1.0,
             outcome='accepted', Zorblaxian='x', error='Zorblaxian')
         code, out = self._check(tmp_path, capsys)
         assert code == 1 and '1 unknown keys' in out and 'error: a string' in out
@@ -760,8 +760,8 @@ class TestCheckScriptPassB:
         from src.core.events import RunEvents
         path = _make_project(tmp_path, n=1)
         RunEvents(path, 'cli', run_id='20260101T000000Z-abcdef').emit(
-            'call', kind='request', segment='c1_seg0001', backend='fake', model='m1', timeout=60,
-            seconds=1.0, outcome='rejected', issues=['tag_count'], warnings=['length_ratio'],
+            'call', kind='request', segment='c1_seg0001', attempt=1, backend='fake', model='m1',
+            timeout=60, seconds=1.0, outcome='rejected', issues=['tag_count'], warnings=['length_ratio'],
             error='RateLimitError')
         code, out = self._check(tmp_path, capsys)
         assert code == 0, out
