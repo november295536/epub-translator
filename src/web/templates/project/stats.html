@@ -168,13 +168,19 @@ function statsController() {
                             ['段落最終失敗', this.stats.failure_issues],
                             ['已翻譯段落的警告', this.stats.warnings]];
             for (const [group, counts] of groups) {
-                for (const [code, n] of Object.entries(counts)) rows.push({ group, code, n });
+                // most frequent first, equal counts by code (as the CLI report)
+                for (const [code, n] of this.byCount(counts)) rows.push({ group, code, n });
             }
             return rows;
         },
 
+        byCount(counts) {
+            // JSON object keys arrive sorted by name, not by count
+            return Object.entries(counts).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+        },
+
         outcomes(counts) {
-            return Object.entries(counts).map(([k, n]) => k + ' ' + n).join('、');
+            return this.byCount(counts).map(([k, n]) => k + ' ' + n).join('、');
         },
 
         count(n, share) {

@@ -364,3 +364,26 @@ def test_delete_waits_for_an_append_in_progress(tmp_path, monkeypatch):
     appender.join(10)
     deleter.join(10)
     assert not os.path.exists(path)
+
+
+def test_codes_by_count_and_measured_duration():
+    from src.core.stats import summarize
+    from tests.test_run_records import _call, _rec
+    records = [_rec('run_start', ts='2026-01-01T00:00:00.000Z'),
+               _call('s1', 1, 'rejected', issues=['tag_count']),
+               _call('s1', 2, 'rejected', issues=['not_html']),
+               _call('s1', 3, 'rejected', issues=['not_html']),
+               _call('s2', 1, 'rejected', issues=['empty_reply']),
+               _rec('run_end', ts='2026-01-01T00:00:09.000Z', state='completed', seconds=7.25)]
+    s = summarize(records)
+    assert list(s['rejected_issues']) == ['not_html', 'empty_reply', 'tag_count']
+    assert s['runs'][0]['duration'] == 7.25  # the run's own measure, not the 9 s between lines
+
+
+def test_page_sorts_codes_by_count(tmp_path):
+    from src.web.server import create_app
+    from tests.test_run_records import PROJECT
+    _make_project(tmp_path)
+    page = create_app(projects_dir=str(tmp_path)).test_client() \
+        .get(f'/project/{PROJECT}/stats').get_data(as_text=True)
+    assert 'this.byCount(counts)' in page and 'b[1] - a[1]' in page

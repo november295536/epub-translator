@@ -131,6 +131,12 @@ def _key(record: dict) -> tuple:
             str(record.get('effort') or '-'))
 
 
+def _by_count(counts: Counter) -> dict:
+    """Most frequent first, equal counts by code (the page sorts the same
+    way: JSON object keys do not keep an order)."""
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
 def _share(part: int, whole: int) -> float | None:
     return round(part / whole, 3) if whole else None
 
@@ -183,6 +189,7 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
                 info[field] = r.get(field)
         elif event == 'run_end':
             info['end'] = r['ts']
+            info['seconds'] = _number(r.get('seconds'))
             info['state'] = r.get('state')
             info['error'] = r.get('error')
         elif event == 'pause':
@@ -236,8 +243,8 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
     for g in sorted(groups.values(), key=lambda g: (g['work'] != 'translation', g['backend'],
                                                     g['model'], g['effort'] or '')):
         seconds = g.pop('seconds')
-        g['outcomes'] = dict(g['outcomes'].most_common())
-        g['issues'] = dict(g['issues'].most_common())
+        g['outcomes'] = _by_count(g['outcomes'])
+        g['issues'] = _by_count(g['issues'])
         g['seconds_calls'] = len(seconds)  # the calls the two durations are based on
         g['seconds_median'] = percentile(seconds, 0.5)
         g['seconds_p90'] = percentile(seconds, 0.9)
@@ -250,7 +257,11 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
 
     run_list = []
     for info in sorted(runs.values(), key=lambda i: i['start']):
-        info['duration'] = _seconds_between(info['start'], info['end'] or info['last'])
+        # A finished run: the duration it measured itself (monotonic clock);
+        # else from the record times (an unfinished run: up to its last line)
+        seconds = info.pop('seconds', None)
+        info['duration'] = (seconds if seconds is not None and info['end'] else
+                            _seconds_between(info['start'], info['end'] or info['last']))
         if info['state'] is None:
             info['state'] = 'unfinished'  # no run_end: still running, or the process died
         del info['last']
@@ -262,9 +273,9 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
         'since': since,
         'run': run,
         'models': models,
-        'rejected_issues': dict(rejections.most_common()),
-        'failure_issues': dict(failures.most_common()),
-        'warnings': dict(warnings.most_common()),
+        'rejected_issues': _by_count(rejections),
+        'failure_issues': _by_count(failures),
+        'warnings': _by_count(warnings),
         'runs': run_list,
     }
 
