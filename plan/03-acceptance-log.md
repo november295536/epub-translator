@@ -8092,7 +8092,7 @@ survived, 6 no tests: `_web_end`, which runs only in a child process at exit), `
 of 187 (28 survived, mostly `_pause_for`, which later tests target, unverified). Route
 functions in the blueprints (Flask-decorated) are not mutated by mutmut at all.
 
-### Real end-to-end check (invented text; REAL calls: 28)
+### Real end-to-end check (invented text; REAL calls: 23)
 
 The first end-to-end run's files were lost in the machine crash; the numbers below are from the
 rerun on the final code (commit `b832a3e` plus the two later fixes being only an exit code in
@@ -8118,12 +8118,14 @@ the server with SIGINT to its process group.
 - From the files alone: `logs/web.log` has the start line (version from `git describe`, pid),
   every request line (`POST …/translate/pause` twice), the model change, the task's start and
   segment lines and `end: web server stopped`; `logs/cli.log` has a start and end line for each
-  of the 14 commands, the `run stopped: …` warning of the unavailable backend and
+  of the 11 commands, the `run stopped: …` warning of the unavailable backend and
   `interrupted (Ctrl-C)` (that run logged `exit 130` while the process exited 1; fixed in
   `bef0da5`, and the Ctrl-C call, recorded as `unexpected`, is now `cancelled`, `eb02772`). The
   event records (59 lines) contain none of the book's words, title, author or project names and
   no CJK character; `scripts/verify/run_records_check.py --anonymize` passed for all three
   projects.
+- Model calls: 10 (web, two cancelled within 0.1 s by the pause) + 6 + 7 (CLI; the
+  backend-unavailable attempt made none).
 - Left behind: no `copilot --headless` process. The SIGINT reached the Copilot runtime in the
   same process group while a session was being created: one session folder was left under
   Copilot's session state with only start, abort and shutdown events (no prompt); it was
