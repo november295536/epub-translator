@@ -8312,3 +8312,58 @@ found).
 
 Suite at `83102b5`: once alone `3152 passed in 282.57s`; three at once `3152 passed in 280.52s
 / 282.43s / 281.97s` (no failure, no warning).
+
+## Run records — review round 3
+
+Each behaviour finding was first reproduced by a test in `tests/test_run_records_round3.py`
+that failed on the round's starting commit `9c4105f` (a `git archive` copy) and passes after
+the fix.
+
+| # | Finding | Reproduced | Change |
+|---|---------|------------|--------|
+| 1 | Hang: a worker between its stop check and the pause gate, a streak stop opening the gate, then a user pause closing it | **yes, real**: forced with a gated pause event (the worker held at its sixth `wait()`); the pause was accepted and the coordinator was still alive 10 s later. The window existed on `main` too: its `pause_translation` checks only the state and its streak stop sets `stop_event` and opens the gate the same way | a pause is refused once `stop_event` is set, under the task lock, as the streak stop's transition is (`8d5d0b0`) |
+| 2 | `stop_translation` ignored `finishing` | yes: a stop after the last result recorded `stopped` with everything translated; a stop in a failure's drain flipped the state to `stopped` | a stop changes nothing once `finishing` is set; the start path still joins the coordinator (`8d5d0b0`) |
+| 3 | `_fail_task` raising left the task `running` and `run_end` saying `running` | yes (`test_a_failing_failure_handler_still_ends_the_run`: the run never reached a terminal state) | the error class is set before the handler; the coordinator's `finally` ends any non-terminal run with `run_end('failed')` and the failed state, under the lock (`dae43dc`) |
+| 4 | Pause/resume refused while finishing answered 500 with the running state | yes: the endpoint answered 500, 500 | 409 `{ending: true}` without a state; the page keeps its state for that answer and the `complete` event clears an error. Checked by a test of the endpoint (the forced interleaving through the Flask client) and a test of the page source; the page's behaviour itself was not forced in a browser (the extension did not connect, and headless Chrome cannot click at the right moment) — reasoned from the handler: an `ending` answer returns before any state or error is set (`5ce06f0`) |
+| 5 | CLI extract: Ctrl-C during the save recorded `failed`; `added` lost by a closed pipe after the save. Web extract: a failed save dropped `terms` | yes (`TestExtractionEnds`, 3) | `interrupted` with `KeyboardInterrupt`; `added` set right after the save; the web keeps `terms` (`b50acec`) |
+| 6 | `--since`: a run begun before the cutoff paired the first selected line with the whole run's duration | yes (`test_run_started_before_since`) | such a run has `start` None (text and page: 開始不在所選紀錄中) and only the duration its run_end measured (none when unfinished); two older tests updated for that (`1554660`) |
+| 7 | `describe --dirty` takes `index.lock` regardless of `GIT_OPTIONAL_LOCKS` | yes, by experiment (git 2.50, a scratch repository, a touched tracked file): `describe --dirty` rewrote `.git/index` with and without the variable; `GIT_OPTIONAL_LOCKS=0 git status --porcelain --untracked-files=no` and `describe --always` did not. So round 2's fix had no effect | at the owner's decision the program reads no git at all: the start line's version is `src.__version__` only, so there is no lock, no dependence on a checkout, and the version comes from the release process. `__version__` is 2.0.0, `CHANGELOG.md` added, the release rule in CLAUDE.md ("Releases", referenced from README); tests: the start line carries `__version__` and `proclog` starts no process; the changelog's top heading, `__version__` and `--version` agree. The line no longer says whether the tree had uncommitted changes (`known-issues.md`) (`4b941c3`, `ebf61fe`, `b5009a9`) |
+| 8 | Retranslation and web extraction built their recorder after the snapshot's lock | yes: a replacement forced right after the snapshot (from another thread, under the project mutex) put their lines into the new book's record | the recorder is created in the same locked section as the snapshot (`3afb2c6`) |
+| 9 | Unreachable `finishing` check in `_pause_for`; the delete test's 0.5 s join | — | check removed (its only caller returns once `stop_event` is set); the delete test waits until the deleter is seen blocked on the record's lock and asserts the thread's end and the 200 answer; it still fails against the code before round 2's fix (`59d713f`) |
+
+Documented only: Ctrl-C in a parallel CLI run between a result's count and its `segment` line
+(`known-issues.md`).
+
+Not changing: none asked this round.
+
+### Review round 3: suite, final mutation pass, reverts
+
+Suite once alone at `b5009a9` (all round-3 fixes): `3166 passed in 290.67s`, no failure, no
+warning.
+
+**Final mutation pass** (deferred from round 2; base `f991452`, the end of round 1, so the lines
+changed in rounds 2 and 3; file filter = every source file changed in those rounds:
+`run_records_check.py`, `events.py`, `proclog.py`, `stats.py`, `term_extractor.py`, the
+`glossary`/`projects`/`review`/`translation` blueprints, `tasks.py`, `translate.py`,
+`src/__init__.py`; 12 workers; 35 min bound). The first start stopped in mutmut's stats run: the
+changelog test could not find `CHANGELOG.md` in mutmut's run directory, which copies only its
+source paths; `mutation.py` now copies it too (`6124484`). The second run finished in 17 min
+(19:42–19:59), lowest free memory 45 %: `TOTAL mutants 416 killed 391 survived 25 timeout 0
+suspicious 0 untested 0`. Every changed line in the filter was reached. Not mutated at all
+(mutmut's scope): route bodies of the blueprints, `events.retired` (a decorated context
+manager), and lines that were only deleted (`proclog`'s git code).
+
+Survivors that showed a gap got tests (`dbae00f`; each kill checked by hand with bytecode off,
+not by another mutmut run): two timeouts counted; a coordinator left by a `BaseException` ends
+`failed` with `UnexpectedExit` and `finishing`; the check script reads on after a blank line,
+counts two cut lines, keeps a translation call's base requirements, asks no segment of an
+extraction call. Survivors left, and why:
+- log text (`翻譯任務的失敗處理也失敗` and its `None`);
+- equivalent here: `info.pop('started', None)` (falsy either way); `(info['end']) or True` for a
+  run without a selected run_start (its `seconds` exist only with a run_end); `_parsed(None/True,
+  error=e)` (with an error the flag decides nothing); `'failed'` misspelt in the finally's
+  terminal set (`_end_record` writes once and the state is `failed` already); `finishing = None`
+  (falsy, set after the run ended); `_end_record(task, None)` in the else branch (a terminal state
+  means run_end was written already); `record_problems(r, None)` (the parameter is not used
+  there); `decode('UTF-8')`;
+- the check script's 20-problem cap boundary (`<=`, `< 21`).
