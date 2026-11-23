@@ -148,3 +148,63 @@ class TestPauseRecord:
             from src.web.tasks import TaskManager
             TaskManager._instance = None
         assert held == [True]
+
+
+def test_failed_state_published_after_run_end(tmp_path, monkeypatch):
+    from src.core import events as events_module
+    from src.web import tasks as tasks_module
+    from tests.conftest import like
+    from tests.test_run_records import PROJECT, _of, _records
+    tm = _tm(monkeypatch)
+    seen = []
+    emit = events_module.RunEvents.emit
+
+    def spy(self, event, **fields):
+        if event == 'run_end':
+            seen.append(tm.tasks[PROJECT].state)
+        return emit(self, event, **fields)
+    monkeypatch.setattr(events_module.RunEvents, 'emit', spy)
+
+    def explode(self, task, pm, res):
+        raise ZeroDivisionError('invented')
+    monkeypatch.setattr(tasks_module.TaskManager, '_apply_result', explode)
+    try:
+        task, path = _run_web(tmp_path, monkeypatch, tm, lambda r: like(r, '好'))
+    finally:
+        from src.web.tasks import TaskManager
+        TaskManager._instance = None
+    assert seen == ['running'] and task.state == 'failed'
+    assert _of(_records(path), 'run_end')[0]['state'] == 'failed'
+
+
+def test_stopped_event_after_run_end(tmp_path, monkeypatch):
+    import threading
+    from src.llm.fake import FakeBackend
+    from src.web import tasks as tasks_module
+    from tests.conftest import like, use_fake_backend
+    from tests.test_run_records import PROJECT, _of, _records, _wait
+    tm = _tm(monkeypatch)
+    path = _make_project(tmp_path, n=2)
+    published = []
+    put = tasks_module.EventBroadcaster.put
+
+    def spy(self, event):
+        if event['event'] == 'stopped':
+            published.append(len(_of(_records(path), 'run_end')))
+        put(self, event)
+    monkeypatch.setattr(tasks_module.EventBroadcaster, 'put', spy)
+    go = threading.Event()
+
+    def responder(request):
+        go.wait(10)
+        return like(request, '好')
+    try:
+        with use_fake_backend(FakeBackend(responder=responder)):
+            task = tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+            tm.stop_translation(PROJECT)
+            go.set()
+            _wait(lambda: not task.threads_alive())
+    finally:
+        from src.web.tasks import TaskManager
+        TaskManager._instance = None
+    assert published == [1]

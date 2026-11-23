@@ -677,7 +677,9 @@ class TaskManager:
         before the caller releases the lock."""
         task.error_class = type(error).__name__  # the event record
         with task._lock:
-            task.state = 'failed'
+            # The state says failed only after run_end (below); until then
+            # finishing and stop_event refuse every pause, resume and worker
+            task.finishing = True
             task.resume_at = None  # a failed run does not resume
             task.stop_event.set()
             task.cancel_event.set()
@@ -706,7 +708,9 @@ class TaskManager:
             message += f'（{len(unsaved)} 個段落的結果未儲存：{", ".join(unsaved)}）'
         logger.error("Translation task failed: %s", message)
         task.error = message
-        self._end_record(task, 'failed')
+        with task._lock:
+            self._end_record(task, 'failed')
+            task.state = 'failed'  # published only now
         task.progress.put({'event': 'error', 'data': {
             'error': message,
             'unsaved': unsaved,
@@ -770,6 +774,8 @@ class TaskManager:
         user and wins over an automatic wait in progress. A later rate limit
         during an automatic wait extends it. A user pause stays as it is."""
         delay = resume_delay(error)
+        if task.finishing:
+            return  # the run is ending: nothing to pause
         if task.state == 'running':
             pass
         elif task.state == 'paused' and task.resume_at is not None:
