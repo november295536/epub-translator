@@ -2818,3 +2818,27 @@ class TestPreMergeRunEndsWithItsThreads:
             task._coordinator.join(timeout=30)
         assert order == ['worker ended', 'complete']
         assert not task.threads_alive()
+
+
+def test_resume_while_the_coordinator_starts_its_workers(tmp_path, fresh_tm, monkeypatch):
+    """A pause and a resume between the coordinator loading the glossary
+    and counting its workers (forced: the resume runs inside the start
+    log line) must not start a second, uncounted worker; the run ends."""
+    _make_project(tmp_path, n=2)
+    real_info = tasks_module.logger.info
+    done = threading.Event()
+
+    def info(msg, *args, **kwargs):
+        if msg.startswith('翻譯開始') and not done.is_set():
+            done.set()
+            # start_translation registers the task after starting this
+            # thread: wait for it, or the pause finds no task
+            _wait(lambda: PROJECT in fresh_tm.tasks)
+            assert fresh_tm.pause_translation(PROJECT)
+            assert fresh_tm.resume_translation(PROJECT)
+        return real_info(msg, *args, **kwargs)
+    monkeypatch.setattr(tasks_module.logger, 'info', info)
+    with use_fake_backend(FakeBackend(responder=lambda r: like(r, '好'))):
+        task = fresh_tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+        _wait(lambda: task.state == 'completed' and not task.threads_alive())
+    assert done.is_set() and task.active_workers == 0 and len(task._threads) == 1

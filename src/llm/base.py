@@ -94,6 +94,11 @@ class TransientError(LLMError):
     """A failure worth retrying: timeout, non-zero exit, connection error."""
 
 
+class CallTimeoutError(TransientError):
+    """The call did not finish within the request's timeout (a
+    TransientError: retried like one; told apart only in the event record)."""
+
+
 class BackendUnavailableError(LLMError):
     """The backend cannot be used at all (e.g. its program is missing):
     concerns the run, not one request."""

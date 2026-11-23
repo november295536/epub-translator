@@ -63,13 +63,14 @@ python3 -m flask --app src.web.server:create_app run --port 3000
 
 開啟 http://localhost:3000：
 
-1. **首頁** — 專案列表；「新增專案」上傳 EPUB。同名專案若沒有在翻譯，會被取代（`project.json`、`source.epub` 重建，`log/failed/` 清除；`glossary.json` 保留），CLI 的 `init` 則拒絕已存在的專案
+1. **首頁** — 專案列表；「新增專案」上傳 EPUB。同名專案若沒有在翻譯，會被取代（`project.json`、`source.epub` 重建，`log/failed/` 清除，舊的事件紀錄改名為 `log/events-<時間>.jsonl` 保留、統計從新書重新開始；`glossary.json` 保留），CLI 的 `init` 則拒絕已存在的專案
 2. **總覽** — 各章節進度
 3. **術語表** — 新增、編輯、批次刪除、自動提取；人物可填性別與備註
 4. **翻譯** — 選擇後端與模型、推理強度、呼叫逾時、worker 數、書籍簡介；背景翻譯並即時顯示進度（SSE），可暫停、繼續，可重試失敗段落
 5. **審閱** — 原文譯文對照編輯與核可、單段重新翻譯、只顯示有問題的段落
 6. **搜尋** — 以關鍵字找段落並重新翻譯選取的段落
 7. **匯出** — 選擇格式，產生並下載 EPUB
+8. **統計** — 讀取專案的事件紀錄：依用途（翻譯、術語提取分開）與後端／模型／推理強度的呼叫次數、首次即通過、需多次呼叫（其中分割）、最終失敗、有回覆的呼叫的耗時中位數與 p90（不含暫停時取消、很快失敗與逾時的呼叫，並列出是根據幾次呼叫）、逾時次數、tokens，問題代碼依次數排列，以及每次執行（開始、結束、耗時、已翻譯／失敗、暫停）。翻譯進行中也可以看；按「重新整理」更新
 
 ### CLI
 
@@ -91,6 +92,7 @@ python3 translate.py validate projects/book         # 檢查已存的譯文（�
 python3 translate.py validate projects/book --mark-failed   # 未通過結構檢查的段落標為 failed（保留原譯文）
 python3 translate.py export -f bilingual-horizontal # 輸出到 projects/book/output/
 python3 translate.py review                         # 開啟審閱頁（預設 port 5000）
+python3 translate.py stats                          # 事件紀錄的統計（--json、--run ID、--since 2026-11-01）
 ```
 
 - 另一種 `start`：`python3 translate.py start -b copilot-cli -m claude-haiku-4.5 -w 4`（改用 Copilot、4 個 worker）。
@@ -142,9 +144,16 @@ projects/<name>/              # 不進版控
 ├── project.lock              # 寫入鎖
 ├── glossary.json             # 術語表
 ├── source.epub               # 原書副本
-├── log/                      # Web 翻譯日誌 translation_*.log；failed/ 為失敗段落的診斷
+├── log/                      # events.jsonl 事件紀錄；Web 翻譯日誌 translation_*.log；failed/ 為失敗段落的診斷
 └── output/                   # 匯出的 EPUB
+logs/                         # 與 projects/ 同一層，不進版控：程序紀錄 web.log、cli.log
 ```
+
+### 紀錄
+
+- **程序紀錄** `logs/web.log`（Web 伺服器）、`logs/cli.log`（每個 CLI 指令），放在專案資料夾（`projects/`）的上一層，除了終端機的輸出之外持續保留。每次啟動先寫一行版本號（`src.__version__`）、Python 版本、指令與 PID，接著是 INFO 以上的所有紀錄（`src.*` 與第三方套件，例如 Web 的請求行、Copilot SDK 轉來的執行環境輸出），以及請求、CLI 指令或執行緒中未處理例外的完整 traceback；CLI 指令結束時寫 `end: exit N`，Web 伺服器正常結束時寫 `end: web server stopped`（被強制終止時沒有結束行）。終端機照舊顯示：CLI 指令顯示警告以上，Web 伺服器顯示 INFO 以上；`translate.py review` 的紀錄留在 `cli.log`。每個檔案滿 5 MB 輪替，保留 5 個舊檔。這個檔案可能含書名、術語，以及引用模型輸出的錯誤訊息（只有 Copilot 後端會遮蔽其中的電子郵件地址），只留在本機。
+- **事件紀錄** `projects/<name>/log/events.jsonl`：每行一個 JSON 物件。每次模型呼叫一行（翻譯請求、附錯誤重問、拆半、單段重新翻譯、術語提取批次、術語統一），記錄時間、執行 ID、呼叫種類、段落 ID、後端、模型、推理強度、逾時、耗時、tokens（後端有回報時；`claude-cli` 不回報）、結果（accepted、rejected 與問題代碼、timeout、cancelled、rate_limit、auth、backend_unavailable、refusal、truncated、transient、error、unexpected）與該段的第幾次呼叫；另有執行的開始、暫停／繼續與原因、使用量上限的等待、結束與計數，以及每段的最終結果（translated、failed、dropped：翻譯期間被編輯）。**不含書的文字**（原文、譯文、提示、回覆、術語、錯誤訊息都不記，只記代碼、次數、字元數與耗時），所以這是可以交給開發者分析的檔案（段落 ID 的例外見 `known-issues.md`）。寫入失敗只記一則警告，不影響翻譯；專案被取代或刪除後，仍在進行的單段重新翻譯或術語提取不再寫入（也不會重建已刪除的專案資料夾）。術語提取的回覆無法解析時記為 rejected（`unusable_reply`）。
+- `translate.py stats` 與 Web 的「統計」頁讀的就是事件紀錄（同一個函式計算）；無法解析的行（例如程序在寫入中途結束）或欄位型別不對的行會略過並列出數量。統計的已知限制見 `known-issues.md`。
 
 ## 測試
 
@@ -152,7 +161,9 @@ projects/<name>/              # 不進版控
 python3 -m pytest tests/ -q -p no:cacheprovider -rfw
 ```
 
-突變測試：在專案的虛擬環境（已安裝 `requirements.txt` 與 `requirements-dev.txt`）執行 `scripts/verify/mutation.sh main`；與 `main` 相比沒有可突變的變更行時以 exit 2 結束。`scripts/verify/` 其他腳本見 [CLAUDE.md](CLAUDE.md)。
+突變測試：在專案的虛擬環境（已安裝 `requirements.txt` 與 `requirements-dev.txt`）執行 `scripts/verify/mutation.sh main`（第二個參數限制同時執行的突變 worker 數，例如 `main 4`，預設每個核心一個）；與 `main` 相比沒有可突變的變更行時以 exit 2 結束。`scripts/verify/` 其他腳本見 [CLAUDE.md](CLAUDE.md)。
+
+版本與變更紀錄：每個修改 `src/`、`translate.py` 或 `requirements*.txt` 的 pull request 都要調高 `src/__init__.py` 的 `__version__`，並在 [CHANGELOG.md](CHANGELOG.md) 最上面加一段；規則見 CLAUDE.md「Releases」。程序紀錄只用這個版本號識別程式，從未合併或本機修改過的程式碼執行時，顯示的是上一個發行版本號。
 
 ## 疑難排解
 
@@ -165,7 +176,7 @@ python3 -m pytest tests/ -q -p no:cacheprovider -rfw
 - 呼叫逾時（紀錄寫「timed out」）：逾時的呼叫會在該段的呼叫次數內重試，重試成功時段落不會失敗、也不會寫失敗診斷檔（Web 翻譯日誌仍會留下一則警告）；用完次數時，待翻譯的段落以 failed 結束，已翻譯或已審閱的段落保留原譯文與狀態、只記下問題；術語提取的呼叫逾時則記錄警告、不重試：該批次不提出術語（裁決呼叫逾時則各術語保留最常見的譯法）。常逾時就用 `model set -t` 或翻譯頁調高逾時，或降低推理強度。
 - Copilot 停在「Copilot CLI 不接受此模型的推理強度設定」：改選這個模型可用的推理強度（`model show` 列出）或換模型。
 - Copilot SDK 停在「找不到 Copilot SDK」：在專案的虛擬環境執行 `pip install -r requirements.txt`；「找不到 copilot 程式」：安裝 GitHub Copilot CLI 並 `copilot login`；「無法啟動 Copilot SDK 的執行環境」：確認 `copilot --version` 能執行。
-- Web 翻譯日誌：`projects/<name>/log/translation_*.log`。
+- Web 翻譯日誌：`projects/<name>/log/translation_*.log`；程序紀錄（含請求與錯誤的 traceback）：`logs/web.log`、`logs/cli.log`；要回顧某次翻譯發生了什麼，先看 `translate.py stats`（或 Web 的「統計」頁），再依時間對照程序紀錄。
 
 ## 授權
 

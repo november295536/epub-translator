@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
+import time
 from dataclasses import asdict
 from flask import Blueprint, request, jsonify, current_app
 
-from src.core.project import ProjectManager
+from src.core.events import RunEvents, settings_fields
+from src.core.project import ProjectManager, project_mutex
 from src.core.segmenter import SegmentType
 from src.glossary.glossary_manager import GlossaryManager
 from src.glossary.term_extractor import ExtractionError, TermExtractor
 
+
+logger = logging.getLogger(__name__)
 
 glossary_bp = Blueprint('glossary', __name__)
 
@@ -126,12 +131,18 @@ def extract_terms(project_name: str):
     if project_name in _extraction_tasks and _extraction_tasks[project_name].get('running'):
         return jsonify({'error': '已有提取任務正在執行'}), 409
 
-    # Get project segments for extraction
-    pm = _get_pm(project_name)
-    # All text segments; TermExtractor splits them into bounded batches
-    segments = [{'text': s.text} for s in pm.data.segments
-                if s.segment_type != SegmentType.CODE]
-    settings = pm.call_settings()
+    projects_dir = current_app.config['PROJECTS_DIR']
+    project_dir = os.path.join(projects_dir, project_name)
+    # The snapshot and the recorder under the project mutex, which a
+    # replacement holds while it sets the record aside: never the old book's
+    # text with the new book's record
+    with project_mutex(project_dir):
+        pm = _get_pm(project_name)
+        # All text segments; TermExtractor splits them into bounded batches
+        segments = [{'text': s.text} for s in pm.data.segments
+                    if s.segment_type != SegmentType.CODE]
+        settings = pm.call_settings()
+        events = RunEvents(project_dir, 'extract')
 
     _extraction_tasks[project_name] = {
         'running': True,
@@ -141,18 +152,22 @@ def extract_terms(project_name: str):
         'error': None
     }
 
-    # Get config for thread
-    projects_dir = current_app.config['PROJECTS_DIR']
+    events.emit('run_start', segments=len(segments), **settings_fields(settings))
+    logger.info("術語提取開始: %s (%d 段)", project_name, len(segments))
 
     def run_extraction():
+        started = time.monotonic()
+        end = {'state': 'failed'}
         try:
-            extractor = TermExtractor(**settings.call_args())
+            extractor = TermExtractor(**settings.call_args(), events=events)
             stopped = None
             try:
                 terms = extractor.extract_from_segments(segments)
             except ExtractionError as e:
                 # Keep the terms of the batches finished before the stop
                 stopped, terms = e, e.terms
+            # (a stop's cause is in the record of the call that hit it)
+            end = {'state': 'completed' if stopped is None else 'stopped', 'terms': len(terms)}
 
             # Add extracted terms to glossary
             glossary_path = os.path.join(projects_dir, project_name, 'glossary.json')
@@ -171,13 +186,27 @@ def extract_terms(project_name: str):
             if stopped is not None:
                 _extraction_tasks[project_name]['error'] = (
                     f'提取中斷：{stopped}（已加入先前批次的 {count} 個術語）')
+            end['added'] = count
+            logger.info("術語提取結束: %s (%s, %d 個術語, 新增 %d)", project_name,
+                        end['state'], len(terms), count)
         except Exception as e:
+            logger.exception("術語提取失敗: %s", project_name)
+            # terms found stay in the record, as in the CLI (`added` only once saved)
+            end = {**end, 'state': 'failed', 'error': type(e).__name__}
             _extraction_tasks[project_name]['error'] = str(e)
         finally:
+            # before the status says it ended
+            events.emit('run_end', seconds=round(time.monotonic() - started, 3), **end)
             _extraction_tasks[project_name]['running'] = False
 
     thread = threading.Thread(target=run_extraction, daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except BaseException as e:
+        # No thread: the run ends here, and the next extraction may start
+        events.emit('run_end', state='failed', error=type(e).__name__, seconds=0.0)
+        _extraction_tasks[project_name]['running'] = False
+        raise
 
     return jsonify({'status': 'started'})
 

@@ -19,7 +19,7 @@ level; --effort-model claude-haiku-5.5, 1x):
   4. one call with --level on --effort-model: the model call reports that
      level (`assistant.usage` reasoningEffort);
   5. a long reply cancelled 1 s into the model call (CancelledError) and one
-     timed out after --timeout-s seconds (TransientError): each session went
+     timed out after --timeout-s seconds (TransientError, CallTimeoutError): each session went
      idle as aborted with no `assistant.usage` event (nothing reported
      billed), and the call returned promptly;
   6. the session of every request is deleted (no
@@ -227,7 +227,7 @@ def aborted_turn(watch, checks, backend, label, model, *, timeout, cancel_after=
     describe(watch, label, sid, result)
     expected = CancelledError if cancel_after is not None else TransientError
     checks.check(f'{label}: {expected.__name__}',
-                 not result['ok'] and type(result['error']) is expected)
+                 not result['ok'] and isinstance(result['error'], expected))
     checks.check(f'{label}: the model call had started', bool(watch.of(sid, 'model.call_start')))
     # When the call returned: after the cancel, or after the timeout
     stop = cancelled_at[0] if cancelled_at else result['start'] + timeout

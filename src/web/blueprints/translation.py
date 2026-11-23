@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from flask import Blueprint, Response, jsonify, request, current_app
 
@@ -14,6 +15,8 @@ import src.llm as llm
 from src.core.translator import available_backends, available_models
 from src.web.tasks import TaskManager
 
+
+logger = logging.getLogger(__name__)
 
 translation_bp = Blueprint('translation', __name__)
 
@@ -75,6 +78,13 @@ def pause_translation(project_name: str):
     action = data.get('action')
     if action not in ('pause', 'resume'):
         return jsonify({'error': 'action 必須是 pause 或 resume'}), 400
+    def ending():
+        # The run is ending (its last result is in, it failed, or it was
+        # stopped): nothing to pause or resume. No state: the page keeps
+        # what the stream told it
+        return jsonify({'error': '翻譯正在結束', 'ending': True}), 409
+    if task.finishing or task.stop_event.is_set():
+        return ending()
     if action == 'resume':
         # Resume — optionally adjust workers
         num_workers = None
@@ -85,12 +95,16 @@ def pause_translation(project_name: str):
                 pass
         if tm.resume_translation(project_name, num_workers=num_workers):
             return jsonify({'status': 'ok', 'state': 'running'})
+        if task.finishing or task.stop_event.is_set():
+            return ending()  # it began ending meanwhile
         # Resume failed (e.g. thread died) — return actual state so frontend can recover
         return jsonify({'error': task.error or '無法繼續翻譯', 'state': task.state}), 500
     else:
         # Pause
         if tm.pause_translation(project_name):
             return jsonify({'status': 'ok', 'state': 'paused'})
+        if task.finishing or task.stop_event.is_set():
+            return ending()  # it began ending meanwhile
         return jsonify({'error': '無法暫停翻譯', 'state': task.state}), 500
 
 
@@ -256,6 +270,9 @@ def set_model(project_name: str):
                     raise
                 answer = _settings(pm.call_settings())
                 note = effort_reset_note(previous[2], pm.data)
+                logger.info("模型設定已變更: %s → 後端 %s, 模型 %s, 推理強度 %s, 逾時 %s 秒",
+                            project_name, answer['backend'], answer['current'],
+                            answer['effort'], answer['timeout'])
     except (FileNotFoundError, ValueError) as e:
         return jsonify({'error': str(e)}), 404
 
@@ -296,6 +313,7 @@ def set_brief(project_name: str):
                     pm.data.brief = previous  # not saved: the workers keep the old one
                     raise
                 brief = pm.data.brief or ''
+                logger.info("書籍簡介已變更: %s (%d 字元)", project_name, len(brief))
     except (FileNotFoundError, ValueError) as e:
         return jsonify({'error': str(e)}), 404
     return jsonify({'status': 'ok', 'brief': brief})

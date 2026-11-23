@@ -21,7 +21,7 @@ from typing import List, Optional
 
 from src.llm.base import (
     BackendUnavailableError, CancelledError, LLMError, LLMRequest, LLMResponse,
-    ModelInfo, TransientError,
+    CallTimeoutError, ModelInfo, TransientError,
 )
 
 # How often a running process is checked for cancellation (latency only:
@@ -203,7 +203,7 @@ class CLIBackend:
                                  env=self.environment(), cancel=cancel)
         except subprocess.TimeoutExpired as e:
             # What the program wrote before it hung, for the diagnostics
-            raise TransientError(f'{self.name} timed out after {request.timeout:g} s',
+            raise CallTimeoutError(f'{self.name} timed out after {request.timeout:g} s',
                                  raw=self.redact(_text(e.output) + _text(e.stderr))[:KEPT_OUTPUT_CHARS])
         except OSError as e:
             message = f'{self.name} could not be started: {str(e)[:ERROR_CHARS]}'
