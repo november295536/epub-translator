@@ -134,3 +134,29 @@ class TestStopWhileFinishing:
             _reset()
         assert states == ['running'] and task.state == 'failed'
         assert _of(_records(path), 'run_end')[0]['state'] == 'failed'
+
+
+def test_a_failing_failure_handler_still_ends_the_run(tmp_path, monkeypatch):
+    from src.web import tasks as tasks_module
+    from tests.conftest import like
+    tm = _tm(monkeypatch)
+
+    def explode(self, task, pm, res):
+        raise ZeroDivisionError('invented')
+    real = tasks_module.TaskManager._fail_task
+
+    def fail_task(self, task, error, saver):
+        with task._lock:
+            task.finishing = True
+            task.stop_event.set()
+            task.pause_event.set()
+        raise OSError('the handler fails too')
+    monkeypatch.setattr(tasks_module.TaskManager, '_apply_result', explode)
+    monkeypatch.setattr(tasks_module.TaskManager, '_fail_task', fail_task)
+    try:
+        task, path = _run(tm, tmp_path, lambda r: like(r, '好'))
+    finally:
+        _reset()
+    [end] = _of(_records(path), 'run_end')
+    assert (task.state, end['state']) == ('failed', 'failed')
+    assert end['error'] == 'ZeroDivisionError' and real
