@@ -67,7 +67,10 @@ def program_version() -> str:
         try:
             result = subprocess.run(
                 ['git', '-C', _REPO, 'describe', '--always', '--dirty', '--abbrev=12'],
-                capture_output=True, text=True, timeout=5, check=False)
+                capture_output=True, text=True, timeout=5, check=False,
+                # --dirty refreshes the index: without this it takes
+                # .git/index.lock, and a git add/commit at that moment fails
+                env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0'})
             _commit = result.stdout.strip() if result.returncode == 0 else ''
         except (OSError, subprocess.SubprocessError):
             _commit = ''
