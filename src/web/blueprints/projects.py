@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
 import uuid
 from flask import Blueprint, render_template, redirect, request, jsonify, current_app
 
+from src.core.events import retired, set_aside
 from src.core.project import (
     ProjectLock, ProjectLockedError, ProjectManager, project_mutex, sha256_file,
 )
@@ -30,6 +32,8 @@ def sanitize_project_name(name: str) -> str:
     name = name.strip('-.')
     return name or 'untitled'
 
+
+logger = logging.getLogger(__name__)
 
 projects_bp = Blueprint('projects', __name__)
 
@@ -191,6 +195,12 @@ def create_project():
                     raise
                 # The old book's failure diagnostics
                 shutil.rmtree(os.path.join(project_dir, 'log', 'failed'), ignore_errors=True)
+                # The old book's event record: kept under its own name, so the
+                # new book's statistics start empty
+                try:
+                    set_aside(project_dir)
+                except OSError as e:  # the new project stands; its stats mix the old runs
+                    logger.warning("無法移開舊的事件紀錄: %s", e)
             finally:
                 lock.release()
 
@@ -198,6 +208,7 @@ def create_project():
         if epub_path.startswith(get_uploads_dir()):
             os.remove(epub_path)
 
+        logger.info("專案已建立: %s (%d 段)", project_name, len(all_segments))
         return jsonify({
             'status': 'ok',
             'name': project_name,
@@ -209,6 +220,7 @@ def create_project():
     except EPUBError as e:
         return jsonify({'error': f'無法解析 EPUB：{e}'}), 400
     except Exception as e:
+        logger.exception("建立專案失敗")
         return jsonify({'error': f'建立專案失敗：{str(e)}'}), 500
 
 
@@ -326,9 +338,13 @@ def delete_project(project_name: str):
         except ProjectLockedError as e:
             return jsonify({'error': str(e)}), 409
         try:
-            shutil.rmtree(project_dir)
+            # a retranslation or extraction still going stops writing; one
+            # in the middle of an append finishes it first
+            with retired(project_dir):
+                shutil.rmtree(project_dir)
         finally:
             lock.release()
+    logger.info("專案已刪除: %s", project_name)
     return jsonify({'status': 'ok'})
 
 

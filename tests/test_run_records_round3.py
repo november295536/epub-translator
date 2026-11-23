@@ -1,0 +1,586 @@
+"""Run records, review round 3: each test reproduces one finding (it failed
+before the fix). All text is invented."""
+
+import os
+import threading
+
+import pytest
+
+from src.core.events import RunEvents, events_path
+from tests.test_run_records import PROJECT, _make_project, _of, _records, _wait
+
+
+def _tm(monkeypatch):
+    from src.web import tasks as tasks_module
+    from src.web.tasks import TaskManager
+    TaskManager._instance = None
+    monkeypatch.setattr(tasks_module, 'COORDINATOR_TICK_SECONDS', 0.02)
+    return TaskManager()
+
+
+def _reset():
+    from src.web.tasks import TaskManager
+    TaskManager._instance = None
+
+
+class GatedEvent(threading.Event):
+    """The task's pause gate; its `nth` wait() from a worker first blocks
+    until `release` is set: a worker between its stop check and the gate."""
+
+    def __init__(self, nth):
+        super().__init__()
+        self.nth, self.waits = nth, 0
+        self.reached, self.release = threading.Event(), threading.Event()
+
+    def wait(self, timeout=None):
+        if threading.current_thread().name.startswith('Thread') and not self.reached.is_set():
+            self.waits += 1
+            if self.waits == self.nth:
+                self.reached.set()
+                assert self.release.wait(20)
+        return super().wait(timeout)
+
+
+def test_pause_after_a_streak_stop_cannot_hang_the_run(tmp_path, monkeypatch):
+    """Five unexpected failures stop the run; a worker is between its stop
+    check and the pause gate; a user pause arrives then. Before: accepted,
+    the gate closed, the worker waited for ever and the run never ended."""
+    from dataclasses import field
+    from src.llm.fake import FakeBackend
+    from src.web import tasks as tasks_module
+    from tests.conftest import use_fake_backend
+    tm = _tm(monkeypatch)
+    _make_project(tmp_path, n=7)
+    gate = GatedEvent(nth=6)  # the wait before the sixth segment
+
+    original = tasks_module.TranslationTask.__init__
+
+    def init(self, *a, **k):
+        original(self, *a, **k)
+        gate.set()  # as the task's own gate starts (open)
+        self.pause_event = gate
+    monkeypatch.setattr(tasks_module.TranslationTask, '__init__', init)
+
+    def boom(request):
+        raise KeyError('invented')
+    try:
+        with use_fake_backend(FakeBackend(responder=boom)):
+            task = tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+            assert gate.reached.wait(20)
+            _wait(lambda: task.stop_event.is_set())  # the streak stopped the run
+            paused = tm.pause_translation(PROJECT)
+            gate.release.set()
+            task._coordinator.join(10)
+            alive = task._coordinator.is_alive()
+            if alive:  # free the worker, so the test leaves no thread behind
+                tm.stop_translation(PROJECT)
+                task._coordinator.join(20)
+    finally:
+        _reset()
+    assert paused is False and not alive
+    assert task.state == 'failed'
+
+
+def _run(tm, tmp_path, responder, n=1, workers=1):
+    from src.llm.fake import FakeBackend
+    from tests.conftest import use_fake_backend
+    path = _make_project(tmp_path, n=n)
+    with use_fake_backend(FakeBackend(responder=responder)):
+        task = tm.start_translation(PROJECT, str(tmp_path), num_workers=workers)
+        _wait(lambda: task.state in ('completed', 'stopped', 'failed') and not task.threads_alive())
+    _wait(lambda: _of(_records(path), 'run_end'))
+    return task, path
+
+
+class TestStopWhileFinishing:
+    def test_stop_after_the_last_result(self, tmp_path, monkeypatch):
+        from tests.conftest import like
+        tm = _tm(monkeypatch)
+        done = tm._workers_done
+
+        def workers_done(task):
+            if done(task):
+                tm.stop_translation(PROJECT)  # forced: right after the last result
+                return True
+            return False
+        monkeypatch.setattr(tm, '_workers_done', workers_done)
+        try:
+            task, path = _run(tm, tmp_path, lambda r: like(r, '好'))
+        finally:
+            _reset()
+        [end] = _of(_records(path), 'run_end')
+        assert (task.state, end['state'], end['translated']) == ('completed', 'completed', 1)
+
+    def test_stop_during_a_failure_drain(self, tmp_path, monkeypatch):
+        from src.core import runcontrol
+        from src.web import tasks as tasks_module
+        from tests.conftest import like
+        tm = _tm(monkeypatch)
+        states = []
+        flush = runcontrol.DebouncedSaver.flush
+
+        def flush_and_stop(self):
+            task = tm.tasks.get(PROJECT)
+            if task is not None and task.finishing and not states:
+                tm.stop_translation(PROJECT)  # forced: a stop in the drain
+                states.append(task.state)
+            return flush(self)
+        monkeypatch.setattr(runcontrol.DebouncedSaver, 'flush', flush_and_stop)
+
+        def explode(self, task, pm, res):
+            raise ZeroDivisionError('invented')
+        monkeypatch.setattr(tasks_module.TaskManager, '_apply_result', explode)
+        try:
+            task, path = _run(tm, tmp_path, lambda r: like(r, '好'))
+        finally:
+            _reset()
+        assert states == ['running'] and task.state == 'failed'
+        assert _of(_records(path), 'run_end')[0]['state'] == 'failed'
+
+
+def test_a_failing_failure_handler_still_ends_the_run(tmp_path, monkeypatch):
+    from src.web import tasks as tasks_module
+    from tests.conftest import like
+    tm = _tm(monkeypatch)
+
+    def explode(self, task, pm, res):
+        raise ZeroDivisionError('invented')
+    real = tasks_module.TaskManager._fail_task
+
+    def fail_task(self, task, error, saver):
+        with task._lock:
+            task.finishing = True
+            task.stop_event.set()
+            task.pause_event.set()
+        raise OSError('the handler fails too')
+    monkeypatch.setattr(tasks_module.TaskManager, '_apply_result', explode)
+    monkeypatch.setattr(tasks_module.TaskManager, '_fail_task', fail_task)
+    try:
+        task, path = _run(tm, tmp_path, lambda r: like(r, '好'))
+    finally:
+        _reset()
+    [end] = _of(_records(path), 'run_end')
+    assert (task.state, end['state']) == ('failed', 'failed')
+    assert end['error'] == 'ZeroDivisionError' and real
+
+
+def test_pause_or_resume_while_finishing_answers_409(tmp_path, monkeypatch):
+    from src.web.server import create_app
+    from src.web.tasks import TaskManager
+    from tests.conftest import like
+    tm = _tm(monkeypatch)
+    answers = []
+    client_box = {}
+    done = tm._workers_done
+
+    def workers_done(task):
+        if done(task):
+            client = client_box['client']
+            for action in ('pause', 'resume'):
+                res = client.post(f'/api/projects/{PROJECT}/translate/pause', json={'action': action})
+                answers.append((res.status_code, res.get_json()))
+            return True
+        return False
+    monkeypatch.setattr(tm, '_workers_done', workers_done)
+    try:
+        app = create_app(projects_dir=str(tmp_path))
+        monkeypatch.setattr('src.web.blueprints.translation._get_task_manager', lambda: tm)
+        client_box['client'] = app.test_client()
+        task, path = _run(tm, tmp_path, lambda r: like(r, '好'))
+    finally:
+        _reset()
+    assert [code for code, _ in answers] == [409, 409]
+    assert all('state' not in body and body['ending'] for _, body in answers)
+    assert task.state == 'completed'
+
+
+def test_page_keeps_completed_after_a_refused_pause(tmp_path):
+    from src.web.server import create_app
+    _make_project(tmp_path)
+    page = create_app(projects_dir=str(tmp_path)).test_client() \
+        .get(f'/project/{PROJECT}/translation').get_data(as_text=True)
+    assert 'if (data.ending) {' in page
+    assert ("this.state = 'completed';\n                this.autoResume = false;\n"
+            "                this.error = null;") in page
+
+
+class TestExtractionEnds:
+    def _cli(self, tmp_path, monkeypatch, patch):
+        import json
+        from click.testing import CliRunner
+        import translate
+        from src.llm.fake import FakeBackend
+        from tests.conftest import use_fake_backend
+        path = _make_project(tmp_path, n=1)
+        patch()
+        reply = json.dumps([{'term': 'Quillfeather', 'translation': '羽筆', 'category': 'term'}])
+        with use_fake_backend(FakeBackend([reply])):
+            CliRunner().invoke(translate.cli, ['glossary', 'extract', '-p', path])
+        return path, _of(_records(path), 'run_end')
+
+    def test_ctrl_c_during_the_save(self, tmp_path, monkeypatch):
+        from src.glossary.glossary_manager import GlossaryManager
+
+        def interrupt(self, *a, **k):
+            raise KeyboardInterrupt()
+        _, [end] = self._cli(tmp_path, monkeypatch,
+                             lambda: monkeypatch.setattr(GlossaryManager, 'save', interrupt))
+        assert (end['state'], end['error'], end['terms']) == ('interrupted', 'KeyboardInterrupt', 1)
+
+    def test_closed_pipe_after_the_save_keeps_added(self, tmp_path, monkeypatch):
+        import click
+        import translate
+        echo = click.echo
+
+        def closed(message=None, *a, **k):
+            if message and str(message).startswith('已儲存到'):
+                raise BrokenPipeError()
+            return echo(message, *a, **k)
+        path, [end] = self._cli(tmp_path, monkeypatch,
+                                lambda: monkeypatch.setattr(translate.click, 'echo', closed))
+        assert (end['added'], end['terms']) == (1, 1) and end['error'] == 'BrokenPipeError'
+        assert os.path.exists(os.path.join(path, 'glossary.json'))
+
+    def test_web_save_failure_keeps_terms(self, tmp_path, monkeypatch):
+        import json
+        from src.glossary.glossary_manager import GlossaryManager
+        from src.llm.fake import FakeBackend
+        from src.web.server import create_app
+        from tests.conftest import use_fake_backend
+        path = _make_project(tmp_path, n=1)
+
+        def explode(self, *a, **k):
+            raise OSError('disk full')
+        monkeypatch.setattr(GlossaryManager, 'save', explode)
+        client = create_app(projects_dir=str(tmp_path)).test_client()
+        reply = json.dumps([{'term': 'Quillfeather', 'translation': '羽筆', 'category': 'term'}])
+        with use_fake_backend(FakeBackend([reply])):
+            assert client.post(f'/api/projects/{PROJECT}/glossary/extract').status_code == 200
+            _wait(lambda: _of(_records(path), 'run_end'))
+        [end] = _of(_records(path), 'run_end')
+        assert (end['state'], end['error'], end['terms']) == ('failed', 'OSError', 1)
+        assert 'added' not in end
+
+
+def test_run_started_before_since():
+    from src.core.stats import START_UNKNOWN, summarize, text_report
+    from tests.test_run_records import _call, _rec
+    records = [_rec('run_start', ts='2026-01-01T09:00:00.000Z'),
+               _call('s1', 1, ts='2026-01-01T09:30:00.000Z'),
+               _call('s2', 1, ts='2026-01-01T11:00:00.000Z'),
+               _rec('run_end', ts='2026-01-01T11:00:05.000Z', state='completed', seconds=7205.0),
+               _rec('run_start', run='r2', ts='2026-01-01T11:10:00.000Z'),
+               _call('s3', 1, run='r2', ts='2026-01-01T11:20:00.000Z')]
+    s = summarize(records, since='2026-01-01T10:00:00.000Z')
+    first, second = s['runs']
+    assert (first['start'], first['duration']) == (None, 7205.0)  # its own measure, start unknown
+    assert (second['start'], second['duration']) == ('2026-01-01T11:10:00.000Z', 600.0)
+    unfinished = summarize(records[:3], since='2026-01-01T10:00:00.000Z')['runs'][0]
+    assert (unfinished['start'], unfinished['duration']) == (None, None)
+    text = '\n'.join(text_report({**s, 'exists': True}))
+    assert f'{START_UNKNOWN} → ' in text
+
+
+def test_page_shows_unknown_start(tmp_path):
+    from src.web.server import create_app
+    _make_project(tmp_path)
+    page = create_app(projects_dir=str(tmp_path)).test_client() \
+        .get(f'/project/{PROJECT}/stats').get_data(as_text=True)
+    assert "r.start ? time(r.start) : '（開始不在所選紀錄中）'" in page
+
+
+def test_start_line_version_without_git(tmp_path, monkeypatch):
+    """The start line carries src.__version__ and nothing from git:
+    proclog starts no process at all."""
+    import subprocess
+    from src import __version__
+    from src.core import proclog
+    started = []
+
+    def no_process(*a, **k):
+        started.append(a)
+        raise AssertionError('proclog started a process')
+    monkeypatch.setattr(subprocess, 'Popen', no_process)
+    monkeypatch.setenv(proclog.LOG_DIR_ENV, str(tmp_path / 'logs'))
+    proclog.teardown()
+    try:
+        path = proclog.setup(str(tmp_path / 'projects'), 'cli', 'cli status')
+    finally:
+        proclog.teardown()
+    line = open(path, encoding='utf-8').read()
+    assert f'| epub-translator {__version__} | Python ' in line and started == []
+
+
+def test_changelog_and_version_in_step():
+    import re
+    from click.testing import CliRunner
+    import translate
+    from src import __version__
+    from tests.conftest import _REPO_ROOT
+    with open(os.path.join(_REPO_ROOT, 'CHANGELOG.md'), encoding='utf-8') as f:
+        top = re.search(r'^## (\S+)', f.read(), re.M).group(1)
+    assert top == __version__
+    assert CliRunner().invoke(translate.cli, ['--version']).output.strip().endswith(__version__)
+
+
+def _replacement_now(project_dir):
+    """A replacement of the project from another thread, as the web create
+    does it (set_aside under the project mutex). Returns once it is done,
+    or once it is blocked because this thread holds the mutex."""
+    from src.core import events as events_module
+    from src.core.project import project_mutex
+    mutex = project_mutex(project_dir)
+    done, blocked = threading.Event(), threading.Event()
+
+    def replace():
+        if not mutex.acquire(blocking=False):
+            blocked.set()
+            mutex.acquire()
+        try:
+            events_module.set_aside(project_dir)
+        finally:
+            mutex.release()
+            done.set()
+    threading.Thread(target=replace, daemon=True).start()
+    _wait(lambda: done.is_set() or blocked.is_set())
+    return done
+
+
+def test_retranslation_recorder_from_the_snapshot(tmp_path, monkeypatch):
+    """A replacement between the snapshot and the call: the old work must
+    not get the new book's record."""
+    from src.llm.fake import FakeBackend
+    from src.web.blueprints import review as review_module
+    from src.web.server import create_app
+    from tests.conftest import like, use_fake_backend
+    path = _make_project(tmp_path, n=1)
+    RunEvents(path, 'cli').emit('run_start')  # the old book's record exists
+    glossary = review_module._glossary
+    replaced = []
+
+    def replace_then_glossary(project_dir):
+        # right after the snapshot's transaction, before the model call
+        replaced.append(_replacement_now(path))
+        return glossary(project_dir)
+    monkeypatch.setattr(review_module, '_glossary', replace_then_glossary)
+    client = create_app(projects_dir=str(tmp_path)).test_client()
+    with use_fake_backend(FakeBackend(responder=lambda r: like(r, '好'))):
+        client.post(f'/api/projects/{PROJECT}/segments/c1_seg0001/retranslate')
+    assert replaced[0].wait(10)
+    assert not os.path.exists(events_path(path))  # nothing in the new book's record
+
+
+def test_extraction_recorder_from_the_snapshot(tmp_path, monkeypatch):
+    import json
+    from src.core.project import ProjectManager
+    from src.llm.fake import FakeBackend
+    from src.web.blueprints import glossary as glossary_module
+    from src.web.server import create_app
+    from tests.conftest import use_fake_backend
+    path = _make_project(tmp_path, n=1)
+    RunEvents(path, 'cli').emit('run_start')
+    settings = ProjectManager.call_settings
+    replaced = []
+
+    def settings_then_replace(self):
+        value = settings(self)
+        replaced.append(_replacement_now(path))
+        return value
+    monkeypatch.setattr(ProjectManager, 'call_settings', settings_then_replace)
+    client = create_app(projects_dir=str(tmp_path)).test_client()
+    reply = json.dumps([{'term': 'Quill', 'translation': '羽', 'category': 'term'}])
+    with use_fake_backend(FakeBackend([reply])):
+        assert client.post(f'/api/projects/{PROJECT}/glossary/extract').status_code == 200
+        _wait(lambda: not glossary_module._extraction_tasks[PROJECT]['running'])
+    assert replaced[0].wait(10)
+    assert not os.path.exists(events_path(path))
+
+
+# --- survivors of the final mutation pass that pointed at gaps -------------------------
+
+def test_two_timeouts_counted():
+    from src.core.stats import summarize
+    from tests.test_run_records import _call
+    [g] = summarize([_call('s1', 1, 'timeout'), _call('s1', 2, 'timeout')])['models']
+    assert g['timeouts'] == 2
+
+
+@pytest.mark.filterwarnings('ignore::pytest.PytestUnhandledThreadExceptionWarning')
+def test_coordinator_left_by_a_base_exception(tmp_path, monkeypatch):
+    """A way out that is not an Exception (no handler ran): the run still
+    ends failed, with a class name for it, and finishing set. (The
+    exception then leaves the thread, as it should: the warning pytest
+    gives for that is expected here.)"""
+    from src.web import tasks as tasks_module
+    from tests.conftest import like
+    tm = _tm(monkeypatch)
+
+    def leave(self, task, pm, res):
+        raise GeneratorExit()  # a BaseException, not an Exception
+    monkeypatch.setattr(tasks_module.TaskManager, '_apply_result', leave)
+    try:
+        task, path = _run(tm, tmp_path, lambda r: like(r, '好'))
+    finally:
+        _reset()
+    [end] = _of(_records(path), 'run_end')
+    assert (task.state, end['state'], end['error']) == ('failed', 'failed', 'UnexpectedExit')
+    assert task.finishing
+
+
+class TestCheckScriptFinal:
+    def _check(self, tmp_path, capsys):
+        from tests import test_run_records as trr
+        code = trr.TestRunRecordsCheckScript._check(None, tmp_path)
+        return code, capsys.readouterr().out
+
+    def test_lines_after_a_blank_one_and_two_cut_lines(self, tmp_path, capsys):
+        path = _make_project(tmp_path, n=1)
+        RunEvents(path, 'cli', run_id='20260101T000000Z-abcdef').emit('pause', reason='user')
+        with open(events_path(path), 'a', encoding='utf-8') as f:
+            f.write('\n{"cut\n{"cut\n{"leak": "x"}\n')
+        code, out = self._check(tmp_path, capsys)
+        assert code == 1 and 'skipped lines 2' in out and 'line 5: no event, run or ts' in out
+
+    def test_translation_call_keeps_the_base_requirements(self, tmp_path, capsys):
+        path = _make_project(tmp_path, n=1)
+        RunEvents(path, 'cli', run_id='20260101T000000Z-abcdef').emit(
+            'call', kind='request', segment='c1_seg0001', attempt=1, model='m1', timeout=60,
+            seconds=1.0, outcome='accepted')  # no backend
+        code, out = self._check(tmp_path, capsys)
+        assert code == 1 and 'call without backend' in out
+
+    def test_extraction_call_needs_no_segment(self, tmp_path, capsys):
+        path = _make_project(tmp_path, n=1)
+        RunEvents(path, 'extract', run_id='20260101T000000Z-abcdef').emit(
+            'call', kind='extract', backend='fake', model='m1', timeout=60, seconds=1.0,
+            outcome='accepted')
+        code, out = self._check(tmp_path, capsys)
+        assert code == 0, out
+
+
+# --- review round 4 --------------------------------------------------------------------
+
+@pytest.mark.filterwarnings('ignore::pytest.PytestUnhandledThreadExceptionWarning')
+def test_unexpected_exit_stops_a_worker_at_the_pause_gate(tmp_path, monkeypatch):
+    """Round 4: the coordinator leaves by a BaseException while a worker is
+    parked at the pause gate: the worker is stopped and joined, the run
+    ends failed, and the project can be started again."""
+    from src.llm.fake import FakeBackend
+    from src.web import tasks as tasks_module
+    from tests.conftest import like, use_fake_backend
+    tm = _tm(monkeypatch)
+    _make_project(tmp_path, n=2)
+    paused, parked = threading.Event(), threading.Event()
+
+    class Gate(threading.Event):
+        def wait(self, timeout=None):
+            if not self.is_set():
+                parked.set()  # a worker waits at the closed gate
+            return super().wait(timeout)
+
+    def leave(self, task, pm, res):
+        # first result: the user pauses while the worker's second call runs;
+        # once the worker waits at the gate the coordinator leaves
+        gate = Gate()
+        gate.set()
+        task.pause_event = gate
+        assert tm.pause_translation(PROJECT)
+        paused.set()
+        assert parked.wait(20)
+        raise GeneratorExit()
+    monkeypatch.setattr(tasks_module.TaskManager, '_apply_result', leave)
+    calls = []
+
+    def responder(request):
+        calls.append(1)
+        if len(calls) == 2:
+            assert paused.wait(20)  # the second call ends after the pause
+        return like(request, '好')
+    try:
+        with use_fake_backend(FakeBackend(responder=responder)):
+            task = tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+            task._coordinator.join(20)
+            assert not task._coordinator.is_alive()
+            assert task.error_class == 'UnexpectedExit'  # the fallback, not _fail_task
+            assert not task.threads_alive() and task.state == 'failed'
+            monkeypatch.undo()  # the next run applies results normally
+            monkeypatch.setattr(tasks_module, 'COORDINATOR_TICK_SECONDS', 0.02)
+            again = tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+            _wait(lambda: again.state in ('completed', 'failed') and not again.threads_alive())
+    finally:
+        _reset()
+    assert again.state == 'completed'
+
+class TestPauseEndpointEnding:
+    """Round 4: a pause/resume refused because the run began ending between
+    the endpoint's check and the manager's (or after a streak stop)
+    answers 409 ending, not 500 with the running state."""
+
+    def _client(self, tmp_path, monkeypatch, tm):
+        from src.web.server import create_app
+        monkeypatch.setattr('src.web.blueprints.translation._get_task_manager', lambda: tm)
+        return create_app(projects_dir=str(tmp_path)).test_client()
+
+    def _task(self, tmp_path, tm):
+        from src.web.tasks import TranslationTask
+        _make_project(tmp_path, n=1)
+        task = TranslationTask(task_id='t', project_name=PROJECT, projects_dir=str(tmp_path),
+                               num_workers=1)
+        task.state = 'running'
+        tm.tasks[PROJECT] = task
+        return task
+
+    def test_began_ending_in_between(self, tmp_path, monkeypatch):
+        tm = _tm(monkeypatch)
+        try:
+            task = self._task(tmp_path, tm)
+            client = self._client(tmp_path, monkeypatch, tm)
+            for action, method in (('pause', 'pause_translation'), ('resume', 'resume_translation')):
+                def refuse(*a, **k):
+                    task.finishing = True  # the run ends between the two checks
+                    return False
+                monkeypatch.setattr(tm, method, refuse)
+                res = client.post(f'/api/projects/{PROJECT}/translate/pause', json={'action': action})
+                assert res.status_code == 409 and 'state' not in res.get_json()
+                task.finishing = False
+        finally:
+            _reset()
+
+    def test_after_a_streak_stop(self, tmp_path, monkeypatch):
+        tm = _tm(monkeypatch)
+        try:
+            task = self._task(tmp_path, tm)
+            task.stop_event.set()  # stopped, not yet finishing
+            client = self._client(tmp_path, monkeypatch, tm)
+            for action in ('pause', 'resume'):
+                res = client.post(f'/api/projects/{PROJECT}/translate/pause', json={'action': action})
+                assert res.status_code == 409 and res.get_json()['ending']
+        finally:
+            _reset()
+
+
+def test_stopped_extraction_keeps_terms_when_stdout_closes(tmp_path, monkeypatch):
+    """Round 4: the count is in the end record before the stop notice is
+    printed, so a closed stdout there does not lose it."""
+    import json
+    import click
+    from click.testing import CliRunner
+    import translate
+    from src.llm import RateLimitError
+    from src.llm.fake import FakeBackend
+    from src.glossary import term_extractor as te
+    from tests.conftest import use_fake_backend
+    path = _make_project(tmp_path, n=2)
+    monkeypatch.setattr(te, 'MAX_CHARS_PER_BATCH', 10)  # one batch per segment
+    echo = click.echo
+
+    def closed(message=None, *a, **k):
+        if message and str(message).startswith('提取中斷'):
+            raise BrokenPipeError()
+        return echo(message, *a, **k)
+    monkeypatch.setattr(translate.click, 'echo', closed)
+    reply = json.dumps([{'term': 'Quill', 'translation': '羽', 'category': 'term'}])
+    with use_fake_backend(FakeBackend([reply, RateLimitError('limit')])):
+        CliRunner().invoke(translate.cli, ['glossary', 'extract', '-p', path])
+    [end] = _of(_records(path), 'run_end')
+    assert (end['terms'], end['error']) == (1, 'BrokenPipeError')

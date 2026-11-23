@@ -7962,3 +7962,467 @@ exit 0                      (reverts not detected: 0; 105 OK)
 $ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
 exit 0                      (not killed 0; 81 KILLED)
 ```
+
+## Run records: process log, event record, statistics
+
+Branch `feat/run-records`. Three parts (CLAUDE.md, "Run records"):
+
+1. **Process log** (`src/core/proclog.py`): `logs/web.log` (web server) and `logs/cli.log` (every
+   CLI command) beside the projects directory, rotating at 5 MB × 5. Start line (command or
+   "web server", version with `git describe` (since review round 3: `src.__version__` only), Python, platform, pid), every `src.*` record,
+   werkzeug request lines, tracebacks of requests, commands and threads, an end line
+   (`end: exit N` for commands, `end: web server stopped` at a normal server exit).
+2. **Event record** (`src/core/events.py`): `<project>/log/events.jsonl`, one JSON object per
+   line: one `call` line per model call and `run_start`, `pause`, `wait_extended`, `resume`,
+   `segment`, `run_end` lines. Ids, codes, counts, character counts, settings and durations only.
+   Invented examples, one per kind:
+
+   ```json
+   {"v":1,"ts":"2026-01-05T09:00:00.120Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"run_start","workers":2,"segments":6,"mode":"pending","backend":"copilot-sdk","model":"claude-haiku-4.5","timeout":30}
+   {"v":1,"ts":"2026-01-05T09:00:07.400Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"call","kind":"request","segment":"ch01_seg0001","attempt":1,"backend":"copilot-sdk","model":"claude-haiku-4.5","timeout":30,"seconds":7.21,"tokens_in":1690,"tokens_out":480,"outcome":"rejected","issues":["tag_count"],"chars_in":1800,"chars_out":61}
+   {"v":1,"ts":"2026-01-05T09:00:14.900Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"call","kind":"retry","segment":"ch01_seg0001","attempt":2,"backend":"copilot-sdk","model":"claude-haiku-4.5","timeout":30,"seconds":7.4,"outcome":"accepted","warnings":["length_ratio"],"chars_in":1920,"chars_out":60}
+   {"v":1,"ts":"2026-01-05T09:00:14.910Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"segment","segment":"ch01_seg0001","result":"translated","model":"claude-haiku-4.5","calls":2,"warnings":["length_ratio"]}
+   {"v":1,"ts":"2026-01-05T09:00:20.000Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"pause","reason":"user","completed":1}
+   {"v":1,"ts":"2026-01-05T09:00:20.050Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"call","kind":"request","segment":"ch02_seg0001","attempt":1,"backend":"copilot-sdk","model":"claude-haiku-4.5","timeout":30,"seconds":0.1,"outcome":"cancelled","error":"CancelledError","chars_in":1790}
+   {"v":1,"ts":"2026-01-05T09:00:31.000Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"resume","reason":"user","workers":2}
+   {"v":1,"ts":"2026-01-05T09:02:00.000Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"pause","reason":"rate_limit","error":"RateLimitError","resume_in":300.0,"completed":4}
+   {"v":1,"ts":"2026-01-05T09:02:01.000Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"wait_extended","reason":"rate_limit","resume_in":299.0}
+   {"v":1,"ts":"2026-01-05T09:08:00.000Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"segment","segment":"ch05_seg0001","result":"dropped","reason":"edited_during_call","model":"claude-haiku-4.5","calls":1}
+   {"v":1,"ts":"2026-01-05T09:09:00.000Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"run_end","state":"completed","translated":5,"failed":0,"dropped":1,"seconds":540.0}
+   {"v":1,"ts":"2026-01-05T09:20:03.000Z","run":"20260105T092000Z-4d5e6f","source":"extract","event":"call","kind":"consolidate","backend":"copilot-sdk","model":"claude-haiku-4.5","timeout":30,"seconds":3.2,"tokens_in":900,"tokens_out":120,"outcome":"accepted","chars_in":640,"chars_out":210}
+   ```
+
+3. **Statistics** (`src/core/stats.py`, one function): `translate.py stats [--since] [--run]
+   [--json]` and `GET /api/projects/<name>/stats` behind the "統計" tab (`/project/<name>/stats`).
+
+Hooks: `_Session.call` / `_Session.checked` (`translator.py`) record each call (an exception at
+once, a reply once its check is known); `TermExtractor._call`; runs in `TaskManager`
+(`_start_locked`, `_apply_result`, `pause_translation`, `_pause_for`, `resume_translation`, the
+coordinator's `finally`), the retranslate endpoint, web and CLI extraction, CLI `_Run`. The new
+`CallTimeoutError` (a `TransientError`, retried as before) tells timeouts apart.
+
+Decisions taken with the coordinator: segment ids stay as they are (they can carry chapter-id
+words; `known-issues.md` says to look at the record before sharing it); a project replaced
+through the web gets a fresh record (the old one moved to `log/events-<UTC time>.jsonl`); the
+record does not rotate; a killed web server writes no end line.
+
+### Pre-existing bug found: a resume right after start could leave a run that never ends
+
+`TaskManager._run_translation` set `task._gm` and then, in a separate step under the lock,
+`task.active_workers`. A pause and resume landing between the two let `_top_up_workers` (which
+starts workers once `_gm` is set) start a worker that the coordinator's count then overwrote, so
+two worker threads ran with a count of one. The count could never return to 0: the run never
+reached `completed`, and the web task kept its `project.lock`, so the project answered 409 until
+the server stopped. It shows when a user pauses and resumes right after pressing start. It was
+found because a new test (`test_pause_and_resume`) timed out under the load of mutmut's clean
+run. `tests/test_runtime.py::test_resume_while_the_coordinator_starts_its_workers` forces the
+interleaving (pause and resume run inside the coordinator's start log line, which sat between
+the two assignments): on the old code it hangs until the 20 s wait fails; with the fix (both set
+together under `task._lock`, commit `074801d`) it passes. Other places checked: the CLI parallel
+path has no shared worker count and no resume top-up; every other change of `active_workers` in
+`tasks.py` already happens under `task._lock`. No other instance.
+
+### Tests
+
+`tests/test_run_records.py` (96) and one test in `tests/test_runtime.py`. They cover:
+- appends: one JSON object per line, a cut-off last line ended before the next append, a write
+  failure logged and not raised (also during a translation), 20 threads and a second process
+  appending at once (every line whole), file mode 0644, NaN refused;
+- every outcome class, and call records for request, retry, split, timeout, refusal, rate limit,
+  cancel, truncated, unexpected; extraction and consolidation calls with every field;
+- runs: web (start, pause/resume, rate-limit pause and `wait_extended`, auth and
+  backend-unavailable pauses, dropped segment, retranslate, extraction), CLI (sequential,
+  parallel, rate-limit pause/resume and `wait_extended` with two workers in flight, auth stop,
+  unexpected-streak stop, Ctrl-C), whole `run_start`/`run_end`/`segment` lines;
+- no invented source, reply, glossary, title or author word in any record of these runs;
+- `summarize` (whole dict on a record that reaches every branch), `text_report` (whole text),
+  filters, unparsable lines, `stats` command (missing, empty, JSON = endpoint, `--since`,
+  `--run`), the stats page (tab, 404, empty state, during a running task);
+- process log: location beside the projects directory, the override, version line with and
+  without git, CLI start/end lines with text parameters reduced to their length, traceback of a
+  command, a request and a thread, rotation bound, an unopenable file, web end line;
+- replacing a project sets its record aside; `scripts/verify/run_records_check.py` (passes a
+  clean record, fails on text, on unknown keys, on counts that do not add up; whole output).
+
+### Commands and results
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw        # three at once, commit b832a3e
+3084 passed in 268.33s / 263.72s / 266.88s          (no failure, no warning)
+```
+
+(The three concurrent runs are repeated at the final commit below.)
+
+### Mutation (`scripts/verify/mutation.sh`)
+
+The machine crashed during an uncapped run (10 workers) earlier in this work; that run's results
+were lost. The scripts gained two options for this (default unchanged): `MAX_CHILDREN` (mutmut
+workers) and `FILE...` (only some files of the list).
+
+- **Pass 1** (3 workers, all changed lines, stopped by hand after 41 min because the remaining
+  mutants sat in functions nearly every test runs through, about 5 mutants a minute): 2379
+  mutants, 1617 checked: 967 killed, 320 survived, 330 no tests; 762 not checked. Memory, read
+  once a minute: start 85 % free, swap 828 MB; lowest 79 % free; peak swap 1,933 MB; end 84 %
+  free, swap 1,692 MB.
+- **Pass 2** (6 workers, after new tests; `stats.py`, `events.py`, `term_extractor.py`,
+  `exporter.py`, `server.py`, `run_records_check.py`; 29 min within the 30 min bound): 1538
+  mutants, 1311 killed, 227 survived, 0 no tests. Memory: start 84 % free, swap 1,556 MB; lowest
+  61 % free; end 69 % free, swap 716 MB. The check script's "no tests" came from tests loading it
+  under another module name; they now load it as `scripts.verify.run_records_check`, like
+  `test_verify_scripts.py` does.
+- After pass 2, two test commits (`4e5f5fb`, `b832a3e`) target the cheap survivors (UTC stamps,
+  compact separators, record field checks, summary counts over two runs, report helpers, empty
+  reports, the check script's whole output, segment `split`/`warnings` keys, file mode, NaN,
+  log message of a record failure). These kills were not re-verified by a mutation run.
+
+Survivors left and why (pass 2): log-message wording and arguments (`export_project` 17,
+`append_record` 4, `_record` 5 before its new test); mutants equivalent here (`ensure_ascii`
+for records that hold ASCII codes only; `.encode('UTF-8')`; `pread(fd, 2, …)` at the file end
+reads 1 byte either way; one lock for every path instead of one per path; `fromisoformat` taking
+`Z` itself on Python 3.12, so the `'Z'` replacements and `round(…, 4)` of millisecond times
+change nothing; `'web'` vs `'WEB'` on the case-insensitive macOS file system; `//1001` for
+milliseconds differing only at a few microsecond values; `calls or 1` for a segment without a
+`calls` field landing in the same branch); the sort key of groups (`'XXXX'` vs `''`); output
+wording of the check script's `--help`/argparse defaults.
+
+**Not mutation-checked** (changed lines never reached, counts from pass 1): `translator.py`
+149 of 153 mutants, `translate.py` 140 of 316 (69 of the checked survived: mostly the CLI
+parallel path and `_Run`, which later tests target, unverified), `proclog.py` 128 of 161 (9
+survived, 6 no tests: `_web_end`, which runs only in a child process at exit), `tasks.py` 120
+of 187 (28 survived, mostly `_pause_for`, which later tests target, unverified). Route
+functions in the blueprints (Flask-decorated) are not mutated by mutmut at all.
+
+### Real end-to-end check (invented text; REAL calls: 23)
+
+The first end-to-end run's files were lost in the machine crash; the numbers below are from the
+rerun on the final code (commit `b832a3e` plus the two later fixes being only an exit code in
+the process log and the outcome class of a Ctrl-C call). An invented six-chapter EPUB (one
+paragraph per chapter), a temporary projects directory, `copilot-sdk` with `claude-haiku-4.5`,
+timeout 30 s. A driver script started the web server, called the API, ran the CLI and stopped
+the server with SIGINT to its process group.
+
+- Web: create, 2 workers, a pause as soon as one segment was done, resume, all 6 translated;
+  one retranslation; one glossary extraction. Stats page loaded in Chrome; it shows the same
+  numbers as `stats --json`, which equals the endpoint's JSON (compared as dicts: equal).
+  Per backend/model: 10 calls (accepted 8, cancelled 2 by the pause, each recorded at 0.1 s),
+  7 segments all accepted at the first attempt, median 6.9 s, p90 11.3 s (computed over all 10 calls, the two cancelled ones included; review round 2 changed both to calls that returned a reply, and these can no longer be recomputed: the run's files were removed after the check), tokens 12,468 in,
+  4,710 out; runs: web 35.1 s, 6 translated, 1 pause, 8 calls; retranslate 7.6 s; extract
+  6.8 s, 2 terms added. A line `not json` appended to the record: the page said "略過 1 行無法解析的紀錄".
+  A new untouched project showed the empty state.
+- CLI: `init`, `model set`, `start -w 3` on a second project (6 calls, all accepted first,
+  15.5 s); on a third project `start` with no `copilot` on PATH (run_end `stopped`,
+  `BackendUnavailableError`, call outcome `backend_unavailable`, exit 1); `start` again with
+  SIGINT sent to its own process group (`start_new_session=True`, `os.killpg`) after the first
+  segment: run_end `interrupted`, 1 translated, `KeyboardInterrupt`, process exit 1
+  ("Aborted!"); `start` once more finished the other 5.
+- From the files alone: `logs/web.log` has the start line (version from `git describe` at the time; since review round 3 `src.__version__` only, pid),
+  every request line (`POST …/translate/pause` twice), the model change, the task's start and
+  segment lines and `end: web server stopped`; `logs/cli.log` has a start and end line for each
+  of the 11 commands, the `run stopped: …` warning of the unavailable backend and
+  `interrupted (Ctrl-C)` (that run logged `exit 130` while the process exited 1; fixed in
+  `bef0da5`, and the Ctrl-C call, recorded as `unexpected`, is now `cancelled`, `eb02772`). The
+  event records (59 lines) contain none of the book's words, title, author or project names and
+  no CJK character; `scripts/verify/run_records_check.py --anonymize` passed for all three
+  projects.
+- Model calls: 10 (web, two cancelled within 0.1 s by the pause) + 6 + 7 (CLI; the
+  backend-unavailable attempt made none).
+- Left behind: no `copilot --headless` process. The SIGINT reached the Copilot runtime in the
+  same process group while a session was being created: one session folder was left under
+  Copilot's session state with only start, abort and shutdown events (no prompt); it was
+  removed by hand (known behaviour, CLAUDE.md).
+
+Not verified: a real timeout, a real rate limit, a real refusal or truncated reply (the
+classifications are tested with the fake backend only); `claude-cli` and `copilot-cli` in a
+real run; two processes rotating the same process log at the same moment; a crash in the middle
+of a write (simulated with a cut-off line only); the Ctrl-C path of a web server.
+
+### Suite at the final code commit
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw        # three at once, commit 8223eb6
+3085 passed in 268.45s / 270.46s / 261.85s          (no failure, no warning)
+```
+
+## Run records — review round 1
+
+Each finding was first reproduced by a test in `tests/test_run_records_review.py` (or an
+existing test, named) that failed on the round's starting commit `beaafab` (run on a
+`git archive` copy of it) and passes after the fix.
+
+| # | Finding | Reproduced | Change |
+|---|---------|------------|--------|
+| 1 | CLI warnings no longer reach the terminal (the root file handler disabled `logging.lastResort`); `translate.py review` lost its request lines and moved the command's end line to `web.log`; relative log path | yes: `TestTerminalOutput` (3 tests, subprocesses, so pytest's own handlers are not on the root logger) | `proclog.terminal()`: stderr WARNING+ bare message for CLI commands, INFO+ with time for the web server, unless another handler owns the root logger; a web app created inside a CLI command keeps `cli.log` and writes no web end line (`_web_end` writes only into a web log); `abspath` (`3c3560a`) |
+| 2 | A completed call is lost when cleaning or checking its reply raises (or Ctrl-C there); the unexpected outcome reports 0 calls | yes: `TestCallLostWhenCheckRaises` (3) | `_Session.unchecked` records the pending call with the error's outcome; `unexpected_error_outcome` takes the session's calls and split (`f35ac75`) |
+| 3 | Web `run_end` can say `paused`; `run_end` written after the lock release and the SSE event; extraction sets `running=False` before `run_end` | yes: `TestWebRunEnd` (pause forced inside `_workers_done` after the last result: state stayed `paused`), `TestExtractionEnd::test_run_end_before_status_says_ended` | final state decided under the task lock (a pause that leaves nothing to resume ends `completed`), `_end_record` writes `run_end` once, before the state, the SSE event and the lock release; extraction writes `run_end` before `running=False` (`eda34f1`) |
+| 4 | A retranslation or extraction still running when its project is replaced writes into the new book's record; after a delete, `append_record` recreates the project directory | yes: `TestRetiredRecord` (3) | per-path generation in `events.py`, bumped by `set_aside` and by project deletion (`retire`), captured by `RunEvents`; `append_record` never creates the project directory (`d4e1b41`) |
+| 5 | `run_records_check.py` FAILs real books whose text contains the record's own words (request, accepted, completed, pending, timeout …) | yes: `TestCheckScriptRound1::test_book_with_enum_words_passes` | per-event required fields, field types (`stats.shape_problem`), closed sets for every string field (issue codes from `src/core/validation.py` plus the session's and extraction's failure codes, exception class names by suffix); source-word comparison dropped; unknown keys counted, values reported by field and length only; skipped lines printed (`a780643`) |
+| 6 | A coordinator or extraction thread that cannot start leaves no `run_end` (extraction: `running` stays true) | yes: `test_translation_thread_start_failure`, `TestExtractionEnd::test_thread_start_failure` | failed `run_end` with the error class, state cleared (`eda34f1`) |
+| 7 | Extraction calls recorded `accepted` before their reply is parsed | yes: `TestExtractionRecordedAfterParsing::test_unusable_replies` | recorded after parsing (`_parsed`); unreadable reply → `rejected` with `unusable_reply`; a consolidation reply that is JSON but not a list is unusable (`test_extraction_brief.py::test_top_level_list` updated) (`803ed2a`) |
+| 8 | Statistics: split counted outside "needed retry or split"; extraction calls mixed with translation; per-model outcome list without backend; `--since` far in the past raises OverflowError; wrong-typed fields counted as records; `run_start.workers` requested (web) vs min (CLI) | yes: `TestStatisticsRound1` (6) | `split` counts translated segments only (a part of `more_calls`, label 需多次呼叫); `work` (`translation`/`extraction`) in the group key; page lists work and backend; OverflowError → ValueError (exit 2 / 400); `shape_problem` skips wrong types (null counts as absent); both record the workers asked for (`a780643`) |
+| 9 | A short `os.write` is not detected | yes: `test_short_write_is_reported` | count checked, warning, `False` (`d4e1b41`) |
+| 10 | `test_ctrl_c_is_interrupted` accepts any non-zero exit; two scheduling claims | assertion: weak, as said; claim A (startup test's log callback before the task is registered) **real**; claim B (wait-extension test stopping before the second worker records its extension) **real**. Both forced with a 0.5 s delay at the gap (`Thread.start` of the coordinator; after the second `RunEvents.call`): the old tests failed, the new ones pass | exact `exit 1` + `Aborted!`; the tests wait for registration / for the `wait_extended` line (`ca7efbf`) |
+| 11 | Docs | — | INFO+ of every logger (third-party included, said and kept unfiltered: werkzeug and the Copilot SDK runtime's stderr are often the clue); what error messages can quote and that only the Copilot backends mask e-mail addresses; concurrent rotation: what is and is not guaranteed instead of "紀錄不會遺失"; the two statistics limits (first attempt within the last budget; a result line written when applied, before the save) (`6f35fa3`) |
+
+Not changing (answers to the review):
+- Segment ids stay as they are (decided earlier; `known-issues.md` says to look before sharing).
+- The co-author trailer's no-reply address stays (the repository's commit rule).
+- Record writes under the task lock stay (one short local append; ordering with the state change is what item 3 needs).
+- Run-id length stays (UTC second + 6 hex: unique per project in practice, short in reports).
+- No cross-process lock for process-log rotation (documented instead, item 11).
+- File modes stay default (0644 under the user's umask), like the project files beside them.
+- `--since` does not reconstruct run metadata from before the cutoff (a run started before it shows only its later lines).
+- No separate `truncated` flag: `truncated` stays an outcome; the reply's check codes are still recorded beside it in `issues`/`warnings`, so only whether it would otherwise have been accepted is not stored (not a two-line change: the summary and the check script would follow).
+
+### Review round 1: suite, mutation, real check
+
+Suite once alone after the fixes (commit `6f35fa3`): `3111 passed in 268.11s`, no failure, no
+warning.
+
+Mutation (`scripts/verify/mutation.sh main N FILE...`, lines changed vs `main`; memory read
+every 20–30 s, stop below 15 % free; nothing else heavy at the same time). mutmut's own summary is
+lost when the time bound stops it (the script removes its copy), so each pass's `mutants/*.meta`
+and mutated sources were copied out shortly before the bound and counted from there
+(`exit_code_by_key`: 1 killed, 0 survived, 33 no tests, none not checked).
+
+- **Pass A** (10 workers; the files the first passes never reached, most valuable first:
+  `translator.py`, `tasks.py`, `translate.py`, `proclog.py`; 17:11–17:42, stopped by the 31 min
+  bound): 927 mutants: 642 killed, 111 survived, 9 no tests, 165 not checked (`translator.py` 154
+  of 186: its mutants sit in functions nearly every test runs through; `tasks.py` 11 of 227).
+  Memory: 82–84 % free throughout.
+  Per file: `proclog.py` 201: 179 killed, 13 survived, 9 no tests; `tasks.py` 227: 183, 33, 11
+  not checked; `translate.py` 313: 254, 59; `translator.py` 186: 26, 6, 154 not checked.
+- **Pass B** (12 workers: the machine stayed responsive at 10 and memory high, and it was
+  faster; `translator.py` again, then the files whose logic changed this round: `events.py`,
+  `stats.py`, `term_extractor.py`, `run_records_check.py`; 17:43–18:04, finished within its
+  28 min bound): mutmut's summary `TOTAL mutants 1788 killed 1666 survived 122 timeout 0
+  suspicious 0 untested 0`; `translator.py` all 186 reached this time (164 killed, 22 survived); survived per file: `run_records_check.py` 42 (10 in `main`: argparse description and default, `PROJECT.JSON` case, `failed = None`, and a `break` after a project without a record, which got a test), `stats.py` 28, `translator.py` 22, `term_extractor.py` 16, `events.py` 14.
+  Memory: lowest 77 % free.
+- Mutation wall time this round: 31 + 21 = 52 min. Not reached: the 11 `tasks.py` mutants left
+  in pass A (pass B did not include `tasks.py`); nothing else. Not mutated at all (mutmut's
+  scope): module-level code and decorated functions (Flask routes, click commands), so the
+  blueprints' route bodies (`glossary.py`, `projects.py`, `stats.py`) and `server.py`'s factory
+  are covered by tests only.
+
+Survivors that pointed at a real gap got tests (`e0cb44d` after pass A, `cc2ffc0` after pass
+B): web failed results, run modes, `run_end` seconds and failure class, a segment dropped before
+its call, the user pause record, the wait extension's `resume_in` and the automatic resume; CLI
+rate-limit pause fields, parallel segment ids and stop error, a failed run's state and mode,
+logged parameters and exit codes; outcome defaults; a record set aside before it was ever
+retired; shape checks past a null or unknown field; token and first-attempt sums and the
+translation-first order; an error call's `chars_in`, durations, warnings; an extraction error
+call's settings; the check script with valid codes and class names, counts after an extraction
+run, two unknown segments, schema-1 segment ids, going on after a project without a record. These kills were not re-verified by another
+mutmut pass (none was run, as instructed); 18 of them were checked by hand: the mutant applied to
+the source, the new test run (with bytecode off: an edit of the same length within one second
+reused a stale `.pyc` once and made one check look like a survivor), each failed, then restored.
+
+Survivors left, and why:
+- log and message wording, logger names and the arguments of log calls (`_thread_excepthook`,
+  `_stop_run`, `_LoggedCommand.invoke`'s usage/interrupt/exception/end texts, the record-failure
+  warnings in `_Session.record` and `TermExtractor._record`, `shape_problem` and
+  `record_problems` reason texts, `ValueError` messages): text, not behaviour;
+- equivalent here: `'CLI'`/`'PROJECT.JSON'` on the case-insensitive macOS file system;
+  `.encode('UTF-8')`, `ensure_ascii` for ASCII-only records, `allow_nan=None` (falsy);
+  `pread(fd, 2, …)` at the end of the file; one lock for every path (`_lock_for(None)`);
+  `retire` adding 2, subtracting 1 or starting at 1 (any change of the generation stops the old
+  run); `'Z'` replacements before `fromisoformat` (Python 3.12 reads `Z`), `round(…, 4)` of
+  millisecond times, `// 1001` for milliseconds; `calls or 1` for a record without `calls`;
+  `None`/`""` for falsy flags and `_pending`/`terms`; `split(None, 1)` / `[+1]` of a command path
+  that always has two parts; the default projects directory's name (its parent is the log
+  directory either way); `WORK_TEXT.get(work, None)` (work is always a known key);
+  `_known`'s last branch (only `error`/`model`/`ts`/`run` reach it); the check script's `and`/`or`
+  of a segment count (no other event has a `result`), its 20-problem cap, the extraction-run
+  skip (an extraction `run_end` has no counts to differ);
+- reached only in child processes, which mutmut cannot link to tests: `_web_end` (9 no tests;
+  `test_web_server_end_line` and `test_review_keeps_terminal_and_cli_log` run it),
+  `proclog.terminal(None)` and the CLI handler name (`TestTerminalOutput` runs them);
+- test helpers: `proclog.teardown` (5), `command_ended` setting `None`.
+
+Real check, only what this round changed (invented two-chapter EPUB in the scratchpad,
+`copilot-sdk` with `claude-haiku-4.5`, timeout 60 s; REAL calls: 3): CLI `init`, `model set`,
+`glossary extract` (1 call, 4 terms), `start -w 2` (2 calls, both accepted at the first
+attempt), `stats`: the report now lists 翻譯 and 術語提取 apart (translation: 2 calls, median
+8.1 s, p90 9.1 s — recomputed in review round 2 by nearest rank over the calls with a reply, as the code now does: median 7.1 s, p90 9.1 s (the two calls took 7.1 and 9.1 s) —, tokens 3,910 / 1,097; extraction: 1 call, 7.5 s, 563 / 522) and says 需多次呼叫.
+Web server on the same projects directory: the request lines appear in the terminal again
+(`[INFO] werkzeug: … "GET /api/projects/…/stats HTTP/1.1" 200`); endpoint JSON equals
+`stats --json` (compared as dicts); the stats page in Chrome shows the 用途 column with both rows,
+the outcome list with backend (翻譯：copilot-sdk / claude-haiku-4.5：accepted 2), and both runs;
+SIGINT to the server's process group wrote `end: web server stopped` into `web.log`.
+`cli.log` has 6 start and 6 `end: exit 0` lines. `run_records_check.py --anonymize`: PASS
+(records 9, skipped 0, runs 2); the record holds none of the book's words. No `copilot
+--headless` process left and no session folder created by these calls left behind.
+
+Not verified this round: the page's empty and skipped-line states again (unchanged code); a real
+rate limit, timeout or refusal (fake backend only, as before).
+
+Suite at the round's last code commit (`522d65b`), three at once:
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw        # three at once
+3130 passed in 283.06s / 284.76s / 283.14s          (no failure, no warning)
+```
+
+## Run records — review round 2
+
+Each behaviour finding was first reproduced by a test in `tests/test_run_records_round2.py`
+that failed on the round's starting commit `f991452` (a `git archive` copy) and passes after
+the fix. All findings reproduced except where said.
+
+| # | Finding | Reproduced | Change |
+|---|---------|------------|--------|
+| 1 | `run_records_check.py` passed JSON lines of the wrong shape (only counted as skipped); a translation call without segment/attempt passed; an unknown `result` crashed; a run id was printed verbatim | yes: `TestCheckScriptShape` (a wrong-typed field and `{"leak": …}` gave PASS; `result: "end"` raised `TypeError`) | the script reads lines itself: not JSON → counted, tolerated; JSON with a shape problem → FAIL (field name only); translation calls need segment and attempt; counts only known results; lines and runs named by position (`8229f31`) |
+| 2 | Median/p90 over every call, cancelled and quick-error calls and timeouts included | yes: `test_durations_over_replies_only` | both nearest rank over accepted/rejected/truncated calls, `seconds_calls` shown, `timeouts` counted apart (CLI, page, docs); quoted numbers marked recomputed (`f911673`) |
+| 3 | `pause` line written after the task lock; pause/resume after the workers were done | yes: forced inside `_workers_done` (before: both returned True, a resume could start workers); a spy showed the pause line written without the lock | the pause line is written in the locked transition; `task.finishing` (set where `_workers_done` ends the run) makes pause and resume return False (`7a7d018`) |
+| 4 | `_fail_task` and the stop path publish the terminal state before `run_end` | `_fail_task`: yes (`test_failed_state_published_after_run_end`: state was `failed` when run_end was written). Stop path: the SSE `stopped` event already followed run_end (`test_stopped_event_after_run_end` passed before the change); the `stopped` state is set by the user's stop request itself | `_fail_task` stops with `finishing` and the stop event and sets `failed` after run_end, under the lock; a rate limit during the failure pauses nothing. The user stop is the stated exception (CLAUDE.md): round 1's "before the state" claim did not hold for it. One existing test that waited for `failed` during the drain now waits for `finishing` (`df9a87b`, `458639b`) |
+| 5 | Retranslate: an exception after the counts were set replaced them | yes: `test_retranslate_keeps_counts_when_the_answer_fails` | the error branches keep the counts (`354f3ac`) |
+| 6 | CLI `glossary extract` wrote `completed` before the save; an exception before the `try` left no end | yes: `TestCliExtractLifecycle` (3) | one `try` from the extractor to the save; `completed`/`stopped` with `terms` and `added` only after the save, `failed` with the error class otherwise, `interrupted` on Ctrl-C (`5841304`) |
+| 7 | Extraction: Ctrl-C while a reply is read loses the call; empty model recorded | yes: `TestExtractionRound2` (3) | recorded `cancelled`; the record names the backend's default model. The request keeps passing no model flag when none is given (an existing test asserts that the program's own default is used), so only the record changed (`e7446f3`) |
+| 8 | `git describe --dirty` takes `.git/index.lock` | by reading, not forced: a scratch repository with `index.lock` held showed `git describe --dirty` still answering (the lock is optional, so git skips it when taken) — the collision the other way (our refresh holding the lock while a `git commit` starts) was not forced | `GIT_OPTIONAL_LOCKS=0` in the command's environment; `test_version_takes_no_git_lock` asserted it (`e6b3b77`). **Corrected in review round 3:** this had no effect — an experiment (git 2.50, scratch repository, a touched file) showed `describe --dirty` rewriting `.git/index` with and without the variable; since round 3 the program reads no git at all (round 3, item 7) |
+| 9 | Delete: an append past its checks could recreate the record during `rmtree` | yes: `test_delete_waits_for_an_append_in_progress` (append held after its checks; before, the project directory existed again afterwards) | `events.retired()`: retire and delete under the record's lock (`458639b`) |
+| 10 | `phase1_reverts.py`: revert 5's anchor no longer found | yes, and five more: the first rerun reported `BAD` for 16, 19, 24, R2-17, R3-7 (old text changed by this branch) | anchors updated (`c1d7394`, `39ecc95`); the script's result is below |
+| 11 | Page lists codes by name; duration from timestamps | yes: `test_codes_by_count_and_measured_duration` (summary ties), `test_page_sorts_codes_by_count` | page sorts by count (ties by code), the summary breaks ties the same way; a finished run's duration is its `run_end.seconds` (`302e9c9`) |
+| 12 | `task.events` set before `run_start`: a failure between writes a lone `run_end` | yes: `test_no_run_end_without_run_start` | emit first, then assign (`d72a03a`) |
+| 13 | Free-text `glossary add -c` logged verbatim | yes: `test_free_text_category_logged_by_length` | a category outside the known ones is logged by length (`727b299`) |
+
+Documented only (`known-issues.md`, `49f2924`): delete/replace during a web extraction or
+retranslation (results can still be written); two extractions at once; a CLI extraction during a
+web replacement; a web run paused when the server stops stays unfinished; migrated schema-1
+records name old segment ids; filtered extraction replies recorded as accepted, filtered SDK
+refusals' tokens not recorded.
+
+Not changing (answers to the review):
+- Worker ids stay in the process log (they tie a line to a worker thread; no book text).
+- The record's `model` field is not validated against known model ids (the list is static and can lag the backends; a pattern check stays in the check script).
+- CLI parse failures (before a command starts) are not logged (click rejects them before `invoke`; the terminal shows them).
+
+Mutation for round 2's changes is deferred to the final pass after the last review round, as
+instructed; none was run in this round.
+
+Page check (an invented record of 14 lines: four rejected codes with ties, a cancelled call at
+0.1 s, a timeout at 60 s, a `run_end` with `seconds: 88.5` 100 s after `run_start`): the web
+endpoint's JSON equals `stats --json`; the page, rendered by Chrome (headless, its own profile:
+the Chrome extension did not connect on this machine), shows `not_html 2, empty_reply 1,
+tag_count 1` in that order, the outcomes `rejected 4、accepted 3、cancelled 1、timeout 1`, the
+reply durations over 7 calls (median 6.0 s, p90 9.0 s; timeouts 1) and the run's duration
+88.5 s — the same numbers as the JSON.
+
+`scripts/verify/phase1_reverts.py` at `39ecc95`: all 105 reverts detected (`reverts not
+detected: 0`, exit 0); before the anchor fixes, at `c1d7394`, 100 OK and 5 BAD (old text not
+found).
+
+Suite at `83102b5`: once alone `3152 passed in 282.57s`; three at once `3152 passed in 280.52s
+/ 282.43s / 281.97s` (no failure, no warning).
+
+## Run records — review round 3
+
+Each behaviour finding was first reproduced by a test in `tests/test_run_records_round3.py`
+that failed on the round's starting commit `9c4105f` (a `git archive` copy) and passes after
+the fix.
+
+| # | Finding | Reproduced | Change |
+|---|---------|------------|--------|
+| 1 | Hang: a worker between its stop check and the pause gate, a streak stop opening the gate, then a user pause closing it | **yes, real**: forced with a gated pause event (the worker held at its sixth `wait()`); the pause was accepted and the coordinator was still alive 10 s later. The window existed on `main` too: its `pause_translation` checks only the state and its streak stop sets `stop_event` and opens the gate the same way | a pause is refused once `stop_event` is set, under the task lock, as the streak stop's transition is (`8d5d0b0`) |
+| 2 | `stop_translation` ignored `finishing` | yes: a stop after the last result recorded `stopped` with everything translated; a stop in a failure's drain flipped the state to `stopped` | a stop changes nothing once `finishing` is set; the start path still joins the coordinator (`8d5d0b0`) |
+| 3 | `_fail_task` raising left the task `running` and `run_end` saying `running` | yes (`test_a_failing_failure_handler_still_ends_the_run`: the run never reached a terminal state) | the error class is set before the handler; the coordinator's `finally` ends any non-terminal run with `run_end('failed')` and the failed state, under the lock (`dae43dc`) |
+| 4 | Pause/resume refused while finishing answered 500 with the running state | yes: the endpoint answered 500, 500 | 409 `{ending: true}` without a state; the page keeps its state for that answer and the `complete` event clears an error. Checked by a test of the endpoint (the forced interleaving through the Flask client) and a test of the page source; the page's behaviour itself was not forced in a browser (the extension did not connect, and headless Chrome cannot click at the right moment) — reasoned from the handler: an `ending` answer returns before any state or error is set (`5ce06f0`) |
+| 5 | CLI extract: Ctrl-C during the save recorded `failed`; `added` lost by a closed pipe after the save. Web extract: a failed save dropped `terms` | yes (`TestExtractionEnds`, 3) | `interrupted` with `KeyboardInterrupt`; `added` set right after the save; the web keeps `terms` (`b50acec`) |
+| 6 | `--since`: a run begun before the cutoff paired the first selected line with the whole run's duration | yes (`test_run_started_before_since`) | such a run has `start` None (text and page: 開始不在所選紀錄中) and only the duration its run_end measured (none when unfinished); two older tests updated for that (`1554660`) |
+| 7 | `describe --dirty` takes `index.lock` regardless of `GIT_OPTIONAL_LOCKS` | yes, by experiment (git 2.50, a scratch repository, a touched tracked file): `describe --dirty` rewrote `.git/index` with and without the variable; `GIT_OPTIONAL_LOCKS=0 git status --porcelain --untracked-files=no` and `describe --always` did not. So round 2's fix had no effect | at the owner's decision the program reads no git at all: the start line's version is `src.__version__` only, so there is no lock, no dependence on a checkout, and the version comes from the release process. `__version__` is 2.0.0, `CHANGELOG.md` added, the release rule in CLAUDE.md ("Releases", referenced from README); tests: the start line carries `__version__` and `proclog` starts no process; the changelog's top heading, `__version__` and `--version` agree. The line no longer says whether the tree had uncommitted changes (`known-issues.md`) (`4b941c3`, `ebf61fe`, `b5009a9`) |
+| 8 | Retranslation and web extraction built their recorder after the snapshot's lock | yes: a replacement forced right after the snapshot (from another thread, under the project mutex) put their lines into the new book's record | the recorder is created in the same locked section as the snapshot (`3afb2c6`) |
+| 9 | Unreachable `finishing` check in `_pause_for`; the delete test's 0.5 s join | — | check removed (its only caller returns once `stop_event` is set); the delete test waits until the deleter is seen blocked on the record's lock and asserts the thread's end and the 200 answer; it still fails against the code before round 2's fix (`59d713f`) |
+
+Documented only: Ctrl-C in a parallel CLI run between a result's count and its `segment` line
+(`known-issues.md`).
+
+Not changing: none asked this round.
+
+### Review round 3: suite, final mutation pass, reverts
+
+Suite once alone at `b5009a9` (all round-3 fixes): `3166 passed in 290.67s`, no failure, no
+warning.
+
+**Final mutation pass** (deferred from round 2; base `f991452`, the end of round 1, so the lines
+changed in rounds 2 and 3; file filter = every source file changed in those rounds:
+`run_records_check.py`, `events.py`, `proclog.py`, `stats.py`, `term_extractor.py`, the
+`glossary`/`projects`/`review`/`translation` blueprints, `tasks.py`, `translate.py`,
+`src/__init__.py`; 12 workers; 35 min bound). The first start stopped in mutmut's stats run: the
+changelog test could not find `CHANGELOG.md` in mutmut's run directory, which copies only its
+source paths; `mutation.py` now copies it too (`6124484`). The second run finished in 17 min
+(19:42–19:59), lowest free memory 45 %: `TOTAL mutants 416 killed 391 survived 25 timeout 0
+suspicious 0 untested 0`. Every changed line in the filter was reached. Not mutated at all
+(mutmut's scope): route bodies of the blueprints, `events.retired` (a decorated context
+manager), and lines that were only deleted (`proclog`'s git code).
+
+Survivors that showed a gap got tests (`dbae00f`; each kill checked by hand with bytecode off,
+not by another mutmut run): two timeouts counted; a coordinator left by a `BaseException` ends
+`failed` with `UnexpectedExit` and `finishing`; the check script reads on after a blank line,
+counts two cut lines, keeps a translation call's base requirements, asks no segment of an
+extraction call. Survivors left, and why:
+- log text (`翻譯任務的失敗處理也失敗` and its `None`);
+- equivalent here: `info.pop('started', None)` (falsy either way); `(info['end']) or True` for a
+  run without a selected run_start (its `seconds` exist only with a run_end); `_parsed(None/True,
+  error=e)` (with an error the flag decides nothing); `'failed'` misspelt in the finally's
+  terminal set (`_end_record` writes once and the state is `failed` already); `finishing = None`
+  (falsy, set after the run ended); `_end_record(task, None)` in the else branch (a terminal state
+  means run_end was written already); `record_problems(r, None)` (the parameter is not used
+  there); `decode('UTF-8')`;
+- the check script's 20-problem cap boundary (`<=`, `< 21`).
+
+Three suites at once at `dbae00f` (the final code and tests): `3171 passed in 294.23s /
+290.23s / 290.23s`, no failure, no warning. `scripts/verify/phase1_reverts.py`: all 105 reverts
+detected (exit 0); `scripts/verify/phase1_survivor_kills.py`: every recorded mutant killed
+(`not killed 0`, exit 0), both at `16ccb89`.
+
+## Run records — review round 4
+
+Each finding was first reproduced by a test (appended to `tests/test_run_records_round3.py`)
+that failed on the round's starting commit `de0b3fd` (a `git archive` copy) and passes after the
+fix.
+
+| # | Finding | Reproduced | Change |
+|---|---------|------------|--------|
+| 1 | The coordinator's `finally` fallback (a way out that left no terminal state) recorded `failed` and released the lock but left the workers running: one parked at the pause gate waited for ever, and as `finishing` makes stop a no-op the project could not be started again | yes (`test_unexpected_exit_stops_a_worker_at_the_pause_gate`: the worker was still alive after the coordinator left) | the fallback sets stop, cancel and the pause gate as `_fail_task` does, joins the workers (`STOP_WAIT_SECONDS` each), then writes `run_end` and the failed state and releases the lock; the test starts the same project again and it completes (`d7fee58`). The test's first version was racy (it waited for an empty result queue, which the fast fake backend could fill first; it failed once in three concurrent suites); it now parks the worker deterministically (its second call ends only after the pause, the gate records a wait while closed) and asserts `UnexpectedExit`, i.e. the fallback ran (`4542ed4`) |
+| 2 | The pause endpoint checked `finishing` once, before the manager's call, and `stop_event` not at all: a pause/resume refused because the run began ending in between, or after a streak stop, answered 500 with the running state | yes (`TestPauseEndpointEnding`, both triggers: 500 instead of 409) | 409 `{ending: true}` when `finishing` or `stop_event` is set, before the call and again after a refused one (`b261057`) |
+| 3 | CLI `glossary extract`: a closed stdout at the stop notice lost the term count in `run_end` | yes (`test_stopped_extraction_keeps_terms_when_stdout_closes`: `KeyError: 'terms'`) | the count is in the end record before the notice is printed (`b261057`; the survivor-kill anchor `cli90` follows the notice's new text) |
+| 4 | `proclog`'s module docstring still spoke of the git commit | — (text) | corrected; a grep of CLAUDE.md, README, `known-issues.md`, `CHANGELOG.md`, `src/` and `translate.py` for `git describe`, `git commit`, `rev-parse`, `GIT_OPTIONAL_LOCKS` and `dirty` finds no other leftover (`b261057`) |
+
+A pre-existing flake (on `main` too) showed up in a three-suite run:
+`test_rules_1_and_2_export_alike[bilingual-vertical]` refused the export with a hash mismatch. The
+test writes `book.epub` twice into one directory; the first project records the first file's
+digest and reads that path (it has no `source.epub`), and `write_raw_epub` stamped members with
+the current time, so two writes on either side of a zip time step (2 s) differ. Forced by writing
+the book twice 2.1 s apart (digests differed); `write_raw_epub` now uses a fixed member time and
+the forced check gives the same digest (`c3da4e3`).
+
+Suite once alone at `b261057` (the four fixes): `3175 passed in 301.22s`, no failure, no
+warning. Three suites at once at `40ffa4c` (after both test fixes): `3175 passed in 307.10s /
+300.84s / 304.03s`, no failure, no warning. At the same commit
+`scripts/verify/phase1_survivor_kills.py` killed every recorded mutant (`not killed 0`, the changed
+anchor `cli90` included) and `scripts/verify/phase1_reverts.py` detected every revert
+(`reverts not detected: 0`).
+
+Optional item: the start-line test no longer also searches proclog's source for `subprocess`;
+the behavioural part (`subprocess.Popen` patched to fail during `proclog.setup`) stays. The other
+source-text tests of round 3 (the page's handlers, the changelog) were kept: the page cannot be
+driven here (see "Not verified").
+
+Mutation was not rerun for these four changes: each behaviour change has a test that failed
+first on `de0b3fd` and passes now, and the round asked for no mutation run. No real model calls.
+
+### Not verified, for the whole feature
+
+- Real rate limits, timeouts, refusals and truncated replies: their outcome classes are tested with
+  the fake backend only; no real backend produced one in the checks.
+- `claude-cli` and `copilot-cli` in a real run with the records (only `copilot-sdk` was run for
+  real); token counts of `claude-cli` (it reports none).
+- Two processes rotating the same process log at the same moment; a crash in the middle of an
+  append (simulated with a cut-off line only); a full disk (a short write is simulated).
+- The Ctrl-C path of a web server during a run; a web server stopped while a run is paused.
+- The page's handling of a 409 `ending` answer in a real browser at the moment a run ends (tested
+  through the endpoint and the page source, see item 4); the stats page was rendered by headless
+  Chrome, not driven by a person.
+- Cross-process ordering: a CLI run and a web run of the same project in different processes are
+  kept apart only by `project.lock`; generations (`retire`) work within one process.
+- Real books: no record of a real project was produced or checked in this work
+  (`run_records_check.py` was run on invented projects only).
+- Lines changed after the final mutation pass: only tests and documents.

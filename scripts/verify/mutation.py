@@ -1,7 +1,11 @@
 """Mutation testing over the lines changed on this branch (mutmut 3.8.1).
 
 Run through scripts/verify/mutation.sh, in the project environment (both
-requirements files, mutmut 3.8.1). argv: BASE.
+requirements files, mutmut 3.8.1). argv: BASE [MAX_CHILDREN [FILE...]]
+(MAX_CHILDREN: mutmut's --max-children, the number of mutant workers, '' or
+absent: mutmut's default, one per core; a smaller number bounds the memory
+and CPU used. FILE...: only these of FILES are mutated; a name not in FILES
+is refused, exit 2).
 
 Mutates only the lines added or changed versus the merge base with BASE in
 FILES, in a copy of the working tree under a temporary directory (the
@@ -59,12 +63,13 @@ MUTMUT_VERSION = '3.8.1'
 RENAMED = 'epubtr'
 FILES = [
     'src/__init__.py', 'src/core/project.py', 'src/core/runcontrol.py', 'src/core/segmenter.py', 'src/core/translator.py',
-    'src/core/migrate.py', 'src/core/validation.py', 'src/epub/blocks.py', 'src/epub/extractor.py', 'src/epub/exporter.py',
+    'src/core/migrate.py', 'src/core/validation.py', 'src/core/events.py', 'src/core/stats.py',
+    'src/core/proclog.py', 'src/epub/blocks.py', 'src/epub/extractor.py', 'src/epub/exporter.py',
     'src/glossary/glossary_manager.py', 'src/glossary/term_extractor.py',
     'src/llm/__init__.py', 'src/llm/base.py', 'src/llm/cli.py', 'src/llm/claude_cli.py',
     'src/llm/copilot_cli.py', 'src/llm/copilot_sdk.py', 'src/llm/fake.py', 'src/web/tasks.py', 'src/web/server.py', 'src/web/blueprints/export.py', 'src/web/blueprints/home.py',
     'src/web/blueprints/glossary.py', 'src/web/blueprints/projects.py',
-    'src/web/blueprints/review.py', 'src/web/blueprints/search.py',
+    'src/web/blueprints/review.py', 'src/web/blueprints/search.py', 'src/web/blueprints/stats.py',
     'src/web/blueprints/translation.py', 'translate.py',
     'scripts/verify/phase0_code_segments.py', 'scripts/verify/phase1_load_projects.py',
     'scripts/verify/phase2_roundtrip.py', 'scripts/verify/phase2_migrate_copies.py',
@@ -73,7 +78,7 @@ FILES = [
     'scripts/verify/phase7_cli_overhead.py', 'scripts/verify/phase7_throughput.py',
     'scripts/verify/phase8_extraction_compare.py', 'scripts/verify/phase8_brief_sample.py',
     'scripts/verify/phase9_copilot_overhead.py', 'scripts/verify/phase10_effort_check.py',
-    'scripts/verify/phase12_sdk_check.py',
+    'scripts/verify/phase12_sdk_check.py', 'scripts/verify/run_records_check.py',
 ]
 MODULE_REF = re.compile(r'\bsrc\.(core|epub|web|glossary|llm)\b')
 OK = ('killed',)  # any other status, known or not, fails the run
@@ -85,7 +90,7 @@ with open('changed.json') as f:
     CHANGED = {os.path.abspath(p): set(lines) for p, lines in json.load(f).items()}
 main.get_covered_lines_for_file = lambda filename, covered: CHANGED.get(
     os.path.abspath(filename), set())
-sys.argv = ['mutmut', 'run']
+sys.argv = ['mutmut', 'run'] + sys.argv[1:]
 main.cli()
 '''
 
@@ -167,7 +172,7 @@ def prepare(copy: str, changed: dict) -> None:
     with open(os.path.join(copy, 'setup.cfg'), 'w') as fh:
         fh.write(f'[mutmut]\nsource_paths={RENAMED}\n    scripts\n    translate.py\n'
                  f'only_mutate={only}\npytest_add_cli_args_test_selection=tests/\n'
-                 'also_copy=tests\npytest_add_cli_args=-p no:cacheprovider\n')
+                 'also_copy=tests\n    CHANGELOG.md\npytest_add_cli_args=-p no:cacheprovider\n')
     os.makedirs(os.path.join(copy, 'site'))
     with open(os.path.join(copy, 'site', 'sitecustomize.py'), 'w') as fh:
         fh.write(SITECUSTOMIZE)
@@ -188,13 +193,19 @@ def stop_group(proc) -> None:
         time.sleep(1)  # let the other members act on the signal
 
 
-def main(base: str) -> int:
+def main(base: str, max_children: int | None = None, only: list | None = None) -> int:
     if version('mutmut') != MUTMUT_VERSION:
         print(f'mutmut {MUTMUT_VERSION} required (found {version("mutmut")}): '
               'pip install -r requirements-dev.txt', file=sys.stderr)
         return 2
     os.chdir(git('rev-parse', '--show-toplevel').strip())
+    unknown = sorted(set(only or ()) - set(FILES))
+    if unknown:
+        print('not in FILES: ' + ', '.join(unknown), file=sys.stderr)
+        return 2
     changed = changed_lines(git('merge-base', base, 'HEAD').strip())
+    if only:
+        changed = {f: lines for f, lines in changed.items() if f in only}
     if not changed:
         print('no changed lines')
         return 2
@@ -211,7 +222,8 @@ def main(base: str) -> int:
         print('mutating the changed lines of ' + ', '.join(changed), flush=True)
         with open(os.path.join(work, 'run.log'), 'w') as log:
             # its own process group, stopped as a whole on any exit
-            proc = subprocess.Popen([sys.executable, '-c', RUNNER], cwd=copy, env=env,
+            limit = [] if max_children is None else ['--max-children', str(max_children)]
+            proc = subprocess.Popen([sys.executable, '-c', RUNNER] + limit, cwd=copy, env=env,
                                     stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             returncode = proc.wait()
         if returncode != 0:
@@ -256,4 +268,6 @@ def main(base: str) -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else 'main'))
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else 'main',
+                  int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None,
+                  sys.argv[3:]))

@@ -24,6 +24,7 @@ exported as translation and which stayed in the original language, and why.
 from __future__ import annotations
 
 import copy
+import logging
 import os
 import posixpath
 import re
@@ -47,6 +48,8 @@ from src.epub.extractor import (
     XHTML_MEDIA_TYPE, EPUBError, find_body, open_archive, package_path, parse_xml,
     read_member, read_package, unresolved_entities,
 )
+
+logger = logging.getLogger(__name__)
 
 FORMATS = ('chinese-only', 'bilingual-horizontal', 'bilingual-vertical')
 TARGET_LANG = 'zh-TW'
@@ -181,11 +184,21 @@ def export_project(project_dir: str, output_path: str, fmt: str) -> ExportReport
     the project lock while it reads the project."""
     if fmt not in FORMATS:
         raise ValueError(f"Invalid format: {fmt}. Must be one of {FORMATS}")
+    logger.info("匯出開始: %s (%s)", os.path.basename(os.path.abspath(project_dir)), fmt)
     try:
         with ProjectLock(project_dir):
-            return _export(project_dir, output_path, fmt)
+            report = _export(project_dir, output_path, fmt)
     except ProjectLockedError as e:
+        logger.warning("匯出失敗: %s", e)
         raise ExportError(str(e)) from e
+    except ExportError as e:
+        logger.warning("匯出失敗: %s", e)
+        raise
+    except Exception:
+        logger.exception("匯出時發生未預期的錯誤")
+        raise
+    logger.info("匯出完成: %s %s", os.path.basename(output_path), report.summary())
+    return report
 
 
 def _export(project_dir: str, output_path: str, fmt: str) -> ExportReport:

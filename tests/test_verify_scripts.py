@@ -5947,7 +5947,7 @@ PHASE12_EXPECTED = """\
   ok   cancelled: session went idle as aborted  idle events 1
   ok   cancelled: no assistant.usage (nothing reported billed)
   ok   cancelled: session deleted
-  timed out    TransientError           wall   N s  in     0  out     0  cost []  effort []
+  timed out    CallTimeoutError         wall   N s  in     0  out     0  cost []  effort []
   ok   timed out: TransientError
   ok   timed out: the model call had started
   ok   timed out: returned within 1 s  N s

@@ -55,7 +55,7 @@ import uuid
 from typing import List, Optional
 
 from src.llm.base import (
-    AuthError, BackendUnavailableError, CancelledError, Capabilities, LLMError, LLMRequest,
+    AuthError, BackendUnavailableError, CallTimeoutError, CancelledError, Capabilities, LLMError, LLMRequest,
     LLMResponse, ModelInfo, RateLimitError, RefusalError, TransientError, Usage,
 )
 from src.llm.cli import ERROR_CHARS, POLL_SECONDS, SYSTEM_PROMPT, flatten_prompt
@@ -134,7 +134,7 @@ def _error(error: Exception, messages: List[str]) -> LLMError:
     full = redact(' | '.join([str(error)] + messages))
     joined = full[:ERROR_CHARS]
     if isinstance(error, TimeoutError):
-        return TransientError(f'copilot SDK timed out: {joined}')
+        return CallTimeoutError(f'copilot SDK timed out: {joined}')
     if type(error).__name__ == 'ProcessExitedError':
         # The runtime exited (its message can quote its stderr): never a pattern
         return TransientError(f'copilot SDK: {joined}')
@@ -301,13 +301,13 @@ class CopilotSDK:
                     if cancel.is_set():
                         raise CancelledError('cancelled')
                     if time.monotonic() >= deadline:
-                        raise TransientError(f'{self.name} timed out after {request.timeout:g} s')
+                        raise CallTimeoutError(f'{self.name} timed out after {request.timeout:g} s')
                     continue
                 # Finished: still refuse the reply of a cancelled or late call
                 if cancel.is_set():
                     raise CancelledError('cancelled')
                 if time.monotonic() > deadline:
-                    raise TransientError(f'{self.name} timed out after {request.timeout:g} s')
+                    raise CallTimeoutError(f'{self.name} timed out after {request.timeout:g} s')
                 return response
         finally:
             # A turn still running aborts and deletes its session (on the
