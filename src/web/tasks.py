@@ -629,9 +629,22 @@ class TaskManager:
                 }})
 
         except Exception as e:
-            self._fail_task(task, e, saver)
+            task.error_class = type(e).__name__  # the event record
+            try:
+                self._fail_task(task, e, saver)
+            except Exception:  # noqa: BLE001 - the run still ends, below
+                logger.exception("翻譯任務的失敗處理也失敗")
         finally:
-            self._end_record(task, task.state)  # when nothing above wrote it
+            with task._lock:
+                if task.state not in ('completed', 'stopped', 'failed'):
+                    # Any other way out (also a failure inside _fail_task):
+                    # the run failed, and says so after its run_end
+                    task.error_class = task.error_class or 'UnexpectedExit'
+                    self._end_record(task, 'failed')
+                    task.state = 'failed'
+                    task.finishing = True
+                else:
+                    self._end_record(task, task.state)  # when nothing above wrote it
             if task.project_lock is not None:
                 task.project_lock.release()
             teardown_project_logging(handler)
