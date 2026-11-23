@@ -3383,7 +3383,9 @@ class TestRound3StaleResultInFailureDrain:
                                    segment_ids=['ch1_seg0003', 'ch2_seg0001'],
                                    num_workers=2)
             assert in_flight.wait(60)
-            _wait(lambda: task.state == 'failed', timeout=60)  # the drain waits for this call
+            # the failure has begun (the state says failed only after run_end, once
+            # the drain is done); the drain waits for this call
+            _wait(lambda: task.finishing, timeout=60)
             task.pm.update_translation('ch2_seg0001', '人工')  # edited while in flight
             release.set()
             _finish(task, patcher)

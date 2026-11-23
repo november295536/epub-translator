@@ -15,6 +15,7 @@ never fails or blocks a translation beyond the write itself.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import json
 import logging
@@ -68,6 +69,16 @@ def retire(project_dir: str) -> None:
     key = os.path.abspath(events_path(project_dir))
     with _locks_guard:
         _generations[key] = _generations.get(key, 0) + 1
+
+
+@contextlib.contextmanager
+def retired(project_dir: str):
+    """Retire the project's record and hold its lock while the caller
+    deletes the project: an append that already passed its checks finishes
+    first, and every later one sees the retirement."""
+    with _lock_for(events_path(project_dir)):
+        retire(project_dir)
+        yield
 
 
 def _generation(path: str) -> int:
