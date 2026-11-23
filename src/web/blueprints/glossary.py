@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
+import time
 from dataclasses import asdict
 from flask import Blueprint, request, jsonify, current_app
 
+from src.core.events import RunEvents, settings_fields
 from src.core.project import ProjectManager
 from src.core.segmenter import SegmentType
 from src.glossary.glossary_manager import GlossaryManager
 from src.glossary.term_extractor import ExtractionError, TermExtractor
 
+
+logger = logging.getLogger(__name__)
 
 glossary_bp = Blueprint('glossary', __name__)
 
@@ -144,15 +149,24 @@ def extract_terms(project_name: str):
     # Get config for thread
     projects_dir = current_app.config['PROJECTS_DIR']
 
+    project_dir = os.path.join(projects_dir, project_name)
+    events = RunEvents(project_dir, 'extract')
+    events.emit('run_start', segments=len(segments), **settings_fields(settings))
+    logger.info("術語提取開始: %s (%d 段)", project_name, len(segments))
+
     def run_extraction():
+        started = time.monotonic()
+        end = {'state': 'failed'}
         try:
-            extractor = TermExtractor(**settings.call_args())
+            extractor = TermExtractor(**settings.call_args(), events=events)
             stopped = None
             try:
                 terms = extractor.extract_from_segments(segments)
             except ExtractionError as e:
                 # Keep the terms of the batches finished before the stop
                 stopped, terms = e, e.terms
+            # (a stop's cause is in the record of the call that hit it)
+            end = {'state': 'completed' if stopped is None else 'stopped', 'terms': len(terms)}
 
             # Add extracted terms to glossary
             glossary_path = os.path.join(projects_dir, project_name, 'glossary.json')
@@ -171,10 +185,16 @@ def extract_terms(project_name: str):
             if stopped is not None:
                 _extraction_tasks[project_name]['error'] = (
                     f'提取中斷：{stopped}（已加入先前批次的 {count} 個術語）')
+            end['added'] = count
+            logger.info("術語提取結束: %s (%s, %d 個術語, 新增 %d)", project_name,
+                        end['state'], len(terms), count)
         except Exception as e:
+            logger.exception("術語提取失敗: %s", project_name)
+            end = {'state': 'failed', 'error': type(e).__name__}
             _extraction_tasks[project_name]['error'] = str(e)
         finally:
             _extraction_tasks[project_name]['running'] = False
+            events.emit('run_end', seconds=round(time.monotonic() - started, 3), **end)
 
     thread = threading.Thread(target=run_extraction, daemon=True)
     thread.start()

@@ -10,6 +10,7 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
+from src.core.events import RunEvents, segment_result, settings_fields
 from src.core.project import ProjectLock, ProjectManager, SegmentStatus, project_mutex
 from src.core.runcontrol import DebouncedSaver, resume_delay
 from src.core.translator import (
@@ -37,6 +38,10 @@ RUN_ERROR_EVENTS = (
     (BackendUnavailableError, 'backend_error'),
 )
 RUN_ERRORS = tuple(cls for cls, _ in RUN_ERROR_EVENTS)
+
+# The pause reason in the event record of each run-level error event
+PAUSE_REASONS = {'auth_error': 'auth', 'rate_limit': 'rate_limit',
+                 'backend_error': 'backend_unavailable'}
 
 
 def setup_project_logging(project_dir: str) -> logging.Handler:
@@ -163,6 +168,12 @@ class TranslationTask:
     _coordinator: threading.Thread | None = field(default=None, repr=False)
     # segment id -> (revision, status) when the segment was queued
     queued: dict = field(default_factory=dict, repr=False)
+    # The run's event record (log/events.jsonl) and its counts
+    events: RunEvents | None = field(default=None, repr=False)
+    counts: dict = field(default_factory=lambda: {'translated': 0, 'failed': 0, 'dropped': 0},
+                         repr=False)
+    started: float = 0.0  # TaskManager.clock() at the start
+    error_class: str | None = None  # the exception that failed the coordinator
 
     def threads_alive(self) -> bool:
         """True while the coordinator or any worker of this task runs."""
@@ -339,6 +350,13 @@ class TaskManager:
                     task.queued[seg.segment_id] = (seg.revision, seg.status)
                     task.segment_queue.put(seg)
 
+                task.events = RunEvents(project_dir, 'web')
+                task.started = self.clock()
+                task.events.emit('run_start', workers=num_workers, segments=task.total,
+                                 mode='selected' if segment_ids is not None else
+                                 ('retry_failed' if retry_failed else 'pending'),
+                                 **settings_fields(pm.call_settings()))
+
                 coordinator = threading.Thread(
                     target=self._run_translation,
                     args=(task,),
@@ -366,11 +384,15 @@ class TaskManager:
         with task._lock:
             if task.state not in ('running', 'paused'):
                 return False
+            # A new pause (not a repeated click on a paused task) is recorded
+            recorded = task.state == 'running' or task.resume_at is not None
             task.state = 'paused'
             task.resume_at = None
             task.flush_due = True  # saved at the next tick, also if resumed before it
             task.pause_event.clear()
             task.cancel_event.set()  # the calls in flight end; their segments wait
+        if recorded and task.events is not None:
+            task.events.emit('pause', reason='user', completed=task.completed)
         task.progress.put({'event': 'paused', 'data': {
             'completed': task.completed,
             'remaining': task.total - task.completed
@@ -417,6 +439,9 @@ class TaskManager:
             # can go on holding an event that nothing will set any more
             task.cancel_event.set()
             task.cancel_event = threading.Event()  # before the workers go on
+            if task.events is not None:
+                task.events.emit('resume', reason='user' if due is None else 'auto',
+                                 workers=task.num_workers)
             if due is not None:  # automatic: announced before anything can pause again
                 task.progress.put({'event': 'resumed', 'data': {
                     'completed': task.completed,
@@ -581,6 +606,10 @@ class TaskManager:
             if task.project_lock is not None:
                 task.project_lock.release()
             teardown_project_logging(handler)
+            if task.events is not None:
+                task.events.emit('run_end', state=task.state, **task.counts,
+                                 seconds=round(self.clock() - task.started, 3),
+                                 error=task.error_class)
 
     def _workers_done(self, task: TranslationTask) -> bool:
         """Every worker has ended and every result was taken. A segment
@@ -619,6 +648,7 @@ class TaskManager:
         """The coordinator failed: stop dispatching, end the calls in
         flight, save what can be saved and report every result not saved,
         before the caller releases the lock."""
+        task.error_class = type(error).__name__  # the event record
         with task._lock:
             task.state = 'failed'
             task.resume_at = None  # a failed run does not resume
@@ -662,11 +692,15 @@ class TaskManager:
         if outcome is None:
             # Skipped by the worker: edited or approved after it was queued
             logger.info("段落已在排隊期間被編輯，略過: %s", res.segment_id)
+            self._record(task, res.segment_id, None, 'dropped', 'edited_before_call')
         elif not pm.apply_outcome(res.segment_id, outcome, revision=res.revision):
             # Edited while its translation was in flight: the edit wins
             logger.info("段落已在翻譯期間被編輯，捨棄結果: %s", res.segment_id)
+            self._record(task, res.segment_id, outcome, 'dropped', 'edited_during_call')
             outcome = None
-        elif outcome.status == SegmentStatus.FAILED:
+        else:
+            self._record(task, res.segment_id, outcome)
+        if outcome is not None and outcome.status == SegmentStatus.FAILED:
             detail = outcome.issues[0].detail
             logger.warning("段落翻譯失敗: %s — %s", res.segment_id, detail)
             task.progress.put({'event': 'segment_error', 'data': {
@@ -693,6 +727,15 @@ class TaskManager:
         }})
         return True
 
+    @staticmethod
+    def _record(task: TranslationTask, segment_id: str, outcome, result=None,
+                reason=None) -> None:
+        """A segment's result in the event record and the run's counts."""
+        if result is None:
+            result = 'failed' if outcome.status == SegmentStatus.FAILED else 'translated'
+        task.counts[result] += 1
+        segment_result(task.events, segment_id, outcome, result=result, reason=reason)
+
     def _pause_for(self, task: TranslationTask, error: Exception, event_name: str) -> None:
         """A run-level error pauses the task (under task._lock). A rate limit
         resumes by itself after resume_delay; any other error waits for the
@@ -704,6 +747,9 @@ class TaskManager:
         elif task.state == 'paused' and task.resume_at is not None:
             if delay is not None:  # another rate limit during the wait
                 task.resume_at = max(task.resume_at, self.clock() + delay)
+                if task.events is not None:
+                    task.events.emit('wait_extended', reason='rate_limit',
+                                     resume_in=round(task.resume_at - self.clock(), 3))
                 task.progress.put({'event': 'rate_limit', 'data': {
                     'error': task.error,
                     'completed': task.completed,
@@ -717,6 +763,9 @@ class TaskManager:
         task.flush_due = True  # saved at the next tick, also if resumed before it
         task.error = str(error)  # for a page opened later
         task.resume_at = None if delay is None else self.clock() + delay
+        if task.events is not None:
+            task.events.emit('pause', reason=PAUSE_REASONS[event_name], error=type(error).__name__,
+                             resume_in=delay, completed=task.completed)
         task.progress.put({'event': event_name, 'data': {
             'error': str(error),
             'completed': task.completed,
@@ -781,7 +830,8 @@ class TaskManager:
                     if current is not None and wanted.model != current.model:
                         logger.info("[%s] 模型切換: %s → %s", tag, current.model, wanted.model)
                     current = wanted
-                    engine = TranslationEngine(**current.call_args(), interrupted=interrupted)
+                    engine = TranslationEngine(**current.call_args(), interrupted=interrupted,
+                                               events=task.events)
 
                 revision, queued_status = task.queued.get(
                     seg.segment_id, (seg.revision, seg.status))
