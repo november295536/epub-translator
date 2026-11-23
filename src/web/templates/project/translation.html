@@ -629,8 +629,8 @@ function translationController() {
             this.eventSource.addEventListener('complete', (e) => {
                 const data = JSON.parse(e.data);
                 this.state = 'completed';
-                this.error = null;  // e.g. a refused pause while the run ended
                 this.autoResume = false;
+                this.error = null;  // e.g. a refused pause while the run ended
                 this.currentSegment = null;
                 this.completed = data.total_translated;
                 if (this.total > 0) {
