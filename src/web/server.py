@@ -42,12 +42,9 @@ def create_app(projects_dir: str | None = None) -> Flask:
 
     # Configure logging for all src.* modules: the terminal, and the
     # persistent process log beside the projects directory (src/core/proclog.py)
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        datefmt='%H:%M:%S',
-    )
     proclog.setup(projects_dir, 'web', 'web server')
+    proclog.terminal(logging.INFO, '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+                     '%H:%M:%S')
 
     # Register blueprints
     app.register_blueprint(export_bp)
