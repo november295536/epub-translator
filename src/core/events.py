@@ -43,6 +43,21 @@ def events_path(project_dir: str) -> str:
     return os.path.join(project_dir, 'log', EVENTS_FILE)
 
 
+def set_aside(project_dir: str) -> str | None:
+    """Move the project's event record to `events-<UTC time>.jsonl` beside
+    it (kept, not deleted), so the next run starts a fresh one: for a
+    project replaced by another book. Returns the new path; None when there
+    was no record. Raises OSError when it cannot be moved."""
+    path = events_path(project_dir)
+    if not os.path.exists(path):
+        return None
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    target = os.path.join(os.path.dirname(path), f'events-{stamp}.jsonl')
+    with _lock_for(path):
+        os.rename(path, target)
+    return target
+
+
 def _lock_for(path: str) -> threading.Lock:
     with _locks_guard:
         return _locks.setdefault(path, threading.Lock())
