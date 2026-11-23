@@ -8261,3 +8261,51 @@ Suite at the round's last code commit (`522d65b`), three at once:
 $ python3 -m pytest tests/ -q -p no:cacheprovider -rfw        # three at once
 3130 passed in 283.06s / 284.76s / 283.14s          (no failure, no warning)
 ```
+
+## Run records — review round 2
+
+Each behaviour finding was first reproduced by a test in `tests/test_run_records_round2.py`
+that failed on the round's starting commit `f991452` (a `git archive` copy) and passes after
+the fix. All findings reproduced except where said.
+
+| # | Finding | Reproduced | Change |
+|---|---------|------------|--------|
+| 1 | `run_records_check.py` passed JSON lines of the wrong shape (only counted as skipped); a translation call without segment/attempt passed; an unknown `result` crashed; a run id was printed verbatim | yes: `TestCheckScriptShape` (a wrong-typed field and `{"leak": …}` gave PASS; `result: "end"` raised `TypeError`) | the script reads lines itself: not JSON → counted, tolerated; JSON with a shape problem → FAIL (field name only); translation calls need segment and attempt; counts only known results; lines and runs named by position (`8229f31`) |
+| 2 | Median/p90 over every call, cancelled and quick-error calls and timeouts included | yes: `test_durations_over_replies_only` | both nearest rank over accepted/rejected/truncated calls, `seconds_calls` shown, `timeouts` counted apart (CLI, page, docs); quoted numbers marked recomputed (`f911673`) |
+| 3 | `pause` line written after the task lock; pause/resume after the workers were done | yes: forced inside `_workers_done` (before: both returned True, a resume could start workers); a spy showed the pause line written without the lock | the pause line is written in the locked transition; `task.finishing` (set where `_workers_done` ends the run) makes pause and resume return False (`7a7d018`) |
+| 4 | `_fail_task` and the stop path publish the terminal state before `run_end` | `_fail_task`: yes (`test_failed_state_published_after_run_end`: state was `failed` when run_end was written). Stop path: the SSE `stopped` event already followed run_end (`test_stopped_event_after_run_end` passed before the change); the `stopped` state is set by the user's stop request itself | `_fail_task` stops with `finishing` and the stop event and sets `failed` after run_end, under the lock; a rate limit during the failure pauses nothing. The user stop is the stated exception (CLAUDE.md): round 1's "before the state" claim did not hold for it. One existing test that waited for `failed` during the drain now waits for `finishing` (`df9a87b`, `458639b`) |
+| 5 | Retranslate: an exception after the counts were set replaced them | yes: `test_retranslate_keeps_counts_when_the_answer_fails` | the error branches keep the counts (`354f3ac`) |
+| 6 | CLI `glossary extract` wrote `completed` before the save; an exception before the `try` left no end | yes: `TestCliExtractLifecycle` (3) | one `try` from the extractor to the save; `completed`/`stopped` with `terms` and `added` only after the save, `failed` with the error class otherwise, `interrupted` on Ctrl-C (`5841304`) |
+| 7 | Extraction: Ctrl-C while a reply is read loses the call; empty model recorded | yes: `TestExtractionRound2` (3) | recorded `cancelled`; the record names the backend's default model. The request keeps passing no model flag when none is given (an existing test asserts that the program's own default is used), so only the record changed (`e7446f3`) |
+| 8 | `git describe --dirty` takes `.git/index.lock` | by reading, not forced: a scratch repository with `index.lock` held showed `git describe --dirty` still answering (the lock is optional, so git skips it when taken) — the collision the other way (our refresh holding the lock while a `git commit` starts) was not forced | `GIT_OPTIONAL_LOCKS=0` in the command's environment; `test_version_takes_no_git_lock` asserts it (`e6b3b77`) |
+| 9 | Delete: an append past its checks could recreate the record during `rmtree` | yes: `test_delete_waits_for_an_append_in_progress` (append held after its checks; before, the project directory existed again afterwards) | `events.retired()`: retire and delete under the record's lock (`458639b`) |
+| 10 | `phase1_reverts.py`: revert 5's anchor no longer found | yes, and five more: the first rerun reported `BAD` for 16, 19, 24, R2-17, R3-7 (old text changed by this branch) | anchors updated (`c1d7394`, `39ecc95`); the script's result is below |
+| 11 | Page lists codes by name; duration from timestamps | yes: `test_codes_by_count_and_measured_duration` (summary ties), `test_page_sorts_codes_by_count` | page sorts by count (ties by code), the summary breaks ties the same way; a finished run's duration is its `run_end.seconds` (`302e9c9`) |
+| 12 | `task.events` set before `run_start`: a failure between writes a lone `run_end` | yes: `test_no_run_end_without_run_start` | emit first, then assign (`d72a03a`) |
+| 13 | Free-text `glossary add -c` logged verbatim | yes: `test_free_text_category_logged_by_length` | a category outside the known ones is logged by length (`727b299`) |
+
+Documented only (`known-issues.md`, `49f2924`): delete/replace during a web extraction or
+retranslation (results can still be written); two extractions at once; a CLI extraction during a
+web replacement; a web run paused when the server stops stays unfinished; migrated schema-1
+records name old segment ids; filtered extraction replies recorded as accepted, filtered SDK
+refusals' tokens not recorded.
+
+Not changing (answers to the review):
+- Worker ids stay in the process log (they tie a line to a worker thread; no book text).
+- The record's `model` field is not validated against known model ids (the list is static and can lag the backends; a pattern check stays in the check script).
+- CLI parse failures (before a command starts) are not logged (click rejects them before `invoke`; the terminal shows them).
+
+Mutation for round 2's changes is deferred to the final pass after the last review round, as
+instructed; none was run in this round.
+
+Page check (an invented record of 14 lines: four rejected codes with ties, a cancelled call at
+0.1 s, a timeout at 60 s, a `run_end` with `seconds: 88.5` 100 s after `run_start`): the web
+endpoint's JSON equals `stats --json`; the page, rendered by Chrome (headless, its own profile:
+the Chrome extension did not connect on this machine), shows `not_html 2, empty_reply 1,
+tag_count 1` in that order, the outcomes `rejected 4、accepted 3、cancelled 1、timeout 1`, the
+reply durations over 7 calls (median 6.0 s, p90 9.0 s; timeouts 1) and the run's duration
+88.5 s — the same numbers as the JSON.
+
+`scripts/verify/phase1_reverts.py` at `39ecc95`: all 105 reverts detected (`reverts not
+detected: 0`, exit 0); before the anchor fixes, at `c1d7394`, 100 OK and 5 BAD (old text not
+found).
