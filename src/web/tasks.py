@@ -261,6 +261,8 @@ class TaskManager:
         if not task:
             return
         with task._lock:
+            if task.finishing:
+                return  # the run is ending already (completed or failed): nothing to stop
             if task.state in ('running', 'paused'):
                 task.state = 'stopped'
             task.stop_event.set()
@@ -391,7 +393,11 @@ class TaskManager:
         if not task:
             return False
         with task._lock:
-            if task.state not in ('running', 'paused') or task.finishing:
+            # Refused once the run stops (a streak stop or a user stop opened
+            # the gate for the workers to leave; closing it again would keep
+            # one waiting for ever) or ends
+            if (task.state not in ('running', 'paused') or task.finishing
+                    or task.stop_event.is_set()):
                 return False
             # A new pause (not a repeated click on a paused task) is recorded
             recorded = task.state == 'running' or task.resume_at is not None
