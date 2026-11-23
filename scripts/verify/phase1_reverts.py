@@ -78,7 +78,7 @@ r('5 logging set up outside the try',
    (T, '        try:\n            handler = setup_project_logging(project_dir)\n', '        try:\n')],
   ['tests/test_web.py::TestStartFailures::test_logging_setup_failure'])
 r('5 coordinator start failure keeps the lock',
-  [(T, '                if task.project_lock is None or not task.threads_alive():\n                    # Nothing started that would release it\n                    task.state = \'failed\'\n                    lock.release()',
+  [(T, '                if task.project_lock is None or not task.threads_alive():\n                    # Nothing started that would release it (nor end the record)\n                    task.error_class = type(e).__name__\n                    self._end_record(task, \'failed\')\n                    task.state = \'failed\'\n                    lock.release()',
     '                if task.project_lock is None:\n                    lock.release()')],
   ['tests/test_web.py::TestStartFailures::test_coordinator_start_failure'])
 r('5 lock descriptor leaked after flock',
