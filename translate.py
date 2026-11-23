@@ -11,6 +11,9 @@ from collections import Counter
 
 from src import __version__  # first: stops an unsupported Python (src/__init__.py)
 
+import json
+import logging
+
 import click
 
 import src.llm as llm
@@ -28,6 +31,9 @@ from src.core.translator import (
 )
 from src.glossary.glossary_manager import GlossaryManager, load_glossary
 from src.core.migrate import MigrationError, migrate_project
+from src.core import proclog
+from src.core.events import RunEvents, segment_result, settings_fields
+from src.core.stats import parse_since, project_stats, text_report
 from src.core.validation import check_segment
 from src.epub.exporter import SCHEMA_1_MESSAGE, ExportError, export_project
 
@@ -53,7 +59,73 @@ def _get_glossary_path(project_dir: str) -> str:
     return os.path.join(project_dir, 'glossary.json')
 
 
-@click.group()
+logger = logging.getLogger('src.cli')
+
+# Parameters whose value is book text or a glossary entry: the process log
+# gets their length only
+_TEXT_PARAMS = frozenset({'text', 'term', 'translation', 'note', 'gender'})
+
+
+def _command_line(ctx) -> str:
+    """The command and its parameters for the process log."""
+    parts = [ctx.command_path.split(' ', 1)[-1]]
+    for name, value in ctx.params.items():
+        if value is None or value is False:
+            continue
+        if name in _TEXT_PARAMS:
+            value = f'<{len(str(value))} 字元>'
+        parts.append(f'{name}={value}')
+    return 'cli ' + ' '.join(parts)
+
+
+def _projects_dir_of(params: dict) -> str:
+    """The projects directory of a command: the parent of its project
+    directory when it names one, else ./projects (as _find_project)."""
+    project = params.get('project') or params.get('project_dir')
+    if project:
+        return os.path.dirname(os.path.abspath(project))
+    return 'projects'
+
+
+class _LoggedCommand(click.Command):
+    """A command whose run goes to the process log (src/core/proclog.py):
+    a start line, its end with the exit code and duration, and the
+    traceback of an exception it does not handle."""
+
+    def invoke(self, ctx):
+        proclog.setup(_projects_dir_of(ctx.params), 'cli', _command_line(ctx))
+        started = time.monotonic()
+        code = 0
+        try:
+            return super().invoke(ctx)
+        except SystemExit as e:
+            code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+            raise
+        except click.exceptions.Exit as e:
+            code = e.exit_code
+            raise
+        except click.ClickException as e:
+            code = e.exit_code
+            logger.info("usage error: %s", e.format_message())
+            raise
+        except (KeyboardInterrupt, click.exceptions.Abort):
+            code = 130
+            logger.warning("interrupted (Ctrl-C)")
+            raise
+        except BaseException:
+            code = 1
+            logger.exception("uncaught exception in command")
+            raise
+        finally:
+            logger.info("end: exit %s after %.1f s", code, time.monotonic() - started)
+
+
+class _LoggedGroup(click.Group):
+    command_class = _LoggedCommand
+    group_class = type  # subgroups are logged groups too
+
+
+@click.group(cls=_LoggedGroup)
 @click.version_option(__version__, prog_name='epub-translator')
 def cli():
     """EPUB 智能翻譯系統 - Translate English EPUB books to Traditional Chinese."""
@@ -208,10 +280,13 @@ def _start(project_dir, backend, model, workers, retry_failed):
     all_segments = pm.data.segments
 
     log_dir = os.path.join(project_dir, 'log')
-    if workers > 1:
-        failed = _start_parallel(pm, gm, pending, all_segments, progress, workers, log_dir)
-    else:
-        failed = _start_sequential(pm, gm, pending, all_segments, progress, log_dir)
+    run = _Run(project_dir, pm, min(workers, len(pending)), len(pending), retry_failed)
+    with run:
+        if workers > 1:
+            failed = _start_parallel(pm, gm, pending, all_segments, progress, workers, log_dir,
+                                     run)
+        else:
+            failed = _start_sequential(pm, gm, pending, all_segments, progress, log_dir, run)
 
     click.echo()
     if failed:
@@ -224,6 +299,44 @@ def _start(project_dir, backend, model, workers, retry_failed):
 # Errors that stop or pause a whole run, leaving the segment pending
 RUN_ERRORS = (RateLimitError, AuthError, BackendUnavailableError)
 
+
+class _Run:
+    """The event record of one CLI translation run (log/events.jsonl):
+    run_start on entry, each segment's result, rate-limit pauses, and
+    run_end with the counts on any way out."""
+
+    def __init__(self, project_dir, pm, workers, segments, retry_failed):
+        self.events = RunEvents(project_dir, 'cli')
+        self.counts = {'translated': 0, 'failed': 0}
+        self.started = time.monotonic()
+        self.events.emit('run_start', workers=workers, segments=segments,
+                         mode='retry_failed' if retry_failed else 'pending',
+                         **settings_fields(pm.call_settings()))
+        self.state = 'completed'
+        self.error = None
+
+    def segment(self, segment_id, outcome):
+        failed = outcome.status == SegmentStatus.FAILED
+        self.counts['failed' if failed else 'translated'] += 1
+        segment_result(self.events, segment_id, outcome)
+
+    def stopped(self, error):
+        """A run-level error (or too many unexpected failures) stops the run."""
+        self.state = 'stopped'
+        # A message (the streak's) may quote an error: the record gets a code
+        self.error = 'UnexpectedStreak' if isinstance(error, str) else type(error).__name__
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None and exc_type is not SystemExit:
+            self.state = 'interrupted' if issubclass(exc_type, KeyboardInterrupt) else 'failed'
+            self.error = exc_type.__name__
+        self.events.emit('run_end', state=self.state, **self.counts, error=self.error,
+                         seconds=round(time.monotonic() - self.started, 3))
+        return False
+
 # Injectable (tests): sleeping through a rate-limit pause, and the clock
 _sleep = time.sleep
 _clock = time.monotonic
@@ -232,6 +345,7 @@ _clock = time.monotonic
 def _stop_run(e):
     """An expired login or a backend that cannot be started stops the whole
     run (so do too many unexpected failures in a row)."""
+    logger.warning("run stopped: %s", e)
     click.echo(f"  ✗ {e}")
     click.echo("翻譯中斷。已完成的進度已儲存，可用 start 繼續。")
     sys.exit(1)
@@ -261,9 +375,9 @@ class _RunStopped(Exception):
     (args[0]: the error)."""
 
 
-def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
+def _start_sequential(pm, gm, pending, all_segments, progress, log_dir, run):
     """Single-worker sequential translation. Returns the number of failed segments."""
-    engine = TranslationEngine(**pm.call_settings().call_args())
+    engine = TranslationEngine(**pm.call_settings().call_args(), events=run.events)
     failed = 0
     streak = UnexpectedStreak()
     saver = _saver(pm, log_dir)
@@ -284,8 +398,12 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
                         raise _RunStopped(e)
                     saver.flush()  # a pause saves what is waiting
                     click.echo(_rate_limit_message(e, delay))
+                    run.events.emit('pause', reason='rate_limit', error=type(e).__name__,
+                                    resume_in=delay)
                     _sleep(delay)
+                    run.events.emit('resume', reason='auto')
             pm.apply_outcome(seg.segment_id, outcome)
+            run.segment(seg.segment_id, outcome)
             saver.add((seg.segment_id, outcome))
             saver.maybe_save()
             if outcome.status == SegmentStatus.FAILED:
@@ -308,11 +426,12 @@ def _start_sequential(pm, gm, pending, all_segments, progress, log_dir):
             _report_unsaved(saver)
             raise
     if stopped is not None:
+        run.stopped(stopped)
         _stop_run(stopped)  # "已完成的進度已儲存": now true
     return failed
 
 
-def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_dir):
+def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_dir, run):
     """Multi-worker parallel translation. Returns the number of failed segments."""
     import threading
     import queue as queue_mod
@@ -337,7 +456,7 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
         # A retry's backoff wait ends, and no call is made, once the run
         # stops or a rate limit pauses it
         engine = TranslationEngine(
-            **pm.call_settings().call_args(),
+            **pm.call_settings().call_args(), events=run.events,
             interrupted=lambda: error_event.is_set() or not gate.is_set())
 
         while not error_event.is_set():
@@ -372,8 +491,12 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
                     if gate.is_set():  # the first worker to hit it
                         gate.clear()
                         pause.update(until=_clock() + delay, error=e, shown=False)
+                        run.events.emit('pause', reason='rate_limit', error=type(e).__name__,
+                                        resume_in=delay)
                     else:  # a later limit during the wait extends it
                         pause['until'] = max(pause['until'], _clock() + delay)
+                        run.events.emit('wait_extended', reason='rate_limit',
+                                        resume_in=round(pause['until'] - _clock(), 3))
                 seg_queue.put(seg)  # pending again, once the gate is closed
                 continue
             result_queue.put((seg.segment_id, outcome, seg.word_count, tag))
@@ -395,6 +518,7 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
             stop_errors.append(stop)
             error_event.set()
         pm.apply_outcome(seg_id, outcome)
+        run.segment(seg_id, outcome)
         saver.add((seg_id, outcome))
         saver.maybe_save()  # the window, after every result
         if outcome.status == SegmentStatus.FAILED:
@@ -417,6 +541,7 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
                                                    pause['until'] - _clock()))
                 if _clock() >= pause['until']:
                     click.echo("  繼續翻譯")
+                    run.events.emit('resume', reason='auto')
                     gate.set()
         else:
             saver.maybe_save()
@@ -462,6 +587,7 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
                 except queue_mod.Empty:
                     break
                 pm.apply_outcome(seg_id, outcome)
+                run.segment(seg_id, outcome)
                 saver.add((seg_id, outcome))
             try:
                 saver.flush(force=True)
@@ -474,6 +600,7 @@ def _start_parallel(pm, gm, pending, all_segments, progress, num_workers, log_di
         t.join()
 
     if error_event.is_set():
+        run.stopped(stop_errors[0])
         _stop_run(stop_errors[0])
     return failed
 
@@ -745,18 +872,30 @@ def glossary_extract(project):
     pm.load()
 
     from src.glossary.term_extractor import ExtractionError, TermExtractor
-    extractor = TermExtractor(**pm.call_settings().call_args())
-
+    settings = pm.call_settings()
     segments = [{'text': s.text} for s in pm.data.segments if s.segment_type == SegmentType.TEXT]
+    events = RunEvents(project_dir, 'extract')
+    events.emit('run_start', segments=len(segments), **settings_fields(settings))
+    extractor = TermExtractor(**settings.call_args(), events=events)
     click.echo(f"正在從 {len(segments)} 個文字段落中提取術語...")
 
     stopped = None
+    started = time.monotonic()
+    end = {'state': 'interrupted'}
     try:
-        terms = extractor.extract_from_segments(segments)
-    except ExtractionError as e:
-        # Keep what the finished batches found
-        stopped, terms = e, e.terms
-        click.echo(f"提取中斷：{e}")
+        try:
+            terms = extractor.extract_from_segments(segments)
+        except ExtractionError as e:
+            # Keep what the finished batches found
+            stopped, terms = e, e.terms
+            click.echo(f"提取中斷：{e}")
+        # (a stop's cause is in the record of the call that hit it)
+        end = {'state': 'completed' if stopped is None else 'stopped', 'terms': len(terms)}
+    except Exception as e:
+        end = {'state': 'failed', 'error': type(e).__name__}
+        raise
+    finally:
+        events.emit('run_end', seconds=round(time.monotonic() - started, 3), **end)
     click.echo(f"提取到 {len(terms)} 個術語")
 
     if terms:
@@ -920,6 +1059,33 @@ def model_set(backend, model_name, effort, timeout, project):
         sys.exit(1)
     click.echo(f"已設定模型：{pm.data.model}（{pm.data.backend or llm.default_backend().name}）")
     click.echo(_settings_line(pm))
+
+
+# --- Statistics ---
+
+@cli.command()
+@click.option('--project', '-p', default=None, help='Project directory path')
+@click.option('--since', default=None,
+              help='Only records at or after this time (ISO date or date and time, local time)')
+@click.option('--run', 'run_id', default=None, help='Only the records of this run id')
+@click.option('--json', 'as_json', is_flag=True, default=False, help='Print the numbers as JSON')
+def stats(project, since, run_id, as_json):
+    """Summarize the project's event record (log/events.jsonl): model calls,
+    retries, failures, durations and tokens per backend/model/effort, and runs."""
+    project_dir = _find_project(project)
+    if not project_dir:
+        click.echo("找不到專案。")
+        sys.exit(1)
+    try:
+        since_ts = parse_since(since) if since else None
+    except ValueError as e:
+        raise click.BadParameter(f'無法解讀時間：{since}', param_hint="'--since'") from e
+    numbers = project_stats(project_dir, since=since_ts, run=run_id)
+    if as_json:
+        click.echo(json.dumps(numbers, ensure_ascii=False, indent=2))
+        return
+    for line in text_report(numbers):
+        click.echo(line)
 
 
 def _find_project(project_dir: str | None) -> str | None:

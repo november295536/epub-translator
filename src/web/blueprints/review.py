@@ -9,6 +9,9 @@ from flask import Blueprint, render_template, request, jsonify, current_app
 
 from dataclasses import asdict
 
+import time
+
+from src.core.events import RunEvents, segment_result, settings_fields
 from src.core.project import ProjectManager, SegmentStatus
 from src.core.validation import check_segment
 from src.core.translator import (
@@ -114,6 +117,8 @@ def update_segment(project_name: str, segment_id: str):
                 issues = result.issues
             pm.update_translation(segment_id, data['text'], issues=issues)
             pm.save()
+            logger.info("段落已編輯: %s (%d 字元, %d 個警告)", segment_id,
+                        len(data['text']), len(issues))
             # A person's version replaces the failed one: its diagnostics go too
             remove_failure_log(_log_dir(pm), segment_id)
             answer = _answer(pm, gm, issues, status='ok', segment_id=segment_id)
@@ -186,6 +191,7 @@ def approve_segment(project_name: str, segment_id: str):
                 return _refused(result, pm, gm)
             pm.mark_reviewed(segment_id, text=text)  # a person's decision: stored issues cleared
             pm.save()
+            logger.info("段落已核可: %s%s", segment_id, '（含編輯）' if text else '')
             remove_failure_log(_log_dir(pm), segment_id)
             # the warnings the approved text still has, for the reviewer to see
             answer = _answer(pm, gm, result.issues, status='ok', segment_id=segment_id)
@@ -220,18 +226,29 @@ def retranslate_segment(project_name: str, segment_id: str):
     gm = _glossary(project_dir)  # None: translated without the glossary, and said so
 
     handler = setup_project_logging(project_dir)
+    events = RunEvents(project_dir, 'retranslate')
+    events.emit('run_start', workers=1, segments=1, mode='selected', **settings_fields(settings))
+    started = time.monotonic()
+    end = {'state': 'failed'}  # the run_end fields; replaced on every way out
     try:
-        engine = TranslationEngine(**settings.call_args())
+        engine = TranslationEngine(**settings.call_args(), events=events)
         logger.info("重新翻譯段落: %s (模型: %s)", segment_id, engine.model)
         outcome = translate_segment(engine, seg, segments, gm, translations=translations,
                                     brief=brief)
         with transaction(project_name) as pm:
             current = next((s for s in pm.data.segments if s.segment_id == segment_id), None)
             if current is None or (current.html, current.text) != source:
+                segment_result(events, segment_id, outcome, 'dropped', 'project_replaced')
+                end = {'state': 'completed', 'dropped': 1}
                 return jsonify({'error': '專案已在翻譯期間被重新建立，未套用新譯文'}), 409
             if not pm.apply_outcome(segment_id, outcome, revision=revision):
+                segment_result(events, segment_id, outcome, 'dropped', 'edited_during_call')
+                end = {'state': 'completed', 'dropped': 1}
                 return jsonify({'error': '段落已在翻譯期間被編輯，未套用新譯文'}), 409
             pm.save()
+            segment_result(events, segment_id, outcome)
+            failed = outcome.status == SegmentStatus.FAILED
+            end = {'state': 'completed', 'translated': int(not failed), 'failed': int(failed)}
             record_failure_log(_log_dir(pm), segment_id, outcome)
             # the stored issues: a failure keeps the old text and status
             answer = _answer(pm, gm, outcome.issues)
@@ -244,15 +261,22 @@ def retranslate_segment(project_name: str, segment_id: str):
                         'translated_text': outcome.text, **answer})
     except AuthError as e:
         logger.warning("Auth error during retranslation: %s", e)
+        end = {'state': 'stopped', 'error': type(e).__name__}
         return jsonify({'error': str(e), 'auth_error': True}), 401
     except RateLimitError as e:
         logger.warning("Rate limit during retranslation: %s", e)
+        end = {'state': 'stopped', 'error': type(e).__name__}
         return jsonify({'error': str(e)}), 500
     except BackendUnavailableError as e:
         logger.warning("Backend unavailable during retranslation: %s", e)
+        end = {'state': 'stopped', 'error': type(e).__name__}
         return jsonify({'error': str(e)}), 503
+    except BaseException as e:
+        end = {'state': 'failed', 'error': type(e).__name__}
+        raise
     finally:
         teardown_project_logging(handler)
+        events.emit('run_end', seconds=round(time.monotonic() - started, 3), **end)
 
 
 @review_bp.route('/api/projects/<project_name>/progress')
