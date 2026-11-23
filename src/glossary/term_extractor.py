@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from collections import Counter
 
 import src.llm as llm
+import src.core.events as events
 from src.core.project import DEFAULT_TIMEOUT
 from src.llm import (
     AuthError, BackendUnavailableError, LLMError, LLMRequest, Message, RateLimitError,
@@ -166,19 +168,42 @@ class TermExtractor:
     """Extracts technical terms from text through an LLM backend."""
 
     def __init__(self, model: str = '', timeout: int = DEFAULT_TIMEOUT,
-                 backend: llm.LLMBackend | None = None, effort: str | None = None):
+                 backend: llm.LLMBackend | None = None, effort: str | None = None,
+                 events: events.RunEvents | None = None):
+        self.events = events  # one record per call (None: none)
         self.model = model
         self.timeout = timeout
         self.effort = effort  # passed with every call (None: none)
         self.backend = backend if backend is not None else llm.default_backend()
 
-    def _call(self, prompt: str) -> str | None:
+    def _record(self, kind: str, started: float, outcome: str, **fields) -> None:
+        if self.events is None:
+            return
+        try:
+            self.events.call(kind=kind, backend=self.backend.name, model=self.model,
+                             effort=self.effort, timeout=self.timeout,
+                             seconds=time.monotonic() - started, outcome=outcome, **fields)
+        except Exception:  # noqa: BLE001 - a record never stops an extraction
+            logger.warning("無法記錄模型呼叫", exc_info=True)
+
+    def _call(self, prompt: str, kind: str = 'extract') -> str | None:
         """The reply to one prompt; None when the call failed (logged).
-        Raises ExtractionError on an error every further call would hit too."""
+        Raises ExtractionError on an error every further call would hit too.
+        `kind` (extract, consolidate) names the call in the event record."""
         request = LLMRequest(system='', messages=[Message('user', prompt)],
                              model=self.model, timeout=self.timeout, effort=self.effort)
+        started = time.monotonic()
         try:
-            return self.backend.complete(request, threading.Event()).text
+            try:
+                response = self.backend.complete(request, threading.Event())
+            except BaseException as e:
+                self._record(kind, started, events.error_outcome(e), error=e,
+                             chars_in=len(prompt))
+                raise
+            self._record(kind, started, 'truncated' if response.stop_reason == 'truncated'
+                         else 'accepted', usage=response.usage, chars_in=len(prompt),
+                         chars_out=len(response.text))
+            return response.text
         except (AuthError, RateLimitError, BackendUnavailableError) as e:
             # Every further call would fail the same way
             raise ExtractionError(str(e))
@@ -270,7 +295,7 @@ class TermExtractor:
         ExtractionError on a rate limit, an expired login or an unusable
         backend."""
         lines = '\n'.join(_candidate_line(g) for g in groups)
-        reply = self._call(CONSOLIDATE_PROMPT.format(candidates=lines))
+        reply = self._call(CONSOLIDATE_PROMPT.format(candidates=lines), 'consolidate')
         if reply is None:
             return {}
         try:
