@@ -636,15 +636,23 @@ class TaskManager:
                 logger.exception("翻譯任務的失敗處理也失敗")
         finally:
             with task._lock:
-                if task.state not in ('completed', 'stopped', 'failed'):
+                left = task.state not in ('completed', 'stopped', 'failed')
+                if left:
                     # Any other way out (also a failure inside _fail_task):
-                    # the run failed, and says so after its run_end
+                    # the workers stop as for a failure, then the run fails
                     task.error_class = task.error_class or 'UnexpectedExit'
-                    self._end_record(task, 'failed')
-                    task.state = 'failed'
                     task.finishing = True
+                    task.stop_event.set()
+                    task.cancel_event.set()
+                    task.pause_event.set()  # a worker at the gate leaves too
                 else:
                     self._end_record(task, task.state)  # when nothing above wrote it
+            if left:
+                for t in list(task._threads):
+                    t.join(timeout=STOP_WAIT_SECONDS)
+                with task._lock:
+                    self._end_record(task, 'failed')  # says so after its run_end
+                    task.state = 'failed'
             if task.project_lock is not None:
                 task.project_lock.release()
             teardown_project_logging(handler)
