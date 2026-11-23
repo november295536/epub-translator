@@ -63,7 +63,7 @@ python3 -m flask --app src.web.server:create_app run --port 3000
 
 開啟 http://localhost:3000：
 
-1. **首頁** — 專案列表；「新增專案」上傳 EPUB。同名專案若沒有在翻譯，會被取代（`project.json`、`source.epub` 重建，`log/failed/` 清除；`glossary.json` 保留），CLI 的 `init` 則拒絕已存在的專案
+1. **首頁** — 專案列表；「新增專案」上傳 EPUB。同名專案若沒有在翻譯，會被取代（`project.json`、`source.epub` 重建，`log/failed/` 清除，舊的事件紀錄改名為 `log/events-<時間>.jsonl` 保留、統計從新書重新開始；`glossary.json` 保留），CLI 的 `init` 則拒絕已存在的專案
 2. **總覽** — 各章節進度
 3. **術語表** — 新增、編輯、批次刪除、自動提取；人物可填性別與備註
 4. **翻譯** — 選擇後端與模型、推理強度、呼叫逾時、worker 數、書籍簡介；背景翻譯並即時顯示進度（SSE），可暫停、繼續，可重試失敗段落
@@ -151,7 +151,7 @@ logs/                         # 與 projects/ 同一層，不進版控：程序�
 
 ### 紀錄
 
-- **程序紀錄** `logs/web.log`（Web 伺服器）、`logs/cli.log`（每個 CLI 指令），放在專案資料夾（`projects/`）的上一層，除了終端機的輸出之外持續保留。每次啟動先寫一行版本（git commit）、Python 版本、指令與 PID，接著是所有 `src.*` 的紀錄、Web 的請求行，以及請求、CLI 指令或執行緒中未處理例外的完整 traceback；CLI 指令結束時寫 `end: exit N`。每個檔案滿 5 MB 輪替，保留 5 個舊檔。這個檔案可能含書名、術語等內容，只留在本機。
+- **程序紀錄** `logs/web.log`（Web 伺服器）、`logs/cli.log`（每個 CLI 指令），放在專案資料夾（`projects/`）的上一層，除了終端機的輸出之外持續保留。每次啟動先寫一行版本（git commit）、Python 版本、指令與 PID，接著是所有 `src.*` 的紀錄、Web 的請求行，以及請求、CLI 指令或執行緒中未處理例外的完整 traceback；CLI 指令結束時寫 `end: exit N`，Web 伺服器正常結束時寫 `end: web server stopped`（被強制終止時沒有結束行）。每個檔案滿 5 MB 輪替，保留 5 個舊檔。這個檔案可能含書名、術語等內容，只留在本機。
 - **事件紀錄** `projects/<name>/log/events.jsonl`：每行一個 JSON 物件。每次模型呼叫一行（翻譯請求、附錯誤重問、拆半、單段重新翻譯、術語提取批次、術語統一），記錄時間、執行 ID、呼叫種類、段落 ID、後端、模型、推理強度、逾時、耗時、tokens（後端有回報時；`claude-cli` 不回報）、結果（accepted、rejected 與問題代碼、timeout、cancelled、rate_limit、auth、backend_unavailable、refusal、truncated、transient、error、unexpected）與該段的第幾次呼叫；另有執行的開始、暫停／繼續與原因、使用量上限的等待、結束與計數，以及每段的最終結果（translated、failed、dropped：翻譯期間被編輯）。**不含書的文字**（原文、譯文、提示、回覆、術語、錯誤訊息都不記，只記代碼、次數、字元數與耗時），所以這是可以交給開發者分析的檔案（段落 ID 的例外見 `known-issues.md`）。寫入失敗只記一則警告，不影響翻譯。
 - `translate.py stats` 與 Web 的「統計」頁讀的就是事件紀錄（同一個函式計算）；無法解析的行（例如程序在寫入中途結束）會略過並列出數量。
 
@@ -161,7 +161,7 @@ logs/                         # 與 projects/ 同一層，不進版控：程序�
 python3 -m pytest tests/ -q -p no:cacheprovider -rfw
 ```
 
-突變測試：在專案的虛擬環境（已安裝 `requirements.txt` 與 `requirements-dev.txt`）執行 `scripts/verify/mutation.sh main`；與 `main` 相比沒有可突變的變更行時以 exit 2 結束。`scripts/verify/` 其他腳本見 [CLAUDE.md](CLAUDE.md)。
+突變測試：在專案的虛擬環境（已安裝 `requirements.txt` 與 `requirements-dev.txt`）執行 `scripts/verify/mutation.sh main`（第二個參數限制同時執行的突變 worker 數，例如 `main 4`，預設每個核心一個）；與 `main` 相比沒有可突變的變更行時以 exit 2 結束。`scripts/verify/` 其他腳本見 [CLAUDE.md](CLAUDE.md)。
 
 ## 疑難排解
 

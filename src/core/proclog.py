@@ -17,6 +17,7 @@ text (error messages, project names in request lines): it stays local.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import logging.handlers
 import os
@@ -44,6 +45,7 @@ _lock = threading.Lock()
 _handler: logging.Handler | None = None
 _previous_excepthook = None
 _commit: str | None = None
+_end_registered = False
 
 
 def log_dir_for(projects_dir: str) -> str:
@@ -80,13 +82,21 @@ def _thread_excepthook(args):
         _previous_excepthook(args)
 
 
+def _web_end() -> None:
+    """The end line of a web server that stops normally (atexit; a killed
+    process writes none)."""
+    logger.info("end: web server stopped | pid %d", os.getpid())
+
+
 def setup(projects_dir: str, name: str, what: str) -> str | None:
     """Make the root logger append to `<log dir>/<name>.log` (replacing an
     earlier file of this module in the same process), make sure INFO
     records pass, write the start line naming `what` (the command, or "web
-    server"). Returns the file's path; None, after a warning on stderr,
-    when the file cannot be opened (the program goes on without it)."""
-    global _handler, _previous_excepthook
+    server"). The web server's log also gets an end line at a normal exit
+    (CLI commands write their own). Returns the file's path; None, after a
+    warning on stderr, when the file cannot be opened (the program goes on
+    without it)."""
+    global _handler, _previous_excepthook, _end_registered
     path = os.path.join(log_dir_for(projects_dir), f'{name}.log')
     root = logging.getLogger()
     with _lock:
@@ -112,6 +122,9 @@ def setup(projects_dir: str, name: str, what: str) -> str | None:
         if _previous_excepthook is None:
             _previous_excepthook = threading.excepthook
             threading.excepthook = _thread_excepthook
+        if name == 'web' and not _end_registered:
+            _end_registered = True
+            atexit.register(_web_end)
     logger.info("start: %s | epub-translator %s | Python %s | %s | pid %d",
                 what, program_version(), platform.python_version(), sys.platform, os.getpid())
     return path

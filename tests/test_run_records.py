@@ -775,3 +775,42 @@ class TestRunRecordsCheckScript:
         ev = RunEvents(path, 'cli', run_id='20260101T000000Z-abcdef')
         ev.emit('run_end', state='completed', translated=2, failed=0)
         assert self._check(tmp_path) == 1
+
+
+class TestReplacedProject:
+    def test_old_record_set_aside(self, tmp_path, sample_epub):
+        client = create_app(projects_dir=str(tmp_path)).test_client()
+
+        def create():
+            res = client.post('/api/projects', json={'epub_path': sample_epub})
+            assert res.status_code == 200, res.get_json()
+            return os.path.join(str(tmp_path), res.get_json()['name'])
+        path = create()
+        RunEvents(path, 'cli', run_id='old').emit('run_start', segments=9)
+        old = open(events_path(path), encoding='utf-8').read()
+        assert create() == path  # the same name: replaced
+        assert not os.path.exists(events_path(path))
+        [aside] = [n for n in os.listdir(os.path.join(path, 'log'))
+                   if n.startswith('events-') and n.endswith('.jsonl')]
+        assert open(os.path.join(path, 'log', aside), encoding='utf-8').read() == old
+        assert client.get(f'/api/projects/{os.path.basename(path)}/stats').get_json()['records'] == 0
+        create()  # replaced again without a record: nothing to set aside
+        assert len([n for n in os.listdir(os.path.join(path, 'log'))
+                    if n.startswith('events-')]) == 1
+
+    def test_set_aside_without_record(self, tmp_path):
+        assert events.set_aside(str(tmp_path)) is None
+
+
+def test_web_server_end_line(tmp_path):
+    """A web server process that exits normally writes its end line."""
+    code = ('import sys; sys.path.insert(0, sys.argv[1])\n'
+            'from src.web.server import create_app\n'
+            'create_app(projects_dir=sys.argv[2])\n')
+    env = dict(os.environ, **{proclog.LOG_DIR_ENV: str(tmp_path / 'logs')})
+    subprocess.run([sys.executable, '-c', code, _REPO_ROOT, str(tmp_path / 'projects')],
+                   env=env, check=True, timeout=60)
+    log = (tmp_path / 'logs' / 'web.log').read_text(encoding='utf-8')
+    lines = log.splitlines()
+    assert 'start: web server' in lines[0] and 'end: web server stopped' in lines[-1]
+
