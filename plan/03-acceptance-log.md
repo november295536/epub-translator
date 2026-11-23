@@ -8309,3 +8309,6 @@ reply durations over 7 calls (median 6.0 s, p90 9.0 s; timeouts 1) and the run's
 `scripts/verify/phase1_reverts.py` at `39ecc95`: all 105 reverts detected (`reverts not
 detected: 0`, exit 0); before the anchor fixes, at `c1d7394`, 100 OK and 5 BAD (old text not
 found).
+
+Suite at `83102b5`: once alone `3152 passed in 282.57s`; three at once `3152 passed in 280.52s
+/ 282.43s / 281.97s` (no failure, no warning).
