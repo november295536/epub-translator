@@ -796,8 +796,6 @@ class TaskManager:
         user and wins over an automatic wait in progress. A later rate limit
         during an automatic wait extends it. A user pause stays as it is."""
         delay = resume_delay(error)
-        if task.finishing:
-            return  # the run is ending: nothing to pause
         if task.state == 'running':
             pass
         elif task.state == 'paused' and task.resume_at is not None:

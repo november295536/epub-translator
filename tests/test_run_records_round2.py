@@ -322,32 +322,55 @@ class TestExtractionRound2:
 
 def test_delete_waits_for_an_append_in_progress(tmp_path, monkeypatch):
     """An append that passed its checks when the delete starts: the delete
-    waits for it, so the directory is not recreated behind the delete."""
+    waits for it (it is seen blocked on the record's lock), so the
+    directory is not recreated behind the delete."""
     import threading
     from src.core import events as events_module
     from src.web.server import create_app
-    from tests.test_run_records import PROJECT
+    from tests.test_run_records import PROJECT, _wait
     path = _make_project(tmp_path, n=1)
     run = RunEvents(path, 'extract')
-    inside, go = threading.Event(), threading.Event()
-    makedirs = os.makedirs
+    inside, go, blocked = threading.Event(), threading.Event(), threading.Event()
+    makedirs, lock_for = os.makedirs, events_module._lock_for
 
     def slow_makedirs(name, *a, **k):
         if threading.current_thread().name == 'appender':
             inside.set()
             go.wait(10)
         return makedirs(name, *a, **k)
+
+    class Watched:
+        """The record's lock; notes when the deleter has to wait for it."""
+        def __init__(self, lock):
+            self.lock = lock
+
+        def __enter__(self):
+            if threading.current_thread().name == 'deleter' and not self.lock.acquire(False):
+                blocked.set()
+                self.lock.acquire()
+            elif threading.current_thread().name != 'deleter':
+                self.lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self.lock.release()
     monkeypatch.setattr(events_module.os, 'makedirs', slow_makedirs)
+    monkeypatch.setattr(events_module, '_lock_for', lambda p: Watched(lock_for(p)))
     appender = threading.Thread(target=run.emit, args=('run_end',), name='appender')
     appender.start()
     assert inside.wait(10)
     client = create_app(projects_dir=str(tmp_path)).test_client()
-    deleter = threading.Thread(target=lambda: client.delete(f'/api/projects/{PROJECT}'))
+    answers = []
+    deleter = threading.Thread(name='deleter', target=lambda: answers.append(
+        client.delete(f'/api/projects/{PROJECT}').status_code))
     deleter.start()
-    deleter.join(0.5)  # before the fix the delete finishes here, the append still pending
+    # the delete reaches the record's lock and waits (before the fix: it
+    # took no lock and finished, the append still pending)
+    _wait(lambda: blocked.is_set() or not deleter.is_alive())
     go.set()
     appender.join(10)
     deleter.join(10)
+    assert blocked.is_set() and not deleter.is_alive() and answers == [200]
     assert not os.path.exists(path)
 
 
