@@ -356,6 +356,7 @@ class TestWebRun:
         _wait(lambda: _of(_records(path), 'run_end'))
         [seg] = _of(_records(path), 'segment')
         assert (seg['result'], seg['reason']) == ('dropped', 'edited_during_call')
+        assert (seg['segment'], seg['calls']) == ('c1_seg0001', 1)  # the outcome's fields
         assert _of(_records(path), 'run_end')[0]['dropped'] == 1
 
     def test_retranslate_endpoint(self, tmp_path):
