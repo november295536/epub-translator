@@ -2831,6 +2831,9 @@ def test_resume_while_the_coordinator_starts_its_workers(tmp_path, fresh_tm, mon
     def info(msg, *args, **kwargs):
         if msg.startswith('翻譯開始') and not done.is_set():
             done.set()
+            # start_translation registers the task after starting this
+            # thread: wait for it, or the pause finds no task
+            _wait(lambda: PROJECT in fresh_tm.tasks)
             assert fresh_tm.pause_translation(PROJECT)
             assert fresh_tm.resume_translation(PROJECT)
         return real_info(msg, *args, **kwargs)
