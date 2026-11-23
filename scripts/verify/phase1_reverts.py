@@ -174,8 +174,8 @@ r('15 missing program is a per-segment error',
   [(LLM, '            raise BackendUnavailableError(', '            raise LLMError(')],
   ['tests/test_llm.py::TestBackendUnavailable', 'tests/test_llm.py::TestCLIBackendComplete::test_missing_program_is_not_transient'])
 r('16 dropped result sends a success event',
-  [(T, '            logger.info("段落已在翻譯期間被編輯，捨棄結果: %s", res.segment_id)\n            outcome = None\n',
-    '            logger.info("段落已在翻譯期間被編輯，捨棄結果: %s", res.segment_id)\n')],
+  [(T, '            self._record(task, res.segment_id, outcome, \'dropped\', \'edited_during_call\')\n            outcome = None\n',
+    '            self._record(task, res.segment_id, outcome, \'dropped\', \'edited_during_call\')\n')],
   ['tests/test_web.py::TestQueuedEdits::test_dropped_result_sends_no_success_event'])
 r('17 revision taken when the worker picks the segment',
   [(T, '                revision, queued_status = task.queued.get(\n                    seg.segment_id, (seg.revision, seg.status))',
@@ -198,7 +198,7 @@ r('19 extraction stop drops earlier terms',
   ['tests/test_glossary.py::TestExtractionStopKeepsTerms', 'tests/test_cli.py::TestCLIGlossaryExtractStop',
    'tests/test_web.py::TestTermExtractionStop'])
 r('19 CLI extraction stop not caught',
-  [(CLI, '    except ExtractionError as e:\n        # Keep what the finished batches found', '    except ZeroDivisionError as e:\n        # Keep what the finished batches found')],
+  [(CLI, '        except ExtractionError as e:\n            # Keep what the finished batches found', '        except ZeroDivisionError as e:\n            # Keep what the finished batches found')],
   ['tests/test_cli.py::TestCLIGlossaryExtractStop'])
 r('19 long successful replies searched for error phrases',
   [('src/llm/claude_cli.py', 'if result.returncode != 0 or len(stdout) <= SHORT_REPLY_CHARS:', 'if True:')],
@@ -216,8 +216,8 @@ r('24 edit leaves the failure log',
   [(REV, "            # A person's version replaces the failed one: its diagnostics go too\n            remove_failure_log(_log_dir(pm), segment_id)\n", '')],
   ['tests/test_web.py::TestEditRemovesFailureLog'])
 r('24 approve leaves the failure log',
-  [(REV, "            pm.save()\n            remove_failure_log(_log_dir(pm), segment_id)\n            # the warnings",
-    "            pm.save()\n            # the warnings")],
+  [(REV, "            remove_failure_log(_log_dir(pm), segment_id)\n            # the warnings",
+    "            # the warnings")],
   ['tests/test_web.py::TestEditRemovesFailureLog'])
 r('25 call spent on a segment edited after queueing',
   [(T, '                if skip:\n', '                if False:\n')],
@@ -280,8 +280,8 @@ r('R2-17 web failure log written before acceptance',
     "        outcome = res.outcome\n        if outcome is not None:\n            record_failure_log(os.path.join(pm.project_dir, 'log'), res.segment_id, outcome)\n        if outcome is None:")],
   ['tests/test_web.py::TestRound2FailureLogAtAcceptance::test_stale_failure_writes_no_log'])
 r('R2-17 edit removes the log outside the transaction',
-  [(REV, "            pm.save()\n            # A person's version replaces the failed one: its diagnostics go too\n            remove_failure_log(_log_dir(pm), segment_id)\n            answer = _answer(pm, gm, issues, status='ok', segment_id=segment_id)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 404\n",
-    "            pm.save()\n            answer = _answer(pm, gm, issues, status='ok', segment_id=segment_id)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 404\n    remove_failure_log(_log_dir(pm), segment_id)\n")],
+  [(REV, "            # A person's version replaces the failed one: its diagnostics go too\n            remove_failure_log(_log_dir(pm), segment_id)\n            answer = _answer(pm, gm, issues, status='ok', segment_id=segment_id)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 404\n",
+    "            answer = _answer(pm, gm, issues, status='ok', segment_id=segment_id)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 404\n    remove_failure_log(_log_dir(pm), segment_id)\n")],
   ['tests/test_web.py::TestRound2FailureLogAtAcceptance::test_edit_removes_the_log_inside_the_transaction'])
 r('R2-11 run-level error not kept on the task',
   [(T, '        task.error = str(error)  # for a page opened later\n', '')],
@@ -361,8 +361,8 @@ r('R3-7 strict decoding of the output',
   [(LLM, "encoding='utf-8', errors='replace',", 'text=True,')],
   ['tests/test_llm.py::TestRound3UndecodableOutput', 'tests/test_translator.py::TestRound3UnexpectedFailureLog'])
 r('R3-7 unexpected failure without diagnostics',
-  [(TR, "blocking=True)],\n        failure=TranslationError(detail, code='unexpected', prompt=prompt,\n                                 attempts=[(f'{type(error).__name__}: {error}', trace)]))",
-    'blocking=True)])')],
+  [(TR, "blocking=True)],\n        failure=TranslationError(detail, code='unexpected', prompt=prompt,\n                                 attempts=[(f'{type(error).__name__}: {error}', trace)],\n                                 calls=calls, split=split),\n        calls=calls, split=split)",
+    'blocking=True)], calls=calls, split=split)')],
   ['tests/test_translator.py::TestRound3UnexpectedFailureLog',
    'tests/test_translator.py::TestRound2EntryPointWritesNoFile'])
 r('R3-7 request not in the unexpected-failure log',
