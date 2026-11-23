@@ -151,7 +151,7 @@ logs/                         # 與 projects/ 同一層，不進版控：程序�
 
 ### 紀錄
 
-- **程序紀錄** `logs/web.log`（Web 伺服器）、`logs/cli.log`（每個 CLI 指令），放在專案資料夾（`projects/`）的上一層，除了終端機的輸出之外持續保留。每次啟動先寫一行版本（git commit；不標示是否有未提交的變更）、Python 版本、指令與 PID，接著是 INFO 以上的所有紀錄（`src.*` 與第三方套件，例如 Web 的請求行、Copilot SDK 轉來的執行環境輸出），以及請求、CLI 指令或執行緒中未處理例外的完整 traceback；CLI 指令結束時寫 `end: exit N`，Web 伺服器正常結束時寫 `end: web server stopped`（被強制終止時沒有結束行）。終端機照舊顯示：CLI 指令顯示警告以上，Web 伺服器顯示 INFO 以上；`translate.py review` 的紀錄留在 `cli.log`。每個檔案滿 5 MB 輪替，保留 5 個舊檔。這個檔案可能含書名、術語，以及引用模型輸出的錯誤訊息（只有 Copilot 後端會遮蔽其中的電子郵件地址），只留在本機。
+- **程序紀錄** `logs/web.log`（Web 伺服器）、`logs/cli.log`（每個 CLI 指令），放在專案資料夾（`projects/`）的上一層，除了終端機的輸出之外持續保留。每次啟動先寫一行版本號（`src.__version__`）、Python 版本、指令與 PID，接著是 INFO 以上的所有紀錄（`src.*` 與第三方套件，例如 Web 的請求行、Copilot SDK 轉來的執行環境輸出），以及請求、CLI 指令或執行緒中未處理例外的完整 traceback；CLI 指令結束時寫 `end: exit N`，Web 伺服器正常結束時寫 `end: web server stopped`（被強制終止時沒有結束行）。終端機照舊顯示：CLI 指令顯示警告以上，Web 伺服器顯示 INFO 以上；`translate.py review` 的紀錄留在 `cli.log`。每個檔案滿 5 MB 輪替，保留 5 個舊檔。這個檔案可能含書名、術語，以及引用模型輸出的錯誤訊息（只有 Copilot 後端會遮蔽其中的電子郵件地址），只留在本機。
 - **事件紀錄** `projects/<name>/log/events.jsonl`：每行一個 JSON 物件。每次模型呼叫一行（翻譯請求、附錯誤重問、拆半、單段重新翻譯、術語提取批次、術語統一），記錄時間、執行 ID、呼叫種類、段落 ID、後端、模型、推理強度、逾時、耗時、tokens（後端有回報時；`claude-cli` 不回報）、結果（accepted、rejected 與問題代碼、timeout、cancelled、rate_limit、auth、backend_unavailable、refusal、truncated、transient、error、unexpected）與該段的第幾次呼叫；另有執行的開始、暫停／繼續與原因、使用量上限的等待、結束與計數，以及每段的最終結果（translated、failed、dropped：翻譯期間被編輯）。**不含書的文字**（原文、譯文、提示、回覆、術語、錯誤訊息都不記，只記代碼、次數、字元數與耗時），所以這是可以交給開發者分析的檔案（段落 ID 的例外見 `known-issues.md`）。寫入失敗只記一則警告，不影響翻譯；專案被取代或刪除後，仍在進行的單段重新翻譯或術語提取不再寫入（也不會重建已刪除的專案資料夾）。術語提取的回覆無法解析時記為 rejected（`unusable_reply`）。
 - `translate.py stats` 與 Web 的「統計」頁讀的就是事件紀錄（同一個函式計算）；無法解析的行（例如程序在寫入中途結束）或欄位型別不對的行會略過並列出數量。統計的已知限制見 `known-issues.md`。
 
@@ -162,6 +162,8 @@ python3 -m pytest tests/ -q -p no:cacheprovider -rfw
 ```
 
 突變測試：在專案的虛擬環境（已安裝 `requirements.txt` 與 `requirements-dev.txt`）執行 `scripts/verify/mutation.sh main`（第二個參數限制同時執行的突變 worker 數，例如 `main 4`，預設每個核心一個）；與 `main` 相比沒有可突變的變更行時以 exit 2 結束。`scripts/verify/` 其他腳本見 [CLAUDE.md](CLAUDE.md)。
+
+版本與變更紀錄：每個修改 `src/`、`translate.py` 或 `requirements*.txt` 的 pull request 都要調高 `src/__init__.py` 的 `__version__`，並在 [CHANGELOG.md](CHANGELOG.md) 最上面加一段；規則見 CLAUDE.md「Releases」。程序紀錄只用這個版本號識別程式，從未合併或本機修改過的程式碼執行時，顯示的是上一個發行版本號。
 
 ## 疑難排解
 

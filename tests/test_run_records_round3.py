@@ -287,42 +287,39 @@ def test_page_shows_unknown_start(tmp_path):
     assert "r.start ? time(r.start) : '（開始不在所選紀錄中）'" in page
 
 
-def test_version_leaves_the_index_alone(tmp_path, monkeypatch):
-    """In a temporary repository with a modified tracked file (so a status
-    or describe --dirty would refresh the index): the version lookup leaves
-    .git/index as it was and names the commit."""
+def test_start_line_version_without_git(tmp_path, monkeypatch):
+    """The start line carries src.__version__ and nothing from git:
+    proclog starts no process at all."""
     import subprocess
-    import time
+    from src import __version__
     from src.core import proclog
-    env = {'GIT_AUTHOR_NAME': 'n', 'GIT_AUTHOR_EMAIL': 'n@example.invalid',
-           'GIT_COMMITTER_NAME': 'n', 'GIT_COMMITTER_EMAIL': 'n@example.invalid',
-           'PATH': os.environ['PATH'], 'HOME': str(tmp_path)}
+    started = []
 
-    def git(*args):
-        return subprocess.run(['git', '-C', str(tmp_path), *args], check=True, env=env,
-                              capture_output=True, text=True).stdout.strip()
-    git('init', '-q')
-    (tmp_path / 'f').write_text('a')
-    git('add', 'f')
-    git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'x')
-    time.sleep(1.1)  # a later mtime than the index records: a stale index entry
-    (tmp_path / 'f').write_text('b')
-    index = tmp_path / '.git' / 'index'
-    before = (index.stat().st_mtime_ns, index.read_bytes())
-    monkeypatch.setattr(proclog, '_REPO', str(tmp_path))
-    monkeypatch.setattr(proclog, '_commit', None)
-    assert proclog.program_version() == f'1.0.0 ({git("rev-parse", "--short=12", "HEAD")})'
-    assert (index.stat().st_mtime_ns, index.read_bytes()) == before
+    def no_process(*a, **k):
+        started.append(a)
+        raise AssertionError('proclog started a process')
+    monkeypatch.setattr(subprocess, 'Popen', no_process)
+    monkeypatch.setenv(proclog.LOG_DIR_ENV, str(tmp_path / 'logs'))
+    proclog.teardown()
+    try:
+        path = proclog.setup(str(tmp_path / 'projects'), 'cli', 'cli status')
+    finally:
+        proclog.teardown()
+    line = open(path, encoding='utf-8').read()
+    assert f'| epub-translator {__version__} | Python ' in line and started == []
+    assert 'subprocess' not in open(proclog.__file__, encoding='utf-8').read()
 
 
-def test_version_without_git(tmp_path, monkeypatch):
-    from src.core import proclog
-    monkeypatch.setattr(proclog, '_REPO', str(tmp_path))  # not a checkout
-    monkeypatch.setattr(proclog, '_commit', None)
-    assert proclog.program_version() == '1.0.0'
-    monkeypatch.setenv('PATH', str(tmp_path))  # no git program at all
-    monkeypatch.setattr(proclog, '_commit', None)
-    assert proclog.program_version() == '1.0.0'
+def test_changelog_and_version_in_step():
+    import re
+    from click.testing import CliRunner
+    import translate
+    from src import __version__
+    from tests.conftest import _REPO_ROOT
+    with open(os.path.join(_REPO_ROOT, 'CHANGELOG.md'), encoding='utf-8') as f:
+        top = re.search(r'^## (\S+)', f.read(), re.M).group(1)
+    assert top == __version__
+    assert CliRunner().invoke(translate.cli, ['--version']).output.strip().endswith(__version__)
 
 
 def _replacement_now(project_dir):

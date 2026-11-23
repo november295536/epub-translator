@@ -22,7 +22,6 @@ import logging
 import logging.handlers
 import os
 import platform
-import subprocess
 import sys
 import threading
 
@@ -37,8 +36,6 @@ BACKUP_COUNT = 5
 FORMAT = '%(asctime)s %(process)d [%(levelname)s] %(name)s: %(message)s'
 DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
-_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
@@ -47,7 +44,6 @@ _handler_name: str | None = None
 _terminal: logging.Handler | None = None
 _in_command = False  # between a CLI command's setup() and command_ended()
 _previous_excepthook = None
-_commit: str | None = None
 _end_registered = False
 
 
@@ -57,22 +53,6 @@ def log_dir_for(projects_dir: str) -> str:
     if override:
         return override
     return os.path.join(os.path.dirname(os.path.abspath(projects_dir)), 'logs')
-
-
-def program_version() -> str:
-    """The package version and, in a git checkout, the commit (`git
-    rev-parse --short=12 HEAD`: read-only, it never touches the index, so it
-    cannot take .git/index.lock while someone commits); computed once. It
-    does not say whether the tree has uncommitted changes."""
-    global _commit
-    if _commit is None:
-        try:
-            result = subprocess.run(['git', '-C', _REPO, 'rev-parse', '--short=12', 'HEAD'],
-                                    capture_output=True, text=True, timeout=5, check=False)
-            _commit = result.stdout.strip() if result.returncode == 0 else ''
-        except (OSError, subprocess.SubprocessError):
-            _commit = ''
-    return f'{__version__} ({_commit})' if _commit else __version__
 
 
 def _thread_excepthook(args):
@@ -159,7 +139,7 @@ def setup(projects_dir: str, name: str, what: str) -> str | None:
             _end_registered = True
             atexit.register(_web_end)
     logger.info("start: %s | epub-translator %s | Python %s | %s | pid %d",
-                what, program_version(), platform.python_version(), sys.platform, os.getpid())
+                what, __version__, platform.python_version(), sys.platform, os.getpid())
     return path
 
 

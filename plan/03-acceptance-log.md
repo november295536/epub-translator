@@ -7969,7 +7969,7 @@ Branch `feat/run-records`. Three parts (CLAUDE.md, "Run records"):
 
 1. **Process log** (`src/core/proclog.py`): `logs/web.log` (web server) and `logs/cli.log` (every
    CLI command) beside the projects directory, rotating at 5 MB × 5. Start line (command or
-   "web server", version with `git describe`, Python, platform, pid), every `src.*` record,
+   "web server", version with `git describe` (since review round 3: `src.__version__` only), Python, platform, pid), every `src.*` record,
    werkzeug request lines, tracebacks of requests, commands and threads, an end line
    (`end: exit N` for commands, `end: web server stopped` at a normal server exit).
 2. **Event record** (`src/core/events.py`): `<project>/log/events.jsonl`, one JSON object per
@@ -8115,7 +8115,7 @@ the server with SIGINT to its process group.
   SIGINT sent to its own process group (`start_new_session=True`, `os.killpg`) after the first
   segment: run_end `interrupted`, 1 translated, `KeyboardInterrupt`, process exit 1
   ("Aborted!"); `start` once more finished the other 5.
-- From the files alone: `logs/web.log` has the start line (version from `git describe`, pid),
+- From the files alone: `logs/web.log` has the start line (version from `git describe` at the time; since review round 3 `src.__version__` only, pid),
   every request line (`POST …/translate/pause` twice), the model change, the task's start and
   segment lines and `end: web server stopped`; `logs/cli.log` has a start and end line for each
   of the 11 commands, the `run stopped: …` warning of the unavailable backend and
@@ -8277,7 +8277,7 @@ the fix. All findings reproduced except where said.
 | 5 | Retranslate: an exception after the counts were set replaced them | yes: `test_retranslate_keeps_counts_when_the_answer_fails` | the error branches keep the counts (`354f3ac`) |
 | 6 | CLI `glossary extract` wrote `completed` before the save; an exception before the `try` left no end | yes: `TestCliExtractLifecycle` (3) | one `try` from the extractor to the save; `completed`/`stopped` with `terms` and `added` only after the save, `failed` with the error class otherwise, `interrupted` on Ctrl-C (`5841304`) |
 | 7 | Extraction: Ctrl-C while a reply is read loses the call; empty model recorded | yes: `TestExtractionRound2` (3) | recorded `cancelled`; the record names the backend's default model. The request keeps passing no model flag when none is given (an existing test asserts that the program's own default is used), so only the record changed (`e7446f3`) |
-| 8 | `git describe --dirty` takes `.git/index.lock` | by reading, not forced: a scratch repository with `index.lock` held showed `git describe --dirty` still answering (the lock is optional, so git skips it when taken) — the collision the other way (our refresh holding the lock while a `git commit` starts) was not forced | `GIT_OPTIONAL_LOCKS=0` in the command's environment; `test_version_takes_no_git_lock` asserted it (`e6b3b77`). **Corrected in review round 3:** this had no effect — an experiment (git 2.50, scratch repository, a touched file) showed `describe --dirty` rewriting `.git/index` with and without the variable; the version now comes from `git rev-parse` and has no dirty marker (round 3, item 7) |
+| 8 | `git describe --dirty` takes `.git/index.lock` | by reading, not forced: a scratch repository with `index.lock` held showed `git describe --dirty` still answering (the lock is optional, so git skips it when taken) — the collision the other way (our refresh holding the lock while a `git commit` starts) was not forced | `GIT_OPTIONAL_LOCKS=0` in the command's environment; `test_version_takes_no_git_lock` asserted it (`e6b3b77`). **Corrected in review round 3:** this had no effect — an experiment (git 2.50, scratch repository, a touched file) showed `describe --dirty` rewriting `.git/index` with and without the variable; since round 3 the program reads no git at all (round 3, item 7) |
 | 9 | Delete: an append past its checks could recreate the record during `rmtree` | yes: `test_delete_waits_for_an_append_in_progress` (append held after its checks; before, the project directory existed again afterwards) | `events.retired()`: retire and delete under the record's lock (`458639b`) |
 | 10 | `phase1_reverts.py`: revert 5's anchor no longer found | yes, and five more: the first rerun reported `BAD` for 16, 19, 24, R2-17, R3-7 (old text changed by this branch) | anchors updated (`c1d7394`, `39ecc95`); the script's result is below |
 | 11 | Page lists codes by name; duration from timestamps | yes: `test_codes_by_count_and_measured_duration` (summary ties), `test_page_sorts_codes_by_count` | page sorts by count (ties by code), the summary breaks ties the same way; a finished run's duration is its `run_end.seconds` (`302e9c9`) |

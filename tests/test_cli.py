@@ -501,7 +501,7 @@ class TestCLIVersion:
     def test_version(self, runner):
         result = runner.invoke(cli, ['--version'])
         assert result.exit_code == 0
-        assert '1.0.0' in result.output
+        assert '2.0.0' in result.output
 
 
 class TestCLIGlossaryExtract:
@@ -526,7 +526,7 @@ class TestCLIMessages:
     FAIL = 'Translation failed after 4 attempts: exit 1'
 
     def test_version_line(self, runner):
-        assert runner.invoke(cli, ['--version']).output == 'epub-translator, version 1.0.0\n'
+        assert runner.invoke(cli, ['--version']).output == 'epub-translator, version 2.0.0\n'
 
     def test_retry_failed_help(self, runner):
         output = ' '.join(runner.invoke(cli, ['start', '--help']).output.split())
