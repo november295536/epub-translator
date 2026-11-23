@@ -41,7 +41,7 @@
                             <tr>
                                 <th>用途</th><th>後端</th><th>模型</th><th>推理強度</th><th>模型呼叫</th>
                                 <th>段落</th><th>首次即通過</th><th>需多次呼叫</th><th>其中分割</th>
-                                <th>最終失敗</th><th>耗時中位數</th><th>耗時 p90</th>
+                                <th>最終失敗</th><th>有回覆的呼叫</th><th>回覆耗時中位數</th><th>回覆耗時 p90</th><th>逾時</th>
                                 <th>輸入 tokens</th><th>輸出 tokens</th>
                             </tr>
                         </thead>
@@ -58,8 +58,10 @@
                                     <td x-text="count(g.more_calls, g.more_calls_share)"></td>
                                     <td x-text="g.split"></td>
                                     <td x-text="count(g.failed, g.failed_share)"></td>
+                                    <td x-text="g.seconds_calls"></td>
                                     <td x-text="secs(g.seconds_median)"></td>
                                     <td x-text="secs(g.seconds_p90)"></td>
+                                    <td x-text="g.timeouts"></td>
                                     <td x-text="g.tokens_in === null ? '未回報' : g.tokens_in"></td>
                                     <td x-text="g.tokens_out === null ? '未回報' : g.tokens_out"></td>
                                 </tr>
@@ -67,7 +69,7 @@
                         </tbody>
                     </table>
                     <p class="text-muted" style="margin: 0.75rem 1rem; font-size: 0.85rem;">
-                        段落依其最後一次模型呼叫歸類；「需多次呼叫」是翻譯成功但用了一次以上的呼叫（退回後重試、逾時後重試、分割），「其中分割」是其中經過分割的段落。claude-cli 不回報 tokens。
+                        段落依其最後一次模型呼叫歸類；耗時中位數與 p90 只算有回覆的呼叫（accepted、rejected、truncated），不含暫停時取消的、很快失敗的與逾時的呼叫；「需多次呼叫」是翻譯成功但用了一次以上的呼叫（退回後重試、逾時後重試、分割），「其中分割」是其中經過分割的段落。claude-cli 不回報 tokens。
                         各呼叫結果（滑鼠移到「模型呼叫」上可看）：
                     </p>
                     <ul class="text-muted" style="margin: 0 1rem 0.75rem; font-size: 0.85rem;">

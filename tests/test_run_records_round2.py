@@ -55,3 +55,18 @@ class TestCheckScriptShape:
         code, out = self._check(tmp_path, capsys)
         assert code == 1 and 'result: a string' in out and 'run 1: run_end translated=1' in out
         assert 'Zorblaxian' not in out
+
+
+def test_durations_over_replies_only():
+    """A call cancelled by a pause, a quick error and a timeout do not count
+    in the median and p90; timeouts are counted apart."""
+    from src.core.stats import summarize, text_report
+    from tests.test_run_records import _call
+    records = [_call('s1', 1, seconds=8.0), _call('s2', 1, 'rejected', seconds=10.0),
+               _call('s3', 1, 'cancelled', seconds=0.1), _call('s4', 1, 'rate_limit', seconds=0.2),
+               _call('s5', 1, 'timeout', seconds=60.0), _call('s6', 1, 'truncated', seconds=12.0)]
+    [g] = summarize(records)['models']
+    assert (g['seconds_calls'], g['seconds_median'], g['seconds_p90'], g['timeouts']) == (
+        3, 10.0, 12.0, 1)
+    text = '\n'.join(text_report({**summarize(records), 'exists': True}))
+    assert '回覆耗時（3 次有回覆的呼叫）：中位數 10.0 秒，p90 12.0 秒；逾時 1 次' in text

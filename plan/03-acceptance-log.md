@@ -8105,7 +8105,7 @@ the server with SIGINT to its process group.
   one retranslation; one glossary extraction. Stats page loaded in Chrome; it shows the same
   numbers as `stats --json`, which equals the endpoint's JSON (compared as dicts: equal).
   Per backend/model: 10 calls (accepted 8, cancelled 2 by the pause, each recorded at 0.1 s),
-  7 segments all accepted at the first attempt, median 6.9 s, p90 11.3 s, tokens 12,468 in,
+  7 segments all accepted at the first attempt, median 6.9 s, p90 11.3 s (computed over all 10 calls, the two cancelled ones included; review round 2 changed both to calls that returned a reply, and these can no longer be recomputed: the run's files were removed after the check), tokens 12,468 in,
   4,710 out; runs: web 35.1 s, 6 translated, 1 pause, 8 calls; retranslate 7.6 s; extract
   6.8 s, 2 terms added. A line `not json` appended to the record: the page said "略過 1 行無法解析的紀錄".
   A new untouched project showed the empty state.
@@ -8242,7 +8242,7 @@ Real check, only what this round changed (invented two-chapter EPUB in the scrat
 `copilot-sdk` with `claude-haiku-4.5`, timeout 60 s; REAL calls: 3): CLI `init`, `model set`,
 `glossary extract` (1 call, 4 terms), `start -w 2` (2 calls, both accepted at the first
 attempt), `stats`: the report now lists 翻譯 and 術語提取 apart (translation: 2 calls, median
-8.1 s, p90 9.1 s, tokens 3,910 / 1,097; extraction: 1 call, 7.5 s, 563 / 522) and says 需多次呼叫.
+8.1 s, p90 9.1 s — recomputed in review round 2 by nearest rank over the calls with a reply, as the code now does: median 7.1 s, p90 9.1 s (the two calls took 7.1 and 9.1 s) —, tokens 3,910 / 1,097; extraction: 1 call, 7.5 s, 563 / 522) and says 需多次呼叫.
 Web server on the same projects directory: the request lines appear in the terminal again
 (`[INFO] werkzeug: … "GET /api/projects/…/stats HTTP/1.1" 200`); endpoint JSON equals
 `stats --json` (compared as dicts); the stats page in Chrome shows the 用途 column with both rows,

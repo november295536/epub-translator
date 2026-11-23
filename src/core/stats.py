@@ -7,10 +7,13 @@ import datetime
 import json
 import math
 import os
-import statistics
 from collections import Counter
 
 from src.core.events import EVENTS_VERSION, events_path
+
+# Outcomes of a call that returned a reply: the only ones whose duration
+# says how fast a model answers (not a pause's cancel, a quick error, a timeout)
+_REPLIED = ('accepted', 'rejected', 'truncated')
 
 # The segment results that count as a segment's end (dropped ones do not)
 _FINAL = ('translated', 'failed')
@@ -139,7 +142,8 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
 
     Per work (translation; extraction: calls of kind extract/consolidate)
     and backend/model/effort: model calls, their outcomes, issue codes of
-    rejected replies, duration median and p90, tokens in/out (the calls
+    rejected replies, duration median and p90 (nearest rank, over the calls
+    that returned a reply: `seconds_calls`), timeouts, tokens in/out (the calls
     that report them); the segments that ended there (the model of their
     last call): translated with one call, translated with more (retries,
     transient retries, a split; `split` counts those split), failed. Per run: source, start, end, duration, segments
@@ -155,7 +159,7 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
             'work': key[0], 'backend': key[1], 'model': key[2],
             'effort': None if key[3] == '-' else key[3],
             'calls': 0, 'outcomes': Counter(), 'issues': Counter(), 'seconds': [],
-            'tokens_in': 0, 'tokens_out': 0, 'calls_with_tokens': 0,
+            'tokens_in': 0, 'tokens_out': 0, 'calls_with_tokens': 0, 'timeouts': 0,
             'segments': 0, 'first_attempt': 0, 'more_calls': 0, 'split': 0, 'failed': 0,
         })
 
@@ -193,8 +197,10 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
             g['issues'].update(codes)
             rejections.update(codes)
             seconds = _number(r.get('seconds'))
-            if seconds is not None:
-                g['seconds'].append(seconds)
+            if seconds is not None and r.get('outcome') in _REPLIED:
+                g['seconds'].append(seconds)  # a call cancelled or failed fast would skew it
+            if r.get('outcome') == 'timeout':
+                g['timeouts'] += 1
             tokens_in, tokens_out = _number(r.get('tokens_in')), _number(r.get('tokens_out'))
             if tokens_in is not None or tokens_out is not None:
                 g['calls_with_tokens'] += 1
@@ -232,7 +238,8 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
         seconds = g.pop('seconds')
         g['outcomes'] = dict(g['outcomes'].most_common())
         g['issues'] = dict(g['issues'].most_common())
-        g['seconds_median'] = round(statistics.median(seconds), 3) if seconds else None
+        g['seconds_calls'] = len(seconds)  # the calls the two durations are based on
+        g['seconds_median'] = percentile(seconds, 0.5)
         g['seconds_p90'] = percentile(seconds, 0.9)
         g['first_attempt_share'] = _share(g['first_attempt'], g['segments'])
         g['more_calls_share'] = _share(g['more_calls'], g['segments'])
@@ -330,8 +337,9 @@ def text_report(stats: dict) -> list[str]:
                 f'最終失敗 {g["failed"]}（{_pct(g["failed_share"])}）')
         if g['issues']:
             lines.append(f'    回覆被退回的原因：{_codes(g["issues"])}')
-        lines.append(f'    每次呼叫耗時：中位數 {_secs(g["seconds_median"])}，'
-                     f'p90 {_secs(g["seconds_p90"])}')
+        lines.append(f'    回覆耗時（{g["seconds_calls"]} 次有回覆的呼叫）：中位數 '
+                     f'{_secs(g["seconds_median"])}，p90 {_secs(g["seconds_p90"])}'
+                     + (f'；逾時 {g["timeouts"]} 次' if g['timeouts'] else ''))
         if g['tokens_in'] is None:
             lines.append('    tokens：後端未回報')
         else:
