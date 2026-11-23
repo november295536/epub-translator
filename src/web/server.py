@@ -7,9 +7,12 @@ import os
 from flask import Flask, jsonify
 
 import src.llm as llm
+from src.core import proclog
 from src.core.project import ProjectLockedError
 
-from src.web.blueprints import export_bp, glossary_bp, home_bp, projects_bp, review_bp, search_bp, translation_bp
+from src.web.blueprints import (
+    export_bp, glossary_bp, home_bp, projects_bp, review_bp, search_bp, stats_bp, translation_bp,
+)
 
 
 def create_app(projects_dir: str | None = None) -> Flask:
@@ -37,12 +40,14 @@ def create_app(projects_dir: str | None = None) -> Flask:
 
     app.config['PROJECTS_DIR'] = projects_dir
 
-    # Configure logging for all src.* modules
+    # Configure logging for all src.* modules: the terminal, and the
+    # persistent process log beside the projects directory (src/core/proclog.py)
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
         datefmt='%H:%M:%S',
     )
+    proclog.setup(projects_dir, 'web', 'web server')
 
     # Register blueprints
     app.register_blueprint(export_bp)
@@ -51,6 +56,7 @@ def create_app(projects_dir: str | None = None) -> Flask:
     app.register_blueprint(projects_bp)
     app.register_blueprint(review_bp)
     app.register_blueprint(search_bp)
+    app.register_blueprint(stats_bp)
     app.register_blueprint(translation_bp)
 
     @app.context_processor
