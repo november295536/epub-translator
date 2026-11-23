@@ -21,14 +21,59 @@ def parse_since(text: str) -> str:
     date and time, read as local time unless it names an offset. Raises
     ValueError."""
     moment = datetime.datetime.fromisoformat(text.strip())
-    moment = moment.astimezone(datetime.timezone.utc)
+    try:
+        moment = moment.astimezone(datetime.timezone.utc)
+    except OverflowError as e:  # e.g. 0001-01-01 east of UTC
+        raise ValueError(f'out of range: {text}') from e
     return moment.strftime('%Y-%m-%dT%H:%M:%S.') + f'{moment.microsecond // 1000:03d}Z'
+
+
+# The type of each field the record format defines (src/core/events.py);
+# a record with a field of another type is skipped (and FAILs the check
+# script, which shares this)
+_TEXT_FIELDS = frozenset({'ts', 'run', 'source', 'event', 'mode', 'backend', 'model', 'effort',
+                          'kind', 'segment', 'outcome', 'error', 'result', 'reason', 'state'})
+_NUMBER_FIELDS = frozenset({'v', 'workers', 'segments', 'timeout', 'attempt', 'seconds',
+                            'tokens_in', 'tokens_out', 'chars_in', 'chars_out', 'calls',
+                            'translated', 'failed', 'dropped', 'completed', 'resume_in',
+                            'terms', 'added'})
+_FLAG_FIELDS = frozenset({'split'})
+_CODE_LIST_FIELDS = frozenset({'issues', 'warnings'})
+FIELDS = _TEXT_FIELDS | _NUMBER_FIELDS | _FLAG_FIELDS | _CODE_LIST_FIELDS
+
+
+def shape_problem(record) -> str | None:
+    """Why `record` is not a record of this format (not an object; no
+    event/run/ts; a later version; a known field of the wrong type: null
+    counts as left out), or
+    None. Unknown fields pass (the check script reports them)."""
+    if not isinstance(record, dict):
+        return 'not an object'
+    if not all(isinstance(record.get(k), str) for k in ('event', 'run', 'ts')):
+        return 'no event, run or ts'
+    if record.get('v', EVENTS_VERSION) != EVENTS_VERSION:
+        return 'another version'
+    for key, value in record.items():
+        if value is None:
+            continue  # as if left out
+        if key in _TEXT_FIELDS:
+            ok = isinstance(value, str)
+        elif key in _NUMBER_FIELDS:
+            ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+        elif key in _FLAG_FIELDS:
+            ok = isinstance(value, bool)
+        elif key in _CODE_LIST_FIELDS:
+            ok = isinstance(value, list) and all(isinstance(c, str) for c in value)
+        else:
+            continue
+        if not ok:
+            return f'{key}: wrong type'
+    return None
 
 
 def read_records(path: str) -> tuple[list[dict], int]:
     """The records of an event file and the number of lines skipped (not
-    JSON, not an object, no event/run/ts, or a later format version).
-    ([], 0) when the file does not exist."""
+    JSON, or shape_problem). ([], 0) when the file does not exist."""
     records, skipped = [], 0
     try:
         f = open(path, 'rb')
@@ -43,10 +88,7 @@ def read_records(path: str) -> tuple[list[dict], int]:
             except (UnicodeDecodeError, ValueError):
                 skipped += 1
                 continue
-            if (not isinstance(record, dict) or not isinstance(record.get('event'), str)
-                    or not isinstance(record.get('run'), str)
-                    or not isinstance(record.get('ts'), str)
-                    or record.get('v', EVENTS_VERSION) != EVENTS_VERSION):
+            if shape_problem(record) is not None:
                 skipped += 1
                 continue
             records.append(record)
@@ -76,8 +118,13 @@ def _number(value) -> float | None:
     return value
 
 
+# Call kinds of term extraction; every other kind is a translation call
+_EXTRACTION_KINDS = ('extract', 'consolidate')
+
+
 def _key(record: dict) -> tuple:
-    return (str(record.get('backend') or '?'), str(record.get('model') or '?'),
+    work = 'extraction' if record.get('kind') in _EXTRACTION_KINDS else 'translation'
+    return (work, str(record.get('backend') or '?'), str(record.get('model') or '?'),
             str(record.get('effort') or '-'))
 
 
@@ -90,11 +137,12 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
     """The numbers of `records` (in file order), optionally only those at
     or after `since` (a record time, parse_since) and of run `run`.
 
-    Per backend/model/effort: model calls, their outcomes, issue codes of
+    Per work (translation; extraction: calls of kind extract/consolidate)
+    and backend/model/effort: model calls, their outcomes, issue codes of
     rejected replies, duration median and p90, tokens in/out (the calls
     that report them); the segments that ended there (the model of their
-    last call): accepted at the first attempt, needing more calls, split,
-    failed. Per run: source, start, end, duration, segments
+    last call): translated with one call, translated with more (retries,
+    transient retries, a split; `split` counts those split), failed. Per run: source, start, end, duration, segments
     translated/failed/dropped, pauses, calls, end state."""
     groups: dict[tuple, dict] = {}
     runs: dict[str, dict] = {}
@@ -104,7 +152,8 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
 
     def group(key):
         return groups.setdefault(key, {
-            'backend': key[0], 'model': key[1], 'effort': None if key[2] == '-' else key[2],
+            'work': key[0], 'backend': key[1], 'model': key[2],
+            'effort': None if key[3] == '-' else key[3],
             'calls': 0, 'outcomes': Counter(), 'issues': Counter(), 'seconds': [],
             'tokens_in': 0, 'tokens_out': 0, 'calls_with_tokens': 0,
             'segments': 0, 'first_attempt': 0, 'more_calls': 0, 'split': 0, 'failed': 0,
@@ -161,7 +210,7 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
                 continue
             key = last_call.get((r['run'], r.get('segment')))
             if key is None:  # its calls are not in the selection
-                key = ('?', str(r.get('model') or '?'), '-')
+                key = ('translation', '?', str(r.get('model') or '?'), '-')
             g = group(key)
             g['segments'] += 1
             calls = _number(r.get('calls')) or 0
@@ -174,11 +223,12 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
                     g['first_attempt'] += 1
                 else:
                     g['more_calls'] += 1
-            if r.get('split'):
-                g['split'] += 1
+                    if r.get('split'):  # a part of more_calls
+                        g['split'] += 1
 
     models = []
-    for g in sorted(groups.values(), key=lambda g: (g['backend'], g['model'], g['effort'] or '')):
+    for g in sorted(groups.values(), key=lambda g: (g['work'] != 'translation', g['backend'],
+                                                    g['model'], g['effort'] or '')):
         seconds = g.pop('seconds')
         g['outcomes'] = dict(g['outcomes'].most_common())
         g['issues'] = dict(g['issues'].most_common())
@@ -245,6 +295,9 @@ def _codes(counts: dict) -> str:
     return '、'.join(f'{code} {n}' for code, n in counts.items()) or '無'
 
 
+# How the kinds of work read in the text report
+WORK_TEXT = {'translation': '翻譯', 'extraction': '術語提取'}
+
 # How the run states read in the text report
 STATE_TEXT = {'completed': '完成', 'stopped': '停止', 'failed': '失敗',
               'interrupted': '中斷', 'unfinished': '未結束（執行中或程序已終止）'}
@@ -266,12 +319,13 @@ def text_report(stats: dict) -> list[str]:
     lines.append('')
     lines.append('依後端／模型／推理強度：')
     for g in stats['models']:
-        lines.append(f'  {g["backend"]} / {g["model"]} / {g["effort"] or "-"}')
+        lines.append(f'  {WORK_TEXT.get(g["work"], g["work"])}：'
+                     f'{g["backend"]} / {g["model"]} / {g["effort"] or "-"}')
         lines.append(f'    模型呼叫 {g["calls"]} 次：{_codes(g["outcomes"])}')
         if g['segments']:
             lines.append(
                 f'    段落 {g["segments"]}：首次即通過 {g["first_attempt"]}'
-                f'（{_pct(g["first_attempt_share"])}），需重試或分割 {g["more_calls"]}'
+                f'（{_pct(g["first_attempt_share"])}），需多次呼叫 {g["more_calls"]}'
                 f'（{_pct(g["more_calls_share"])}；其中分割 {g["split"]}），'
                 f'最終失敗 {g["failed"]}（{_pct(g["failed_share"])}）')
         if g['issues']:

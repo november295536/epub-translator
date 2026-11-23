@@ -847,7 +847,8 @@ RICH_SUMMARY = {'records': 12,
  'skipped_lines': 0,
  'since': None,
  'run': None,
- 'models': [{'backend': '?',
+ 'models': [{'work': 'translation',
+             'backend': '?',
              'model': 'm3',
              'effort': None,
              'calls': 0,
@@ -866,7 +867,8 @@ RICH_SUMMARY = {'records': 12,
              'first_attempt_share': 0.0,
              'more_calls_share': 0.0,
              'failed_share': 1.0},
-            {'backend': 'b',
+            {'work': 'translation',
+             'backend': 'b',
              'model': 'm1',
              'effort': 'low',
              'calls': 3,
@@ -909,14 +911,14 @@ RICH_SUMMARY = {'records': 12,
 RICH_TEXT = ('事件紀錄：12 筆\n'
  '\n'
  '依後端／模型／推理強度：\n'
- '  ? / m3 / -\n'
+ '  翻譯：? / m3 / -\n'
  '    模型呼叫 0 次：無\n'
- '    段落 1：首次即通過 0（0.0%），需重試或分割 0（0.0%；其中分割 0），最終失敗 1（100.0%）\n'
+ '    段落 1：首次即通過 0（0.0%），需多次呼叫 0（0.0%；其中分割 0），最終失敗 1（100.0%）\n'
  '    每次呼叫耗時：中位數 -，p90 -\n'
  '    tokens：後端未回報\n'
- '  b / m1 / low\n'
+ '  翻譯：b / m1 / low\n'
  '    模型呼叫 3 次：accepted 2、rejected 1\n'
- '    段落 1：首次即通過 0（0.0%），需重試或分割 1（100.0%；其中分割 1），最終失敗 0（0.0%）\n'
+ '    段落 1：首次即通過 0（0.0%），需多次呼叫 1（100.0%；其中分割 1），最終失敗 0（0.0%）\n'
  '    回覆被退回的原因：tag_count 1\n'
  '    每次呼叫耗時：中位數 3.0 秒，p90 4.0 秒\n'
  '    tokens：輸入 0，輸出 7（1 次呼叫有回報）\n'
@@ -1245,7 +1247,7 @@ class TestCheckScriptOutput:
         assert capsys.readouterr().out == (
             'project-1: PASS  records 1, skipped lines 0, runs 1\n'
             'project-2: FAIL  records 2, skipped lines 0, runs 1\n'
-            '  record 1: issues: a word of the source text\n'
+            '  record 1: issues: a string that is not a known value (10 chars)\n'
             '  run 20260101T000000Z-abcdef: run_end translated=1, segment records 0\n'
             '  run 20260101T000000Z-abcdef: run_end failed=0, segment records 1\n'
             '  1 records name a segment id not in project.json\n'

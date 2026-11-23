@@ -282,7 +282,7 @@ def _start(project_dir, backend, model, workers, retry_failed):
     all_segments = pm.data.segments
 
     log_dir = os.path.join(project_dir, 'log')
-    run = _Run(project_dir, pm, min(workers, len(pending)), len(pending), retry_failed)
+    run = _Run(project_dir, pm, workers, len(pending), retry_failed)  # workers asked for, as the web
     with run:
         if workers > 1:
             failed = _start_parallel(pm, gm, pending, all_segments, progress, workers, log_dir,
