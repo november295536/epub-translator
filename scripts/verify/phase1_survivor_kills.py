@@ -102,7 +102,7 @@ M = [  # (name, file, old text, mutated text, tests)
  ('cli78','translate.py','click.echo("翻譯中斷，正在停止進行中的段落……")','click.echo("XX翻譯中斷，正在停止進行中的段落……XX")',['tests/test_cli.py::TestCLIRound1Exact::test_supervisor_failure_output']),
  ('cli80','translate.py','f"未儲存的結果（','f"XX未儲存的結果（',['tests/test_cli.py::TestCLIRound1Exact::test_supervisor_failure_output']),
  ('cli82','translate.py',"+ ', '.join(item[0] for item in saver.pending))","+ 'XX, XX'.join(item[0] for item in saver.pending))",['tests/test_cli.py::TestCLIRound1Exact::test_supervisor_failure_output']),
- ('cli90','translate.py','click.echo(f"提取中斷：{e}")','click.echo(f"XX提取中斷：{e}XX")',['tests/test_cli.py::TestCLIRound1Exact::test_extraction_stop_line']),
+ ('cli90','translate.py','click.echo(f"提取中斷：{stopped}")','click.echo(f"XX提取中斷：{stopped}XX")',['tests/test_cli.py::TestCLIRound1Exact::test_extraction_stop_line']),
  ('scr14','scripts/verify/phase1_load_projects.py',"        return 'equal', ''","        return 'equal', 'XXXX'",['tests/test_verify_scripts.py::TestLoadCheckRoundTripExact']),
  ('scr20','scripts/verify/phase1_load_projects.py',"if 'model' not in on_disk and {","if 'model' not in on_disk or {",['tests/test_verify_scripts.py::TestLoadCheckRoundTripExact']),
  ('scr22','scripts/verify/phase1_load_projects.py',"return 'model added', ''","return 'model added', 'XXXX'",['tests/test_verify_scripts.py::TestLoadCheckRoundTripExact']),
