@@ -261,18 +261,19 @@ def retranslate_segment(project_name: str, segment_id: str):
                         'translated_text': outcome.text, **answer})
     except AuthError as e:
         logger.warning("Auth error during retranslation: %s", e)
-        end = {'state': 'stopped', 'error': type(e).__name__}
+        end = {**end, 'state': 'stopped', 'error': type(e).__name__}
         return jsonify({'error': str(e), 'auth_error': True}), 401
     except RateLimitError as e:
         logger.warning("Rate limit during retranslation: %s", e)
-        end = {'state': 'stopped', 'error': type(e).__name__}
+        end = {**end, 'state': 'stopped', 'error': type(e).__name__}
         return jsonify({'error': str(e)}), 500
     except BackendUnavailableError as e:
         logger.warning("Backend unavailable during retranslation: %s", e)
-        end = {'state': 'stopped', 'error': type(e).__name__}
+        end = {**end, 'state': 'stopped', 'error': type(e).__name__}
         return jsonify({'error': str(e)}), 503
     except BaseException as e:
-        end = {'state': 'failed', 'error': type(e).__name__}
+        # the counts stay: a segment line may already be written
+        end = {**end, 'state': 'failed', 'error': type(e).__name__}
         raise
     finally:
         teardown_project_logging(handler)
