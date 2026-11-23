@@ -497,15 +497,19 @@ class TaskManager:
             glossary_path = os.path.join(project_dir, 'glossary.json')
             gm = GlossaryManager(glossary_path)
             gm.load()
-            task._gm = gm
 
-            num_workers = min(task.num_workers, task.total)
+            # The glossary and the worker count together, under the lock: a
+            # resume tops up workers only once both are there
+            # (_top_up_workers), never in between, where it would start a
+            # worker this count does not include and the run would not end
+            with task._lock:
+                task._gm = gm
+                num_workers = min(task.num_workers, task.total)
+                task.active_workers = num_workers
             logger.info("翻譯開始: %s (共 %d 段待翻譯, %d workers, 模型: %s)",
                         task.project_name, task.total, num_workers, pm.data.model)
 
             # Start worker threads; _threads lists only those that started
-            with task._lock:
-                task.active_workers = num_workers
             for i in range(num_workers):
                 t = threading.Thread(
                     target=self._worker_loop,
