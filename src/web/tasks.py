@@ -175,6 +175,9 @@ class TranslationTask:
     started: float = 0.0  # TaskManager.clock() at the start
     error_class: str | None = None  # the exception that failed the coordinator
     end_recorded: bool = False  # run_end written (once)
+    # Set (under _lock) once every worker is done and the coordinator ends
+    # the run: a pause or resume then changes nothing and starts no worker
+    finishing: bool = False
 
     def threads_alive(self) -> bool:
         """True while the coordinator or any worker of this task runs."""
@@ -385,7 +388,7 @@ class TaskManager:
         if not task:
             return False
         with task._lock:
-            if task.state not in ('running', 'paused'):
+            if task.state not in ('running', 'paused') or task.finishing:
                 return False
             # A new pause (not a repeated click on a paused task) is recorded
             recorded = task.state == 'running' or task.resume_at is not None
@@ -394,8 +397,9 @@ class TaskManager:
             task.flush_due = True  # saved at the next tick, also if resumed before it
             task.pause_event.clear()
             task.cancel_event.set()  # the calls in flight end; their segments wait
-        if recorded and task.events is not None:
-            task.events.emit('pause', reason='user', completed=task.completed)
+            if recorded and task.events is not None:
+                # in the transition, so it comes before a resume or run_end
+                task.events.emit('pause', reason='user', completed=task.completed)
         task.progress.put({'event': 'paused', 'data': {
             'completed': task.completed,
             'remaining': task.total - task.completed
@@ -412,8 +416,8 @@ class TaskManager:
         if not task:
             return False
         with task._lock:
-            if task.stop_event.is_set():
-                return False  # stopping
+            if task.stop_event.is_set() or task.finishing:
+                return False  # stopping, or the run is ending
             if due is not None and task.resume_at != due:
                 return False
             if task.state == 'running' and due is None:
@@ -641,6 +645,7 @@ class TaskManager:
             if task.active_workers != 0 or not task.result_queue.empty():
                 return False
             if task.segment_queue.empty() or task.stop_event.is_set():
+                task.finishing = True  # from now on no pause or resume
                 return True
             if not self._top_up_workers(task):
                 raise RuntimeError(task.error)
