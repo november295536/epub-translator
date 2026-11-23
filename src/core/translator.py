@@ -15,7 +15,9 @@ from dataclasses import asdict, dataclass, field
 import src.llm as llm
 from lxml import etree
 
+import src.core.events as events
 import src.core.validation as validation
+from src.core.events import RunEvents
 from src.core.project import DEFAULT_TIMEOUT, Issue, SegmentStatus
 from src.core.segmenter import SegmentType
 from src.llm import (  # noqa: F401  (RateLimitError, AuthError re-exported)
@@ -242,9 +244,12 @@ class TranslationError(Exception):
     """
 
     def __init__(self, message: str, *, code: str, prompt: str, attempts: list,
-                 issues: list | None = None, usage: Usage | None = None):
+                 issues: list | None = None, usage: Usage | None = None,
+                 calls: int = 0, split: bool = False):
         super().__init__(message)
         self.usage = usage  # the usage of the calls made for the segment
+        self.calls = calls  # model calls made for the segment
+        self.split = split  # the request was split in two halves
         self.code = code
         self.prompt = prompt
         self.attempts = attempts
@@ -257,6 +262,9 @@ class Reply:
     text: str
     usage: Usage | None
     issues: list = field(default_factory=list)  # quality warnings of the accepted text
+    # For the event record only (not part of the reply's value)
+    calls: int = field(default=0, compare=False)       # model calls made for it
+    split: bool = field(default=False, compare=False)  # accepted after a split
 
 
 @dataclass
@@ -269,6 +277,9 @@ class TranslationOutcome:
     usage: Usage | None
     # The error of a failure, for its diagnostics (see record_failure_log)
     failure: TranslationError | None = field(default=None, repr=False, compare=False)
+    # For the event record only (not part of the result's value)
+    calls: int = field(default=0, compare=False)       # model calls of its budget
+    split: bool = field(default=False, compare=False)  # the request was split in two halves
 
 
 # Characters of raw output kept per failed attempt in a diagnostics file
@@ -318,19 +329,52 @@ class _Rejected(Exception):
 class _Session:
     """The calls made for one segment: budget, usage and diagnostics."""
 
-    def __init__(self, engine: TranslationEngine, cancel: threading.Event):
+    def __init__(self, engine: TranslationEngine, cancel: threading.Event,
+                 segment_id: str | None = None):
         self.engine = engine
         self.cancel = cancel
+        self.segment_id = segment_id  # for the event record
+        self.split = False     # the request was split in two halves
+        self.pending = None    # the event fields of the last reply, until checked
         self.left = engine.max_calls
         self.prompt = ''       # the first request, for the diagnostics
         self.attempts = []     # (message, raw output) of each failed call
         self.usage = None
         self.transient = 0     # transient errors so far
 
-    def call(self, messages: list, clean) -> str:
+    def record(self, kind: str, seconds: float, outcome: str, **fields) -> None:
+        """One call in the engine's event record (when it has one): codes,
+        counts and durations only. Never raises."""
+        engine = self.engine
+        if engine.events is None:
+            return
+        try:
+            engine.events.call(kind=kind, segment=self.segment_id, attempt=self.used,
+                               backend=engine.backend.name, model=engine.model,
+                               effort=engine.effort, timeout=engine.timeout,
+                               seconds=seconds, outcome=outcome, **fields)
+        except Exception:  # noqa: BLE001 - a record never fails a translation
+            logger.warning("無法記錄模型呼叫", exc_info=True)
+
+    def checked(self, result: validation.Result) -> None:
+        """Record the last reply with its check's result."""
+        pending, self.pending = self.pending, None
+        if pending is None:
+            return
+        kind, seconds, fields = pending
+        blocking = [i.code for i in result.blocking]
+        if fields.pop('truncated'):
+            outcome = 'truncated'
+        else:
+            outcome = 'rejected' if blocking else 'accepted'
+        self.record(kind, seconds, outcome, issues=blocking,
+                    warnings=[i.code for i in result.issues if not i.blocking], **fields)
+
+    def call(self, messages: list, clean, kind: str = 'request') -> str:
         """One reply to `messages`, passed through `clean`. A transient
         error is retried while calls are left; raises TranslationError
-        when none are."""
+        when none are. `kind` names the call in the event record (request,
+        retry, split); a reply is recorded once checked (`checked`)."""
         if not self.prompt:
             self.prompt = messages[0].content
         engine = self.engine
@@ -342,11 +386,21 @@ class _Session:
                 # no call; the segment goes back
                 raise CancelledError('cancelled')
             self.left -= 1
+            started = time.monotonic()
+            chars_in = sum(len(m.content) for m in request.messages)
             try:
                 response = engine.backend.complete(request, self.cancel)
-            except (RateLimitError, AuthError, BackendUnavailableError, CancelledError):
-                raise
-            except TransientError as e:
+            except BaseException as e:
+                # Recorded first, whatever it is (codes and class name only)
+                self.record(kind, time.monotonic() - started, events.error_outcome(e), error=e,
+                            chars_in=chars_in)
+                if (not isinstance(e, LLMError) or isinstance(
+                        e, (RateLimitError, AuthError, BackendUnavailableError, CancelledError))):
+                    raise
+                if not isinstance(e, TransientError):
+                    # A refusal or an error that a retry cannot fix
+                    self.attempts.append((str(e), e.raw))
+                    self.fail('refusal' if isinstance(e, RefusalError) else 'error', str(e))
                 logger.warning("Translation attempt %d/%d failed: %s", self.used,
                                engine.max_calls, str(e)[:ERROR_MESSAGE_CHARS])
                 self.attempts.append((str(e), e.raw))
@@ -357,15 +411,15 @@ class _Session:
                     if (engine.wait or wait_or_cancel)(delay, self.cancel, engine.interrupted):
                         raise CancelledError('cancelled')
                 continue
-            except LLMError as e:
-                # A refusal or an error that a retry cannot fix
-                self.attempts.append((str(e), e.raw))
-                self.fail('refusal' if isinstance(e, RefusalError) else 'error', str(e))
             if response.usage is not None:
                 u = self.usage or Usage(0, 0)
                 self.usage = Usage(u.input_tokens + response.usage.input_tokens,
                                    u.output_tokens + response.usage.output_tokens)
             self.last_raw = response.text
+            # Recorded once its check is known (checked)
+            self.pending = (kind, time.monotonic() - started, {
+                'usage': response.usage, 'chars_in': chars_in, 'chars_out': len(response.text),
+                'truncated': response.stop_reason == 'truncated'})
             return clean(response.text)
         self.fail('transient', self.attempts[-1][0])
 
@@ -379,7 +433,8 @@ class _Session:
         else:
             text = f"Translation failed after {self.used} attempts: {message}"
         raise TranslationError(text, code=code, prompt=self.prompt, attempts=self.attempts,
-                               issues=issues, usage=self.usage)
+                               issues=issues, usage=self.usage, calls=self.used,
+                               split=self.split)
 
     def rejected(self, result: validation.Result, raw: str | None = None) -> None:
         """Record a reply (or, `raw`, a text joined from replies) that failed
@@ -394,20 +449,23 @@ class _Session:
         self.attempts.append(('; '.join(f'{i.code}: {i.detail}' for i in blocking)
                               [:ERROR_MESSAGE_CHARS], self.last_raw if raw is None else raw))
 
-    def attempt(self, prompt: str, check, clean, retries: int = 1) -> tuple:
+    def attempt(self, prompt: str, check, clean, retries: int = 1,
+                kind: str = 'request') -> tuple:
         """The request and, while its reply fails `check`, up to `retries`
-        follow-ups with the errors. Returns (text, result); raises
-        _Rejected."""
+        follow-ups with the errors (kind `retry` in the event record).
+        Returns (text, result); raises _Rejected."""
         messages = [Message('user', prompt)]
         while True:
-            reply = self.call(messages, clean)
+            reply = self.call(messages, clean, kind)
             text, result = check(reply)
+            self.checked(result)
             if not result.blocking:
                 return text, result
             self.rejected(result)
             if retries == 0 or self.left == 0:
                 raise _Rejected(result)
             retries -= 1
+            kind = 'retry'
             problems = '\n'.join(f'- {i.detail}' for i in result.blocking)
             messages += [Message('assistant', self.last_raw),
                          Message('user', FEEDBACK_PROMPT.format(problems=problems))]
@@ -460,13 +518,17 @@ class TranslationEngine:
 
     def __init__(self, max_calls: int = MAX_CALLS, model: str | None = None,
                  backend: llm.LLMBackend | None = None, timeout: float = DEFAULT_TIMEOUT,
-                 wait=None, interrupted=None, effort: str | None = None):
+                 wait=None, interrupted=None, effort: str | None = None,
+                 events: RunEvents | None = None):
         """`timeout`: seconds per call; `effort`: the reasoning effort
         passed with every call (None: none).
         `wait(seconds, cancel, interrupted) -> bool` waits before a retry
         after a transient error and returns True when cancelled or
         interrupted; None: wait_or_cancel. `interrupted() -> bool`: the run
-        stopped or paused (no retry is made then); None: never."""
+        stopped or paused (no retry is made then); None: never.
+        `events`: the run's event record (one line per model call); None:
+        none."""
+        self.events = events
         self.wait = wait
         self.interrupted = interrupted
         self.max_calls = max_calls
@@ -486,7 +548,8 @@ class TranslationEngine:
     def translate_reply(self, text: str, segment_type: SegmentType, glossary_text: str,
                         context_before: str, context_after: str, html: str,
                         cancel: threading.Event | None = None,
-                        fingerprints: list | None = None, brief: str = '') -> Reply:
+                        fingerprints: list | None = None, brief: str = '',
+                        segment_id: str | None = None) -> Reply:
         """Translate a segment through the backend, validated (plan 4.1).
 
         Args:
@@ -501,6 +564,7 @@ class TranslationEngine:
             cancel: Set to abandon the call (raises CancelledError).
             fingerprints: The blocks' fingerprints (schema 2), for the check.
             brief: The book's brief; '' for none.
+            segment_id: The segment's id, for the event record.
 
         A reply that fails its check gets one follow-up with the errors.
         When that fails too and the HTML has two or more top-level blocks,
@@ -518,7 +582,8 @@ class TranslationEngine:
             RateLimitError, AuthError, BackendUnavailableError, CancelledError:
                 at once, no retry.
         """
-        session = _Session(self, cancel if cancel is not None else threading.Event())
+        session = _Session(self, cancel if cancel is not None else threading.Event(),
+                           segment_id)
         is_code = segment_type == SegmentType.CODE
 
         def build(source_html: str = '') -> str:
@@ -543,7 +608,7 @@ class TranslationEngine:
         except _Rejected as e:
             issues = e.result.blocking
             session.fail(issues[0].code, issues[0].detail, issues)
-        return Reply(accepted, session.usage, list(result.issues))
+        return Reply(accepted, session.usage, list(result.issues), session.used, session.split)
 
     def _translate_html(self, session: _Session, html: str, fingerprints, build) -> tuple:
         protected = validation.protect(html)
@@ -561,6 +626,7 @@ class TranslationEngine:
         # Split once at the middle block boundary; each half once, no retry.
         # Each half is checked with its share of the fingerprints, its
         # blocks numbered as in the segment.
+        session.split = True
         mid = len(units) // 2
         cut, resume = units[mid - 1][1], units[mid][0]
         counts = validation.pieces_per_group(html, fingerprints)  # one per unit
@@ -573,7 +639,7 @@ class TranslationEngine:
             half_protected = validation.protect(half)
             text, _ = session.attempt(build(half_protected.html),
                                       _html_check(half, share, half_protected, first), _clean_html,
-                                      retries=0)
+                                      retries=0, kind='split')
             texts.append(text)
         joined = texts[0] + html[cut:resume] + texts[1]
         result = validation.check_html(html, joined, fingerprints)
@@ -726,6 +792,7 @@ def translate_segment(engine: TranslationEngine, seg, segments,
             cancel=cancel,
             fingerprints=seg.fingerprints or None,
             brief=brief,
+            segment_id=seg.segment_id,
         )
     except (RateLimitError, AuthError, BackendUnavailableError, CancelledError):
         raise
@@ -735,14 +802,15 @@ def translate_segment(engine: TranslationEngine, seg, segments,
             raise CancelledError('cancelled') from e
         return TranslationOutcome(
             text=None, status=SegmentStatus.FAILED, model=model, usage=e.usage,
-            issues=list(e.issues), failure=e)
+            issues=list(e.issues), failure=e, calls=e.calls, split=e.split)
     except Exception as e:  # noqa: BLE001 - the segment fails, the run goes on
         logger.exception("未預期的錯誤: %s", seg.segment_id)
         prompt = _request_text(engine, seg, glossary_text, context, brief) if context else ''
         return unexpected_error_outcome(model, e, prompt)
     issues = list(reply.issues) + _glossary_warnings(seg, reply.text, glossary)
     return TranslationOutcome(text=reply.text, status=SegmentStatus.TRANSLATED,
-                              issues=issues, model=model, usage=reply.usage)
+                              issues=issues, model=model, usage=reply.usage,
+                              calls=reply.calls, split=reply.split)
 
 
 def _glossary_warnings(seg, text: str, glossary) -> list:
