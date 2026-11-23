@@ -172,7 +172,7 @@ def prepare(copy: str, changed: dict) -> None:
     with open(os.path.join(copy, 'setup.cfg'), 'w') as fh:
         fh.write(f'[mutmut]\nsource_paths={RENAMED}\n    scripts\n    translate.py\n'
                  f'only_mutate={only}\npytest_add_cli_args_test_selection=tests/\n'
-                 'also_copy=tests\npytest_add_cli_args=-p no:cacheprovider\n')
+                 'also_copy=tests\n    CHANGELOG.md\npytest_add_cli_args=-p no:cacheprovider\n')
     os.makedirs(os.path.join(copy, 'site'))
     with open(os.path.join(copy, 'site', 'sitecustomize.py'), 'w') as fh:
         fh.write(SITECUSTOMIZE)
