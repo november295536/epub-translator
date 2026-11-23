@@ -685,3 +685,110 @@ def test_outcome_defaults():
     outcome = unexpected_error_outcome('m', ValueError('v'), '')
     assert (outcome.calls, outcome.split) == (0, False)
     assert (outcome.failure.calls, outcome.failure.split) == (0, False)
+
+
+# --- survivors of pass B that pointed at gaps -----------------------------------------
+
+def test_set_aside_retires_a_record_never_retired(tmp_path):
+    from src.core import events as events_module
+    run = events_module.RunEvents(str(tmp_path), 'cli')
+    assert run.emit('run_start')
+    events_module.set_aside(str(tmp_path))
+    assert run.emit('run_end', state='completed') is False
+
+
+def test_shape_checks_every_field():
+    from src.core.stats import shape_problem
+    base = {'v': 1, 'ts': 't', 'run': 'r', 'event': 'call'}
+    assert shape_problem({**base, 'segment': None, 'issues': 7}) == 'issues: wrong type'
+    assert shape_problem({**base, 'other': 1, 'seconds': 'slow'}) == 'seconds: wrong type'
+
+
+def test_summary_sums_tokens_and_segments():
+    from src.core.stats import summarize
+    from tests.test_run_records import _call, _rec
+    records = [_call('s1', 1, tokens_in=10), _call('s2', 1, tokens_in=20),
+               _rec('segment', segment='s1', result='translated', calls=1),
+               _rec('segment', segment='s2', result='translated', calls=1),
+               {**_call(None, 1), 'kind': 'extract', 'backend': 'a'}]
+    s = summarize(records)
+    assert [g['work'] for g in s['models']] == ['translation', 'extraction']
+    g = s['models'][0]
+    assert (g['tokens_in'], g['tokens_out'], g['first_attempt']) == (30, 0, 2)
+
+
+class TestSessionRecordFields:
+    def _calls(self, tmp_path, replies, seg=None):
+        from src.core.events import RunEvents
+        from src.core.translator import TranslationEngine, translate_segment
+        from src.llm.fake import FakeBackend
+        from tests.test_run_records import _of, _records, _seg
+        seg = seg or _seg()
+        engine = TranslationEngine(backend=FakeBackend(replies), wait=lambda *a: False,
+                                   events=RunEvents(str(tmp_path), 'cli', run_id='r'))
+        translate_segment(engine, seg, [seg])
+        return _of(_records(str(tmp_path)), 'call')
+
+    def test_error_call_fields_and_warnings(self, tmp_path):
+        from src.llm import TransientError
+        calls = self._calls(tmp_path, [TransientError('x'), '<p k="1">Hello.</p>'])
+        assert calls[0]['chars_in'] > 0 and 0 <= calls[0]['seconds'] < 60
+        assert calls[1]['warnings'] == ['untranslated'] and 0 <= calls[1]['seconds'] < 60
+
+
+def test_extraction_error_call_fields(tmp_path):
+    from src.core.events import RunEvents
+    from src.glossary.term_extractor import TermExtractor
+    from src.llm import TransientError
+    from src.llm.fake import FakeBackend
+    from tests.test_run_records import _of, _records
+    extractor = TermExtractor(model='m7', backend=FakeBackend([TransientError('x')]), effort='low',
+                              timeout=45, events=RunEvents(str(tmp_path), 'extract'))
+    extractor.extract_from_text('Nothing.')
+    [c] = _of(_records(str(tmp_path)), 'call')
+    assert (c['backend'], c['model'], c['effort'], c['timeout']) == ('fake', 'm7', 'low', 45)
+    assert c['outcome'] == 'transient' and 0 <= c['seconds'] < 60
+
+
+class TestCheckScriptPassB:
+    def _check(self, projects, capsys):
+        from tests.test_run_records import TestRunRecordsCheckScript
+        code = TestRunRecordsCheckScript._check(None, projects)
+        return code, capsys.readouterr().out
+
+    def test_known_codes_and_classes_pass(self, tmp_path, capsys):
+        from src.core.events import RunEvents
+        path = _make_project(tmp_path, n=1)
+        RunEvents(path, 'cli', run_id='20260101T000000Z-abcdef').emit(
+            'call', kind='request', segment='c1_seg0001', backend='fake', model='m1', timeout=60,
+            seconds=1.0, outcome='rejected', issues=['tag_count'], warnings=['length_ratio'],
+            error='RateLimitError')
+        code, out = self._check(tmp_path, capsys)
+        assert code == 0, out
+
+    def test_counts_checked_after_an_extraction_run(self, tmp_path, capsys):
+        from src.core.events import RunEvents
+        path = _make_project(tmp_path, n=1)
+        RunEvents(path, 'extract', run_id='20260101T000000Z-aaaaaa').emit('run_end', state='completed')
+        RunEvents(path, 'cli', run_id='20260101T000001Z-bbbbbb').emit(
+            'run_end', state='completed', translated=1)
+        for seg in ('x1', 'x2'):
+            RunEvents(path, 'cli', run_id='20260101T000001Z-bbbbbb').emit(
+                'segment', segment=seg, result='dropped')
+        code, out = self._check(tmp_path, capsys)
+        assert code == 1 and 'run_end translated=1, segment records 0' in out
+        assert '2 records name a segment id not in project.json' in out
+
+    def test_old_segment_ids(self, tmp_path, capsys):
+        import json
+        from src.core.events import RunEvents
+        path = _make_project(tmp_path, n=1)
+        with open(os.path.join(path, 'project.json'), encoding='utf-8') as f:
+            data = json.load(f)
+        data['segments'] = [{'id': 'old1', 'text': 'x'}]  # schema 1 names it `id`
+        with open(os.path.join(path, 'project.json'), 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        RunEvents(path, 'cli', run_id='20260101T000000Z-abcdef').emit(
+            'segment', segment='old1', result='dropped')
+        code, out = self._check(tmp_path, capsys)
+        assert 'segment id not in project.json' not in out
