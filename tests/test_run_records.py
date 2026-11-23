@@ -495,7 +495,9 @@ class TestSummary:
         assert m1['calls'] == 4 and m1['outcomes'] == {'accepted': 2, 'rejected': 1, 'timeout': 1}
         assert (m1['segments'], m1['first_attempt'], m1['more_calls'], m1['failed']) == (3, 1, 1, 1)
         assert m1['first_attempt_share'] == round(1 / 3, 3)
-        assert m1['seconds_median'] == 5.0 and m1['seconds_p90'] == 10.0
+        # replies only (the timeout's 10 s is not a reply), nearest rank for both
+        assert m1['seconds_median'] == 4.0 and m1['seconds_p90'] == 6.0
+        assert (m1['seconds_calls'], m1['timeouts']) == (3, 1)
         assert (m1['tokens_in'], m1['tokens_out'], m1['calls_with_tokens']) == (100, 40, 1)
         m2 = next(g for g in s['models'] if g['model'] == 'm2')
         assert m2['tokens_in'] is None and m2['segments'] == 0
@@ -537,7 +539,7 @@ class TestSummary:
     def test_text_report(self):
         text = '\n'.join(text_report({**summarize(SAMPLE, skipped=1), 'exists': True}))
         assert '略過 1 行' in text and 'b / m1 / low' in text and 'tag_count 1' in text
-        assert '中位數 5.0 秒' in text and 'p90 10.0 秒' in text and '後端未回報' in text
+        assert '中位數 4.0 秒' in text and 'p90 6.0 秒' in text and '逾時 1 次' in text and '後端未回報' in text
         assert '未結束' in text
 
 
@@ -864,6 +866,8 @@ RICH_SUMMARY = {'records': 12,
              'more_calls': 0,
              'split': 0,
              'failed': 1,
+             'seconds_calls': 0,
+             'timeouts': 0,
              'seconds_median': None,
              'seconds_p90': None,
              'first_attempt_share': 0.0,
@@ -884,7 +888,9 @@ RICH_SUMMARY = {'records': 12,
              'more_calls': 1,
              'split': 1,
              'failed': 0,
-             'seconds_median': 3.0,
+             'seconds_calls': 2,
+             'timeouts': 0,
+             'seconds_median': 2.0,
              'seconds_p90': 4.0,
              'first_attempt_share': 0.0,
              'more_calls_share': 1.0,
@@ -916,13 +922,13 @@ RICH_TEXT = ('事件紀錄：12 筆\n'
  '  翻譯：? / m3 / -\n'
  '    模型呼叫 0 次：無\n'
  '    段落 1：首次即通過 0（0.0%），需多次呼叫 0（0.0%；其中分割 0），最終失敗 1（100.0%）\n'
- '    每次呼叫耗時：中位數 -，p90 -\n'
+ '    回覆耗時（0 次有回覆的呼叫）：中位數 -，p90 -\n'
  '    tokens：後端未回報\n'
  '  翻譯：b / m1 / low\n'
  '    模型呼叫 3 次：accepted 2、rejected 1\n'
  '    段落 1：首次即通過 0（0.0%），需多次呼叫 1（100.0%；其中分割 1），最終失敗 0（0.0%）\n'
  '    回覆被退回的原因：tag_count 1\n'
- '    每次呼叫耗時：中位數 3.0 秒，p90 4.0 秒\n'
+ '    回覆耗時（2 次有回覆的呼叫）：中位數 2.0 秒，p90 4.0 秒\n'
  '    tokens：輸入 0，輸出 7（1 次呼叫有回報）\n'
  '\n'
  '問題代碼（依次數）：\n'
@@ -1195,7 +1201,7 @@ class TestCheapKills:
         mixed = summarize([_call('s', 1, seconds=1.23456),
                            {**_call('s', 1), 'effort': None}])
         assert [g['effort'] for g in mixed['models']] == [None, 'low']
-        assert mixed['models'][1]['seconds_median'] == 1.235
+        assert mixed['models'][1]['seconds_median'] == 1.23456
 
     def test_since_is_inclusive_and_unfinished_duration(self):
         records = [_rec('call', ts='2026-01-01T00:00:00.000Z'),
