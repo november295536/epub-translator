@@ -8135,3 +8135,10 @@ Not verified: a real timeout, a real rate limit, a real refusal or truncated rep
 classifications are tested with the fake backend only); `claude-cli` and `copilot-cli` in a
 real run; two processes rotating the same process log at the same moment; a crash in the middle
 of a write (simulated with a cut-off line only); the Ctrl-C path of a web server.
+
+### Suite at the final code commit
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw        # three at once, commit 8223eb6
+3085 passed in 268.45s / 270.46s / 261.85s          (no failure, no warning)
+```
