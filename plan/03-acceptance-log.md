@@ -8367,3 +8367,26 @@ extraction call. Survivors left, and why:
   means run_end was written already); `record_problems(r, None)` (the parameter is not used
   there); `decode('UTF-8')`;
 - the check script's 20-problem cap boundary (`<=`, `< 21`).
+
+Three suites at once at `dbae00f` (the final code and tests): `3171 passed in 294.23s /
+290.23s / 290.23s`, no failure, no warning. `scripts/verify/phase1_reverts.py`: all 105 reverts
+detected (exit 0); `scripts/verify/phase1_survivor_kills.py`: every recorded mutant killed
+(`not killed 0`, exit 0), both at `16ccb89`.
+
+### Not verified, for the whole feature
+
+- Real rate limits, timeouts, refusals and truncated replies: their outcome classes are tested with
+  the fake backend only; no real backend produced one in the checks.
+- `claude-cli` and `copilot-cli` in a real run with the records (only `copilot-sdk` was run for
+  real); token counts of `claude-cli` (it reports none).
+- Two processes rotating the same process log at the same moment; a crash in the middle of an
+  append (simulated with a cut-off line only); a full disk (a short write is simulated).
+- The Ctrl-C path of a web server during a run; a web server stopped while a run is paused.
+- The page's handling of a 409 `ending` answer in a real browser at the moment a run ends (tested
+  through the endpoint and the page source, see item 4); the stats page was rendered by headless
+  Chrome, not driven by a person.
+- Cross-process ordering: a CLI run and a web run of the same project in different processes are
+  kept apart only by `project.lock`; generations (`retire`) work within one process.
+- Real books: no record of a real project was produced or checked in this work
+  (`run_records_check.py` was run on invented projects only).
+- Lines changed after the final mutation pass: only tests and documents.
