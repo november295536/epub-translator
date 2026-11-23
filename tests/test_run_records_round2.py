@@ -316,3 +316,20 @@ class TestExtractionRound2:
         extractor.extract_from_text('Nothing.')
         [c] = _of(_records(str(tmp_path)), 'call')
         assert c['model'] == backend.default_model and c['model']
+
+
+def test_version_takes_no_git_lock(monkeypatch):
+    import subprocess
+    from src.core import proclog
+    seen = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, 'abc\n', '')
+    monkeypatch.setattr(proclog, '_commit', None)
+    monkeypatch.setattr(proclog.subprocess, 'run', fake_run)
+    proclog.program_version()
+    [(cmd, kwargs)] = seen
+    assert kwargs['env']['GIT_OPTIONAL_LOCKS'] == '0'  # git's switch for the index refresh
+    assert cmd[:2] == ['git', '-C'] and 'describe' in cmd
+
