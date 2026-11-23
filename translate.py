@@ -29,7 +29,7 @@ from src.core.translator import (
     AuthError, BackendUnavailableError, CancelledError, RateLimitError, TranslationEngine,
     available_models, UnexpectedStreak, record_failure_log, translate_segment,
 )
-from src.glossary.glossary_manager import GlossaryManager, load_glossary
+from src.glossary.glossary_manager import CATEGORY_LABELS, GlossaryManager, load_glossary
 from src.core.migrate import MigrationError, migrate_project
 from src.core import proclog
 from src.core.events import RunEvents, segment_result, settings_fields
@@ -72,7 +72,8 @@ def _command_line(ctx) -> str:
     for name, value in ctx.params.items():
         if value is None or value is False:
             continue
-        if name in _TEXT_PARAMS:
+        if name in _TEXT_PARAMS or (name == 'category' and value not in CATEGORY_LABELS):
+            # a category outside the known set is free text too
             value = f'<{len(str(value))} 字元>'
         parts.append(f'{name}={value}')
     return 'cli ' + ' '.join(parts)

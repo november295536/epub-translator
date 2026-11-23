@@ -406,3 +406,18 @@ def test_no_run_end_without_run_start(tmp_path, monkeypatch):
         from src.web.tasks import TaskManager
         TaskManager._instance = None
     assert not os.path.exists(events_path(path))  # neither a run_start nor a lone run_end
+
+
+def test_free_text_category_logged_by_length(tmp_path):
+    from click.testing import CliRunner
+    import translate
+    from src.core import proclog
+    path = _make_project(tmp_path, n=1)
+    CliRunner().invoke(translate.cli, ['glossary', 'add', 'Quill', '羽', '-c', 'Zorblaxian lore',
+                                       '-p', path])
+    CliRunner().invoke(translate.cli, ['glossary', 'add', 'Mira', '米拉', '-c', 'person',
+                                       '-p', path])
+    with open(os.path.join(os.environ[proclog.LOG_DIR_ENV], 'cli.log'), encoding='utf-8') as f:
+        log = f.read()
+    assert 'Zorblaxian' not in log and 'category=<15 字元>' in log
+    assert 'category=person' in log  # a known category is no text
