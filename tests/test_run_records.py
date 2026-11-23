@@ -746,12 +746,13 @@ class TestRunRecordsCheckScript:
     text in it and on counts that do not add up."""
 
     def _check(self, projects):
-        sys.path.insert(0, os.path.join(_REPO_ROOT, 'scripts', 'verify'))
-        try:
-            import run_records_check
-        finally:
-            sys.path.pop(0)
-        return run_records_check.main(['--projects-dir', str(projects)])
+        import importlib.util
+        path = os.path.join(_REPO_ROOT, 'scripts', 'verify', 'run_records_check.py')
+        # under its module path, so the mutation run links these tests to it
+        spec = importlib.util.spec_from_file_location('scripts.verify.run_records_check', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.main(['--projects-dir', str(projects)])
 
     def test_clean_record_passes(self, tmp_path, capsys):
         path = _make_project(tmp_path, n=2)
@@ -814,3 +815,303 @@ def test_web_server_end_line(tmp_path):
     lines = log.splitlines()
     assert 'start: web server' in lines[0] and 'end: web server stopped' in lines[-1]
 
+
+
+# A record that reaches every branch of summarize (a split segment, a
+# dropped one, a failure whose calls are not in the selection, an unknown
+# result, a bool duration, a non-text issue code, tokens out only)
+RICH = [
+    _rec('run_start', run='a', ts='2026-03-01T10:00:00.000Z', workers=3, segments=4,
+         backend='b', model='m1', effort='high'),
+    _call('s1', 1, run='a', seconds=2.0, tokens_out=7),
+    _call('s1', 2, 'rejected', run='a', seconds=True, issues=['tag_count', 5]),
+    _call('s1', 3, run='a', seconds=4.0),
+    _rec('segment', run='a', segment='s1', result='translated', calls=3, split=True),
+    _rec('segment', run='a', segment='s2', result='dropped', reason='edited_before_call'),
+    _rec('segment', run='a', segment='s9', result='failed', calls=0, model='m3',
+         issues=['not_html']),
+    _rec('segment', run='a', segment='s8', result='skipped'),
+    _rec('pause', run='a', reason='rate_limit'),
+    _rec('wait_extended', run='a'),
+    _rec('resume', run='a', reason='auto'),
+    _rec('run_end', run='a', ts='2026-03-01T10:01:30.500Z', state='stopped',
+         error='AuthError'),
+]
+
+RICH_SUMMARY = {'records': 12,
+ 'skipped_lines': 0,
+ 'since': None,
+ 'run': None,
+ 'models': [{'backend': '?',
+             'model': 'm3',
+             'effort': None,
+             'calls': 0,
+             'outcomes': {},
+             'issues': {},
+             'tokens_in': None,
+             'tokens_out': None,
+             'calls_with_tokens': 0,
+             'segments': 1,
+             'first_attempt': 0,
+             'more_calls': 0,
+             'split': 0,
+             'failed': 1,
+             'seconds_median': None,
+             'seconds_p90': None,
+             'first_attempt_share': 0.0,
+             'more_calls_share': 0.0,
+             'failed_share': 1.0},
+            {'backend': 'b',
+             'model': 'm1',
+             'effort': 'low',
+             'calls': 3,
+             'outcomes': {'accepted': 2, 'rejected': 1},
+             'issues': {'tag_count': 1},
+             'tokens_in': 0,
+             'tokens_out': 7,
+             'calls_with_tokens': 1,
+             'segments': 1,
+             'first_attempt': 0,
+             'more_calls': 1,
+             'split': 1,
+             'failed': 0,
+             'seconds_median': 3.0,
+             'seconds_p90': 4.0,
+             'first_attempt_share': 0.0,
+             'more_calls_share': 1.0,
+             'failed_share': 0.0}],
+ 'rejected_issues': {'tag_count': 1},
+ 'failure_issues': {'not_html': 1},
+ 'warnings': {},
+ 'runs': [{'run': 'a',
+           'source': 'web',
+           'start': '2026-03-01T10:00:00.000Z',
+           'end': '2026-03-01T10:01:30.500Z',
+           'state': 'stopped',
+           'workers': 3,
+           'segments': 4,
+           'translated': 1,
+           'failed': 1,
+           'dropped': 1,
+           'pauses': 1,
+           'calls': 3,
+           'backend': 'b',
+           'model': 'm1',
+           'effort': 'high',
+           'error': 'AuthError',
+           'duration': 90.5}]}
+
+RICH_TEXT = ('事件紀錄：12 筆\n'
+ '\n'
+ '依後端／模型／推理強度：\n'
+ '  ? / m3 / -\n'
+ '    模型呼叫 0 次：無\n'
+ '    段落 1：首次即通過 0（0.0%），需重試或分割 0（0.0%；其中分割 0），最終失敗 1（100.0%）\n'
+ '    每次呼叫耗時：中位數 -，p90 -\n'
+ '    tokens：後端未回報\n'
+ '  b / m1 / low\n'
+ '    模型呼叫 3 次：accepted 2、rejected 1\n'
+ '    段落 1：首次即通過 0（0.0%），需重試或分割 1（100.0%；其中分割 1），最終失敗 0（0.0%）\n'
+ '    回覆被退回的原因：tag_count 1\n'
+ '    每次呼叫耗時：中位數 3.0 秒，p90 4.0 秒\n'
+ '    tokens：輸入 0，輸出 7（1 次呼叫有回報）\n'
+ '\n'
+ '問題代碼（依次數）：\n'
+ '  回覆被退回：tag_count 1\n'
+ '  段落最終失敗：not_html 1\n'
+ '  已翻譯段落的警告：無\n'
+ '\n'
+ '執行紀錄：\n'
+ '  a  web  2026-03-01 10:00:00 → 2026-03-01 10:01:30（90.5 秒）  停止（AuthError）\n'
+ '    已翻譯 1、失敗 1、捨棄 1、暫停 1 次、模型呼叫 3 次（共 4 段待處理）')
+
+
+@pytest.fixture
+def utc(monkeypatch):
+    """Local time is UTC (text_report prints local times)."""
+    monkeypatch.setenv('TZ', 'UTC')
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+class TestWholeSummary:
+    def test_summarize(self):
+        assert summarize(RICH) == RICH_SUMMARY
+
+    def test_text_report(self, utc):
+        assert '\n'.join(text_report({**summarize(RICH), 'exists': True})) == RICH_TEXT
+
+
+def _limited_twice(replies_after):
+    """A responder whose first two calls meet (both in flight) and then
+    raise RateLimitError; later calls answer like() the request."""
+    barrier = threading.Barrier(2, timeout=10)
+    count = {'n': 0}
+    lock = threading.Lock()
+
+    def respond(request):
+        with lock:
+            count['n'] += 1
+            n = count['n']
+        if n <= 2:
+            barrier.wait()
+            raise RateLimitError('limit')
+        return like(request, replies_after)
+    return respond
+
+
+class TestMorePauseRecords:
+    def test_cli_parallel_rate_limit(self, tmp_path, monkeypatch):
+        path = _make_project(tmp_path, n=2)
+        now = {'t': 0.0}
+
+        def clock():  # every look at the clock is 200 s later
+            now['t'] += 200.0
+            return now['t']
+        monkeypatch.setattr(translate, '_clock', clock)
+        with use_fake_backend(FakeBackend(responder=_limited_twice('好'))):
+            result = CliRunner().invoke(translate.cli, ['start', '-p', path, '-w', '2'])
+        assert result.exit_code == 0, result.output
+        records = _records(path)
+        events_ = [r['event'] for r in records if r['event'] != 'call']
+        assert events_[:4] == ['run_start', 'pause', 'wait_extended', 'resume']
+        pause, extended = _of(records, 'pause')[0], _of(records, 'wait_extended')[0]
+        assert (pause['reason'], pause['error'], pause['resume_in']) == (
+            'rate_limit', 'RateLimitError', 300.0)
+        assert extended['reason'] == 'rate_limit' and extended['resume_in'] > 0
+        assert _of(records, 'resume')[0]['reason'] == 'auto'
+        assert [c['outcome'] for c in _of(records, 'call')][:2] == ['rate_limit'] * 2
+        assert _of(records, 'run_end')[0]['translated'] == 2
+
+    def test_web_wait_extended(self, tmp_path, fresh_tm):
+        path = _make_project(tmp_path, n=2)
+        with use_fake_backend(FakeBackend(responder=_limited_twice('好'))):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path), num_workers=2)
+            _wait(lambda: len(_of(_records(path), 'call')) == 2)
+            _wait(lambda: task.state == 'paused')
+            fresh_tm.stop_translation(PROJECT)
+            _wait(lambda: not task.threads_alive())
+        _wait(lambda: _of(_records(path), 'run_end'))
+        records = _records(path)
+        assert [r['reason'] for r in _of(records, 'pause')] == ['rate_limit']
+        [extended] = _of(records, 'wait_extended')
+        assert extended['reason'] == 'rate_limit' and 0 < extended['resume_in'] <= 300
+
+    @pytest.mark.parametrize('error, reason', [
+        (AuthError('expired'), 'auth'),
+        (BackendUnavailableError('missing'), 'backend_unavailable')])
+    def test_web_pause_for_user_errors(self, tmp_path, fresh_tm, error, reason):
+        path = _make_project(tmp_path, n=1)
+        with use_fake_backend(FakeBackend([error])):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+            _wait(lambda: task.state == 'paused')
+            fresh_tm.stop_translation(PROJECT)
+            _wait(lambda: not task.threads_alive())
+        _wait(lambda: _of(_records(path), 'run_end'))
+        records = _records(path)
+        [pause] = _of(records, 'pause')
+        assert (pause['reason'], pause['error'], pause['completed']) == (
+            reason, type(error).__name__, 0)
+        assert 'resume_in' not in pause  # waits for the user
+        end = _of(records, 'run_end')[0]
+        assert (end['state'], end['translated'], end['failed'], end['dropped']) == (
+            'stopped', 0, 0, 0)
+
+    def test_user_resume_records_workers(self, tmp_path, fresh_tm):
+        path = _make_project(tmp_path, n=1)
+        with use_fake_backend(FakeBackend([AuthError('expired'), '<p k="1">好</p>'])):
+            task = fresh_tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+            _wait(lambda: task.state == 'paused')
+            assert fresh_tm.resume_translation(PROJECT, num_workers=3)
+            _wait(lambda: task.state == 'completed' and not task.threads_alive())
+        _wait(lambda: _of(_records(path), 'run_end'))
+        [resume] = _of(_records(path), 'resume')
+        assert (resume['reason'], resume['workers']) == ('user', 3)
+
+
+class TestExtractionCallFields:
+    def test_every_field(self, tmp_path, monkeypatch):
+        ev = RunEvents(str(tmp_path), 'extract', run_id='x')
+        clock = iter([100.0, 102.5])
+        monkeypatch.setattr('src.glossary.term_extractor.time.monotonic', lambda: next(clock))
+        reply = _reply('[]', Usage(11, 3), stop='truncated')
+        extractor = TermExtractor(model='m9', backend=FakeBackend([reply]), effort='high',
+                                  timeout=77, events=ev)
+        assert extractor._call('prompt of 19 chars.', 'consolidate') == '[]'
+        [c] = _of(_records(str(tmp_path)), 'call')
+        assert {k: v for k, v in c.items() if k != 'ts'} == {
+            'v': 1, 'run': 'x', 'source': 'extract', 'event': 'call', 'kind': 'consolidate',
+            'backend': 'fake', 'model': 'm9', 'effort': 'high', 'timeout': 77,
+            'seconds': 2.5, 'tokens_in': 11, 'tokens_out': 3, 'outcome': 'truncated',
+            'chars_in': 19, 'chars_out': 2}
+
+    def test_error_fields(self, tmp_path):
+        ev = RunEvents(str(tmp_path), 'extract', run_id='x')
+        extractor = TermExtractor(model='m9', backend=FakeBackend([CallTimeoutError('slow')]),
+                                  events=ev)
+        assert extractor._call('abc') is None  # logged, not raised
+        [c] = _of(_records(str(tmp_path)), 'call')
+        assert (c['kind'], c['outcome'], c['error'], c['chars_in']) == (
+            'extract', 'timeout', 'CallTimeoutError', 3)
+        assert 'chars_out' not in c and 'tokens_in' not in c
+
+    def test_no_events_no_record(self, tmp_path):
+        extractor = TermExtractor(model='m9', backend=FakeBackend(['[]']))
+        assert extractor._call('abc') == '[]'
+        assert not os.path.exists(events_path(str(tmp_path)))
+
+    def test_recorder_failure_does_not_stop_extraction(self, tmp_path, monkeypatch):
+        ev = RunEvents(str(tmp_path), 'extract')
+        monkeypatch.setattr(ev, 'call', lambda **k: 1 / 0)
+        extractor = TermExtractor(model='m9', backend=FakeBackend(['[]']), events=ev)
+        assert extractor._call('abc') == '[]'
+
+
+class TestWholeRunLines:
+    def _strip(self, record):
+        return {k: v for k, v in record.items() if k not in ('ts', 'run', 'seconds')}
+
+    def test_cli_run_start_and_end(self, tmp_path):
+        path = _make_project(tmp_path, n=2)
+        with use_fake_backend(FakeBackend(['<p k="1">好</p>', RefusalError('no')])):
+            CliRunner().invoke(translate.cli, ['start', '-p', path, '--retry-failed'])
+        records = _records(path)
+        assert self._strip(records[0]) == {
+            'v': 1, 'source': 'cli', 'event': 'run_start', 'workers': 1, 'segments': 2,
+            'mode': 'retry_failed', 'backend': 'fake', 'model': 'sonnet', 'timeout': 180}
+        assert self._strip(records[-1]) == {
+            'v': 1, 'source': 'cli', 'event': 'run_end', 'state': 'completed',
+            'translated': 1, 'failed': 1}
+        assert records[-1]['seconds'] >= 0
+        assert self._strip(_of(records, 'segment')[1]) == {
+            'v': 1, 'source': 'cli', 'event': 'segment', 'segment': 'c1_seg0002',
+            'result': 'failed', 'model': 'sonnet', 'calls': 1, 'issues': ['refusal']}
+
+    def test_cli_streak_stop(self, tmp_path):
+        path = _make_project(tmp_path, n=6)
+        with use_fake_backend(FakeBackend([KeyError('x')] * 5)):
+            result = CliRunner().invoke(translate.cli, ['start', '-p', path])
+        assert result.exit_code == 1
+        end = _of(_records(path), 'run_end')[0]
+        assert (end['state'], end['error'], end['failed']) == ('stopped', 'UnexpectedStreak', 5)
+
+    def test_set_aside_name(self, tmp_path):
+        ev = RunEvents(str(tmp_path), 'cli')
+        ev.emit('pause')
+        target = events.set_aside(str(tmp_path))
+        import re
+        assert re.fullmatch(r'events-\d{8}T\d{12}Z\.jsonl', os.path.basename(target))
+        assert os.path.dirname(target) == os.path.join(str(tmp_path), 'log')
+        assert len(read_records(target)[0]) == 1
+
+    def test_thread_hook_ignores_system_exit(self, monkeypatch, caplog):
+        import types
+        handed = []
+        monkeypatch.setattr(proclog, '_previous_excepthook', handed.append)
+        args = types.SimpleNamespace(exc_type=SystemExit, exc_value=SystemExit(0),
+                                     exc_traceback=None, thread=None)
+        with caplog.at_level(logging.ERROR):
+            proclog._thread_excepthook(args)
+        assert not caplog.records and handed == [args]
