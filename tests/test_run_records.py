@@ -648,9 +648,30 @@ class TestProcessLog:
         monkeypatch.setenv(proclog.LOG_DIR_ENV, str(tmp_path / 'elsewhere'))
         assert proclog.log_dir_for('/any/projects') == str(tmp_path / 'elsewhere')
 
-    def test_version_has_commit(self):
-        version = proclog.program_version()
-        assert version.startswith('1.0.0 (') and len(version) > len('1.0.0 ()')
+    def test_version_has_commit(self, monkeypatch):
+        """The git describe output when there is one (asked once), the
+        package version alone when git fails or cannot run."""
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, 'abc123def456-dirty\n', '')
+        monkeypatch.setattr(proclog, '_commit', None)
+        monkeypatch.setattr(proclog.subprocess, 'run', fake_run)
+        assert proclog.program_version() == '1.0.0 (abc123def456-dirty)'
+        assert proclog.program_version() == '1.0.0 (abc123def456-dirty)'
+        assert len(calls) == 1 and calls[0][:3] == ['git', '-C', proclog._REPO]
+        assert 'describe' in calls[0] and '--dirty' in calls[0]
+        monkeypatch.setattr(proclog, '_commit', None)
+        monkeypatch.setattr(proclog.subprocess, 'run', lambda cmd, **k: subprocess.CompletedProcess(
+            cmd, 128, '', 'not a git repository'))
+        assert proclog.program_version() == '1.0.0'
+
+        def missing(cmd, **kwargs):
+            raise FileNotFoundError('git')
+        monkeypatch.setattr(proclog, '_commit', None)
+        monkeypatch.setattr(proclog.subprocess, 'run', missing)
+        assert proclog.program_version() == '1.0.0'
 
     def test_cli_lines_and_traceback(self, tmp_path, default_location, monkeypatch):
         projects = tmp_path / 'projects'
