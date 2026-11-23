@@ -7962,3 +7962,174 @@ exit 0                      (reverts not detected: 0; 105 OK)
 $ python3 scripts/verify/phase1_survivor_kills.py; echo "exit $?"
 exit 0                      (not killed 0; 81 KILLED)
 ```
+
+## Run records: process log, event record, statistics
+
+Branch `feat/run-records`. Three parts (CLAUDE.md, "Run records"):
+
+1. **Process log** (`src/core/proclog.py`): `logs/web.log` (web server) and `logs/cli.log` (every
+   CLI command) beside the projects directory, rotating at 5 MB × 5. Start line (command or
+   "web server", version with `git describe`, Python, platform, pid), every `src.*` record,
+   werkzeug request lines, tracebacks of requests, commands and threads, an end line
+   (`end: exit N` for commands, `end: web server stopped` at a normal server exit).
+2. **Event record** (`src/core/events.py`): `<project>/log/events.jsonl`, one JSON object per
+   line: one `call` line per model call and `run_start`, `pause`, `wait_extended`, `resume`,
+   `segment`, `run_end` lines. Ids, codes, counts, character counts, settings and durations only.
+   Invented examples, one per kind:
+
+   ```json
+   {"v":1,"ts":"2026-01-05T09:00:00.120Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"run_start","workers":2,"segments":6,"mode":"pending","backend":"copilot-sdk","model":"claude-haiku-4.5","timeout":30}
+   {"v":1,"ts":"2026-01-05T09:00:07.400Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"call","kind":"request","segment":"ch01_seg0001","attempt":1,"backend":"copilot-sdk","model":"claude-haiku-4.5","timeout":30,"seconds":7.21,"tokens_in":1690,"tokens_out":480,"outcome":"rejected","issues":["tag_count"],"chars_in":1800,"chars_out":61}
+   {"v":1,"ts":"2026-01-05T09:00:14.900Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"call","kind":"retry","segment":"ch01_seg0001","attempt":2,"backend":"copilot-sdk","model":"claude-haiku-4.5","timeout":30,"seconds":7.4,"outcome":"accepted","warnings":["length_ratio"],"chars_in":1920,"chars_out":60}
+   {"v":1,"ts":"2026-01-05T09:00:14.910Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"segment","segment":"ch01_seg0001","result":"translated","model":"claude-haiku-4.5","calls":2,"warnings":["length_ratio"]}
+   {"v":1,"ts":"2026-01-05T09:00:20.000Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"pause","reason":"user","completed":1}
+   {"v":1,"ts":"2026-01-05T09:00:20.050Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"call","kind":"request","segment":"ch02_seg0001","attempt":1,"backend":"copilot-sdk","model":"claude-haiku-4.5","timeout":30,"seconds":0.1,"outcome":"cancelled","error":"CancelledError","chars_in":1790}
+   {"v":1,"ts":"2026-01-05T09:00:31.000Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"resume","reason":"user","workers":2}
+   {"v":1,"ts":"2026-01-05T09:02:00.000Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"pause","reason":"rate_limit","error":"RateLimitError","resume_in":300.0,"completed":4}
+   {"v":1,"ts":"2026-01-05T09:02:01.000Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"wait_extended","reason":"rate_limit","resume_in":299.0}
+   {"v":1,"ts":"2026-01-05T09:08:00.000Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"segment","segment":"ch05_seg0001","result":"dropped","reason":"edited_during_call","model":"claude-haiku-4.5","calls":1}
+   {"v":1,"ts":"2026-01-05T09:09:00.000Z","run":"20260105T090000Z-1a2b3c","source":"web","event":"run_end","state":"completed","translated":5,"failed":0,"dropped":1,"seconds":540.0}
+   {"v":1,"ts":"2026-01-05T09:20:03.000Z","run":"20260105T092000Z-4d5e6f","source":"extract","event":"call","kind":"consolidate","backend":"copilot-sdk","model":"claude-haiku-4.5","timeout":30,"seconds":3.2,"tokens_in":900,"tokens_out":120,"outcome":"accepted","chars_in":640,"chars_out":210}
+   ```
+
+3. **Statistics** (`src/core/stats.py`, one function): `translate.py stats [--since] [--run]
+   [--json]` and `GET /api/projects/<name>/stats` behind the "統計" tab (`/project/<name>/stats`).
+
+Hooks: `_Session.call` / `_Session.checked` (`translator.py`) record each call (an exception at
+once, a reply once its check is known); `TermExtractor._call`; runs in `TaskManager`
+(`_start_locked`, `_apply_result`, `pause_translation`, `_pause_for`, `resume_translation`, the
+coordinator's `finally`), the retranslate endpoint, web and CLI extraction, CLI `_Run`. The new
+`CallTimeoutError` (a `TransientError`, retried as before) tells timeouts apart.
+
+Decisions taken with the coordinator: segment ids stay as they are (they can carry chapter-id
+words; `known-issues.md` says to look at the record before sharing it); a project replaced
+through the web gets a fresh record (the old one moved to `log/events-<UTC time>.jsonl`); the
+record does not rotate; a killed web server writes no end line.
+
+### Pre-existing bug found: a resume right after start could leave a run that never ends
+
+`TaskManager._run_translation` set `task._gm` and then, in a separate step under the lock,
+`task.active_workers`. A pause and resume landing between the two let `_top_up_workers` (which
+starts workers once `_gm` is set) start a worker that the coordinator's count then overwrote, so
+two worker threads ran with a count of one. The count could never return to 0: the run never
+reached `completed`, and the web task kept its `project.lock`, so the project answered 409 until
+the server stopped. It shows when a user pauses and resumes right after pressing start. It was
+found because a new test (`test_pause_and_resume`) timed out under the load of mutmut's clean
+run. `tests/test_runtime.py::test_resume_while_the_coordinator_starts_its_workers` forces the
+interleaving (pause and resume run inside the coordinator's start log line, which sat between
+the two assignments): on the old code it hangs until the 20 s wait fails; with the fix (both set
+together under `task._lock`, commit `074801d`) it passes. Other places checked: the CLI parallel
+path has no shared worker count and no resume top-up; every other change of `active_workers` in
+`tasks.py` already happens under `task._lock`. No other instance.
+
+### Tests
+
+`tests/test_run_records.py` (96) and one test in `tests/test_runtime.py`. They cover:
+- appends: one JSON object per line, a cut-off last line ended before the next append, a write
+  failure logged and not raised (also during a translation), 20 threads and a second process
+  appending at once (every line whole), file mode 0644, NaN refused;
+- every outcome class, and call records for request, retry, split, timeout, refusal, rate limit,
+  cancel, truncated, unexpected; extraction and consolidation calls with every field;
+- runs: web (start, pause/resume, rate-limit pause and `wait_extended`, auth and
+  backend-unavailable pauses, dropped segment, retranslate, extraction), CLI (sequential,
+  parallel, rate-limit pause/resume and `wait_extended` with two workers in flight, auth stop,
+  unexpected-streak stop, Ctrl-C), whole `run_start`/`run_end`/`segment` lines;
+- no invented source, reply, glossary, title or author word in any record of these runs;
+- `summarize` (whole dict on a record that reaches every branch), `text_report` (whole text),
+  filters, unparsable lines, `stats` command (missing, empty, JSON = endpoint, `--since`,
+  `--run`), the stats page (tab, 404, empty state, during a running task);
+- process log: location beside the projects directory, the override, version line with and
+  without git, CLI start/end lines with text parameters reduced to their length, traceback of a
+  command, a request and a thread, rotation bound, an unopenable file, web end line;
+- replacing a project sets its record aside; `scripts/verify/run_records_check.py` (passes a
+  clean record, fails on text, on unknown keys, on counts that do not add up; whole output).
+
+### Commands and results
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw        # three at once, commit b832a3e
+3084 passed in 268.33s / 263.72s / 266.88s          (no failure, no warning)
+```
+
+(The three concurrent runs are repeated at the final commit below.)
+
+### Mutation (`scripts/verify/mutation.sh`)
+
+The machine crashed during an uncapped run (10 workers) earlier in this work; that run's results
+were lost. The scripts gained two options for this (default unchanged): `MAX_CHILDREN` (mutmut
+workers) and `FILE...` (only some files of the list).
+
+- **Pass 1** (3 workers, all changed lines, stopped by hand after 41 min because the remaining
+  mutants sat in functions nearly every test runs through, about 5 mutants a minute): 2379
+  mutants, 1617 checked: 967 killed, 320 survived, 330 no tests; 762 not checked. Memory, read
+  once a minute: start 85 % free, swap 828 MB; lowest 79 % free; peak swap 1,933 MB; end 84 %
+  free, swap 1,692 MB.
+- **Pass 2** (6 workers, after new tests; `stats.py`, `events.py`, `term_extractor.py`,
+  `exporter.py`, `server.py`, `run_records_check.py`; 29 min within the 30 min bound): 1538
+  mutants, 1311 killed, 227 survived, 0 no tests. Memory: start 84 % free, swap 1,556 MB; lowest
+  61 % free; end 69 % free, swap 716 MB. The check script's "no tests" came from tests loading it
+  under another module name; they now load it as `scripts.verify.run_records_check`, like
+  `test_verify_scripts.py` does.
+- After pass 2, two test commits (`4e5f5fb`, `b832a3e`) target the cheap survivors (UTC stamps,
+  compact separators, record field checks, summary counts over two runs, report helpers, empty
+  reports, the check script's whole output, segment `split`/`warnings` keys, file mode, NaN,
+  log message of a record failure). These kills were not re-verified by a mutation run.
+
+Survivors left and why (pass 2): log-message wording and arguments (`export_project` 17,
+`append_record` 4, `_record` 5 before its new test); mutants equivalent here (`ensure_ascii`
+for records that hold ASCII codes only; `.encode('UTF-8')`; `pread(fd, 2, …)` at the file end
+reads 1 byte either way; one lock for every path instead of one per path; `fromisoformat` taking
+`Z` itself on Python 3.12, so the `'Z'` replacements and `round(…, 4)` of millisecond times
+change nothing; `'web'` vs `'WEB'` on the case-insensitive macOS file system; `//1001` for
+milliseconds differing only at a few microsecond values; `calls or 1` for a segment without a
+`calls` field landing in the same branch); the sort key of groups (`'XXXX'` vs `''`); output
+wording of the check script's `--help`/argparse defaults.
+
+**Not mutation-checked** (changed lines never reached, counts from pass 1): `translator.py`
+149 of 153 mutants, `translate.py` 140 of 316 (69 of the checked survived: mostly the CLI
+parallel path and `_Run`, which later tests target, unverified), `proclog.py` 128 of 161 (9
+survived, 6 no tests: `_web_end`, which runs only in a child process at exit), `tasks.py` 120
+of 187 (28 survived, mostly `_pause_for`, which later tests target, unverified). Route
+functions in the blueprints (Flask-decorated) are not mutated by mutmut at all.
+
+### Real end-to-end check (invented text; REAL calls: 28)
+
+The first end-to-end run's files were lost in the machine crash; the numbers below are from the
+rerun on the final code (commit `b832a3e` plus the two later fixes being only an exit code in
+the process log and the outcome class of a Ctrl-C call). An invented six-chapter EPUB (one
+paragraph per chapter), a temporary projects directory, `copilot-sdk` with `claude-haiku-4.5`,
+timeout 30 s. A driver script started the web server, called the API, ran the CLI and stopped
+the server with SIGINT to its process group.
+
+- Web: create, 2 workers, a pause as soon as one segment was done, resume, all 6 translated;
+  one retranslation; one glossary extraction. Stats page loaded in Chrome; it shows the same
+  numbers as `stats --json`, which equals the endpoint's JSON (compared as dicts: equal).
+  Per backend/model: 10 calls (accepted 8, cancelled 2 by the pause, each recorded at 0.1 s),
+  7 segments all accepted at the first attempt, median 6.9 s, p90 11.3 s, tokens 12,468 in,
+  4,710 out; runs: web 35.1 s, 6 translated, 1 pause, 8 calls; retranslate 7.6 s; extract
+  6.8 s, 2 terms added. A line `not json` appended to the record: the page said "略過 1 行無法解析的紀錄".
+  A new untouched project showed the empty state.
+- CLI: `init`, `model set`, `start -w 3` on a second project (6 calls, all accepted first,
+  15.5 s); on a third project `start` with no `copilot` on PATH (run_end `stopped`,
+  `BackendUnavailableError`, call outcome `backend_unavailable`, exit 1); `start` again with
+  SIGINT sent to its own process group (`start_new_session=True`, `os.killpg`) after the first
+  segment: run_end `interrupted`, 1 translated, `KeyboardInterrupt`, process exit 1
+  ("Aborted!"); `start` once more finished the other 5.
+- From the files alone: `logs/web.log` has the start line (version from `git describe`, pid),
+  every request line (`POST …/translate/pause` twice), the model change, the task's start and
+  segment lines and `end: web server stopped`; `logs/cli.log` has a start and end line for each
+  of the 14 commands, the `run stopped: …` warning of the unavailable backend and
+  `interrupted (Ctrl-C)` (that run logged `exit 130` while the process exited 1; fixed in
+  `bef0da5`, and the Ctrl-C call, recorded as `unexpected`, is now `cancelled`, `eb02772`). The
+  event records (59 lines) contain none of the book's words, title, author or project names and
+  no CJK character; `scripts/verify/run_records_check.py --anonymize` passed for all three
+  projects.
+- Left behind: no `copilot --headless` process. The SIGINT reached the Copilot runtime in the
+  same process group while a session was being created: one session folder was left under
+  Copilot's session state with only start, abort and shutdown events (no prompt); it was
+  removed by hand (known behaviour, CLAUDE.md).
+
+Not verified: a real timeout, a real rate limit, a real refusal or truncated reply (the
+classifications are tested with the fake backend only); `claude-cli` and `copilot-cli` in a
+real run; two processes rotating the same process log at the same moment; a crash in the middle
+of a write (simulated with a cut-off line only); the Ctrl-C path of a web server.
