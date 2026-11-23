@@ -176,39 +176,47 @@ class TermExtractor:
                  backend: llm.LLMBackend | None = None, effort: str | None = None,
                  events: events.RunEvents | None = None):
         self.events = events  # one record per call (None: none)
-        self.model = model
         self.timeout = timeout
         self.effort = effort  # passed with every call (None: none)
         self.backend = backend if backend is not None else llm.default_backend()
+        self.model = model  # '' : no --model flag, the program's own default
+        # The model the event record names: with none given, the backend's
+        # default (as TranslationEngine uses), not an empty string
+        self.recorded_model = model or self.backend.default_model
         self._pending = None  # the last reply's record, until parsed
 
     def _record(self, kind: str, started: float, outcome: str, **fields) -> None:
         if self.events is None:
             return
         try:
-            self.events.call(kind=kind, backend=self.backend.name, model=self.model,
+            self.events.call(kind=kind, backend=self.backend.name, model=self.recorded_model,
                              effort=self.effort, timeout=self.timeout,
                              seconds=time.monotonic() - started, outcome=outcome, **fields)
         except Exception:  # noqa: BLE001 - a record never stops an extraction
             logger.warning("無法記錄模型呼叫", exc_info=True)
 
-    def _parsed(self, usable: bool) -> None:
+    def _parsed(self, usable: bool, error: BaseException | None = None) -> None:
         """Record the last reply: accepted, or rejected with the issue code
         UNUSABLE_REPLY when it could not be read (truncated either way when
-        cut off)."""
+        cut off); `error`: reading it was interrupted (Ctrl-C), the outcome
+        is the error's class."""
         pending, self._pending = self._pending, None
         if pending is None or self.events is None:
             return
         kind, seconds, fields = pending
-        if fields.pop('truncated'):
+        truncated = fields.pop('truncated')
+        if error is not None:
+            outcome = events.error_outcome(error)
+        elif truncated:
             outcome = 'truncated'
         else:
             outcome = 'accepted' if usable else 'rejected'
         try:
-            self.events.call(kind=kind, backend=self.backend.name, model=self.model,
+            self.events.call(kind=kind, backend=self.backend.name, model=self.recorded_model,
                              effort=self.effort, timeout=self.timeout, seconds=seconds,
-                             outcome=outcome, issues=None if usable else [UNUSABLE_REPLY],
-                             **fields)
+                             outcome=outcome,
+                             issues=None if usable or error is not None else [UNUSABLE_REPLY],
+                             error=error, **fields)
         except Exception:  # noqa: BLE001 - a record never stops an extraction
             logger.warning("無法記錄模型呼叫", exc_info=True)
 
@@ -252,6 +260,9 @@ class TermExtractor:
         except Exception as e:
             logger.warning("Term extraction error: %s", e)
             terms = None
+        except BaseException as e:  # Ctrl-C while the reply is read: the call was made
+            self._parsed(False, error=e)
+            raise
         self._parsed(terms is not None)
         return terms or []
 
@@ -333,6 +344,9 @@ class TermExtractor:
         except Exception as e:  # noqa: BLE001 - e.g. not JSON, or a too deeply nested reply
             logger.warning("Term consolidation error: %s", type(e).__name__)
             items = None
+        except BaseException as e:  # Ctrl-C while the reply is read
+            self._parsed(False, error=e)
+            raise
         self._parsed(items is not None)
         items = items or []
         wanted = {g['term'].lower(): g for g in groups}

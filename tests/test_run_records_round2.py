@@ -269,3 +269,50 @@ class TestCliExtractLifecycle:
         [end] = self._run(tmp_path, monkeypatch,
                           lambda: monkeypatch.setattr(te.TermExtractor, '__init__', explode))
         assert (end['state'], end['error']) == ('failed', 'ZeroDivisionError')
+
+
+class TestExtractionRound2:
+    def test_ctrl_c_while_reading_a_reply(self, tmp_path, monkeypatch):
+        import pytest
+        from src.glossary import term_extractor as te
+        from src.llm.fake import FakeBackend
+        from tests.test_run_records import _of, _records
+
+        def interrupt(*a, **k):
+            raise KeyboardInterrupt()
+        monkeypatch.setattr(te.TermExtractor, '_parse_reply', staticmethod(interrupt))
+        extractor = te.TermExtractor(model='m', backend=FakeBackend(['[]']),
+                                     events=RunEvents(str(tmp_path), 'extract'))
+        with pytest.raises(KeyboardInterrupt):
+            extractor.extract_from_text('Nothing.')
+        [c] = _of(_records(str(tmp_path)), 'call')
+        assert (c['outcome'], c['error']) == ('cancelled', 'KeyboardInterrupt')
+
+    def test_ctrl_c_while_reading_a_consolidation(self, tmp_path, monkeypatch):
+        import pytest
+        from src.glossary import term_extractor as te
+        from src.llm.fake import FakeBackend
+        from tests.test_run_records import _of, _records
+
+        def interrupt(*a, **k):
+            raise KeyboardInterrupt()
+        monkeypatch.setattr(te, '_top_level_list', interrupt)
+        extractor = te.TermExtractor(model='m', backend=FakeBackend(['[]']),
+                                     events=RunEvents(str(tmp_path), 'extract'))
+        group = {'term': 'Quill', 'translations': {'羽': 1, '筆': 1}, 'categories': {}}
+        from collections import Counter
+        group = {**group, 'translations': Counter(group['translations']), 'categories': Counter()}
+        with pytest.raises(KeyboardInterrupt):
+            extractor.consolidate([group])
+        [c] = _of(_records(str(tmp_path)), 'call')
+        assert (c['kind'], c['outcome']) == ('consolidate', 'cancelled')
+
+    def test_default_model_is_the_backends(self, tmp_path):
+        from src.glossary.term_extractor import TermExtractor
+        from src.llm.fake import FakeBackend
+        from tests.test_run_records import _of, _records
+        backend = FakeBackend(['[]'])
+        extractor = TermExtractor(backend=backend, events=RunEvents(str(tmp_path), 'extract'))
+        extractor.extract_from_text('Nothing.')
+        [c] = _of(_records(str(tmp_path)), 'call')
+        assert c['model'] == backend.default_model and c['model']
