@@ -10,7 +10,7 @@ from dataclasses import asdict
 from flask import Blueprint, request, jsonify, current_app
 
 from src.core.events import RunEvents, settings_fields
-from src.core.project import ProjectManager
+from src.core.project import ProjectManager, project_mutex
 from src.core.segmenter import SegmentType
 from src.glossary.glossary_manager import GlossaryManager
 from src.glossary.term_extractor import ExtractionError, TermExtractor
@@ -131,12 +131,18 @@ def extract_terms(project_name: str):
     if project_name in _extraction_tasks and _extraction_tasks[project_name].get('running'):
         return jsonify({'error': '已有提取任務正在執行'}), 409
 
-    # Get project segments for extraction
-    pm = _get_pm(project_name)
-    # All text segments; TermExtractor splits them into bounded batches
-    segments = [{'text': s.text} for s in pm.data.segments
-                if s.segment_type != SegmentType.CODE]
-    settings = pm.call_settings()
+    projects_dir = current_app.config['PROJECTS_DIR']
+    project_dir = os.path.join(projects_dir, project_name)
+    # The snapshot and the recorder under the project mutex, which a
+    # replacement holds while it sets the record aside: never the old book's
+    # text with the new book's record
+    with project_mutex(project_dir):
+        pm = _get_pm(project_name)
+        # All text segments; TermExtractor splits them into bounded batches
+        segments = [{'text': s.text} for s in pm.data.segments
+                    if s.segment_type != SegmentType.CODE]
+        settings = pm.call_settings()
+        events = RunEvents(project_dir, 'extract')
 
     _extraction_tasks[project_name] = {
         'running': True,
@@ -146,11 +152,6 @@ def extract_terms(project_name: str):
         'error': None
     }
 
-    # Get config for thread
-    projects_dir = current_app.config['PROJECTS_DIR']
-
-    project_dir = os.path.join(projects_dir, project_name)
-    events = RunEvents(project_dir, 'extract')
     events.emit('run_start', segments=len(segments), **settings_fields(settings))
     logger.info("術語提取開始: %s (%d 段)", project_name, len(segments))
 

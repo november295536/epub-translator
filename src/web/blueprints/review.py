@@ -221,12 +221,14 @@ def retranslate_segment(project_name: str, segment_id: str):
         brief = pm.data.brief or ''
         segments = copy.deepcopy(pm.data.segments)
         seg = next(s for s in segments if s.segment_id == segment_id)
+        # In the same locked section as the snapshot: a replacement of the
+        # project after it retires this record, never one before it
+        events = RunEvents(pm.project_dir, 'retranslate')
     project_dir = pm.project_dir
 
     gm = _glossary(project_dir)  # None: translated without the glossary, and said so
 
     handler = setup_project_logging(project_dir)
-    events = RunEvents(project_dir, 'retranslate')
     events.emit('run_start', workers=1, segments=1, mode='selected', **settings_fields(settings))
     started = time.monotonic()
     end = {'state': 'failed'}  # the run_end fields; replaced on every way out
