@@ -109,7 +109,7 @@ class _LoggedCommand(click.Command):
             logger.info("usage error: %s", e.format_message())
             raise
         except (KeyboardInterrupt, click.exceptions.Abort):
-            code = 130
+            code = 1  # click's exit status for an interrupted command ("Aborted!")
             logger.warning("interrupted (Ctrl-C)")
             raise
         except BaseException:
