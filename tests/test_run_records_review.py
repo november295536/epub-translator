@@ -108,7 +108,7 @@ class TestCallLostWhenCheckRaises:
         assert outcome.calls == 1 and outcome.failure.calls == 1
         [c] = calls
         assert (c['outcome'], c['error'], c['attempt']) == ('unexpected', 'ZeroDivisionError', 1)
-        assert c['chars_out'] > 0
+        assert c['chars_out'] > 0 and c['kind'] == 'request'
 
     def test_ctrl_c_in_clean(self, tmp_path, monkeypatch):
         outcome, calls = self._run(tmp_path, monkeypatch, '_clean_html', KeyboardInterrupt())
@@ -434,3 +434,254 @@ class TestCheckScriptRound1:
             f.write('{"cut\n')
         code, out = self._check(tmp_path, capsys)
         assert code == 1 and 'segment without segment' in out and 'skipped lines 1' in out
+
+
+# --- survivors of the round-1 mutation pass that pointed at gaps in the tests ---------
+
+def _tm(monkeypatch):
+    from src.web import tasks as tasks_module
+    from src.web.tasks import TaskManager
+    TaskManager._instance = None
+    monkeypatch.setattr(tasks_module, 'COORDINATOR_TICK_SECONDS', 0.02)
+    return TaskManager()
+
+
+class TestWebRecordFields:
+    def _run(self, tmp_path, monkeypatch, responder, n=2, **start):
+        from src.llm.fake import FakeBackend
+        from tests.conftest import use_fake_backend
+        from tests.test_run_records import PROJECT, _of, _records, _wait
+        tm = _tm(monkeypatch)
+        path = _make_project(tmp_path, n=n)
+        try:
+            with use_fake_backend(FakeBackend(responder=responder)):
+                task = tm.start_translation(PROJECT, str(tmp_path), **start)
+                _wait(lambda: task.state in ('completed', 'stopped', 'failed')
+                      and not task.threads_alive())
+            _wait(lambda: _of(_records(path), 'run_end'))
+            return tm, task, path, _records(path)
+        finally:
+            from src.web.tasks import TaskManager
+            TaskManager._instance = None
+
+    def test_modes_and_failed_result(self, tmp_path, monkeypatch):
+        from src.llm import RefusalError
+        from tests.test_run_records import _of
+
+        def refuse(request):
+            raise RefusalError('no')
+        _, _, path, records = self._run(tmp_path, monkeypatch, refuse, n=1)
+        [seg] = _of(records, 'segment')
+        assert (seg['segment'], seg['result'], seg['issues']) == ('c1_seg0001', 'failed', ['refusal'])
+        assert _of(records, 'run_end')[0]['failed'] == 1
+        from tests.conftest import like
+        _, _, _, again = self._run(tmp_path / 'b', monkeypatch, lambda r: like(r, '好'), n=1,
+                                   retry_failed=True)
+        assert _of(again, 'run_start')[0]['mode'] == 'retry_failed'
+        _, _, _, chosen = self._run(tmp_path / 'c', monkeypatch, lambda r: like(r, '好'), n=1,
+                                    segment_ids=['c1_seg0001'])
+        assert _of(chosen, 'run_start')[0]['mode'] == 'selected'
+
+    def test_run_end_seconds_and_failure(self, tmp_path, monkeypatch):
+        from tests.conftest import like
+        from tests.test_run_records import _of
+        from src.web import tasks as tasks_module
+        clock = iter(range(1000, 100000, 7))
+        monkeypatch.setattr(tasks_module.TaskManager, 'clock', staticmethod(lambda: next(clock)))
+        _, task, _, records = self._run(tmp_path, monkeypatch, lambda r: like(r, '好'), n=1)
+        [end] = _of(records, 'run_end')
+        assert end['seconds'] > 0 and end['seconds'] % 7 == 0  # clock steps of 7 s
+
+        def explode(self, task, pm, res):
+            raise ZeroDivisionError('invented')
+        monkeypatch.setattr(tasks_module.TaskManager, '_apply_result', explode)
+        _, task, _, records = self._run(tmp_path / 'b', monkeypatch, lambda r: like(r, '好'), n=1)
+        [end] = _of(records, 'run_end')
+        assert (end['state'], end['error']) == ('failed', 'ZeroDivisionError')
+
+    def test_dropped_before_call(self, tmp_path, monkeypatch):
+        import threading
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        from tests.test_run_records import PROJECT, _of, _records, _wait
+        tm = _tm(monkeypatch)
+        path = _make_project(tmp_path, n=2)
+        started, go = threading.Event(), threading.Event()
+
+        def responder(request):
+            started.set()
+            go.wait(10)
+            return like(request, '好')
+        try:
+            with use_fake_backend(FakeBackend(responder=responder)):
+                task = tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+                assert started.wait(10)
+                with tm.transaction(PROJECT, str(tmp_path)) as pm:
+                    pm.update_translation('c1_seg0002', '人工譯文')  # still queued
+                    pm.save()
+                go.set()
+                _wait(lambda: task.state == 'completed' and not task.threads_alive())
+            _wait(lambda: _of(_records(path), 'run_end'))
+        finally:
+            from src.web.tasks import TaskManager
+            TaskManager._instance = None
+        dropped = [s for s in _of(_records(path), 'segment') if s['result'] == 'dropped']
+        assert [(s['segment'], s['reason']) for s in dropped] == [
+            ('c1_seg0002', 'edited_before_call')]
+
+    def test_user_pause_record(self, tmp_path, monkeypatch):
+        import threading
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        from tests.test_run_records import PROJECT, _of, _records, _wait
+        tm = _tm(monkeypatch)
+        path = _make_project(tmp_path, n=2)
+        first = threading.Event()
+
+        def responder(request):
+            first.set()
+            return like(request, '好')
+        try:
+            with use_fake_backend(FakeBackend(responder=responder)):
+                task = tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+                _wait(lambda: task.completed >= 1)
+                assert tm.pause_translation(PROJECT)
+                assert tm.pause_translation(PROJECT)  # a repeated click: not recorded
+                assert tm.resume_translation(PROJECT)
+                _wait(lambda: task.state == 'completed' and not task.threads_alive())
+            _wait(lambda: _of(_records(path), 'run_end'))
+        finally:
+            from src.web.tasks import TaskManager
+            TaskManager._instance = None
+        [pause] = _of(_records(path), 'pause')
+        assert pause['reason'] == 'user' and pause['completed'] >= 1
+
+    def test_auto_resume_and_extension_time(self, tmp_path, monkeypatch):
+        from src.llm import RateLimitError
+        from src.llm.fake import FakeBackend
+        from src.web import tasks as tasks_module
+        from tests.conftest import like, use_fake_backend
+        from tests.test_run_records import PROJECT, _of, _records, _wait
+        now = {'t': 1000.0}
+        monkeypatch.setattr(tasks_module.TaskManager, 'clock', staticmethod(lambda: now['t']))
+        tm = _tm(monkeypatch)
+        path = _make_project(tmp_path, n=1)
+        calls = {'n': 0}
+
+        def responder(request):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise RateLimitError('limit')
+            return like(request, '好')
+        try:
+            with use_fake_backend(FakeBackend(responder=responder)):
+                task = tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+                _wait(lambda: task.state == 'paused')
+                now['t'] += 120.0
+                with task._lock:  # a second rate limit 120 s into the 300 s wait
+                    tm._pause_for(task, RateLimitError('again'), 'rate_limit')
+                now['t'] += 400.0  # the wait is over
+                _wait(lambda: task.state == 'completed' and not task.threads_alive())
+            _wait(lambda: _of(_records(path), 'run_end'))
+        finally:
+            from src.web.tasks import TaskManager
+            TaskManager._instance = None
+        records = _records(path)
+        assert _of(records, 'wait_extended')[0]['resume_in'] == 300.0
+        assert _of(records, 'resume')[0]['reason'] == 'auto'
+
+
+class TestCliRecordFields:
+    def test_rate_limit_pause_fields(self, tmp_path, monkeypatch):
+        from click.testing import CliRunner
+        import translate
+        from src.llm import RateLimitError
+        from src.llm.fake import FakeBackend
+        from tests.conftest import use_fake_backend
+        from tests.test_run_records import _of, _records
+        path = _make_project(tmp_path, n=1)
+        monkeypatch.setattr(translate, '_sleep', lambda s: None)
+        with use_fake_backend(FakeBackend([RateLimitError('limit'), '<p k="1">好</p>'])):
+            assert CliRunner().invoke(translate.cli, ['start', '-p', path]).exit_code == 0
+        records = _records(path)
+        [pause] = _of(records, 'pause')
+        assert (pause['error'], pause['resume_in']) == ('RateLimitError', 300)
+        assert _of(records, 'resume')[0]['reason'] == 'auto'
+
+    def test_parallel_segment_ids_and_stop_error(self, tmp_path):
+        from click.testing import CliRunner
+        import translate
+        from src.llm import BackendUnavailableError
+        from src.llm.fake import FakeBackend
+        from tests.conftest import like, use_fake_backend
+        from tests.test_run_records import _of, _records
+        path = _make_project(tmp_path, n=2)
+        with use_fake_backend(FakeBackend(responder=lambda r: like(r, '好'))):
+            assert CliRunner().invoke(translate.cli, ['start', '-p', path, '-w', '2']).exit_code == 0
+        assert sorted(s['segment'] for s in _of(_records(path), 'segment')) == [
+            'c1_seg0001', 'c1_seg0002']
+
+        def gone(request):
+            raise BackendUnavailableError('missing')
+        other = _make_project(tmp_path / 'o', n=2)
+        with use_fake_backend(FakeBackend(responder=gone)):
+            CliRunner().invoke(translate.cli, ['start', '-p', other, '-w', '2'])
+        [end] = _of(_records(other), 'run_end')
+        assert (end['state'], end['error']) == ('stopped', 'BackendUnavailableError')
+
+    def test_failed_run_and_retry_mode(self, tmp_path, monkeypatch):
+        from click.testing import CliRunner
+        import translate
+        from src.llm.fake import FakeBackend
+        from tests.conftest import use_fake_backend
+        from tests.test_run_records import _of, _records
+        path = _make_project(tmp_path, n=1)
+
+        def explode(*a, **k):
+            raise ZeroDivisionError('invented')
+        monkeypatch.setattr(translate, '_start_sequential', explode)
+        with use_fake_backend(FakeBackend([])):
+            CliRunner().invoke(translate.cli, ['start', '-p', path, '--retry-failed'])
+        [start] = _of(_records(path), 'run_start')
+        [end] = _of(_records(path), 'run_end')
+        assert start['mode'] == 'retry_failed'
+        assert (end['state'], end['error']) == ('failed', 'ZeroDivisionError')
+        assert 0 <= end['seconds'] < 60
+
+    def test_command_line_and_exit_codes(self, tmp_path, monkeypatch):
+        import re
+        import sys
+        from click.testing import CliRunner
+        import translate
+        from tests.test_run_records import PROJECT
+        log_file = os.path.join(os.environ[proclog.LOG_DIR_ENV], 'cli.log')
+        path = _make_project(tmp_path)
+
+        def tail():
+            with open(log_file, encoding='utf-8') as f:
+                return f.read().splitlines()[-3:]
+        CliRunner().invoke(translate.cli, ['validate', path, '--mark-failed'])
+        start = [l for l in tail() if 'start: cli validate' in l][-1]
+        assert 'mark_failed=True' in start and f'project_dir={path}' in start
+        CliRunner().invoke(translate.cli, ['validate', path])  # a False flag, then nothing
+        CliRunner().invoke(translate.cli, ['stats', '--since', 'soon', '-p', path])
+        lines = tail()
+        assert any('usage error: ' in l and 'soon' in l for l in lines)
+        assert lines[-1].endswith(lines[-1].split('end: ')[-1]) and 'end: exit 2 after' in lines[-1]
+        assert float(re.search(r'after ([\d.]+) s', lines[-1]).group(1)) < 60
+        for code, logged in ((None, 0), ('a message', 1), (3, 3)):
+            def leave(*a, code=code, **k):
+                sys.exit(code)
+            monkeypatch.setattr(translate, '_find_project', leave)
+            CliRunner().invoke(translate.cli, ['status', '-p', path])
+            assert f'end: exit {logged} after' in tail()[-1]
+        assert PROJECT
+
+
+def test_outcome_defaults():
+    from src.core.translator import TranslationError, unexpected_error_outcome
+    e = TranslationError('x', code='error', prompt='', attempts=[])
+    assert e.calls == 0 and e.split is False
+    outcome = unexpected_error_outcome('m', ValueError('v'), '')
+    assert (outcome.calls, outcome.split) == (0, False)
+    assert (outcome.failure.calls, outcome.failure.split) == (0, False)
