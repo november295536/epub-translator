@@ -792,3 +792,13 @@ class TestCheckScriptPassB:
             'segment', segment='old1', result='dropped')
         code, out = self._check(tmp_path, capsys)
         assert 'segment id not in project.json' not in out
+
+
+def test_check_goes_on_after_a_project_without_record(tmp_path, capsys):
+    from src.core.events import RunEvents
+    from tests.test_run_records import TestRunRecordsCheckScript
+    _make_project(tmp_path, n=1, name='a')  # no record
+    path = _make_project(tmp_path, n=1, name='b')
+    RunEvents(path, 'cli', run_id='20260101T000000Z-abcdef').emit('segment', result='failed')
+    assert TestRunRecordsCheckScript._check(None, tmp_path) == 1
+    assert 'a: no event record' in capsys.readouterr().out
