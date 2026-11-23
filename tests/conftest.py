@@ -512,13 +512,19 @@ def write_raw_epub(path, items, spine, members, opf_path='OEBPS/content.opf',
                  'xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
                  f'<rootfile full-path="{opf_path}" media-type="application/oebps-package+xml"/>'
                  '</rootfiles></container>')
+    def put(name, content):
+        # a fixed time: the same book written twice has the same bytes (and
+        # digest) even when the clock passes a zip time step in between
+        z.writestr(zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0)), content,
+                   compress_type=zipfile.ZIP_DEFLATED)
+
     with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
         z.writestr(zipfile.ZipInfo('mimetype'), 'application/epub+zip',
                    compress_type=zipfile.ZIP_STORED)
-        z.writestr('META-INF/container.xml', container)
-        z.writestr(opf_path, opf)
+        put('META-INF/container.xml', container)
+        put(opf_path, opf)
         for name, content in members.items():
-            z.writestr(name, content)
+            put(name, content)
     return str(path)
 
 

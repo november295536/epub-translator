@@ -8386,6 +8386,14 @@ fix.
 | 3 | CLI `glossary extract`: a closed stdout at the stop notice lost the term count in `run_end` | yes (`test_stopped_extraction_keeps_terms_when_stdout_closes`: `KeyError: 'terms'`) | the count is in the end record before the notice is printed (`b261057`; the survivor-kill anchor `cli90` follows the notice's new text) |
 | 4 | `proclog`'s module docstring still spoke of the git commit | — (text) | corrected; a grep of CLAUDE.md, README, `known-issues.md`, `CHANGELOG.md`, `src/` and `translate.py` for `git describe`, `git commit`, `rev-parse`, `GIT_OPTIONAL_LOCKS` and `dirty` finds no other leftover (`b261057`) |
 
+A pre-existing flake (on `main` too) showed up in a three-suite run:
+`test_rules_1_and_2_export_alike[bilingual-vertical]` refused the export with a hash mismatch. The
+test writes `book.epub` twice into one directory; the first project records the first file's
+digest and reads that path (it has no `source.epub`), and `write_raw_epub` stamped members with
+the current time, so two writes on either side of a zip time step (2 s) differ. Forced by writing
+the book twice 2.1 s apart (digests differed); `write_raw_epub` now uses a fixed member time and
+the forced check gives the same digest (`FLAKEFIX`).
+
 Optional item: the start-line test no longer also searches proclog's source for `subprocess`;
 the behavioural part (`subprocess.Popen` patched to fail during `proclog.setup`) stays. The other
 source-text tests of round 3 (the page's handlers, the changelog) were kept: the page cannot be
