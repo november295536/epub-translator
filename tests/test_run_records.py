@@ -1252,9 +1252,9 @@ class TestCheckScriptOutput:
         assert capsys.readouterr().out == (
             'project-1: PASS  records 1, skipped lines 0, runs 1\n'
             'project-2: FAIL  records 2, skipped lines 0, runs 1\n'
-            '  record 1: issues: a string that is not a known value (10 chars)\n'
-            '  run 20260101T000000Z-abcdef: run_end translated=1, segment records 0\n'
-            '  run 20260101T000000Z-abcdef: run_end failed=0, segment records 1\n'
+            '  line 1: issues: a string that is not a known value (10 chars)\n'
+            '  run 1: run_end translated=1, segment records 0\n'
+            '  run 1: run_end failed=0, segment records 1\n'
             '  1 records name a segment id not in project.json\n'
             'project-3: no event record\n'
             'FAIL\n')
