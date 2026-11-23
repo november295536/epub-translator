@@ -115,3 +115,167 @@ class TestCallLostWhenCheckRaises:
         assert isinstance(outcome, KeyboardInterrupt)
         [c] = calls
         assert c['outcome'] == 'cancelled'
+
+
+class TestWebRunEnd:
+    def test_pause_after_the_last_result(self, tmp_path, monkeypatch):
+        """A pause that arrives after the last result, while the workers
+        leave: the run is completed (nothing is left to resume), and its
+        run_end line is written before the end is published."""
+        from src.core.events import events_path
+        from src.llm.fake import FakeBackend
+        from src.web import tasks as tasks_module
+        from src.web.tasks import TaskManager
+        from tests.conftest import like, use_fake_backend
+        from tests.test_run_records import PROJECT, _of, _records
+
+        TaskManager._instance = None
+        monkeypatch.setattr(tasks_module, 'COORDINATOR_TICK_SECONDS', 0.02)
+        tm = TaskManager()
+        path = _make_project(tmp_path, n=1)
+        done = tm._workers_done
+
+        def workers_done(task):
+            if done(task):
+                tm.pause_translation(PROJECT)  # the forced interleaving
+                return True
+            return False
+        monkeypatch.setattr(tm, '_workers_done', workers_done)
+        published = []
+        put = tasks_module.EventBroadcaster.put
+
+        def spy(self, event):
+            if event['event'] in ('complete', 'stopped', 'error'):
+                published.append((event['event'], [
+                    r['event'] for r in _of(_records(path), 'run_end')]))
+            put(self, event)
+        monkeypatch.setattr(tasks_module.EventBroadcaster, 'put', spy)
+        try:
+            with use_fake_backend(FakeBackend(responder=lambda r: like(r, '好'))):
+                task = tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+                task._coordinator.join(timeout=20)
+            assert task.state == 'completed'
+            [end] = _of(_records(path), 'run_end')
+            assert end['state'] == 'completed' and end['translated'] == 1
+            assert published == [('complete', ['run_end'])]
+            assert os.path.exists(events_path(path))
+        finally:
+            TaskManager._instance = None
+
+
+def _no_thread(monkeypatch, module):
+    """Threads of `module` cannot start (as when the process has too many)."""
+    import threading
+
+    class Refused(threading.Thread):
+        def start(self):
+            raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(module.threading, 'Thread', Refused)
+
+
+class TestExtractionEnd:
+    def test_run_end_before_status_says_ended(self, tmp_path, monkeypatch):
+        import json
+        from src.core import events as events_module
+        from src.llm.fake import FakeBackend
+        from src.web.blueprints import glossary as glossary_module
+        from src.web.server import create_app
+        from tests.conftest import use_fake_backend
+        from tests.test_run_records import PROJECT, _of, _records, _wait
+
+        path = _make_project(tmp_path, n=1)
+        running_at_end = []
+        emit = events_module.RunEvents.emit
+
+        def spy(self, event, **fields):
+            if event == 'run_end':
+                running_at_end.append(glossary_module._extraction_tasks[PROJECT]['running'])
+            return emit(self, event, **fields)
+        monkeypatch.setattr(events_module.RunEvents, 'emit', spy)
+        client = create_app(projects_dir=str(tmp_path)).test_client()
+        reply = json.dumps([{'term': 'Quillfeather', 'translation': '羽筆', 'category': 'term'}])
+        with use_fake_backend(FakeBackend([reply])):
+            assert client.post(f'/api/projects/{PROJECT}/glossary/extract').status_code == 200
+            _wait(lambda: client.get(f'/api/projects/{PROJECT}/glossary/extract/status')
+                  .get_json()['status'] != 'running')
+        assert running_at_end == [True]
+        assert _of(_records(path), 'run_end')  # there as soon as the status is not running
+
+    def test_thread_start_failure(self, tmp_path, monkeypatch):
+        from src.web.blueprints import glossary as glossary_module
+        from src.web.server import create_app
+        from tests.test_run_records import PROJECT, _of, _records
+
+        path = _make_project(tmp_path, n=1)
+        client = create_app(projects_dir=str(tmp_path)).test_client()
+        _no_thread(monkeypatch, glossary_module)
+        assert client.post(f'/api/projects/{PROJECT}/glossary/extract').status_code == 500
+        assert glossary_module._extraction_tasks[PROJECT]['running'] is False
+        [end] = _of(_records(path), 'run_end')
+        assert (end['state'], end['error']) == ('failed', 'RuntimeError')
+
+
+def test_translation_thread_start_failure(tmp_path, monkeypatch):
+    import pytest
+    from src.web import tasks as tasks_module
+    from src.web.tasks import TaskManager
+    from tests.test_run_records import PROJECT, _of, _records
+
+    TaskManager._instance = None
+    try:
+        tm = TaskManager()
+        path = _make_project(tmp_path, n=1)
+        _no_thread(monkeypatch, tasks_module)
+        with pytest.raises(RuntimeError):
+            tm.start_translation(PROJECT, str(tmp_path), num_workers=1)
+        [end] = _of(_records(path), 'run_end')
+        assert (end['state'], end['error']) == ('failed', 'RuntimeError')
+        assert PROJECT not in tm.tasks
+    finally:
+        TaskManager._instance = None
+
+
+class TestRetiredRecord:
+    """A run still going when its project is replaced or deleted (a
+    retranslation, a web extraction) stops writing: no line in the new
+    book's record, no project directory created again."""
+
+    def test_replaced(self, tmp_path, sample_epub):
+        from src.core.events import RunEvents, events_path
+        from src.web.server import create_app
+        client = create_app(projects_dir=str(tmp_path)).test_client()
+        res = client.post('/api/projects', json={'epub_path': sample_epub})
+        path = os.path.join(str(tmp_path), res.get_json()['name'])
+        old_run = RunEvents(path, 'retranslate')
+        assert old_run.emit('run_start', segments=1)
+        assert client.post('/api/projects', json={'epub_path': sample_epub}).status_code == 200
+        assert old_run.emit('run_end', state='completed') is False
+        assert not os.path.exists(events_path(path))
+        assert RunEvents(path, 'web').emit('run_start', segments=1)  # a new run writes
+
+    def test_deleted(self, tmp_path):
+        from src.core.events import RunEvents
+        from src.web.server import create_app
+        from tests.test_run_records import PROJECT
+        path = _make_project(tmp_path, n=1)
+        old_run = RunEvents(path, 'extract')
+        assert old_run.emit('run_start', segments=1)
+        client = create_app(projects_dir=str(tmp_path)).test_client()
+        assert client.delete(f'/api/projects/{PROJECT}').status_code == 200
+        assert old_run.emit('run_end', state='completed') is False
+        assert not os.path.exists(path)
+
+    def test_never_creates_the_project_directory(self, tmp_path):
+        from src.core.events import RunEvents
+        gone = tmp_path / 'gone'
+        assert RunEvents(str(gone), 'cli').emit('run_start') is False
+        assert not gone.exists()
+
+
+def test_short_write_is_reported(tmp_path, monkeypatch, caplog):
+    import logging
+    from src.core import events as events_module
+    monkeypatch.setattr(events_module.os, 'write', lambda fd, data: 3)
+    with caplog.at_level(logging.WARNING, logger='src.core.events'):
+        assert events_module.RunEvents(str(tmp_path), 'cli').emit('pause') is False
+    assert '只寫入 3 /' in caplog.text

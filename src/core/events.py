@@ -36,6 +36,9 @@ EVENTS_VERSION = 1
 
 _locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
+# Per record path: bumped when the record is set aside or the project
+# deleted, so a run still going in this process stops writing (RunEvents)
+_generations: dict[str, int] = {}
 
 
 def events_path(project_dir: str) -> str:
@@ -49,18 +52,32 @@ def set_aside(project_dir: str) -> str | None:
     project replaced by another book. Returns the new path; None when there
     was no record. Raises OSError when it cannot be moved."""
     path = events_path(project_dir)
-    if not os.path.exists(path):
-        return None
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
-    target = os.path.join(os.path.dirname(path), f'events-{stamp}.jsonl')
     with _lock_for(path):
+        retire(project_dir)
+        if not os.path.exists(path):
+            return None
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        target = os.path.join(os.path.dirname(path), f'events-{stamp}.jsonl')
         os.rename(path, target)
     return target
 
 
+def retire(project_dir: str) -> None:
+    """The runs of this process that started before now no longer write to
+    the project's record: it was set aside, or the project deleted."""
+    key = os.path.abspath(events_path(project_dir))
+    with _locks_guard:
+        _generations[key] = _generations.get(key, 0) + 1
+
+
+def _generation(path: str) -> int:
+    with _locks_guard:
+        return _generations.get(os.path.abspath(path), 0)
+
+
 def _lock_for(path: str) -> threading.Lock:
     with _locks_guard:
-        return _locks.setdefault(path, threading.Lock())
+        return _locks.setdefault(os.path.abspath(path), threading.Lock())
 
 
 def now_stamp() -> str:
@@ -75,13 +92,19 @@ def new_run_id() -> str:
     return f'{stamp}-{secrets.token_hex(3)}'
 
 
-def append_record(path: str, record: dict) -> bool:
+def append_record(path: str, record: dict, generation: int | None = None) -> bool:
     """Append one record as a line. False (logged) when it could not be
-    written; never raises."""
+    written; never raises. Nothing is written (False) when the project
+    directory is gone (it is never created here), or when `generation` is
+    given and the record was retired since (`retire`)."""
     try:
         line = (json.dumps(record, ensure_ascii=False, separators=(',', ':'),
                            allow_nan=False) + '\n').encode('utf-8')
         with _lock_for(path):
+            if generation is not None and generation != _generation(path):
+                return False  # set aside or deleted while the run went on
+            if not os.path.isdir(os.path.dirname(os.path.dirname(path))):
+                return False  # the project was deleted
             os.makedirs(os.path.dirname(path), exist_ok=True)
             fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
             try:
@@ -90,9 +113,14 @@ def append_record(path: str, record: dict) -> bool:
                     # The last line was cut off (a crash mid-write): end it,
                     # so that only it is unreadable, not this one too
                     line = b'\n' + line
-                os.write(fd, line)
+                written = os.write(fd, line)
             finally:
                 os.close(fd)
+        if written != len(line):
+            # A short write (disk full): the line is cut off; the next
+            # append ends it, and a reader skips it
+            logger.warning("事件紀錄只寫入 %d / %d 位元組", written, len(line))
+            return False
         return True
     except Exception as e:  # noqa: BLE001 - a record never stops a run
         logger.warning("無法寫入事件紀錄 (%s): %s", type(e).__name__, e)
@@ -130,13 +158,14 @@ class RunEvents:
         self.path = events_path(project_dir)
         self.source = source
         self.run_id = run_id or new_run_id()
+        self.generation = _generation(self.path)  # see retire
 
     def emit(self, event: str, **fields) -> bool:
         """Append one record; fields that are None are left out."""
         record = {'v': EVENTS_VERSION, 'ts': now_stamp(), 'run': self.run_id,
                   'source': self.source, 'event': event}
         record.update((k, v) for k, v in fields.items() if v is not None)
-        return append_record(self.path, record)
+        return append_record(self.path, record, self.generation)
 
     def call(self, *, kind: str, backend: str, model: str, effort: str | None,
              timeout: float, seconds: float, outcome: str, segment: str | None = None,
