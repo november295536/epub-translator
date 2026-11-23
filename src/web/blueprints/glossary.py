@@ -193,11 +193,18 @@ def extract_terms(project_name: str):
             end = {'state': 'failed', 'error': type(e).__name__}
             _extraction_tasks[project_name]['error'] = str(e)
         finally:
-            _extraction_tasks[project_name]['running'] = False
+            # before the status says it ended
             events.emit('run_end', seconds=round(time.monotonic() - started, 3), **end)
+            _extraction_tasks[project_name]['running'] = False
 
     thread = threading.Thread(target=run_extraction, daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except BaseException as e:
+        # No thread: the run ends here, and the next extraction may start
+        events.emit('run_end', state='failed', error=type(e).__name__, seconds=0.0)
+        _extraction_tasks[project_name]['running'] = False
+        raise
 
     return jsonify({'status': 'started'})
 
