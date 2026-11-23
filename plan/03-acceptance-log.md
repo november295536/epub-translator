@@ -8254,3 +8254,10 @@ SIGINT to the server's process group wrote `end: web server stopped` into `web.l
 
 Not verified this round: the page's empty and skipped-line states again (unchanged code); a real
 rate limit, timeout or refusal (fake backend only, as before).
+
+Suite at the round's last code commit (`522d65b`), three at once:
+
+```
+$ python3 -m pytest tests/ -q -p no:cacheprovider -rfw        # three at once
+3130 passed in 283.06s / 284.76s / 283.14s          (no failure, no warning)
+```
