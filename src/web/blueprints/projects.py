@@ -9,7 +9,7 @@ import shutil
 import uuid
 from flask import Blueprint, render_template, redirect, request, jsonify, current_app
 
-from src.core.events import retire, set_aside
+from src.core.events import retired, set_aside
 from src.core.project import (
     ProjectLock, ProjectLockedError, ProjectManager, project_mutex, sha256_file,
 )
@@ -338,8 +338,10 @@ def delete_project(project_name: str):
         except ProjectLockedError as e:
             return jsonify({'error': str(e)}), 409
         try:
-            retire(project_dir)  # a retranslation or extraction still going stops writing
-            shutil.rmtree(project_dir)
+            # a retranslation or extraction still going stops writing; one
+            # in the middle of an append finishes it first
+            with retired(project_dir):
+                shutil.rmtree(project_dir)
         finally:
             lock.release()
     logger.info("專案已刪除: %s", project_name)

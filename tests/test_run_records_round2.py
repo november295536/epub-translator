@@ -333,3 +333,34 @@ def test_version_takes_no_git_lock(monkeypatch):
     assert kwargs['env']['GIT_OPTIONAL_LOCKS'] == '0'  # git's switch for the index refresh
     assert cmd[:2] == ['git', '-C'] and 'describe' in cmd
 
+
+
+def test_delete_waits_for_an_append_in_progress(tmp_path, monkeypatch):
+    """An append that passed its checks when the delete starts: the delete
+    waits for it, so the directory is not recreated behind the delete."""
+    import threading
+    from src.core import events as events_module
+    from src.web.server import create_app
+    from tests.test_run_records import PROJECT
+    path = _make_project(tmp_path, n=1)
+    run = RunEvents(path, 'extract')
+    inside, go = threading.Event(), threading.Event()
+    makedirs = os.makedirs
+
+    def slow_makedirs(name, *a, **k):
+        if threading.current_thread().name == 'appender':
+            inside.set()
+            go.wait(10)
+        return makedirs(name, *a, **k)
+    monkeypatch.setattr(events_module.os, 'makedirs', slow_makedirs)
+    appender = threading.Thread(target=run.emit, args=('run_end',), name='appender')
+    appender.start()
+    assert inside.wait(10)
+    client = create_app(projects_dir=str(tmp_path)).test_client()
+    deleter = threading.Thread(target=lambda: client.delete(f'/api/projects/{PROJECT}'))
+    deleter.start()
+    deleter.join(0.5)  # before the fix the delete finishes here, the append still pending
+    go.set()
+    appender.join(10)
+    deleter.join(10)
+    assert not os.path.exists(path)
