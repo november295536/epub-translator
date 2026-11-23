@@ -229,3 +229,43 @@ def test_retranslate_keeps_counts_when_the_answer_fails(tmp_path, monkeypatch):
     [seg], [end] = _of(records, 'segment'), _of(records, 'run_end')
     assert seg['result'] == 'translated'
     assert (end['state'], end['error'], end['translated']) == ('failed', 'ZeroDivisionError', 1)
+
+
+class TestCliExtractLifecycle:
+    def _run(self, tmp_path, monkeypatch, patch=None):
+        import json
+        from click.testing import CliRunner
+        import translate
+        from src.llm.fake import FakeBackend
+        from tests.conftest import use_fake_backend
+        from tests.test_run_records import _of, _records
+        path = _make_project(tmp_path, n=1)
+        if patch:
+            patch()
+        reply = json.dumps([{'term': 'Quillfeather', 'translation': '羽筆', 'category': 'term'}])
+        with use_fake_backend(FakeBackend([reply])):
+            CliRunner().invoke(translate.cli, ['glossary', 'extract', '-p', path])
+        return _of(_records(path), 'run_end')
+
+    def test_completed_after_the_save(self, tmp_path, monkeypatch):
+        [end] = self._run(tmp_path, monkeypatch)
+        assert (end['state'], end['terms'], end['added']) == ('completed', 1, 1)
+
+    def test_failed_save(self, tmp_path, monkeypatch):
+        from src.glossary.glossary_manager import GlossaryManager
+
+        def explode(self, *a, **k):
+            raise OSError('disk full')
+        [end] = self._run(tmp_path, monkeypatch,
+                          lambda: monkeypatch.setattr(GlossaryManager, 'save', explode))
+        assert (end['state'], end['error'], end['terms']) == ('failed', 'OSError', 1)
+        assert 'added' not in end
+
+    def test_failure_before_the_calls(self, tmp_path, monkeypatch):
+        import src.glossary.term_extractor as te
+
+        def explode(*a, **k):
+            raise ZeroDivisionError('invented')
+        [end] = self._run(tmp_path, monkeypatch,
+                          lambda: monkeypatch.setattr(te.TermExtractor, '__init__', explode))
+        assert (end['state'], end['error']) == ('failed', 'ZeroDivisionError')

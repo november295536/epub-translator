@@ -878,38 +878,39 @@ def glossary_extract(project):
     segments = [{'text': s.text} for s in pm.data.segments if s.segment_type == SegmentType.TEXT]
     events = RunEvents(project_dir, 'extract')
     events.emit('run_start', segments=len(segments), **settings_fields(settings))
-    extractor = TermExtractor(**settings.call_args(), events=events)
-    click.echo(f"正在從 {len(segments)} 個文字段落中提取術語...")
-
     stopped = None
     started = time.monotonic()
-    end = {'state': 'interrupted'}
+    end = {'state': 'interrupted'}  # Ctrl-C; replaced on every other way out
+    # One lifecycle: run_end after the glossary is saved, with what was stored
     try:
+        extractor = TermExtractor(**settings.call_args(), events=events)
+        click.echo(f"正在從 {len(segments)} 個文字段落中提取術語...")
         try:
             terms = extractor.extract_from_segments(segments)
         except ExtractionError as e:
             # Keep what the finished batches found
             stopped, terms = e, e.terms
             click.echo(f"提取中斷：{e}")
+        click.echo(f"提取到 {len(terms)} 個術語")
+        end = {'state': 'failed', 'terms': len(terms)}  # until the save went through
+        if terms:
+            gm = GlossaryManager(_get_glossary_path(project_dir))
+            gm.load()
+            for t in terms:
+                old = gm.get_term(t['term'])  # a person's gender and note stay
+                gm.add_term(t['term'], t['translation'], category=t.get('category', ''),
+                            gender=old.gender if old else '', note=old.note if old else '',
+                            save=False)
+            gm.save()  # once, right after the glossary was read
+            click.echo(f"已儲存到 {_get_glossary_path(project_dir)}")
         # (a stop's cause is in the record of the call that hit it)
-        end = {'state': 'completed' if stopped is None else 'stopped', 'terms': len(terms)}
+        end = {'state': 'completed' if stopped is None else 'stopped', 'terms': len(terms),
+               'added': len(terms)}
     except Exception as e:
-        end = {'state': 'failed', 'error': type(e).__name__}
+        end = {**end, 'state': 'failed', 'error': type(e).__name__}
         raise
     finally:
         events.emit('run_end', seconds=round(time.monotonic() - started, 3), **end)
-    click.echo(f"提取到 {len(terms)} 個術語")
-
-    if terms:
-        gm = GlossaryManager(_get_glossary_path(project_dir))
-        gm.load()
-        for t in terms:
-            old = gm.get_term(t['term'])  # a person's gender and note stay
-            gm.add_term(t['term'], t['translation'], category=t.get('category', ''),
-                        gender=old.gender if old else '', note=old.note if old else '',
-                        save=False)
-        gm.save()  # once, right after the glossary was read
-        click.echo(f"已儲存到 {_get_glossary_path(project_dir)}")
     if stopped is not None:
         sys.exit(1)
 
