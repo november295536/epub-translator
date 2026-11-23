@@ -7,9 +7,10 @@ normal use the repository's `logs/`, ignored by git, next to `projects/`
 and `uploads/`). EPUB_TRANSLATOR_LOG_DIR, when set, replaces the directory
 (the test suite points it at a temporary one).
 
-The file gets a start line (program version: the git commit when there is
-one; Python version; the command or "web server"; pid), every record of the
-`src.*` loggers and of the web server's request lines (werkzeug), and the
+The file gets a start line (program version: `src.__version__` only, no git
+is read; Python version; the command or "web server"; pid), every record of
+INFO and up (the `src.*` loggers, the web server's request lines, other
+libraries), and the
 traceback of an uncaught exception in a request, a CLI command or a thread.
 Unlike the project's event record (src/core/events.py) it may contain book
 text (error messages, project names in request lines): it stays local.

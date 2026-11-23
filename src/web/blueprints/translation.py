@@ -78,10 +78,13 @@ def pause_translation(project_name: str):
     action = data.get('action')
     if action not in ('pause', 'resume'):
         return jsonify({'error': 'action 必須是 pause 或 resume'}), 400
-    if task.finishing:
-        # The run is ending (its last result is in, or it failed): nothing to
-        # pause or resume. No state: the page keeps what the stream told it
+    def ending():
+        # The run is ending (its last result is in, it failed, or it was
+        # stopped): nothing to pause or resume. No state: the page keeps
+        # what the stream told it
         return jsonify({'error': '翻譯正在結束', 'ending': True}), 409
+    if task.finishing or task.stop_event.is_set():
+        return ending()
     if action == 'resume':
         # Resume — optionally adjust workers
         num_workers = None
@@ -92,12 +95,16 @@ def pause_translation(project_name: str):
                 pass
         if tm.resume_translation(project_name, num_workers=num_workers):
             return jsonify({'status': 'ok', 'state': 'running'})
+        if task.finishing or task.stop_event.is_set():
+            return ending()  # it began ending meanwhile
         # Resume failed (e.g. thread died) — return actual state so frontend can recover
         return jsonify({'error': task.error or '無法繼續翻譯', 'state': task.state}), 500
     else:
         # Pause
         if tm.pause_translation(project_name):
             return jsonify({'status': 'ok', 'state': 'paused'})
+        if task.finishing or task.stop_event.is_set():
+            return ending()  # it began ending meanwhile
         return jsonify({'error': '無法暫停翻譯', 'state': task.state}), 500
 
 

@@ -891,8 +891,10 @@ def glossary_extract(project):
         except ExtractionError as e:
             # Keep what the finished batches found
             stopped, terms = e, e.terms
-            click.echo(f"提取中斷：{e}")
+        # the count first: a closed stdout at a notice below still records it
         end = {'state': 'interrupted', 'terms': len(terms)}  # until the save went through
+        if stopped is not None:
+            click.echo(f"提取中斷：{stopped}")
         click.echo(f"提取到 {len(terms)} 個術語")
         if terms:
             gm = GlossaryManager(_get_glossary_path(project_dir))
