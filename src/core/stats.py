@@ -153,7 +153,8 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
     that report them); the segments that ended there (the model of their
     last call): translated with one call, translated with more (retries,
     transient retries, a split; `split` counts those split), failed. Per run: source, start, end, duration, segments
-    translated/failed/dropped, pauses, calls, end state."""
+    translated/failed/dropped, pauses, calls, end state; a run whose run_start
+    is not selected has start None and only its run_end's own duration."""
     groups: dict[tuple, dict] = {}
     runs: dict[str, dict] = {}
     last_call: dict[tuple, tuple] = {}  # (run, segment) -> key of its last call
@@ -185,6 +186,7 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
         event = r['event']
         if event == 'run_start':
             info['start'] = r['ts']
+            info['started'] = True
             for field in ('workers', 'segments', 'backend', 'model', 'effort'):
                 info[field] = r.get(field)
         elif event == 'run_end':
@@ -256,12 +258,19 @@ def summarize(records: list[dict], skipped: int = 0, since: str | None = None,
         models.append(g)
 
     run_list = []
-    for info in sorted(runs.values(), key=lambda i: i['start']):
+    for info in sorted(runs.values(), key=lambda i: i['start']):  # first line if no run_start
         # A finished run: the duration it measured itself (monotonic clock);
         # else from the record times (an unfinished run: up to its last line)
         seconds = info.pop('seconds', None)
-        info['duration'] = (seconds if seconds is not None and info['end'] else
-                            _seconds_between(info['start'], info['end'] or info['last']))
+        if not info.pop('started', False):
+            # Its run_start is not in the selection (it began before --since,
+            # or the line is missing): the start is unknown, and only a
+            # duration the run measured itself belongs to it
+            info['start'] = None
+            info['duration'] = seconds if info['end'] else None
+        else:
+            info['duration'] = (seconds if seconds is not None and info['end'] else
+                                _seconds_between(info['start'], info['end'] or info['last']))
         if info['state'] is None:
             info['state'] = 'unfinished'  # no run_end: still running, or the process died
         del info['last']
@@ -312,6 +321,9 @@ def _secs(value: float | None) -> str:
 def _codes(counts: dict) -> str:
     return '、'.join(f'{code} {n}' for code, n in counts.items()) or '無'
 
+
+# A run whose run_start is not in the selection (it began before --since)
+START_UNKNOWN = '（開始不在所選紀錄中）'
 
 # How the kinds of work read in the text report
 WORK_TEXT = {'translation': '翻譯', 'extraction': '術語提取'}
@@ -366,7 +378,7 @@ def text_report(stats: dict) -> list[str]:
     for r in stats['runs']:
         end = _local(r['end']) or '-'
         lines.append(
-            f'  {r["run"]}  {r["source"]}  {_local(r["start"])} → {end}'
+            f'  {r["run"]}  {r["source"]}  {_local(r["start"]) or START_UNKNOWN} → {end}'
             f'（{_secs(r["duration"])}）  {STATE_TEXT.get(r["state"], r["state"])}'
             + (f'（{r["error"]}）' if r['error'] else ''))
         lines.append(
