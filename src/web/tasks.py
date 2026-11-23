@@ -354,12 +354,15 @@ class TaskManager:
                     task.queued[seg.segment_id] = (seg.revision, seg.status)
                     task.segment_queue.put(seg)
 
-                task.events = RunEvents(project_dir, 'web')
+                run_events = RunEvents(project_dir, 'web')
                 task.started = self.clock()
-                task.events.emit('run_start', workers=num_workers, segments=task.total,
-                                 mode='selected' if segment_ids is not None else
-                                 ('retry_failed' if retry_failed else 'pending'),
-                                 **settings_fields(pm.call_settings()))
+                run_events.emit('run_start', workers=num_workers, segments=task.total,
+                                mode='selected' if segment_ids is not None else
+                                ('retry_failed' if retry_failed else 'pending'),
+                                **settings_fields(pm.call_settings()))
+                # only now: a failure before this point writes no run_end
+                # (there is no run_start it would end)
+                task.events = run_events
 
                 coordinator = threading.Thread(
                     target=self._run_translation,
