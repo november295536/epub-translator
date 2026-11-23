@@ -8392,7 +8392,7 @@ test writes `book.epub` twice into one directory; the first project records the 
 digest and reads that path (it has no `source.epub`), and `write_raw_epub` stamped members with
 the current time, so two writes on either side of a zip time step (2 s) differ. Forced by writing
 the book twice 2.1 s apart (digests differed); `write_raw_epub` now uses a fixed member time and
-the forced check gives the same digest (`FLAKEFIX`).
+the forced check gives the same digest (`c3da4e3`).
 
 Optional item: the start-line test no longer also searches proclog's source for `subprocess`;
 the behavioural part (`subprocess.Popen` patched to fail during `proclog.setup`) stays. The other
