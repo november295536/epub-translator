@@ -43,6 +43,9 @@ logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _handler: logging.Handler | None = None
+_handler_name: str | None = None
+_terminal: logging.Handler | None = None
+_in_command = False  # between a CLI command's setup() and command_ended()
 _previous_excepthook = None
 _commit: str | None = None
 _end_registered = False
@@ -84,8 +87,30 @@ def _thread_excepthook(args):
 
 def _web_end() -> None:
     """The end line of a web server that stops normally (atexit; a killed
-    process writes none)."""
-    logger.info("end: web server stopped | pid %d", os.getpid())
+    process writes none). Only into the web log: not when the file is a CLI
+    command's (`translate.py review`) or was removed."""
+    if _handler_name == 'web':
+        logger.info("end: web server stopped | pid %d", os.getpid())
+
+
+def terminal(level: int, fmt: str = '%(message)s', datefmt: str | None = None) -> None:
+    """Records of `level` and above also go to stderr, as they did before the
+    file handler: a CLI command WARNING with the bare message (what
+    `logging.lastResort` printed while the root logger had no handler), the
+    web server INFO with time and logger. Nothing when the root logger has a
+    handler of someone else (an embedding program, pytest)."""
+    global _terminal
+    root = logging.getLogger()
+    with _lock:
+        if any(h is not _handler and h is not _terminal for h in root.handlers):
+            return
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
+        if _terminal is not None:
+            root.removeHandler(_terminal)
+        root.addHandler(handler)
+        _terminal = handler
 
 
 def setup(projects_dir: str, name: str, what: str) -> str | None:
@@ -96,12 +121,16 @@ def setup(projects_dir: str, name: str, what: str) -> str | None:
     (CLI commands write their own). Returns the file's path; None, after a
     warning on stderr, when the file cannot be opened (the program goes on
     without it)."""
-    global _handler, _previous_excepthook, _end_registered
-    path = os.path.join(log_dir_for(projects_dir), f'{name}.log')
+    global _handler, _handler_name, _previous_excepthook, _end_registered, _in_command
+    path = os.path.abspath(os.path.join(log_dir_for(projects_dir), f'{name}.log'))
     root = logging.getLogger()
     with _lock:
         if _handler is not None and getattr(_handler, 'baseFilename', None) == path:
             handler = _handler  # the same file again (e.g. a second app): kept
+        elif _in_command and name == 'web':
+            # `translate.py review`: the web server runs inside a CLI
+            # command, whose start and end lines stay in its file
+            path = _handler.baseFilename
         else:
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -117,12 +146,15 @@ def setup(projects_dir: str, name: str, what: str) -> str | None:
                 _handler.close()
             root.addHandler(handler)
             _handler = handler
+            _handler_name = name
+        if name == 'cli':
+            _in_command = True
         if root.level == logging.NOTSET or root.level > logging.INFO:
             root.setLevel(logging.INFO)
         if _previous_excepthook is None:
             _previous_excepthook = threading.excepthook
             threading.excepthook = _thread_excepthook
-        if name == 'web' and not _end_registered:
+        if _handler_name == 'web' and not _end_registered:
             _end_registered = True
             atexit.register(_web_end)
     logger.info("start: %s | epub-translator %s | Python %s | %s | pid %d",
@@ -130,11 +162,22 @@ def setup(projects_dir: str, name: str, what: str) -> str | None:
     return path
 
 
+def command_ended() -> None:
+    """A CLI command has written its end line."""
+    global _in_command
+    _in_command = False
+
+
 def teardown() -> None:
-    """Remove the file handler (tests)."""
-    global _handler
+    """Remove the file and terminal handlers (tests)."""
+    global _handler, _handler_name, _terminal
     with _lock:
         if _handler is not None:
             logging.getLogger().removeHandler(_handler)
             _handler.close()
             _handler = None
+            _handler_name = None
+        command_ended()
+        if _terminal is not None:
+            logging.getLogger().removeHandler(_terminal)
+            _terminal = None

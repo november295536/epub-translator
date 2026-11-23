@@ -94,6 +94,7 @@ class _LoggedCommand(click.Command):
 
     def invoke(self, ctx):
         proclog.setup(_projects_dir_of(ctx.params), 'cli', _command_line(ctx))
+        proclog.terminal(logging.WARNING)  # warnings on stderr, as without the file
         started = time.monotonic()
         code = 0
         try:
@@ -118,6 +119,7 @@ class _LoggedCommand(click.Command):
             raise
         finally:
             logger.info("end: exit %s after %.1f s", code, time.monotonic() - started)
+            proclog.command_ended()
 
 
 class _LoggedGroup(click.Group):
