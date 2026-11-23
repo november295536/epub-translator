@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -30,6 +31,8 @@ def sanitize_project_name(name: str) -> str:
     name = name.strip('-.')
     return name or 'untitled'
 
+
+logger = logging.getLogger(__name__)
 
 projects_bp = Blueprint('projects', __name__)
 
@@ -198,6 +201,7 @@ def create_project():
         if epub_path.startswith(get_uploads_dir()):
             os.remove(epub_path)
 
+        logger.info("專案已建立: %s (%d 段)", project_name, len(all_segments))
         return jsonify({
             'status': 'ok',
             'name': project_name,
@@ -209,6 +213,7 @@ def create_project():
     except EPUBError as e:
         return jsonify({'error': f'無法解析 EPUB：{e}'}), 400
     except Exception as e:
+        logger.exception("建立專案失敗")
         return jsonify({'error': f'建立專案失敗：{str(e)}'}), 500
 
 
@@ -329,6 +334,7 @@ def delete_project(project_name: str):
             shutil.rmtree(project_dir)
         finally:
             lock.release()
+    logger.info("專案已刪除: %s", project_name)
     return jsonify({'status': 'ok'})
 
 

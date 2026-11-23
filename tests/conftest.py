@@ -391,6 +391,22 @@ def model_programs_replaced(tmp_path_factory):
             os.environ[name] = value
 
 
+@pytest.fixture(scope='session', autouse=True)
+def process_log_in_temp(tmp_path_factory):
+    """The process log (src/core/proclog.py) of every app, CLI command and
+    child process of the session goes to a temporary directory, never into
+    the repository (a test of the default location removes the variable)."""
+    from src.core import proclog
+    saved = os.environ.get(proclog.LOG_DIR_ENV)
+    os.environ[proclog.LOG_DIR_ENV] = str(tmp_path_factory.mktemp('process-log'))
+    yield os.environ[proclog.LOG_DIR_ENV]
+    proclog.teardown()
+    if saved is None:
+        os.environ.pop(proclog.LOG_DIR_ENV, None)
+    else:
+        os.environ[proclog.LOG_DIR_ENV] = saved
+
+
 @pytest.fixture(autouse=True)
 def no_real_model_calls(monkeypatch):
     """No test starts the real `claude` program: a call that reaches the
