@@ -946,7 +946,8 @@ class TestRound2:
     def test_top_level_list(self):
         assert te._top_level_list('```json\n[{"term": "a", "translation": "b"}, 5, {"term": "c"}]\n```') \
             == [{'term': 'a', 'translation': 'b'}]
-        assert te._top_level_list(' {"term": "a", "translation": "b"} ') == []
+        with pytest.raises(ValueError):  # JSON, but not a list: unusable
+            te._top_level_list(' {"term": "a", "translation": "b"} ')
         with pytest.raises(ValueError):
             te._top_level_list('[{"term": "a"')
 
