@@ -208,3 +208,24 @@ def test_stopped_event_after_run_end(tmp_path, monkeypatch):
         from src.web.tasks import TaskManager
         TaskManager._instance = None
     assert published == [1]
+
+
+def test_retranslate_keeps_counts_when_the_answer_fails(tmp_path, monkeypatch):
+    from src.llm.fake import FakeBackend
+    from src.web.blueprints import review as review_module
+    from src.web.server import create_app
+    from tests.conftest import like, use_fake_backend
+    from tests.test_run_records import PROJECT, _of, _records
+    path = _make_project(tmp_path, n=1)
+
+    def explode(*a, **k):
+        raise ZeroDivisionError('invented')
+    monkeypatch.setattr(review_module, 'record_failure_log', explode)
+    client = create_app(projects_dir=str(tmp_path)).test_client()
+    with use_fake_backend(FakeBackend(responder=lambda r: like(r, '好'))):
+        assert client.post(f'/api/projects/{PROJECT}/segments/c1_seg0001/retranslate') \
+            .status_code == 500
+    records = _records(path)
+    [seg], [end] = _of(records, 'segment'), _of(records, 'run_end')
+    assert seg['result'] == 'translated'
+    assert (end['state'], end['error'], end['translated']) == ('failed', 'ZeroDivisionError', 1)
