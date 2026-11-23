@@ -1256,3 +1256,33 @@ class TestCheckScriptOutput:
         assert self._main(['--projects-dir', str(tmp_path / 'missing')]) == 2
         assert capsys.readouterr().out == (
             'cannot list the projects directory: FileNotFoundError\n')
+
+
+class TestLastSurvivors:
+    def test_segment_record_split_and_warnings(self, tmp_path):
+        from src.core.project import Issue
+        from src.core.translator import TranslationOutcome
+        ev = RunEvents(str(tmp_path), 'cli', run_id='r')
+        outcome = TranslationOutcome(
+            text='好', status=SegmentStatus.TRANSLATED, model='m', usage=None, calls=4,
+            split=True, issues=[Issue(kind='quality', code='length_ratio', detail='d',
+                                      blocking=False)])
+        events.segment_result(ev, 's1', outcome)
+        [s] = _of(_records(str(tmp_path)), 'segment')
+        assert {k: v for k, v in s.items() if k != 'ts'} == {
+            'v': 1, 'run': 'r', 'source': 'cli', 'event': 'segment', 'segment': 's1',
+            'result': 'translated', 'model': 'm', 'calls': 4, 'split': True,
+            'warnings': ['length_ratio']}
+
+    def test_file_mode_and_nan(self, tmp_path, caplog):
+        path = events_path(str(tmp_path))
+        old = os.umask(0)
+        try:
+            assert append_record(path, {'event': 'pause'})
+        finally:
+            os.umask(old)
+        assert os.stat(path).st_mode & 0o777 == 0o644
+        with caplog.at_level(logging.WARNING, logger='src.core.events'):
+            assert append_record(path, {'seconds': float('nan')}) is False
+        [rec] = caplog.records
+        assert rec.getMessage() == '無法寫入事件紀錄 (ValueError): Out of range float values are not JSON compliant: nan'
