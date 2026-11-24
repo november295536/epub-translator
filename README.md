@@ -161,7 +161,7 @@ logs/                         # 與 projects/ 同一層，不進版控：程序�
 python3 -m pytest tests/ -q -p no:cacheprovider -rfw
 ```
 
-突變測試：在專案的虛擬環境（已安裝 `requirements.txt` 與 `requirements-dev.txt`）執行 `scripts/verify/mutation.sh main`（第二個參數限制同時執行的突變 worker 數，例如 `main 4`，預設每個核心一個）；與 `main` 相比沒有可突變的變更行時以 exit 2 結束。`scripts/verify/` 其他腳本見 [CLAUDE.md](CLAUDE.md)。
+突變測試：在專案的虛擬環境（已安裝 `requirements.txt` 與 `requirements-dev.txt`）執行 `scripts/verify/mutation.sh master`（第二個參數限制同時執行的突變 worker 數，例如 `master 4`，預設每個核心一個）；與 `main` 相比沒有可突變的變更行時以 exit 2 結束。`scripts/verify/` 其他腳本見 [CLAUDE.md](CLAUDE.md)。
 
 版本與變更紀錄：每個修改 `src/`、`translate.py` 或 `requirements*.txt` 的 pull request 都要調高 `src/__init__.py` 的 `__version__`，並在 [CHANGELOG.md](CHANGELOG.md) 最上面加一段；規則見 CLAUDE.md「Releases」。程序紀錄只用這個版本號識別程式，從未合併或本機修改過的程式碼執行時，顯示的是上一個發行版本號。
 
