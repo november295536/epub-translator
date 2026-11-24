@@ -3,7 +3,7 @@
 
 import sys
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 # Oldest supported interpreter. Checked when the package is imported, i.e.
 # before any module that needs a newer Python is compiled: translate.py and
