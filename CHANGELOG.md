@@ -4,6 +4,12 @@ Newest first. Each pull request that changes `src/`, `translate.py` or
 `requirements*.txt` raises `src.__version__` and adds its entry here (see
 "Releases" in CLAUDE.md).
 
+## 2.0.1
+
+- License: the project is now under the GNU Affero General Public License
+  v3.0 (`AGPL-3.0-only`, see `LICENSE`). Versions up to 2.0.0 were released
+  under the MIT License. No change in behaviour.
+
 ## 2.0.0
 
 The improvement plan (`plan/02-improvement-plan.md`) and run records.

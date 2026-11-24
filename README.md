@@ -180,4 +180,6 @@ python3 -m pytest tests/ -q -p no:cacheprovider -rfw
 
 ## 授權
 
-MIT License
+GNU Affero General Public License v3.0（`AGPL-3.0-only`），全文見 [`LICENSE`](LICENSE)。修改後散布，或架成網路服務供他人使用，都必須依同一授權公開完整原始碼。
+
+2.0.0 及更早的版本先前以 MIT License 釋出；自 2.0.1 起改用 AGPL-3.0。
