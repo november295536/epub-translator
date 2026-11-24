@@ -1,5 +1,6 @@
 """Tests for CLI commands."""
 
+import src
 import json
 import os
 import pytest
@@ -501,7 +502,7 @@ class TestCLIVersion:
     def test_version(self, runner):
         result = runner.invoke(cli, ['--version'])
         assert result.exit_code == 0
-        assert '2.0.0' in result.output
+        assert src.__version__ in result.output  # the release number, whatever it is
 
 
 class TestCLIGlossaryExtract:
@@ -526,7 +527,7 @@ class TestCLIMessages:
     FAIL = 'Translation failed after 4 attempts: exit 1'
 
     def test_version_line(self, runner):
-        assert runner.invoke(cli, ['--version']).output == 'epub-translator, version 2.0.0\n'
+        assert runner.invoke(cli, ['--version']).output == f'epub-translator, version {src.__version__}\n'
 
     def test_retry_failed_help(self, runner):
         output = ' '.join(runner.invoke(cli, ['start', '--help']).output.split())

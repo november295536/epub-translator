@@ -4,6 +4,12 @@ Newest first. Each pull request that changes `src/`, `translate.py` or
 `requirements*.txt` raises `src.__version__` and adds its entry here (see
 "Releases" in CLAUDE.md).
 
+## 2.0.1
+
+- Housekeeping: the CLI version tests follow `src.__version__`, and README
+  names the license by its identifier (`AGPL-3.0-only`, see `LICENSE`). No
+  change in behaviour.
+
 ## 2.0.0
 
 The improvement plan (`plan/02-improvement-plan.md`) and run records.
