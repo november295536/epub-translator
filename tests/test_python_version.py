@@ -101,7 +101,7 @@ def test_mutation_script_checks_the_interpreter_first(tmp_path, version, message
                     "sys.modules['mutmut'] = None\n"
                     "exec(compile(sys.argv[2], '-c', 'exec'))\n")
     fake.chmod(0o755)
-    proc = subprocess.run(['bash', os.path.join(ROOT, 'scripts', 'verify', 'mutation.sh'), 'main'],
+    proc = subprocess.run(['bash', os.path.join(ROOT, 'scripts', 'verify', 'mutation.sh'), 'master'],
                           cwd=ROOT, capture_output=True, text=True, timeout=60,
                           env=dict(os.environ, PATH=f'{tmp_path}:{os.environ["PATH"]}'))
     assert (proc.returncode, proc.stdout, proc.stderr) == (2, '', message + '\n')

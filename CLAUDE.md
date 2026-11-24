@@ -15,7 +15,7 @@ pip install -r requirements.txt -r requirements-dev.txt   # dev: test fixtures (
 
 python3 -m flask --app src.web.server:create_app run --port 3000   # web UI
 python3 -m pytest tests/ -q -p no:cacheprovider -rfw               # tests
-scripts/verify/mutation.sh main          # mutation run over lines changed vs main (see below)
+scripts/verify/mutation.sh master        # mutation run over lines changed vs master (see below)
 ```
 
 CLI synopsis (not shell; each command has `--help`). `init`, `validate`, `migrate` take a path; the others take `-p/--project DIR`, default: the first project found under `projects/`.
@@ -96,7 +96,7 @@ API (`/api/...`):
 
 ## Releases
 
-`src.__version__` and `CHANGELOG.md` (repository root, newest first) are the release record. Every pull request that changes `src/`, `translate.py` or `requirements*.txt` raises `__version__` (patch for a fix, minor for a feature, major for a change that needs a migration or breaks stored data) and adds its entry at the top of `CHANGELOG.md`; after the merge the commit on `main` gets the tag `v<version>`. `tests/test_run_records_round3.py::test_changelog_and_version_in_step` keeps the top heading, `__version__` and `translate.py --version` equal. The process log identifies the code by this number only, so code run from an unmerged or locally edited tree shows the last released number.
+`src.__version__` and `CHANGELOG.md` (repository root, newest first) are the release record. Every pull request that changes `src/`, `translate.py` or `requirements*.txt` raises `__version__` (patch for a fix, minor for a feature, major for a change that needs a migration or breaks stored data) and adds its entry at the top of `CHANGELOG.md`; after the merge the commit on `master` gets the tag `v<version>`. `tests/test_run_records_round3.py::test_changelog_and_version_in_step` keeps the top heading, `__version__` and `translate.py --version` equal. The process log identifies the code by this number only, so code run from an unmerged or locally edited tree shows the last released number.
 
 ## Testing and verification
 
